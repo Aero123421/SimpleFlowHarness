@@ -27,7 +27,7 @@
   },
   "definitions": {
     "tool": {
-      "enum": ["codex", "claude", "opencode", "grok", "agy"],
+      "enum": ["codex", "claude", "opencode", "grok", "agy", "pi"],
       "description": "Preset AI CLI. Omit and use cmd: for anything else."
     },
     "access": {
@@ -55,7 +55,7 @@
       "properties": {
         "tool": { "$ref": "#/definitions/tool" },
         "model": { "type": "string" },
-        "effort": { "type": "string", "description": "codex: none..ultra / claude: low..max / grok,agy: low|medium|high / opencode: --variant" },
+        "effort": { "type": "string", "description": "codex: none..ultra / claude: low..max / grok,agy: low|medium|high / pi: off..max / opencode: --variant" },
         "access": { "$ref": "#/definitions/access" },
         "cwd": { "type": "string" },
         "timeout_sec": { "type": "integer", "minimum": 1 },

@@ -18,6 +18,9 @@
 //!   --output-format json gives .text/.sessionId; read = dontAsk + --deny.
 //! - agy: prompt ONLY as the value of a trailing -p; --output-format json gives
 //!   .response/.status/.conversation_id; --print-timeout defaults to 5m.
+//! - pi: prompt on stdin; --mode json emits JSONL (session header, then
+//!   message_end events); --session-id both creates and resumes; there is no
+//!   sandbox at all, so access levels are expressed as a --tools allowlist.
 
 use std::path::{Path, PathBuf};
 
@@ -54,6 +57,8 @@ pub enum OutputParse {
     GrokJson,
     /// agy --output-format json: single-line envelope.
     AgyJson,
+    /// pi --mode json: JSONL events (session header + message_end per turn).
+    PiJsonl,
 }
 
 /// How the rendered prompt reaches the tool.
@@ -88,6 +93,9 @@ pub struct Built {
     /// When resuming: the session id the tool MUST echo back (agy silently
     /// starts a new conversation on an unknown id - detect that as failure).
     pub expect_session: Option<String>,
+    /// When resuming: the session marker the tool must report back. Filled in
+    /// by the caller from the recorded session (pi: creation timestamp).
+    pub expect_marker: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -110,7 +118,65 @@ pub struct BuildPaths<'a> {
 
 /// True when this tool lets sfh choose the session id up front.
 pub fn wants_preassign(tool: &str) -> bool {
-    matches!(tool, "claude" | "grok")
+    matches!(tool, "claude" | "grok" | "pi")
+}
+
+/// Tools whose session lookup is scoped to the working directory.
+pub fn session_is_cwd_scoped(tool: &str) -> bool {
+    matches!(tool, "claude" | "grok" | "agy" | "pi")
+}
+
+/// pi has no sandbox and no permission prompts: the only real lever is which
+/// tools get registered. Bare `pi` already has read+bash+edit+write.
+fn pi_tools(access: Access) -> &'static str {
+    match access {
+        Access::Read => "read,grep,find,ls",
+        // Deliberately no bash: without a sandbox, a shell is indistinguishable
+        // from full access.
+        Access::Write => "read,edit,write,grep,find,ls",
+        Access::Full => "read,bash,edit,write,grep,find,ls",
+    }
+}
+
+fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>) {
+    if let Some(m) = &inp.model {
+        push(a, &["--model"]);
+        a.push(m.clone());
+    }
+    if let Some(e) = &inp.effort {
+        push(a, &["--thinking"]);
+        a.push(e.clone());
+    }
+    if inp.agent.is_some() {
+        warnings.push(
+            "pi preset ignores 'agent' (no --agent flag; use args: [\"--append-system-prompt\", \"...\"] for a persona)"
+                .into(),
+        );
+    }
+    push(a, &["--tools"]);
+    a.push(pi_tools(inp.access).to_string());
+    match inp.access {
+        // Project-local extensions/skills are TypeScript that runs with full
+        // process rights regardless of the tool allowlist, so a read step must
+        // refuse to load them for the allowlist to mean anything.
+        Access::Read => push(
+            a,
+            &[
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-approve",
+            ],
+        ),
+        Access::Write => {
+            push(a, &["--no-approve"]);
+            warnings.push(
+                "pi write registers no shell tool (pi has no sandbox, so bash would equal full access); add args: [\"-t\", \"read,bash,edit,write,grep,find,ls\"] if the step must run commands"
+                    .into(),
+            );
+        }
+        Access::Full => push(a, &["--approve"]),
+    }
 }
 
 const CLAUDE_ENV_SCRUB: [&str; 8] = [
@@ -396,6 +462,20 @@ pub fn build(
             parse = OutputParse::AgyJson;
             delivery = Delivery::Arg;
         }
+        "pi" => {
+            // --mode json already forces non-interactive; -p is avoided because
+            // it swallows the next argv token.
+            push(&mut a, &["pi", "--mode", "json", "--offline"]);
+            pi_common(&mut a, &inp, &mut warnings);
+            if let Some(id) = preassign_session {
+                push(&mut a, &["--session-id"]);
+                a.push(id.to_string());
+                preassigned = Some(id.to_string());
+            }
+            a.extend(inp.extra.iter().cloned());
+            parse = OutputParse::PiJsonl;
+            delivery = Delivery::Stdin;
+        }
         other => {
             return Err(format!(
                 "unknown tool '{other}' (use {}, or a custom cmd:)",
@@ -414,6 +494,7 @@ pub fn build(
         env_remove,
         env_set,
         expect_session: None,
+        expect_marker: None,
         warnings,
     })
 }
@@ -611,6 +692,19 @@ pub fn build_resume(
             parse = OutputParse::AgyJson;
             delivery = Delivery::Arg;
         }
+        "pi" => {
+            // --session-id creates OR resumes; the argv is identical to a fresh
+            // run. The id therefore always matches, so the resume guard compares
+            // the session header timestamp instead (see expect_marker).
+            push(&mut a, &["pi", "--mode", "json", "--offline"]);
+            pi_common(&mut a, &inp, &mut warnings);
+            push(&mut a, &["--session-id"]);
+            a.push(session_id.to_string());
+            a.extend(inp.extra.iter().cloned());
+            expect_session = Some(session_id.to_string());
+            parse = OutputParse::PiJsonl;
+            delivery = Delivery::Stdin;
+        }
         other => return Err(format!("tool '{other}' does not support continue_from")),
     }
     if let Some(bin) = inp.bin {
@@ -624,6 +718,7 @@ pub fn build_resume(
         env_remove,
         env_set,
         expect_session,
+        expect_marker: None,
         warnings,
     })
 }
@@ -826,13 +921,80 @@ mod tests {
     }
 
     #[test]
+    fn pi_access_levels_are_a_tool_allowlist() {
+        let read = build_argv("pi", Access::Read);
+        assert!(read.windows(2).any(|w| w[0] == "--mode" && w[1] == "json"));
+        assert!(read
+            .windows(2)
+            .any(|w| w[0] == "--tools" && w[1] == "read,grep,find,ls"));
+        // Project-local extensions run with full process rights, so a read step
+        // must not load them.
+        for f in [
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-approve",
+        ] {
+            assert!(read.iter().any(|x| x == f), "{f} missing from pi read");
+        }
+        assert!(!read.iter().any(|x| x.contains("bash")));
+
+        let write = build_argv("pi", Access::Write);
+        assert!(write
+            .windows(2)
+            .any(|w| w[0] == "--tools" && w[1] == "read,edit,write,grep,find,ls"));
+        assert!(
+            !write.iter().any(|x| x.contains("bash")),
+            "write must not register a shell"
+        );
+
+        let full = build_argv("pi", Access::Full);
+        assert!(full
+            .windows(2)
+            .any(|w| w[0] == "--tools" && w[1] == "read,bash,edit,write,grep,find,ls"));
+        assert!(full.iter().any(|x| x == "--approve"));
+    }
+
+    #[test]
+    fn pi_write_warns_that_it_has_no_shell() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        let b = build("pi", inp(Access::Write, &[]), &bp, None).unwrap();
+        assert!(
+            b.warnings.iter().any(|w| w.contains("no shell tool")),
+            "{:?}",
+            b.warnings
+        );
+    }
+
+    #[test]
+    fn pi_resume_reuses_session_id_flag_and_reads_stdin() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        let b = build_resume("pi", "sess-x", inp(Access::Read, &[]), &bp).unwrap();
+        assert_eq!(b.delivery, Delivery::Stdin);
+        assert!(b
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--session-id" && w[1] == "sess-x"));
+        // pi has no separate resume verb: create and resume share one flag.
+        assert!(!b.argv.iter().any(|x| x == "--resume" || x == "--continue"));
+    }
+
+    #[test]
     fn resume_sets_expect_session_for_tools_that_can_silently_start_new() {
         let (l, p) = paths();
         let bp = BuildPaths {
             last_msg: &l,
             prompt_file: &p,
         };
-        for t in ["claude", "opencode", "grok", "agy"] {
+        for t in ["claude", "opencode", "grok", "agy", "pi"] {
             let b = build_resume(t, "sid", inp(Access::Read, &[]), &bp).unwrap();
             assert_eq!(b.expect_session.as_deref(), Some("sid"), "{t}");
         }

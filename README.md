@@ -4,11 +4,11 @@
 [![release](https://img.shields.io/github/v/release/Aero123421/SimpleFlowHarness)](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**EN**: `sfh` chains AI coding CLIs — **Codex, Claude Code, opencode, Grok, Antigravity (`agy`)**, or any command — into YAML-defined multi-stage flows: review/retry loops, parallel fan-out, per-step model/effort/permission control, tool **session resume**, cost accounting with spend caps, and **crash-resume** of a whole run. It keeps your main agent's context window clean: stdout carries only the final step's output, everything else lands in a run directory. Single static binary for Windows / macOS / Linux. The docs below are in Japanese, but the YAML reference tables are language-neutral — and your favorite AI can translate the rest. A JSON Schema for flow files lives in [schema/flow.schema.json](schema/flow.schema.json).
+**EN**: `sfh` chains AI coding CLIs — **Codex, Claude Code, opencode, Grok, Antigravity (`agy`), Pi**, or any command — into YAML-defined multi-stage flows: review/retry loops, parallel fan-out, per-step model/effort/permission control, tool **session resume**, cost accounting with spend caps, and **crash-resume** of a whole run. It keeps your main agent's context window clean: stdout carries only the final step's output, everything else lands in a run directory. Single static binary for Windows / macOS / Linux. The docs below are in Japanese, but the YAML reference tables are language-neutral — and your favorite AI can translate the rest. A JSON Schema for flow files lives in [schema/flow.schema.json](schema/flow.schema.json).
 
 ---
 
-AI CLI(codex / claude / opencode / grok / agy / 任意コマンド)を **YAML定義の多段フロー** で非対話実行する小さなオーケストレータ。単一バイナリ、実行時依存なし、Windows / macOS / Linux 対応。
+AI CLI(codex / claude / opencode / grok / agy / pi / 任意コマンド)を **YAML定義の多段フロー** で非対話実行する小さなオーケストレータ。単一バイナリ、実行時依存なし、Windows / macOS / Linux 対応。
 
 メインで使っているエージェント(例: codex app)からサブエージェント群を直接管理するとコンテキストが溶けるので、その管理ループを丸ごとこのCLIに追い出すのが目的。
 
@@ -124,7 +124,7 @@ defaults:                    # 全ステップの既定値(すべて任意)
 steps:
   - id: plan                 # 必須・一意 [A-Za-z0-9_-]
     use: smart               # プロファイル参照(ステップ直書きが優先)
-    tool: codex              # codex | claude | opencode | grok | agy
+    tool: codex              # codex | claude | opencode | grok | agy | pi
     # bin: /path/to/tool     # 実行ファイル差し替え(PATHが古い時など)
     model: gpt-5-codex
     effort: high             # codex/claude/grok/agy/opencodeで意味が対応(下表)
@@ -212,6 +212,7 @@ steps:
 | opencode | `--format json`の`sessionID` | `run -s <id>` | どのcwdからでも再開可 |
 | grok | sfhがUUIDを`--session-id`で事前割当 | `--resume <id>` | cwdスコープ |
 | agy | JSONの`conversation_id` | `--conversation <id>` | 不正IDは黙って新規会話→sfhがID照合して失敗検出 |
+| pi | sfhがIDを`--session-id`で事前割当 | 同じ`--session-id`(作成と再開が同一フラグ) | cwdスコープ。**IDが一致しても別セッションでありうる**ため、sfhはヘッダのタイムスタンプ(マーカー)も照合する |
 
 ### コンテキスト管理
 
@@ -271,7 +272,7 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 
 ## プリセット → 実コマンド対応(2026-07-27 実機検証)
 
-プロンプトの渡し方はツール毎に安全な経路を自動選択: **stdin**(codex/claude/opencode)、**--prompt-file**(grok ※stdin渡しはTUIが開いてハングする)、**argv**(agy ※stdin非対応、25,000字上限)。
+プロンプトの渡し方はツール毎に安全な経路を自動選択: **stdin**(codex/claude/opencode/pi)、**--prompt-file**(grok ※stdin渡しはTUIが開いてハングする)、**argv**(agy ※stdin非対応、25,000字上限)。
 
 | tool | ベース | read | write | full |
 |---|---|---|---|---|
@@ -280,10 +281,13 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | opencode | `run --auto` ※auto必須(askで永久ハング) | `--agent plan` + edit/bash拒否env | `--agent build` + 外部dir拒否env | `--agent build`(制限なし) |
 | grok | `--output-format plain --prompt-file <f>` | `--permission-mode dontAsk --deny Edit/Write/Bash` | `--permission-mode acceptEdits` | `--permission-mode bypassPermissions` |
 | agy | `--print-timeout <t>s --output-format json -p <prompt>` | `--mode plan` | `--mode accept-edits` | `--dangerously-skip-permissions` |
+| pi | `--mode json --offline` | `--tools read,grep,find,ls` +拡張/スキル無効化 | `--tools read,edit,write,grep,find,ls` | `--tools read,bash,edit,write,grep,find,ls --approve` |
 
 補足:
 - **Geminiモデルは `tool: agy` で使う**(gemini-3.6-flash-low 等)。旧gemini CLIには非対応(個人無料枠廃止でAntigravityに統合されたため)。
-- **effortの語彙はツール毎に違う**: codex(none/minimal/low/medium/high/xhigh/max/ultra)、claude(low〜max)、grok/agy(low/medium/high)、opencodeは`--variant`(モデル毎)。範囲外はvalidateで警告。
+- **effortの語彙はツール毎に違う**: codex(none/minimal/low/medium/high/xhigh/max/ultra)、claude(low〜max)、grok/agy(low/medium/high)、pi(off〜max、`--thinking`)、opencodeは`--variant`(モデル毎)。範囲外はvalidateで警告。
+- **pi(`@earendil-works/pi-coding-agent`)にはサンドボックスも権限プロンプトも存在しない**(設計思想として意図的)。素の`pi`は既にread+bash+edit+writeが有効なので、sfhは`--tools`の許可リストで権限を表現する。`read`はツール登録レベルで確実だが、`write`は**書き込み先を制限しない**(ワークスペース境界がない)。またwriteではシェルを登録しない — サンドボックスがない以上bashはfullと同義だから。必要なら`args: ["-t", "read,bash,edit,write,grep,find,ls"]`で明示的に足す。
+- **piの`agent:`は無効**(`--agent`が無い)。ペルソナは`args: ["--append-system-prompt", "..."]`で。
 - **opencodeのmodelは`provider/model`形式必須**。effortは`--variant`に渡る。
 - **agy**: モデルIDにeffortサフィックスがある(例: gemini-3.1-pro-high)場合は`effort:`を併用しない(agyが衝突エラーを出す)。
 - **claude**のネスト実行対策として`CLAUDE_CODE_SESSION_ID`等の環境変数は自動除去。
@@ -339,7 +343,7 @@ codex-local:
 
 ## 既知の注意点
 
-- **検証済みバージョン**: codex-cli 0.146.0-alpha.3.1 / claude 2.1.220 / opencode 1.18.3 / grok 0.2.112 / agy 1.0.8。エージェントCLIのフラグは変わりやすい。ズレたら `args:` で足すか `cmd:` で全部書けば逃げられる。
+- **検証済みバージョン**: codex-cli 0.146.0-alpha.3.1 / claude 2.1.220 / opencode 1.18.3 / grok 0.2.112 / agy 1.0.8 / pi 0.82.1。エージェントCLIのフラグは変わりやすい。ズレたら `args:` で足すか `cmd:` で全部書けば逃げられる。
 - **タイムアウト**: Windowsは`taskkill /T /F`、Unixはprocess group killで子孫ごと落とす。子の終了後にパイプを握り続ける孫プロセスがいてもドレイン期限で先に進む。出力は1ストリーム32MBでキャップ。
 - **opencodeのread**は`OPENCODE_CONFIG_CONTENT`でedit/bashを拒否注入(1.18.3のplan agentはbashを塞がないため。実機でBLOCKED確認済み)。完全な保証が要る変更はwrite/fullレビューを挟むこと。
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。

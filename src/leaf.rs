@@ -9,8 +9,12 @@ use std::time::Duration;
 pub struct SessionInfo {
     pub tool: String,
     pub id: String,
-    /// cwd the step ran in - claude/grok/agy scope session lookup by directory.
+    /// cwd the step ran in - several tools scope session lookup by directory.
     pub cwd: Option<String>,
+    /// Extra identity the tool reports (pi: the session's creation timestamp).
+    /// pi accepts any --session-id and silently CREATES a session when the id
+    /// is not found in this cwd, so the id alone cannot prove a real resume.
+    pub marker: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -49,6 +53,8 @@ pub struct Prepared {
     pub timeout: Option<Duration>,
     pub preassigned_session: Option<String>,
     pub expect_session: Option<String>,
+    /// On resume: the session marker the tool must report back (see SessionInfo).
+    pub expect_marker: Option<String>,
     pub env_remove: Vec<String>,
     pub env_set: Vec<(String, String)>,
     pub out_file: PathBuf,
@@ -72,6 +78,7 @@ pub struct LeafDone {
     pub stderr_clean: String,
     pub out_file: PathBuf,
     pub session_id: Option<String>,
+    pub session_marker: Option<String>,
     pub tool: Option<String>,
     pub cwd: Option<String>,
     pub usage: preset::Usage,
@@ -392,13 +399,15 @@ pub fn prepare_leaf(
                     ));
                 }
                 let new_cwd = cwd.as_ref().map(|c| c.display().to_string());
-                if matches!(tool.as_str(), "claude" | "grok" | "agy") && info.cwd != new_cwd {
+                if preset::session_is_cwd_scoped(&tool) && info.cwd != new_cwd {
                     eprintln!(
                         "sfh: warning: step '{}': {tool} sessions are cwd-scoped; original ran in {:?}, this step uses {:?} - the session may not be found",
                         step.id, info.cwd, new_cwd
                     );
                 }
-                preset::build_resume(&tool, &info.id, inp, &paths)?
+                let mut b = preset::build_resume(&tool, &info.id, inp, &paths)?;
+                b.expect_marker = info.marker.clone();
+                b
             } else {
                 let preassign =
                     if cx.needed_sessions.contains(&step.id) && preset::wants_preassign(&tool) {
@@ -417,12 +426,22 @@ pub fn prepare_leaf(
         }
     };
 
-    let (parse, delivery, preassigned, expect_session, mut env_remove, mut env_set) = match built {
+    #[allow(clippy::type_complexity)]
+    let (parse, delivery, preassigned, expect_session, expect_marker, mut env_remove, mut env_set): (
+        preset::OutputParse,
+        preset::Delivery,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Vec<String>,
+        Vec<(String, String)>,
+    ) = match built {
         Some(b) => (
             b.parse,
             b.delivery,
             b.preassigned_session,
             b.expect_session,
+            b.expect_marker,
             b.env_remove,
             b.env_set,
         ),
@@ -435,6 +454,7 @@ pub fn prepare_leaf(
             (
                 preset::OutputParse::Stdout,
                 d,
+                None,
                 None,
                 None,
                 Vec::new(),
@@ -492,6 +512,7 @@ pub fn prepare_leaf(
         timeout: timeout_sec.map(Duration::from_secs),
         preassigned_session: preassigned,
         expect_session,
+        expect_marker,
         env_remove,
         env_set,
         out_file,
@@ -518,6 +539,8 @@ fn opt_rend(v: &Option<String>, ctx: &template::Ctx) -> Result<Option<String>, S
 pub struct ParsedOut {
     pub text: String,
     pub session: Option<String>,
+    /// Secondary session identity (pi: header timestamp).
+    pub session_marker: Option<String>,
     pub usage: preset::Usage,
     /// In-band failure the exit code may not reflect.
     pub failed: bool,
@@ -546,7 +569,73 @@ pub fn parse_output(parse: &preset::OutputParse, stdout: &str, stderr: &str) -> 
         preset::OutputParse::OpencodeNdjson => parse_opencode_ndjson(stdout),
         preset::OutputParse::GrokJson => parse_grok_json(stdout),
         preset::OutputParse::AgyJson => parse_agy_json(stdout),
+        preset::OutputParse::PiJsonl => parse_pi_jsonl(stdout),
     }
+}
+
+/// pi --mode json: JSONL. Line 1 is the session header; each turn ends with a
+/// message_end. Usage is per message, so it is summed across the run.
+fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
+    let mut o = ParsedOut::default();
+    let (mut inp, mut outp, mut cost) = (0u64, 0u64, 0f64);
+    let mut saw_usage = false;
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match v.get("type").and_then(|x| x.as_str()) {
+            Some("session") => {
+                o.session = v.get("id").and_then(|x| x.as_str()).map(String::from);
+                o.session_marker = v
+                    .get("timestamp")
+                    .and_then(|x| x.as_str())
+                    .map(String::from);
+            }
+            Some("message_end") => {
+                let Some(m) = v.get("message") else { continue };
+                if m.get("role").and_then(|x| x.as_str()) != Some("assistant") {
+                    continue;
+                }
+                // Later assistant messages replace earlier ones (auto-retry).
+                o.text = m
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter(|b| b.get("type").and_then(|x| x.as_str()) == Some("text"))
+                            .filter_map(|b| b.get("text").and_then(|x| x.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                // JSON mode exits 0 even when the model run failed.
+                match m.get("stopReason").and_then(|x| x.as_str()) {
+                    Some("error") | Some("aborted") => o.failed = true,
+                    _ => {}
+                }
+                if let Some(u) = m.get("usage") {
+                    saw_usage = true;
+                    inp += u.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
+                    outp += u.get("output").and_then(|x| x.as_u64()).unwrap_or(0);
+                    cost += u
+                        .get("cost")
+                        .and_then(|c| c.get("total"))
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    if saw_usage {
+        o.usage.input_tokens = Some(inp);
+        o.usage.output_tokens = Some(outp);
+        o.usage.cost_usd = Some(cost);
+    }
+    o
 }
 
 /// Execute one prepared leaf, honouring its retry policy.
@@ -625,6 +714,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 stderr_clean: e,
                 out_file: p.out_file,
                 session_id: None,
+                session_marker: None,
                 tool: p.tool,
                 cwd: cwd_str,
                 usage: preset::Usage::default(),
@@ -661,17 +751,24 @@ fn exec_once(p: Prepared) -> LeafDone {
         None
     };
     if exit_code == 0 && !outcome.timed_out {
-        if let Some(exp) = &p.expect_session {
-            let got = parsed.session.clone();
-            if let Some(got) = got {
-                if got != *exp {
-                    exit_code = 1;
-                    session_id = None;
-                    stderr_clean.push_str(&format!(
-                        "\nsfh: resume mismatch: expected session '{exp}' but the tool reported '{got}' (it silently started a new session)\n"
-                    ));
-                    let _ = std::fs::write(&p.err_file, &stderr_clean);
-                }
+        let mut resume_mismatch = |what: &str, exp: &str, got: &str| {
+            exit_code = 1;
+            session_id = None;
+            stderr_clean.push_str(&format!(
+                "\nsfh: resume mismatch: expected {what} '{exp}' but the tool reported '{got}' (it silently started a new session - resuming from a different working directory does this)\n"
+            ));
+            let _ = std::fs::write(&p.err_file, &stderr_clean);
+        };
+        if let (Some(exp), Some(got)) = (&p.expect_session, &parsed.session) {
+            if got != exp {
+                resume_mismatch("session", exp, got);
+            }
+        }
+        // pi accepts any --session-id and creates one when it is not found in
+        // this cwd, so the id matching proves nothing; the marker does.
+        if let (Some(exp), Some(got)) = (&p.expect_marker, &parsed.session_marker) {
+            if got != exp {
+                resume_mismatch("session marker", exp, got);
             }
         }
         if chain_output.trim().is_empty() && !p.allow_empty {
@@ -711,6 +808,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         stderr_clean,
         out_file: p.out_file,
         session_id,
+        session_marker: parsed.session_marker,
         tool: p.tool,
         cwd: cwd_str,
         usage: parsed.usage,
@@ -1047,6 +1145,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         stderr_clean: "sfh: internal error: worker thread died before producing a result".into(),
         out_file: PathBuf::new(),
         session_id: None,
+        session_marker: None,
         tool: None,
         cwd: None,
         usage: preset::Usage::default(),
@@ -1218,6 +1317,53 @@ mod tests {
         );
         assert_eq!(w.text, "hi");
         assert_eq!(w.session.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn parses_pi_jsonl_text_session_marker_and_summed_usage() {
+        let s = concat!(
+            r#"{"type":"session","id":"sfh-1","timestamp":"2026-07-27T10:00:00.000Z","cwd":"C:\\w"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[{"type":"text","text":"thinking out loud"}],"usage":{"input":100,"output":10,"cost":{"total":0.01}}}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"thinking","text":"hidden"},{"type":"text","text":"final "},{"type":"text","text":"answer"}],"usage":{"input":200,"output":20,"cost":{"total":0.02}}}}"#,
+            "\n",
+            r#"{"type":"agent_settled"}"#,
+        );
+        let o = parse_pi_jsonl(s);
+        assert_eq!(
+            o.text, "final answer",
+            "last assistant message, text blocks only"
+        );
+        assert_eq!(o.session.as_deref(), Some("sfh-1"));
+        assert_eq!(
+            o.session_marker.as_deref(),
+            Some("2026-07-27T10:00:00.000Z")
+        );
+        // usage is per message, so a tool-using turn must be summed
+        assert_eq!(o.usage.input_tokens, Some(300));
+        assert_eq!(o.usage.output_tokens, Some(30));
+        assert_eq!(o.usage.cost_usd, Some(0.03));
+        assert!(!o.failed);
+    }
+
+    #[test]
+    fn pi_reports_in_band_failures_that_exit_zero() {
+        let err = concat!(
+            r#"{"type":"session","id":"s","timestamp":"t"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","content":[]}}"#,
+        );
+        assert!(parse_pi_jsonl(err).failed);
+        let aborted = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"aborted","content":[]}}"#;
+        assert!(parse_pi_jsonl(aborted).failed);
+        // An empty run (no prompt reached the model) yields no text.
+        let empty = r#"{"type":"session","id":"s","timestamp":"t"}"#;
+        let o = parse_pi_jsonl(empty);
+        assert!(o.text.is_empty());
+        assert_eq!(o.usage.input_tokens, None);
     }
 
     #[test]

@@ -82,13 +82,14 @@ pub struct Step {
     /// Profile name from `profiles:` supplying default tool settings.
     #[serde(rename = "use")]
     pub use_: Option<String>,
-    /// Preset tool: codex | claude | opencode | grok | agy. Omit to use `cmd`.
+    /// Preset tool: codex | claude | opencode | grok | agy | pi. Omit to use `cmd`.
     pub tool: Option<String>,
     /// Executable path override for the preset tool (e.g. a specific codex.exe).
     pub bin: Option<String>,
     pub model: Option<String>,
     /// Reasoning effort. codex: model_reasoning_effort, claude: --effort,
-    /// opencode: --variant, grok: --reasoning-effort, agy: --effort.
+    /// opencode: --variant, grok: --reasoning-effort, agy: --effort,
+    /// pi: --thinking.
     pub effort: Option<String>,
     /// read | write | full (default: write)
     pub access: Option<String>,
@@ -189,7 +190,7 @@ pub struct Route {
     pub goto: String,
 }
 
-pub const TOOLS: [&str; 5] = ["codex", "claude", "opencode", "grok", "agy"];
+pub const TOOLS: [&str; 6] = ["codex", "claude", "opencode", "grok", "agy", "pi"];
 
 pub fn load(path: &Path) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)

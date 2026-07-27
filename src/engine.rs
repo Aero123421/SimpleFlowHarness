@@ -217,6 +217,8 @@ fn effort_vocab_warning(tool: &str, e: &str) -> Option<String> {
         "claude" => &["low", "medium", "high", "xhigh", "max", "ultracode"],
         "grok" => &["low", "medium", "high"],
         "agy" => &["low", "medium", "high"],
+        // pi warns and silently falls back to its default on an unknown level.
+        "pi" => &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
         _ => return None, // opencode: per-model variants
     };
     if known.contains(&e) {
@@ -312,6 +314,10 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                                     tool: t.to_string(),
                                     id: id.to_string(),
                                     cwd: s.get("cwd").and_then(|x| x.as_str()).map(String::from),
+                                    marker: s
+                                        .get("marker")
+                                        .and_then(|x| x.as_str())
+                                        .map(String::from),
                                 },
                             );
                         }
@@ -785,6 +791,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 tool: tool.clone(),
                                 id: sid.clone(),
                                 cwd: d.cwd.clone(),
+                                marker: d.session_marker.clone(),
                             },
                         );
                     }
@@ -959,6 +966,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             tool: tool.clone(),
                             id: sid.clone(),
                             cwd: d.cwd.clone(),
+                            marker: d.session_marker.clone(),
                         },
                     );
                 }
@@ -1415,6 +1423,7 @@ fn run_compact(
         timeout: timeout_sec.map(Duration::from_secs),
         preassigned_session: None,
         expect_session: None,
+        expect_marker: None,
         env_remove: built.env_remove,
         env_set: built.env_set,
         out_file: run_dir.join(format!("{ctag}.out.txt")),
@@ -1530,6 +1539,7 @@ fn dry_run(
                                 tool,
                                 id: "<session-id>".into(),
                                 cwd: None,
+                                marker: None,
                             },
                         );
                     }
@@ -1630,7 +1640,9 @@ fn log_step_end(
     d: &leaf::LeafDone,
 ) {
     let session = match (&d.tool, &d.session_id) {
-        (Some(t), Some(id)) => json!({"tool": t, "id": id, "cwd": d.cwd}),
+        (Some(t), Some(id)) => {
+            json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker})
+        }
         _ => serde_json::Value::Null,
     };
     log_event(
@@ -1769,5 +1781,7 @@ mod tests {
         assert!(effort_vocab_warning("codex", "xhigh").is_none());
         assert!(effort_vocab_warning("grok", "max").is_some());
         assert!(effort_vocab_warning("opencode", "whatever").is_none());
+        assert!(effort_vocab_warning("pi", "off").is_none());
+        assert!(effort_vocab_warning("pi", "ultra").is_some());
     }
 }
