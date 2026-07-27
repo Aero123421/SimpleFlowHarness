@@ -63,7 +63,9 @@ jobs:
           Copy-Item README.md, LICENSE pkg/
           Compress-Archive -Path pkg/* -DestinationPath ${{ matrix.asset }} -Force
           $h = (Get-FileHash ${{ matrix.asset }} -Algorithm SHA256).Hash.ToLower()
-          "$h  ${{ matrix.asset }}" | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
+          # LF, not CRLF: Out-File's default trailing CRLF makes the filename
+          # unmatchable for `sha256sum -c` under Git Bash / WSL.
+          "$h  ${{ matrix.asset }}`n" | Out-File -Encoding ascii -NoNewline "${{ matrix.asset }}.sha256"
           Expand-Archive ${{ matrix.asset }} -DestinationPath verify -Force
           ./verify/sfh.exe --version
       - name: Upload to release
