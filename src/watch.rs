@@ -36,14 +36,14 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn terminal(&self) -> bool {
-        matches!(self.state, "done" | "failed" | "dead")
+        matches!(self.state, "done" | "failed" | "dead" | "stopped")
     }
 
-    /// 0 = done, 1 = failed or dead, 3 = still running, 2 = cannot tell.
+    /// 0 = done, 1 = failed / dead / stopped, 3 = still running, 2 = cannot tell.
     pub fn exit(&self) -> i32 {
         match self.state {
             "done" => 0,
-            "failed" | "dead" => 1,
+            "failed" | "dead" | "stopped" => 1,
             "running" => 3,
             _ => 2,
         }
@@ -76,7 +76,26 @@ fn age_sec(p: &Path) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// A poll that lands mid-write must not be reported as a broken run. The writer
+/// renames into place, so any failure here is transient; retry briefly before
+/// giving up.
 pub fn read(dir: &Path) -> Result<Snapshot, String> {
+    let mut last = String::new();
+    for attempt in 0..4 {
+        match read_once(dir) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last = e;
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(120));
+                }
+            }
+        }
+    }
+    Err(last)
+}
+
+fn read_once(dir: &Path) -> Result<Snapshot, String> {
     let sp = dir.join("status.json");
     let text = std::fs::read_to_string(&sp).map_err(|_| {
         if dir.join("log.jsonl").exists() {
@@ -106,6 +125,7 @@ pub fn read(dir: &Path) -> Result<Snapshot, String> {
     let state = match raw.as_str() {
         "done" => "done",
         "failed" => "failed",
+        "stopped" => "stopped",
         "running" => {
             let alive = execute::pid_alive(pid);
             if !alive {
@@ -214,7 +234,7 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
             snap.pid
         ),
         "done" => eprintln!("sfh: result: sfh wait {}", snap.dir.display()),
-        "dead" => eprintln!(
+        "stopped" | "dead" => eprintln!(
             "sfh: this run was killed before it finished. resume with: sfh run {} --resume {}",
             if snap.flow.is_empty() {
                 "<flow.yaml>"
@@ -226,6 +246,64 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         _ => {}
     }
     snap.exit()
+}
+
+/// Cancel a run: kill the process tree and record that it was deliberate, so a
+/// later `sfh status` says "stopped" rather than the ambiguous "dead".
+pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
+    let dir = match resolve(target, root) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("sfh: {e}");
+            return 2;
+        }
+    };
+    let snap = match read(&dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sfh: {e}");
+            return 2;
+        }
+    };
+    if snap.terminal() {
+        eprintln!(
+            "sfh: nothing to stop - this run is already '{}'. run dir: {}",
+            snap.state,
+            dir.display()
+        );
+        return 0;
+    }
+    if !execute::kill_pid_tree(snap.pid) {
+        eprintln!(
+            "sfh: could not kill process {} (already gone?); check: sfh status {}",
+            snap.pid,
+            dir.display()
+        );
+        return 1;
+    }
+    // The run dies without a chance to record anything, so write the verdict
+    // here. Cost and progress stay as of the last heartbeat, which is honest:
+    // they are what was actually spent before the kill.
+    let sp = dir.join("status.json");
+    if let Ok(text) = std::fs::read_to_string(&sp) {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(m) = v.as_object_mut() {
+                m.insert("state".into(), serde_json::json!("stopped"));
+                m.insert("exit_code".into(), serde_json::json!(1));
+                m.insert("error".into(), serde_json::json!("cancelled by sfh stop"));
+                let _ = std::fs::write(&sp, serde_json::to_string_pretty(&v).unwrap_or_default());
+            }
+        }
+    }
+    println!("stopped {}", dir.display());
+    eprintln!(
+        "sfh: killed pid {} and its children. ${:.4} was spent before the stop. resume with: sfh run {} --resume {}",
+        snap.pid,
+        snap.cost_usd,
+        if snap.flow.is_empty() { "<flow.yaml>" } else { &snap.flow },
+        dir.display()
+    );
+    0
 }
 
 /// Print what a foreground run would have printed to stdout.
@@ -296,8 +374,11 @@ pub fn wait(
                 }
                 _ => {
                     eprintln!(
-                        "sfh: run is dead ({}). resume with: sfh run {} --resume {}",
-                        snap.reason.as_deref().unwrap_or("no longer running"),
+                        "sfh: run did not finish ({}). resume with: sfh run {} --resume {}",
+                        snap.reason
+                            .as_deref()
+                            .or(snap.error.as_deref())
+                            .unwrap_or("no longer running"),
                         if snap.flow.is_empty() {
                             "<flow.yaml>"
                         } else {

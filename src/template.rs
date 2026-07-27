@@ -40,12 +40,29 @@ pub fn render_checked(input: &str, ctx: &Ctx, check: SubstCheck) -> Result<Strin
     render_impl(input, ctx, Some(check))
 }
 
+const RAW_END: &str = "{{endraw}}";
+
 fn render_impl(input: &str, ctx: &Ctx, check: Option<SubstCheck>) -> Result<String, String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("{{") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
+        // {{raw}} ... {{endraw}}: copy the body through untouched. A prompt
+        // that talks ABOUT templates - handlebars, jinja, another sfh flow -
+        // needs some way to write {{ without sfh trying to resolve it, and
+        // "put it in a file" is not an answer for a coding tool.
+        if let Some(body) = after.strip_prefix("raw}}") {
+            let end = body.find(RAW_END).ok_or_else(|| {
+                format!(
+                    "unclosed '{{{{raw}}}}' near: {:.40} (close it with '{RAW_END}')",
+                    &rest[start..]
+                )
+            })?;
+            out.push_str(&body[..end]);
+            rest = &body[end + RAW_END.len()..];
+            continue;
+        }
         let end = after
             .find("}}")
             .ok_or_else(|| format!("unclosed '{{{{' near: {:.40}", &rest[start..]))?;
@@ -189,6 +206,31 @@ mod tests {
             builtins: BTreeMap::from([("run_dir".to_string(), "/run".to_string())]),
         };
         render(tpl, &ctx)
+    }
+
+    #[test]
+    fn raw_blocks_pass_braces_through_untouched() {
+        let o = BTreeMap::new();
+        // The motivating case: asking an agent to fix someone else's template.
+        assert_eq!(
+            render_with(
+                "fix this: {{raw}}{{user.name}} and {{#each xs}}{{endraw}} please",
+                o.clone()
+            )
+            .unwrap(),
+            "fix this: {{user.name}} and {{#each xs}} please"
+        );
+        // Substitution still works on either side of a raw block.
+        assert_eq!(
+            render_with(
+                "{{vars.topic}} {{raw}}{{x}}{{endraw}} {{vars.topic}}",
+                o.clone()
+            )
+            .unwrap(),
+            "rust {{x}} rust"
+        );
+        let e = render_with("{{raw}}{{x}} never closed", o).unwrap_err();
+        assert!(e.contains("endraw"), "{e}");
     }
 
     #[test]

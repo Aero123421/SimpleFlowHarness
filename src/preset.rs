@@ -238,7 +238,7 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
 }
 
 /// model/effort/agent/access flags shared by claude's fresh, resume and fork paths.
-fn claude_common(a: &mut Vec<String>, inp: &PresetInput) {
+fn claude_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>) {
     if let Some(m) = &inp.model {
         push(a, &["--model"]);
         a.push(m.clone());
@@ -258,15 +258,20 @@ fn claude_common(a: &mut Vec<String>, inp: &PresetInput) {
             a,
             &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS],
         ),
-        Access::Write => push(
-            a,
-            &[
-                "--permission-mode",
-                "acceptEdits",
-                "--allowedTools",
-                CLAUDE_WRITE_ALLOWED,
-            ],
-        ),
+        Access::Write => {
+            push(
+                a,
+                &[
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--allowedTools",
+                    CLAUDE_WRITE_ALLOWED,
+                ],
+            );
+            warnings.push(
+                "claude write auto-approves edits only; shell commands are not auto-approved (add args: [\"--allowedTools\", \"Bash,WebSearch,WebFetch\"] if the step must run commands)".into(),
+            );
+        }
         Access::Full => push(a, &["--dangerously-skip-permissions"]),
     }
 }
@@ -325,9 +330,14 @@ const CLAUDE_ENV_SCRUB: [&str; 8] = [
 /// claude read-level: hard guarantee via dontAsk + builtin-tool whitelist
 /// (plan mode is only a soft instruction when bypass is available).
 const CLAUDE_READ_TOOLS: &str = "Read,Glob,Grep,WebSearch,WebFetch,TodoWrite";
-/// claude write-level: acceptEdits auto-approves fs edits; shell & web need explicit allows
-/// or a -p run aborts on first denial.
-const CLAUDE_WRITE_ALLOWED: &str = "Bash,WebSearch,WebFetch";
+/// claude write-level: acceptEdits auto-approves fs edits; web tools need an
+/// explicit allow or a -p run aborts on first denial.
+///
+/// Bash is deliberately NOT here. claude has no OS sandbox, so an auto-approved
+/// shell at the "write" tier would be indistinguishable from `full` - the same
+/// reason pi's write tier registers no shell (see `pi_tools`). Steps that really
+/// need commands say so with `args:`, or use `access: full` and mean it.
+const CLAUDE_WRITE_ALLOWED: &str = "WebSearch,WebFetch";
 
 /// Flags a user could put in `args:` that silently escalate past `access:`.
 pub const ESCALATION_FLAGS: [&str; 7] = [
@@ -449,34 +459,7 @@ pub fn build(
         }
         "claude" => {
             push(&mut a, &["claude", "-p", "--output-format", "json"]);
-            if let Some(m) = &inp.model {
-                push(&mut a, &["--model"]);
-                a.push(m.clone());
-            }
-            if let Some(e) = &inp.effort {
-                push(&mut a, &["--effort"]);
-                a.push(e.clone());
-            }
-            if let Some(ag) = &inp.agent {
-                push(&mut a, &["--agent"]);
-                a.push(ag.clone());
-            }
-            match inp.access {
-                Access::Read => push(
-                    &mut a,
-                    &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS],
-                ),
-                Access::Write => push(
-                    &mut a,
-                    &[
-                        "--permission-mode",
-                        "acceptEdits",
-                        "--allowedTools",
-                        CLAUDE_WRITE_ALLOWED,
-                    ],
-                ),
-                Access::Full => push(&mut a, &["--dangerously-skip-permissions"]),
-            }
+            claude_common(&mut a, &inp, &mut warnings);
             if let Some(id) = preassign_session {
                 push(&mut a, &["--session-id"]);
                 a.push(id.to_string());
@@ -509,42 +492,7 @@ pub fn build(
         }
         "grok" => {
             push(&mut a, &["grok", "--output-format", "json"]);
-            if let Some(m) = &inp.model {
-                push(&mut a, &["-m"]);
-                a.push(m.clone());
-            }
-            if let Some(e) = &inp.effort {
-                push(&mut a, &["--reasoning-effort"]);
-                a.push(e.clone());
-            }
-            if let Some(ag) = &inp.agent {
-                push(&mut a, &["--agent"]);
-                a.push(ag.clone());
-            }
-            // --permission-mode plan is compat-only in headless and --sandbox is a
-            // no-op on Windows, so read = dontAsk + hard deny rules (deny always wins).
-            match inp.access {
-                Access::Read => push(
-                    &mut a,
-                    &[
-                        "--permission-mode",
-                        "dontAsk",
-                        "--deny",
-                        "Edit",
-                        "--deny",
-                        "Write",
-                        "--deny",
-                        "Bash",
-                    ],
-                ),
-                Access::Write => {
-                    push(&mut a, &["--permission-mode", "acceptEdits"]);
-                    warnings.push(
-                        "grok write auto-approves edits only; shell commands are not auto-approved (add args: [\"--allow\", \"Bash(...)\"] if the step must run commands)".into(),
-                    );
-                }
-                Access::Full => push(&mut a, &["--permission-mode", "bypassPermissions"]),
-            }
+            grok_common(&mut a, &inp, &mut warnings);
             if let Some(id) = preassign_session {
                 push(&mut a, &["--session-id"]);
                 a.push(id.to_string());
@@ -745,34 +693,7 @@ pub fn build_resume(
         "claude" => {
             push(&mut a, &["claude", "-p", "--output-format", "json", "-r"]);
             a.push(session_id.to_string());
-            if let Some(m) = &inp.model {
-                push(&mut a, &["--model"]);
-                a.push(m.clone());
-            }
-            if let Some(e) = &inp.effort {
-                push(&mut a, &["--effort"]);
-                a.push(e.clone());
-            }
-            if let Some(ag) = &inp.agent {
-                push(&mut a, &["--agent"]);
-                a.push(ag.clone());
-            }
-            match inp.access {
-                Access::Read => push(
-                    &mut a,
-                    &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS],
-                ),
-                Access::Write => push(
-                    &mut a,
-                    &[
-                        "--permission-mode",
-                        "acceptEdits",
-                        "--allowedTools",
-                        CLAUDE_WRITE_ALLOWED,
-                    ],
-                ),
-                Access::Full => push(&mut a, &["--dangerously-skip-permissions"]),
-            }
+            claude_common(&mut a, &inp, &mut warnings);
             a.extend(inp.extra.iter().cloned());
             env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
             expect_session = Some(session_id.to_string());
@@ -801,40 +722,7 @@ pub fn build_resume(
         "grok" => {
             push(&mut a, &["grok", "--output-format", "json", "--resume"]);
             a.push(session_id.to_string());
-            if let Some(m) = &inp.model {
-                push(&mut a, &["-m"]);
-                a.push(m.clone());
-            }
-            if let Some(e) = &inp.effort {
-                push(&mut a, &["--reasoning-effort"]);
-                a.push(e.clone());
-            }
-            if let Some(ag) = &inp.agent {
-                push(&mut a, &["--agent"]);
-                a.push(ag.clone());
-            }
-            match inp.access {
-                Access::Read => push(
-                    &mut a,
-                    &[
-                        "--permission-mode",
-                        "dontAsk",
-                        "--deny",
-                        "Edit",
-                        "--deny",
-                        "Write",
-                        "--deny",
-                        "Bash",
-                    ],
-                ),
-                Access::Write => {
-                    push(&mut a, &["--permission-mode", "acceptEdits"]);
-                    warnings.push(
-                        "grok write auto-approves edits only; shell commands are not auto-approved (add args: [\"--allow\", \"Bash(...)\"] if the step must run commands)".into(),
-                    );
-                }
-                Access::Full => push(&mut a, &["--permission-mode", "bypassPermissions"]),
-            }
+            grok_common(&mut a, &inp, &mut warnings);
             a.extend(inp.extra.iter().cloned());
             push(&mut a, &["--prompt-file"]);
             a.push(paths.prompt_file.display().to_string());
@@ -971,7 +859,7 @@ pub fn build_fork(
             a.push(parent_session_id.to_string());
             push(&mut a, &["--fork-session", "--session-id"]);
             a.push(child_session_id.to_string());
-            claude_common(&mut a, &inp);
+            claude_common(&mut a, &inp, &mut warnings);
             a.extend(inp.extra.iter().cloned());
             env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
             parse = OutputParse::ClaudeJson;
@@ -1343,6 +1231,68 @@ mod tests {
         for t in ["opencode", "grok", "pi"] {
             assert!(!fork_warmup_pays(t), "{t} showed no measured saving");
         }
+    }
+
+    // claude has no OS sandbox, so an auto-approved Bash at the `write` tier
+    // would make write == full while claiming to be a middle ground. This is
+    // the same rule pi's write tier follows; the two must not diverge.
+    #[test]
+    fn claude_write_does_not_auto_approve_a_shell() {
+        for argv in [
+            build_argv("claude", Access::Write),
+            // The resume and fork paths build their own argv; all three have to
+            // agree, and they have drifted apart before.
+            {
+                let l = std::path::PathBuf::from("l");
+                let p = std::path::PathBuf::from("p");
+                build_resume(
+                    "claude",
+                    "sess",
+                    inp(Access::Write, &[]),
+                    &BuildPaths {
+                        last_msg: &l,
+                        prompt_file: &p,
+                    },
+                )
+                .unwrap()
+                .argv
+            },
+            {
+                let l = std::path::PathBuf::from("l");
+                let p = std::path::PathBuf::from("p");
+                build_fork(
+                    "claude",
+                    "parent",
+                    "child",
+                    inp(Access::Write, &[]),
+                    &BuildPaths {
+                        last_msg: &l,
+                        prompt_file: &p,
+                    },
+                )
+                .unwrap()
+                .argv
+            },
+        ] {
+            let allowed = argv
+                .windows(2)
+                .find(|w| w[0] == "--allowedTools")
+                .map(|w| w[1].clone())
+                .unwrap_or_default();
+            assert!(
+                !allowed.contains("Bash"),
+                "claude write must not auto-approve Bash, got '{allowed}' in {argv:?}"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits"),
+                "claude write should still auto-approve edits: {argv:?}"
+            );
+        }
+        // full still means full - the escape hatch has to keep working.
+        assert!(build_argv("claude", Access::Full)
+            .iter()
+            .any(|x| x == "--dangerously-skip-permissions"));
     }
 
     #[test]

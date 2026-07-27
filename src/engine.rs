@@ -269,6 +269,19 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             .unwrap_or("")
             .to_string();
         match ev {
+            // A compacted step's chain file now holds the summary, so `output`
+            // is already right. `outputs` has to be walked back to what was
+            // summarized, or a resumed run sees strictly less than a live one.
+            "compact_end" | "compact_failed" => {
+                if let (Some(e), Some(p)) = (
+                    st.outputs.get_mut(&step),
+                    v.get("precompact_file").and_then(|x| x.as_str()),
+                ) {
+                    if let Ok(t) = std::fs::read_to_string(run_dir.join(p)) {
+                        e.outputs = t.trim_end().to_string();
+                    }
+                }
+            }
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
                     st.total += 1;
@@ -296,7 +309,13 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                             .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
                     };
                     let chain = rd("chain_file").unwrap_or_default();
-                    let outs = rd("out_file").unwrap_or_else(|| chain.clone());
+                    // `outputs` is the pre-compact TEXT, never the raw tool
+                    // output: out_file holds a claude JSON envelope or a codex
+                    // event stream, and restoring that would inject machine
+                    // noise into a resumed prompt. Uncompacted steps have no
+                    // separate original, so chain is the original. A compacted
+                    // step patches this from its compact_end event below.
+                    let outs = chain.clone();
                     let file = v
                         .get("out_file")
                         .and_then(|x| x.as_str())
@@ -460,6 +479,20 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, St
     Ok(0)
 }
 
+/// Drop a self-ignoring .gitignore into the runs root, the way cargo does for
+/// target/. Run dirs hold rendered prompts, model output and session ids in
+/// plaintext inside the user's own repo; one `git add -A` should not be able to
+/// publish them. Never overwrites an existing file.
+fn protect_runs_root(root: &Path) {
+    let f = root.join(".gitignore");
+    if f.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(root).is_ok() {
+        let _ = std::fs::write(&f, "# Created by sfh. Run artifacts are not source.\n*\n");
+    }
+}
+
 /// Cheap change-detection fingerprint (FNV-1a); not a security hash.
 fn fingerprint(s: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -506,7 +539,17 @@ fn write_status(path: &Path, s: &Status) {
         "emit_file": s.emit_file,
         "error": s.error,
     });
-    let _ = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default());
+    let text = serde_json::to_string_pretty(&v).unwrap_or_default();
+    // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
+    // seconds, and a plain write lets them read a half-written document. Rename
+    // is atomic on both platforms, so a reader sees the old or the new file and
+    // never a torn one.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::write(path, &text);
 }
 
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
@@ -530,6 +573,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .runs_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
+    protect_runs_root(&runs_root);
     let name = flow.name.clone().unwrap_or_else(|| "flow".into());
 
     // Which steps must produce resumable sessions (continue_from targets).
@@ -719,6 +763,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut cost_usd: f64 = resumed.cost_usd;
     let mut last_executed: Option<String> = None;
     let mut last_success: Option<String> = None;
+    // step id -> the chain file its LAST visit wrote. A re-visited step writes
+    // <id>.v2.chain.txt, so nothing may assume <id>.chain.txt.
+    let mut chain_files: HashMap<String, PathBuf> = HashMap::new();
     let mut cur = match &resumed.start {
         Some(id) => *index_of
             .get(id)
@@ -847,6 +894,42 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 };
             }
 
+            // fallback: for a member of a fan-out. Same contract as the plain
+            // leaf path - a failed member is re-run under each fallback profile
+            // in turn - so a step that fans out does not silently lose the
+            // failover it declared. Sequential on purpose: the pool has already
+            // finished, and a fallback is the expensive, rare path.
+            macro_rules! fan_fallback {
+                ($done:expr, $mstep:expr, $label:expr, $mtag:expr, $fbs:expr, $extra:expr) => {{
+                    if !$done.ok() && !$done.interrupted && !$fbs.is_empty() {
+                        for fb in $fbs {
+                            if execute::interrupted() {
+                                break;
+                            }
+                            if !opts.quiet {
+                                eprintln!("sfh: [{}] falling back to profile '{fb}'", $label);
+                            }
+                            let ftag = format!("{}.fb-{fb}", $mtag);
+                            let prep = {
+                                let cx = mk_cx!(&outputs, &sessions);
+                                leaf::prepare_leaf(&cx, $mstep, visit, &ftag, $extra, Some(fb))?
+                            };
+                            log_event(
+                                &mut log,
+                                json!({"ts": utc_stamp(), "event": "fallback", "step": $label, "profile": fb, "cmd": prep.inv.describe()}),
+                            );
+                            total += 1;
+                            let alt = leaf::exec_leaf(prep);
+                            let ok = alt.ok();
+                            $done = alt;
+                            if ok {
+                                break;
+                            }
+                        }
+                    }
+                }};
+            }
+
             // ---- execute the step (leaf / parallel / foreach) ----
             // route_text: what route conditions match against - always the
             // pre-compact text, without sfh's "--- id ---" aggregate headers.
@@ -888,7 +971,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     &mut log,
                     json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
                 );
-                let dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                for (ci, c) in children.iter().enumerate() {
+                    let ctag = if visit == 1 {
+                        c.id.clone()
+                    } else {
+                        format!("{}.v{visit}", c.id)
+                    };
+                    fan_fallback!(dones[ci], c, c.id, ctag, &c.fallback, &[]);
+                }
                 let mut agg = String::new();
                 let mut plain = String::new();
                 let mut hard_fail = false;
@@ -1001,7 +1092,21 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     &mut log,
                     json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": items.len()}),
                 );
-                let dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..dones.len() {
+                    let tag = if visit == 1 {
+                        format!("{}.i{i}", step.id)
+                    } else {
+                        format!("{}.v{visit}.i{i}", step.id)
+                    };
+                    let extra = [
+                        ("item", items.get(i).cloned().unwrap_or_default()),
+                        ("item_index", i.to_string()),
+                    ];
+                    let label = format!("{}[{i}]", step.id);
+                    fan_fallback!(dones[i], step, label, tag, &step.fallback, &extra);
+                }
                 let mut agg = String::new();
                 let mut plain = String::new();
                 let mut any_fail = false;
@@ -1125,6 +1230,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         );
                     }
                     total += 1;
+                    // Keep what is about to be summarized: the chain file gets
+                    // overwritten with the summary, and {{steps.X.outputs}} is
+                    // documented as the pre-compact original - including after
+                    // a --resume, which can only read files.
+                    let pre_name = format!("{gtag}.precompact.txt");
+                    let _ = std::fs::write(run_dir.join(&pre_name), &chain_output);
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
@@ -1142,7 +1253,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             cost_usd += usage.cost_usd.unwrap_or(0.0);
                             log_event(
                                 &mut log,
-                                json!({"ts": utc_stamp(), "event": "compact_end", "step": step.id, "chars": sum.chars().count(), "cost_usd": usage.cost_usd}),
+                                json!({"ts": utc_stamp(), "event": "compact_end", "step": step.id, "chars": sum.chars().count(), "cost_usd": usage.cost_usd, "precompact_file": pre_name}),
                             );
                             chain_output = sum.clone();
                             if let Some(e) = outputs.get_mut(&step.id) {
@@ -1156,7 +1267,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             );
                             log_event(
                                 &mut log,
-                                json!({"ts": utc_stamp(), "event": "compact_failed", "step": step.id, "error": e}),
+                                json!({"ts": utc_stamp(), "event": "compact_failed", "step": step.id, "error": e, "precompact_file": pre_name}),
                             );
                             chain_output = head_tail(&chain_output, comp.when_over as usize);
                             if let Some(en) = outputs.get_mut(&step.id) {
@@ -1168,6 +1279,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), &chain_output);
                 }
             }
+
+            // A re-visited step writes <id>.v2.chain.txt, so the emitted file
+            // has to follow the visit rather than assume <id>.chain.txt.
+            chain_files.insert(step.id.clone(), run_dir.join(format!("{gtag}.chain.txt")));
 
             // ---- notes ----
             if step.notes.as_deref() == Some("append") && !errored {
@@ -1314,12 +1429,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             g.cost_usd = cost;
             g.exit_code = Some(code);
             g.emit_step = emit.map(String::from);
-            g.emit_file = emit.map(|id| {
-                run_dir
-                    .join(format!("{id}.chain.txt"))
-                    .display()
-                    .to_string()
-            });
+            g.emit_file = emit
+                .and_then(|id| chain_files.get(id))
+                .map(|p| p.display().to_string());
             g.error = err.map(String::from);
             write_status(&status_path, &g);
         };
@@ -1356,7 +1468,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 .unwrap_or_default();
             // Emit first: `sfh wait` treats a terminal status.json as "the
             // output is ready", so the status must not go terminal before it.
-            print_emit(&out, max_emit, &run_dir, &emit_id);
+            print_emit(&out, max_emit, chain_files.get(&emit_id));
             finish("done", cost_usd, 0, Some(&emit_id), None);
             if !opts.quiet {
                 eprintln!(
@@ -1394,7 +1506,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 if let Some(o) = outputs.get(id) {
                     if !o.output.trim().is_empty() {
                         eprintln!("sfh: emitting partial result from step '{id}'");
-                        print_emit(&o.output, max_emit, &run_dir, id);
+                        print_emit(&o.output, max_emit, chain_files.get(id));
                     }
                 }
             }
@@ -1410,13 +1522,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     }
 }
 
-fn print_emit(out: &str, max: usize, run_dir: &Path, id: &str) {
+/// `chain` must be the file the emitted step's LAST visit wrote, not a path
+/// rebuilt from the step id - those differ once a step is re-visited.
+fn print_emit(out: &str, max: usize, chain: Option<&PathBuf>) {
     let n = out.chars().count();
     if n > max {
         let cut: String = out.chars().take(max).collect();
         println!(
             "{cut}\n[sfh: emit truncated at {max} of {n} chars; full text: {}]",
-            run_dir.join(format!("{id}.chain.txt")).display()
+            chain
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(run dir)".into())
         );
         eprintln!("sfh: warning: emit truncated at max_emit_chars={max}");
     } else {

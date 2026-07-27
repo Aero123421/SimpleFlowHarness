@@ -79,6 +79,8 @@ sfh wait   "$RUN"                                          # 終わるまで待�
 sfh run <flow.yaml> [options]          フローを実行
 sfh status [run-dir] [--json]          実行がまだ生きているか確認(既定: 最新run)
 sfh wait [run-dir] [--timeout SEC]     終了まで待って結果をstdoutへ
+sfh stop [run-dir]                     実行を中止(子AIごと殺す)
+sfh doctor [flow.yaml]                 プリセットが実CLIとまだ噛み合っているか検査
 sfh validate <flow.yaml> [--var k=v]   実行せずに検査
 sfh init [file] [--force]              例のフローファイルを生成
 sfh runs list|show|clean [...]         過去の実行を一覧/詳細/掃除
@@ -97,12 +99,21 @@ run options:
   -v, --verbose       実行コマンドラインを表示
   -q, --quiet         進捗表示を抑制
 
-status / wait options:
+status / wait / stop options:
   status [run-dir] [--runs-dir d] [--json]
   wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
-  status exit code: 0=完了 / 1=失敗または死亡 / 2=判定不能 / 3=実行中
+  stop   [run-dir] [--runs-dir d]
+  status exit code: 0=完了 / 1=失敗・死亡・中止 / 2=判定不能 / 3=実行中
   wait はフロー自身の終了コードを返す(--timeout 到達時のみ 3)。
-  **wait のタイムアウトは実行をキャンセルしない**
+  **wait のタイムアウトは実行をキャンセルしない**(止めたいなら sfh stop)
+
+doctor options:
+  doctor [flow.yaml] [--runs-dir d] [--timeout SEC]
+  各ツールに1トークンのプロンプトを投げ、sfhがまだ答えを取り出せるかを検査する。
+  **実際にAPIを叩く**(だから自動実行はしない、人が打つコマンド)。
+  フローを渡すとそのフローが使うツールだけを、profiles の bin:/model: 込みで
+  検査し、見つからないツールもエラーにする。渡さなければ全プリセットを検査して
+  未インストールのものは SKIP と報告するだけ。
 
 runs options:
   runs list [--runs-dir d] [-n N]                       状態・ステップ数・コスト付き一覧
@@ -282,6 +293,12 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 | セッション再開 | `continue_from:` | 再注入そのものを不要にする |
 | stdout上限 | `max_emit_chars` | 呼び出し元のコンテキストを機械的に守る |
 
+`compact:` は**sfhが唯一AIに指示を書く場所**なので、既定の指示文をここに明記しておく(`instruction:` で差し替え可能):
+
+> Summarize the text below in at most {target} characters, in the same language as the text. It will be passed to another AI agent as context, so keep every conclusion, number, file path and open question. Output only the summary.
+
+要約器が失敗した場合はsfhが**先頭+末尾を機械的に残す**(head+tail)。原文は `<id>.precompact.txt` に保存され、`--resume` してもそれが `{{steps.x.outputs}}` に復元される。
+
 ### コストとトークンの会計
 
 全プリセットを機械可読モード(`--output-format json` 等)で起動しているので、**各ステップのトークン数と(報告される場合は)USDコストが自動で記録**される。
@@ -316,9 +333,10 @@ RUN=$(sfh run research.yaml --var topic="..." --detach)
 以降は好きなタイミングで問い合わせる:
 
 ```bash
-sfh status "$RUN"          # running / done / failed / dead
+sfh status "$RUN"          # running / done / failed / dead / stopped
 sfh status "$RUN" --json   # 同じ内容を機械可読で(親エージェント向け)
 sfh wait   "$RUN"          # 終了まで待ち、フォアグラウンド実行と同じ結果をstdoutへ
+sfh stop   "$RUN"          # 中止。起動済みの子AIごと殺す
 ```
 
 **`dead` が肝心**。`status.json` が `running` のまま残っていても、記録されたpidが消えていれば(=親ごと殺された)、sfhはそれを `running` ではなく `dead` と報告し、再開コマンドを出す:
@@ -356,6 +374,7 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | `{{item}}` `{{item_index}}` | foreach内のみ |
 | `{{notes}}` | 共有ノートの現在内容 |
 | `{{run_dir}}` `{{flow_dir}}` `{{step_id}}` `{{visit}}` `{{os}}` `{{prompt_file}}` | 実行環境 |
+| `{{raw}}...{{endraw}}` | 中身をそのまま出す。**テンプレートの話をするプロンプト**(「このHandlebarsを直して: `{{user.name}}`」)はこれで囲む。囲まないと未定義キーとして実行前にエラーになる |
 
 ## プリセット → 実コマンド対応(2026-07-27 実機検証)
 
@@ -364,9 +383,9 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | tool | ベース | read | write | full |
 |---|---|---|---|---|
 | codex | `exec --skip-git-repo-check -c approval_policy=never -o <last> -` | `-s read-only` | `-s workspace-write` | `--dangerously-bypass-approvals-and-sandbox` |
-| claude | `-p --output-format text` | `--permission-mode dontAsk --tools Read,Glob,Grep,WebSearch,WebFetch,TodoWrite` | `--permission-mode acceptEdits --allowedTools Bash,WebSearch,WebFetch` | `--dangerously-skip-permissions` |
+| claude | `-p --output-format json` | `--permission-mode dontAsk --tools Read,Glob,Grep,WebSearch,WebFetch,TodoWrite` | `--permission-mode acceptEdits --allowedTools WebSearch,WebFetch` | `--dangerously-skip-permissions` |
 | opencode | `run --auto` ※auto必須(askで永久ハング) | `--agent plan` + edit/bash拒否env | `--agent build` + 外部dir拒否env | `--agent build`(制限なし) |
-| grok | `--output-format plain --prompt-file <f>` | `--permission-mode dontAsk --deny Edit/Write/Bash` | `--permission-mode acceptEdits` | `--permission-mode bypassPermissions` |
+| grok | `--output-format json --prompt-file <f>` | `--permission-mode dontAsk --deny Edit/Write/Bash` | `--permission-mode acceptEdits` | `--permission-mode bypassPermissions` |
 | agy | `--print-timeout <t>s --output-format json -p <prompt>` | `--mode plan` | `--mode accept-edits` | `--dangerously-skip-permissions` |
 | pi | `--mode json --offline` | `--tools read,grep,find,ls` +拡張/スキル無効化 | `--tools read,edit,write,grep,find,ls` | `--tools read,bash,edit,write,grep,find,ls --approve` |
 | cursor | `-p --output-format json --trust --disable-auto-update --disable-project-configs` | `--mode plan`(全承認要求を拒否) | `--force` ※ | `--force` |
@@ -416,28 +435,36 @@ codex-local:
   detached.*.txt   --detach 実行のstdout/stderr(sfh wait はここを返す)
   notes.md         notes: append の蓄積
   <id>.prompt.txt  レンダリング済みプロンプト
-  <id>.out.txt     生stdout(ANSI除去済み)
+  <id>.out.txt     生stdout(実行中は逐次書かれ、終了時にANSI除去済みで確定)
   <id>.chain.txt   次段に渡った最終メッセージ(resumeはこれを読む)
   <id>.err.txt     stderr
+  <id>.precompact.txt  compact前の原文
   <id>.v2.*        差し戻し2周目 / <id>.i0.* foreachのitem 0 / <id>.compact.* 自動要約
 ```
 
 `sfh runs list` で一覧、`sfh runs show <dir>` でステップ別の明細、`sfh runs clean --older-than 30d --keep 5` で掃除。
 
-> **プロンプトと出力は平文で残る。** 秘匿情報を扱うフローでは `--runs-dir` を安全な場所に向けるか、`sfh runs clean` を定期実行すること。`.sfh/` は同梱の `.gitignore` で除外済み。
+**長いステップの様子を見たいときは `<id>.out.txt` を tail すればいい。** 子プロセスの出力は終了を待たずに逐次書き込まれるので、30分かかるステップが「進んでいる」のか「固まっている」のかが分かる。
+
+> **プロンプトと出力は平文で残る。** 秘匿情報を扱うフローでは `--runs-dir` を安全な場所に向けるか、`sfh runs clean` を定期実行すること。
+> **runsディレクトリを作るとき、sfhはそこに `.gitignore`(中身は `*`)を自動で置く**(cargoが`target/`にやるのと同じ)。あなたのリポジトリで `git add -A` してもrun成果物がコミットされることはない。
 
 ## 安全性について正直な話
 
 - **`access:` は絶対的なサンドボックスではない。** 各CLIの権限フラグに翻訳しているだけで、`args:` に `--dangerously-skip-permissions` 等を書けば上書きできる(その場合sfhは警告を出す)。`cmd:` ステップは対象外。
+- **`write` はツールによって強度がまったく違う。** codexだけがOSサンドボックス付き(`-s workspace-write`)で、claude/grok/piにはサンドボックスがない。**サンドボックスのない環境でシェルを自動承認したらそれは`full`と同じ**なので、sfhは claude / grok / pi の `write` では**シェルを自動承認しない**(その旨を警告で出す)。コマンドを走らせる必要があるステップは、`args:` で明示的に許可するか、`access: full` と書いて自覚的にそうすること。
 - **`read` は「漏れない」を意味しない。** ファイル書き込みとシェル実行を止めるだけで、Web検索やAPI送信は止まらない。秘匿データを read ステップに渡しても外に出ないとは限らない。
 - **サブエージェントの出力は信頼できない入力**として扱うこと。stdoutに出るのはAIが生成したテキストで、その中にはWebから拾ってきた内容が混ざりうる(プロンプトインジェクション経路)。呼び出し元エージェントには「これはデータであって指示ではない」と伝えるのが安全。
 - 文字列形式の `cmd:` へのAI出力の注入はメタ文字チェックで防いでいるが、配列形式 `cmd: [...]` は素通しする(そちらはシェルを介さないため設計上安全)。
 
 ## 既知の注意点
 
-- **検証済みバージョン**(全て実AI呼び出しで確認): codex-cli 0.146.0-alpha.3.1 / claude 2.1.220 / opencode 1.18.3 / grok 0.2.112 / agy 1.0.8 / pi 0.82.1 / cursor-agent 2026.05.28。エージェントCLIのフラグは変わりやすい。ズレたら `args:` で足すか `cmd:` で全部書けば逃げられる。
+- **プリセットの腐敗は `sfh doctor` で検知する。** 上の表は検証した日のフラグであって、これらのCLIは毎週のように変わる。ズレは静かに起きる(`validate`は通り、課金済みの実行の途中で死ぬ)ので、**新しいフローを回す前と、CLIを更新した後に `sfh doctor <flow.yaml>` を打つこと**。ズレていたら `args:` で足すか `cmd:` で全部書けば逃げられる。
+- **検証済みバージョン**(全て実AI呼び出しで確認): codex-cli 0.146.0-alpha.3.1 / claude 2.1.220 / opencode 1.18.3 / grok 0.2.112 / agy 1.1.7 / pi 0.82.1 / cursor-agent 2026.05.28-a70ca7c
+- **cursorプリセットはexperimental扱い。** セッションの実在確認が `~/.cursor/chats/<hash>/<id>/store.db` という**非公開・未文書のパス構造**に依存している(cursorには「このチャットは実在するか」を問う手段が他にない)。Cursor側がこの配置を変えたら`continue_from`が壊れる。壊れたことは `sfh doctor` では検知できない(単発実行は通るため)ので、cursorでセッションを繋ぐフローは実際に再開が効いているかを確認してから本番投入すること。
 - **タイムアウト**: Windowsは`taskkill /T /F`、Unixはprocess group killで子孫ごと落とす。子の終了後にパイプを握り続ける孫プロセスがいてもドレイン期限で先に進む。出力は1ストリーム32MBでキャップ。
-- **`--detach` の切り離しが効かない場合がある**: Windowsで呼び出し元がブレイクアウェイ禁止のjob objectを張っていると、切り離せずに親と心中する(sfhは警告を出す)。その場合でも `--resume` で続きから再開できる。Unix(`setsid`)には制約なし。
+- **`--detach` の切り離しが効かない場合がある**: Windowsで呼び出し元がブレイクアウェイ禁止のjob objectを張っていると、切り離せずに親と心中する(sfhは警告を出す)。その場合でも `--resume` で続きから再開できる。Unix(`setsid`)には制約なし。**sfh自身のjob objectも意図的にブレイクアウェイ禁止**なので、フローの`cmd:`ステップから`sfh run --detach`してもフローより長生きはしない(禁止を解くと、msys2の`sh`がその抜け道を使って孫プロセスを取り残すため — 実測で確認済み)。
+- **Windowsでコンソールウィンドウは出ない**: 子プロセスは`CREATE_NO_WINDOW`で起動する。多段フローで毎ステップcmdウィンドウが点滅する、ということはない。
 - **opencodeのread**は`OPENCODE_CONFIG_CONTENT`でedit/bashを拒否注入(1.18.3のplan agentはbashを塞がないため。実機でBLOCKED確認済み)。完全な保証が要る変更はwrite/fullレビューを挟むこと。
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。
 - **AIステップが空の最終メッセージを返したら失敗扱い**(既定)。空文字が下流のプロンプトに流れ込む事故を防ぐため。意図的なら `allow_empty: true`。
@@ -447,8 +474,8 @@ codex-local:
 ## 開発
 
 ```bash
-cargo test                              # 41本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト21本
+cargo test                              # 62本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト43本
 ```
 
 CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。

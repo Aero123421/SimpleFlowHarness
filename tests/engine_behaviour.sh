@@ -229,6 +229,92 @@ else
   fail=$((fail + 1))
 fi
 
+# --- fallback: works inside a fan-out, not just on a plain step ---------------
+# It used to be honoured only on plain leaves: a parallel child could declare
+# fallback and silently not have it. Fake tools, so no AI is called - `false`
+# always fails, `echo` always succeeds and codex's parser falls back to stdout.
+cat > fb.yaml <<'YAML'
+name: fb
+profiles:
+  broken: { tool: codex, bin: "false" }
+  works:  { tool: codex, bin: "echo" }
+steps:
+  - id: fan
+    parallel:
+      - id: kid
+        use: broken
+        fallback: [works]
+        prompt: "hi"
+  - id: after
+    cmd: ["echo", "fanout-survived"]
+YAML
+"$SFH" run fb.yaml > fb.out 2>fb.err
+check "a parallel child falls back instead of failing the group" 0 $?
+contains "the flow continued past the fan-out" "fanout-survived" fb.out
+contains "the fallback profile actually ran" "falling back to profile 'works'" fb.err
+
+# --- {{raw}} lets a prompt talk about templates -------------------------------
+# Checked through validate/--dry-run rather than a command's output: msys2's
+# echo brace-expands {{x}} on its own, which would test the shell, not sfh.
+cat > raw.yaml <<'YAML'
+name: raw
+steps:
+  - id: a
+    cmd: ["echo", "{{raw}}{{user.name}} {{#each xs}}{{endraw}}"]
+YAML
+"$SFH" validate raw.yaml > raw.out 2>&1
+check "a literal {{ does not fail the precheck" 0 $?
+"$SFH" run raw.yaml --dry-run > rawdry.out 2>&1
+contains "raw block passed the braces through" "{{user.name}} {{#each xs}}" rawdry.out
+# ...and an unclosed raw block is still an error, with the fix named.
+cat > rawbad.yaml <<'YAML'
+name: rawbad
+steps:
+  - id: a
+    cmd: ["echo", "{{raw}}never closed"]
+YAML
+"$SFH" validate rawbad.yaml > rawbad.out 2>&1
+check "an unclosed raw block is rejected" 2 $?
+contains "and says how to close it" "endraw" rawbad.out
+
+# --- sfh stop kills the whole tree, not just sfh ------------------------------
+# The guarantee is "nothing outlives sfh". It has been broken once already, by
+# granting the job object BREAKAWAY_OK - which msys2's sh uses, so shell steps
+# quietly escaped. A surviving grandchild is a process still burning money, so
+# this checks the grandchild, not sfh.
+# A GRANDCHILD ticks a counter file, so "did it really die" is answered by
+# whether work is still happening - no pid plumbing, same check on every OS.
+# It has to be a grandchild: the direct child is assigned to the job explicitly
+# and cannot escape, so testing it would have missed the real bug entirely.
+cat > longrun.yaml <<'YAML'
+name: longrun
+steps:
+  - id: think
+    cmd: ["sh", "-c", "sh -c 'i=0; while [ $i -lt 600 ]; do i=$((i+1)); echo $i > ticks.txt; sleep 1; done' & sleep 600"]
+YAML
+rm -f ticks.txt
+RUN_DIR3="$("$SFH" run longrun.yaml --detach -q 2>/dev/null)"
+sleep 3
+"$SFH" stop "$RUN_DIR3" > stop.out 2>&1
+check "stop reports success" 0 $?
+contains "stop says what it killed" "killed pid" stop.out
+TICK_AT_STOP="$(cat ticks.txt 2>/dev/null || echo none)"
+sleep 3
+TICK_LATER="$(cat ticks.txt 2>/dev/null || echo none)"
+"$SFH" status "$RUN_DIR3" > st4.out 2>&1
+check "a stopped run reports stopped" 1 $?
+contains "stopped status is not confused with a crash" "stopped" st4.out
+if [ "$TICK_AT_STOP" = "none" ]; then
+  echo "FAIL - the grandchild never started, so this proves nothing"
+  fail=$((fail + 1))
+elif [ "$TICK_AT_STOP" = "$TICK_LATER" ]; then
+  echo "ok   - stop killed the grandchild too (ticks frozen at $TICK_AT_STOP)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - grandchild outlived sfh stop: ticks went $TICK_AT_STOP -> $TICK_LATER"
+  fail=$((fail + 1))
+fi
+
 # --- runs subcommands ---------------------------------------------------------
 "$SFH" runs list > runs.out 2>&1
 check "runs list works" 0 $?

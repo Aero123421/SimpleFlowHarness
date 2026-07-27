@@ -631,6 +631,72 @@ pub struct ParsedOut {
     pub failed: bool,
 }
 
+/// What a resumed or forked run has to prove about the session it landed in.
+pub struct SessionExpect<'a> {
+    pub expect_session: Option<&'a str>,
+    pub expect_marker: Option<&'a str>,
+    pub forbid_session: Option<&'a str>,
+    pub expect_parent: Option<&'a str>,
+    pub allow_empty: bool,
+}
+
+/// The session state machine, as a pure decision: `Some(reason)` means the run
+/// must be treated as failed even though the tool exited 0.
+///
+/// Every tool here will happily report success while doing the wrong thing -
+/// silently opening a NEW session on a resume, or ignoring a fork flag and
+/// appending to the parent that the siblings are also writing to. Those are
+/// unrecoverable in-band lies, so they get checked, and they get checked here
+/// rather than inline so each branch can be tested without spawning anything.
+pub fn check_session(e: &SessionExpect, parsed: &ParsedOut, chain: &str) -> Option<String> {
+    let mismatch = |what: &str, exp: &str, got: &str| {
+        Some(format!(
+            "\nsfh: resume mismatch: expected {what} '{exp}' but the tool reported '{got}' (it silently started a new session - resuming from a different working directory does this)\n"
+        ))
+    };
+    if let (Some(exp), Some(got)) = (e.expect_session, parsed.session.as_deref()) {
+        if got != exp {
+            return mismatch("session", exp, got);
+        }
+    }
+    // pi accepts any --session-id and creates one when it is not found in this
+    // cwd, so the id matching proves nothing; the marker does.
+    if let (Some(exp), Some(got)) = (e.expect_marker, parsed.session_marker.as_deref()) {
+        if got != exp {
+            return mismatch("session marker", exp, got);
+        }
+    }
+    // A fork that came back as the parent means the fork flag was ignored: this
+    // run appended to the session its siblings are also using.
+    if let (Some(parent), Some(got)) = (e.forbid_session, parsed.session.as_deref()) {
+        if got == parent {
+            return Some(format!(
+                "\nsfh: fork failed: the tool reported the PARENT session '{parent}' instead of a new one, so this run appended to the parent instead of branching\n"
+            ));
+        }
+    }
+    // pi names the parent it branched from - positive proof of a fork.
+    if let Some(parent) = e.expect_parent {
+        let ok = parsed
+            .session_parent
+            .as_deref()
+            .map(|sp| sp.contains(parent))
+            .unwrap_or(false);
+        if !ok {
+            return Some(format!(
+                "\nsfh: fork failed: the new session does not name '{parent}' as its parent (got {:?}), so it did not inherit the parent's context\n",
+                parsed.session_parent
+            ));
+        }
+    }
+    if chain.trim().is_empty() && !e.allow_empty {
+        return Some(
+            "\nsfh: the tool exited successfully but produced no final message (set allow_empty: true if that is expected)\n".to_string(),
+        );
+    }
+    None
+}
+
 pub fn parse_output(parse: &preset::OutputParse, stdout: &str, stderr: &str) -> ParsedOut {
     match parse {
         preset::OutputParse::Stdout => ParsedOut {
@@ -823,6 +889,9 @@ fn exec_once(p: Prepared) -> LeafDone {
         p.timeout,
         &p.env_remove,
         &p.env_set,
+        // Tee to the step's out file so a long step is observable while it
+        // runs; the cleaned text replaces it once the child exits.
+        Some(p.out_file.clone()),
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -867,7 +936,7 @@ fn exec_once(p: Prepared) -> LeafDone {
     {
         exit_code = 0;
     }
-    let chain_output = parsed.text;
+    let chain_output = parsed.text.clone();
 
     let mut session_id = if exit_code == 0 && !outcome.timed_out {
         parsed
@@ -886,60 +955,19 @@ fn exec_once(p: Prepared) -> LeafDone {
         }
     }
     if exit_code == 0 && !outcome.timed_out {
-        let mut resume_mismatch = |what: &str, exp: &str, got: &str| {
-            exit_code = 1;
-            session_id = None;
-            stderr_clean.push_str(&format!(
-                "\nsfh: resume mismatch: expected {what} '{exp}' but the tool reported '{got}' (it silently started a new session - resuming from a different working directory does this)\n"
-            ));
-            let _ = std::fs::write(&p.err_file, &stderr_clean);
+        let expect = SessionExpect {
+            expect_session: p.expect_session.as_deref(),
+            expect_marker: p.expect_marker.as_deref(),
+            forbid_session: p.forbid_session.as_deref(),
+            expect_parent: p.expect_parent.as_deref(),
+            allow_empty: p.allow_empty,
         };
-        if let (Some(exp), Some(got)) = (&p.expect_session, &parsed.session) {
-            if got != exp {
-                resume_mismatch("session", exp, got);
-            }
-        }
-        // pi accepts any --session-id and creates one when it is not found in
-        // this cwd, so the id matching proves nothing; the marker does.
-        if let (Some(exp), Some(got)) = (&p.expect_marker, &parsed.session_marker) {
-            if got != exp {
-                resume_mismatch("session marker", exp, got);
-            }
-        }
-        // A fork that came back as the parent means the fork flag was ignored:
-        // this run appended to the session its siblings are also using.
-        if let (Some(parent), Some(got)) = (&p.forbid_session, &parsed.session) {
-            if got == parent {
-                exit_code = 1;
+        if let Some(why) = check_session(&expect, &parsed, &chain_output) {
+            exit_code = 1;
+            if !why.starts_with("\nsfh: the tool exited successfully") {
                 session_id = None;
-                stderr_clean.push_str(&format!(
-                    "\nsfh: fork failed: the tool reported the PARENT session '{parent}' instead of a new one, so this run appended to the parent instead of branching\n"
-                ));
-                let _ = std::fs::write(&p.err_file, &stderr_clean);
             }
-        }
-        // pi names the parent it branched from - positive proof of a fork.
-        if let Some(parent) = &p.expect_parent {
-            let ok = parsed
-                .session_parent
-                .as_deref()
-                .map(|sp| sp.contains(parent.as_str()))
-                .unwrap_or(false);
-            if !ok {
-                exit_code = 1;
-                session_id = None;
-                stderr_clean.push_str(&format!(
-                    "\nsfh: fork failed: the new session does not name '{parent}' as its parent (got {:?}), so it did not inherit the parent's context\n",
-                    parsed.session_parent
-                ));
-                let _ = std::fs::write(&p.err_file, &stderr_clean);
-            }
-        }
-        if chain_output.trim().is_empty() && !p.allow_empty {
-            exit_code = if exit_code == 0 { 1 } else { exit_code };
-            stderr_clean.push_str(
-                "\nsfh: the tool exited successfully but produced no final message (set allow_empty: true if that is expected)\n",
-            );
+            stderr_clean.push_str(&why);
             let _ = std::fs::write(&p.err_file, &stderr_clean);
         }
     }
@@ -1673,6 +1701,118 @@ mod tests {
         for _ in 0..200 {
             assert!(set.insert(gen_uuid()), "uuid collision");
         }
+    }
+
+    fn expect_none() -> SessionExpect<'static> {
+        SessionExpect {
+            expect_session: None,
+            expect_marker: None,
+            forbid_session: None,
+            expect_parent: None,
+            allow_empty: false,
+        }
+    }
+
+    fn parsed_with(session: Option<&str>, marker: Option<&str>, parent: Option<&str>) -> ParsedOut {
+        ParsedOut {
+            text: "answer".into(),
+            session: session.map(String::from),
+            session_marker: marker.map(String::from),
+            session_parent: parent.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    // Every one of these is a tool exiting 0 while having done the wrong thing.
+    // They were all found against live CLIs; this keeps them found.
+    #[test]
+    fn a_resume_that_landed_in_a_different_session_is_a_failure() {
+        let e = SessionExpect {
+            expect_session: Some("sess-1"),
+            ..expect_none()
+        };
+        let ok = check_session(&e, &parsed_with(Some("sess-1"), None, None), "answer");
+        assert!(ok.is_none(), "matching id must pass: {ok:?}");
+
+        let bad = check_session(&e, &parsed_with(Some("sess-2"), None, None), "answer")
+            .expect("a different session id must fail");
+        assert!(bad.contains("resume mismatch"), "{bad}");
+        assert!(bad.contains("sess-1") && bad.contains("sess-2"), "{bad}");
+    }
+
+    #[test]
+    fn a_marker_mismatch_fails_even_when_the_id_matches() {
+        // pi echoes back whatever --session-id it was given, so the id proving
+        // nothing is the entire reason the marker exists.
+        let e = SessionExpect {
+            expect_session: Some("same-id"),
+            expect_marker: Some("2026-07-27T10:00:00Z"),
+            ..expect_none()
+        };
+        let bad = check_session(
+            &e,
+            &parsed_with(Some("same-id"), Some("2026-07-28T09:00:00Z"), None),
+            "answer",
+        )
+        .expect("a new creation timestamp means a new session");
+        assert!(bad.contains("session marker"), "{bad}");
+    }
+
+    #[test]
+    fn a_fork_that_returns_the_parent_session_is_a_failure() {
+        let e = SessionExpect {
+            forbid_session: Some("parent-1"),
+            ..expect_none()
+        };
+        assert!(check_session(&e, &parsed_with(Some("child-9"), None, None), "answer").is_none());
+        let bad = check_session(&e, &parsed_with(Some("parent-1"), None, None), "answer")
+            .expect("appending to the parent must not look like success");
+        assert!(
+            bad.contains("fork failed") && bad.contains("PARENT"),
+            "{bad}"
+        );
+    }
+
+    #[test]
+    fn a_fork_must_positively_name_its_parent_when_the_tool_reports_one() {
+        let e = SessionExpect {
+            expect_parent: Some("parent-1"),
+            ..expect_none()
+        };
+        // Substring, because pi reports a path that contains the id.
+        assert!(check_session(
+            &e,
+            &parsed_with(Some("c"), None, Some("/sessions/parent-1.jsonl")),
+            "answer"
+        )
+        .is_none());
+        let bad = check_session(&e, &parsed_with(Some("c"), None, None), "answer")
+            .expect("no parent reported means no proof the context was inherited");
+        assert!(bad.contains("did not inherit"), "{bad}");
+    }
+
+    #[test]
+    fn an_empty_final_message_fails_unless_opted_in() {
+        let e = expect_none();
+        let bad = check_session(&e, &parsed_with(None, None, None), "   \n ")
+            .expect("empty output must not flow into the next prompt");
+        assert!(bad.contains("no final message"), "{bad}");
+        let allowed = SessionExpect {
+            allow_empty: true,
+            ..expect_none()
+        };
+        assert!(check_session(&allowed, &parsed_with(None, None, None), "").is_none());
+    }
+
+    #[test]
+    fn checks_do_not_fire_when_nothing_was_expected() {
+        // A plain fresh run must never be failed by the session machinery.
+        assert!(check_session(
+            &expect_none(),
+            &parsed_with(Some("whatever"), Some("m"), Some("p")),
+            "answer"
+        )
+        .is_none());
     }
 
     #[test]

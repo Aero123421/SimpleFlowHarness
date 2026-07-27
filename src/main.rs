@@ -1,3 +1,4 @@
+mod doctor;
 mod engine;
 mod execute;
 mod flow;
@@ -18,6 +19,8 @@ USAGE:
   sfh run <flow.yaml> [options]          Run a flow
   sfh status [run-dir] [--json]          Is a run still going? (default: newest run)
   sfh wait [run-dir] [--timeout SEC]     Block until a run finishes, then print its result
+  sfh stop [run-dir]                     Cancel a run and its agents
+  sfh doctor [flow.yaml]                 Check the presets still match the installed CLIs
   sfh validate <flow.yaml> [--var k=v]   Parse and static-check a flow file
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
   sfh runs list|show|clean [...]         Browse or prune past runs
@@ -37,12 +40,21 @@ RUN OPTIONS:
   -v, --verbose       Print full command lines
   -q, --quiet         Suppress progress output (stdout gets the result only)
 
-STATUS / WAIT OPTIONS:
+STATUS / WAIT / STOP OPTIONS:
   status [run-dir] [--runs-dir d] [--json]
   wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
-  status exit codes: 0 = done, 1 = failed or dead, 2 = cannot tell, 3 = running
+  stop   [run-dir] [--runs-dir d]
+  status exit codes: 0 = done, 1 = failed/dead/stopped, 2 = cannot tell, 3 = running
   wait exits with the flow's own code, or 3 if --timeout elapsed first
-  (a wait timeout does NOT cancel the run)
+  (a wait timeout does NOT cancel the run - use `sfh stop` for that)
+
+DOCTOR OPTIONS:
+  doctor [flow.yaml] [--runs-dir d] [--timeout SEC]
+  Sends a one-token prompt to each tool and checks sfh can still parse the
+  answer, so preset drift surfaces here instead of halfway through a paid run.
+  This makes REAL calls. With a flow file it checks exactly that flow's tools
+  (honouring bin:/model: from its profiles) and a missing tool is an error;
+  without one it probes every preset and just reports which are absent.
 
 RUNS OPTIONS:
   runs list [--runs-dir d] [-n N]
@@ -66,8 +78,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
-        Some("status") => cmd_watch(&args[1..], false),
-        Some("wait") => cmd_watch(&args[1..], true),
+        Some("status") => cmd_watch(&args[1..], Watch::Status),
+        Some("wait") => cmd_watch(&args[1..], Watch::Wait),
+        Some("stop") => cmd_watch(&args[1..], Watch::Stop),
+        Some("doctor") => cmd_doctor(&args[1..]),
         Some("validate") => cmd_validate(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
         Some("runs") => cmd_runs(&args[1..]),
@@ -199,18 +213,26 @@ fn cmd_run(rest: &[String]) -> i32 {
     engine::run(opts)
 }
 
-fn cmd_watch(rest: &[String], is_wait: bool) -> i32 {
+#[derive(PartialEq, Clone, Copy)]
+enum Watch {
+    Status,
+    Wait,
+    Stop,
+}
+
+fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
     let mut runs_dir = PathBuf::from(".sfh").join("runs");
     let mut target: Option<PathBuf> = None;
     let mut as_json = false;
     let mut quiet = false;
     let mut timeout: Option<u64> = None;
     let mut interval = 3u64;
+    let is_wait = mode == Watch::Wait;
     let mut i = 0;
     while i < rest.len() {
         let r: Result<(), String> = match rest[i].as_str() {
             "--runs-dir" => need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v)),
-            "--json" if !is_wait => {
+            "--json" if mode == Watch::Status => {
                 as_json = true;
                 Ok(())
             }
@@ -242,11 +264,41 @@ fn cmd_watch(rest: &[String], is_wait: bool) -> i32 {
         }
         i += 1;
     }
-    if is_wait {
-        watch::wait(target.as_deref(), &runs_dir, timeout, interval, quiet)
-    } else {
-        watch::status(target.as_deref(), &runs_dir, as_json)
+    match mode {
+        Watch::Wait => watch::wait(target.as_deref(), &runs_dir, timeout, interval, quiet),
+        Watch::Stop => watch::stop(target.as_deref(), &runs_dir),
+        Watch::Status => watch::status(target.as_deref(), &runs_dir, as_json),
     }
+}
+
+fn cmd_doctor(rest: &[String]) -> i32 {
+    let mut flow_path: Option<PathBuf> = None;
+    let mut runs_dir = PathBuf::from(".sfh").join("runs");
+    let mut timeout = 120u64;
+    let mut i = 0;
+    while i < rest.len() {
+        let r: Result<(), String> = match rest[i].as_str() {
+            "--runs-dir" => need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v)),
+            "--timeout" => need(rest, &mut i, "--timeout")
+                .and_then(|v| v.parse().map_err(|_| "--timeout needs seconds".to_string()))
+                .map(|v| timeout = v),
+            s if s.starts_with('-') => Err(format!("unknown flag '{s}'")),
+            s => {
+                if flow_path.is_some() {
+                    Err("more than one flow file given".to_string())
+                } else {
+                    flow_path = Some(PathBuf::from(s));
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = r {
+            return usage_err(&e);
+        }
+        i += 1;
+    }
+    let work = doctor::default_work_dir(&runs_dir);
+    doctor::run(flow_path.as_deref(), timeout, &work)
 }
 
 fn cmd_validate(rest: &[String]) -> i32 {

@@ -128,7 +128,7 @@ mod windows_guard {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
     static JOB: OnceLock<usize> = OnceLock::new();
@@ -157,13 +157,15 @@ mod windows_guard {
                 return 0;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            // KILL_ON_JOB_CLOSE: children never outlive sfh.
-            // BREAKAWAY_OK: except one that explicitly asks, which is only ever
-            // a nested `sfh run --detach`. A job that forbids breakaway makes
-            // CreateProcess fail outright, so without this a flow could not
-            // launch a background run of its own.
-            info.BasicLimitInformation.LimitFlags =
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            // KILL_ON_JOB_CLOSE and nothing else. JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            // looks harmless - "only a deliberate CREATE_BREAKAWAY_FROM_JOB can
+            // leave" - but it is not ours to grant: msys2/Git-Bash spawns with
+            // that flag, so with BREAKAWAY_OK a `cmd: ["sh", "-c", ...]` step
+            // leaves descendants running after sfh is killed. Measured: an
+            // orphaned `sleep` survived `sfh stop` with the flag, died without
+            // it. The guarantee that nothing outlives sfh is worth more than
+            // letting a flow step launch its own detached run.
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
@@ -254,8 +256,10 @@ pub fn spawn_detached(
                 pid: child.id(),
                 warning: Some(format!(
                     "the calling process is inside a job object that forbids breakaway ({e}); \
-                     the run was started anyway but will still be killed if that process \
-                     tree is torn down"
+                     the run was started anyway but will still be killed if that process tree \
+                     is torn down. Note sfh's own job is deliberately one of these, so a flow \
+                     step cannot launch a background run that outlives the flow - use --resume \
+                     to pick it up instead"
                 )),
             })
         }
@@ -290,6 +294,17 @@ pub fn spawn_detached(
     })
 }
 
+/// Every child is a console program whose output sfh captures, so none of them
+/// need a console of their own. Without this each step - and every `taskkill` -
+/// flashes a cmd window on top of whatever the user is doing, which on a flow
+/// with a dozen steps is unusable.
+#[cfg(windows)]
+fn no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 /// Clear HANDLE_FLAG_INHERIT on our own standard handles so the next child
 /// cannot hold a caller's pipe open. Safe to call late: it does not affect this
 /// process's own use of those handles, only what a child inherits.
@@ -306,6 +321,33 @@ fn windows_no_inherit_std() {
                 SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
             }
         }
+    }
+}
+
+/// Kill a process and its descendants by pid. Used by `sfh stop` on a detached
+/// run, which by construction is not our child, so `kill_tree` does not apply.
+#[cfg(windows)]
+pub fn kill_pid_tree(pid: u32) -> bool {
+    let mut c = Command::new("taskkill");
+    c.args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    no_window(&mut c);
+    c.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Kill a process and its descendants by pid. Used by `sfh stop` on a detached
+/// run, which by construction is not our child, so `kill_tree` does not apply.
+#[cfg(unix)]
+pub fn kill_pid_tree(pid: u32) -> bool {
+    // A detached run is its own session leader (setsid), so the negative pid
+    // reaches the agents it spawned too. Fall back to the bare pid if not.
+    unsafe {
+        if libc::kill(-(pid as i32), libc::SIGKILL) == 0 {
+            return true;
+        }
+        libc::kill(pid as i32, libc::SIGKILL) == 0
     }
 }
 
@@ -354,6 +396,7 @@ pub fn run_cmd(
     timeout: Option<Duration>,
     env_remove: &[String],
     env_set: &[(String, String)],
+    tee_stdout: Option<std::path::PathBuf>,
 ) -> Result<ExecOutcome, String> {
     if interrupted() {
         return Err("interrupted before start".into());
@@ -385,6 +428,8 @@ pub fn run_cmd(
     });
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    #[cfg(windows)]
+    no_window(&mut cmd);
 
     // New session on Unix so a timeout can kill the whole tree, plus
     // parent-death signalling on Linux.
@@ -415,8 +460,8 @@ pub fn run_cmd(
             // handle dropped here -> child sees EOF
         })
     });
-    let rx_out = spawn_reader(child.stdout.take().expect("stdout piped"));
-    let rx_err = spawn_reader(child.stderr.take().expect("stderr piped"));
+    let rx_out = spawn_reader(child.stdout.take().expect("stdout piped"), tee_stdout);
+    let rx_err = spawn_reader(child.stderr.take().expect("stderr piped"), None);
 
     let mut timed_out = false;
     let mut was_interrupted = false;
@@ -491,9 +536,17 @@ pub fn run_cmd(
 /// the child never blocks on a full pipe.
 const MAX_CAPTURE: usize = 32 * 1024 * 1024;
 
-fn spawn_reader<R: Read + Send + 'static>(mut r: R) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
+/// `tee`: mirror each chunk to this file as it arrives. Without it nothing is
+/// observable until the child exits, so a 30-minute step is indistinguishable
+/// from a hung one. The file is rewritten with the cleaned text at the end, so
+/// what is visible mid-run is the raw stream and what remains is canonical.
+fn spawn_reader<R: Read + Send + 'static>(
+    mut r: R,
+    tee: Option<std::path::PathBuf>,
+) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let mut sink = tee.and_then(|p| std::fs::File::create(p).ok());
         let mut buf = Vec::new();
         let mut tmp = [0u8; 65536];
         let mut truncated = false;
@@ -503,6 +556,12 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R) -> std::sync::mpsc::Receiver
                 Ok(n) => {
                     if buf.len() < MAX_CAPTURE {
                         let take = n.min(MAX_CAPTURE - buf.len());
+                        if let Some(f) = sink.as_mut() {
+                            // Same cap as the in-memory capture, so a runaway
+                            // tool cannot fill the disk through this path.
+                            let _ = f.write_all(&tmp[..take]);
+                            let _ = f.flush();
+                        }
                         buf.extend_from_slice(&tmp[..take]);
                         if take < n {
                             truncated = true;
@@ -519,14 +578,23 @@ fn spawn_reader<R: Read + Send + 'static>(mut r: R) -> std::sync::mpsc::Receiver
 }
 
 /// Capture `<program> --version` (no AI call) for the run's provenance record.
+/// Best-effort `--version` for the provenance record. Bounded: a CLI that
+/// hangs on --version (an auth prompt, a stuck update check) must not stop the
+/// run from starting - this is metadata, not a dependency.
 pub fn probe_version(program: &str) -> Option<String> {
-    let out = Command::new(resolve_program(program))
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
+    let out = run_cmd(
+        &Invocation::Argv(vec![program.to_string(), "--version".to_string()]),
+        None,
+        None,
+        Some(Duration::from_secs(15)),
+        &[],
+        &[],
+        None,
+    )
+    .ok()?;
+    if out.timed_out {
+        return None;
+    }
     let text = String::from_utf8_lossy(if out.stdout.is_empty() {
         &out.stderr
     } else {
@@ -582,13 +650,12 @@ fn resolve_program(name: &str) -> String {
 #[cfg(windows)]
 fn kill_tree(child: &mut Child) {
     let pid = child.id().to_string();
-    let ok = Command::new("taskkill")
-        .args(["/PID", &pid, "/T", "/F"])
+    let mut tk = Command::new("taskkill");
+    tk.args(["/PID", &pid, "/T", "/F"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stderr(Stdio::null());
+    no_window(&mut tk);
+    let ok = tk.status().map(|s| s.success()).unwrap_or(false);
     if !ok {
         let _ = child.kill();
     }
