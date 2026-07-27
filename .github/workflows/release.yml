@@ -1,0 +1,60 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: sfh-windows-x64.zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: sfh-macos-arm64.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: sfh-macos-x64.tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: sfh-linux-x64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: sfh-linux-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir pkg
+          cp target/${{ matrix.target }}/release/sfh pkg/
+          cp README.md LICENSE pkg/
+          tar -C pkg -czf ${{ matrix.asset }} .
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/sfh.exe pkg/
+          Copy-Item README.md, LICENSE pkg/
+          Compress-Archive -Path pkg/* -DestinationPath ${{ matrix.asset }}
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          fail_on_unmatched_files: true

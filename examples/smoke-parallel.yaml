@@ -1,0 +1,44 @@
+# v0.2機能のスモークテスト(AI呼び出しなし)。
+#   sfh run examples/smoke-parallel.yaml -v
+# parallel集約 -> foreach fan-out -> フィルタ/notes参照 まで一気に確認する。
+name: smoke2
+
+vars:
+  topic: demo
+  hypos: |
+    alpha
+    beta
+    gamma
+
+steps:
+  # 3並列で実行し、出力は "--- id ---" 区切りで集約される
+  - id: fan
+    max_parallel: 3
+    notes: append
+    parallel:
+      - id: fan_a
+        cmd: "echo idea-A for {{vars.topic}}"
+      - id: fan_b
+        cmd: "echo idea-B for {{vars.topic}}"
+      - id: fan_c
+        cmd: "echo idea-C for {{vars.topic}}"
+    route:
+      - when_contains: "idea-B"
+        goto: verify
+      - goto: fail
+
+  # varsの複数行リストを1行1項目に分割してfan-out
+  # (シェル文字列cmdなので、shで裸の括弧が構文エラーにならないよう全体をクォート)
+  - id: verify
+    foreach:
+      from: "{{vars.hypos}}"
+    max_parallel: 2
+    cmd: 'echo "checking {{item}} ({{item_index}})"'
+    route:
+      - when_contains: "checking gamma"
+        goto: merge
+      - goto: fail
+
+  # フィルタとnotesの参照テスト
+  - id: merge
+    cmd: 'echo "first=[{{steps.verify.outputs | head:1}}] fanB=[{{steps.fan_b.output | trim}}] notes=[{{notes | head:1}}]"'

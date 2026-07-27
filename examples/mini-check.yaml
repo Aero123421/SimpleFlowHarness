@@ -1,0 +1,52 @@
+# プリセット動作確認用ヘルスチェック。5ツールを各1回、極小プロンプトで順に呼ぶ。
+#   sfh run examples/mini-check.yaml
+# ※ codexのPATHが古いマシンでは ~/.sfh/profiles.yaml に codex-local を定義して
+#   tool: codex を use: codex-local に変えること。
+name: mini-check
+
+defaults:
+  timeout_sec: 600
+
+steps:
+  - id: a_codex
+    tool: codex
+    # bin: 'C:\path\to\codex.exe'  # PATHのcodexが古い場合はここで実バイナリを指定
+    access: read
+    effort: low
+    prompt: |
+      1+1 の答えを数字のみで出力してください。説明は不要。
+
+  - id: b_claude
+    tool: claude
+    access: read
+    effort: low
+    prompt: |
+      前段のエージェントの出力は「{{steps.a_codex.output}}」です。
+      これが 2 を意味するなら最終行に VERDICT: OK、違うなら VERDICT: REVISE とだけ出力してください。
+    route:
+      - when_contains: "VERDICT: OK"
+        goto: c_opencode
+      - goto: fail
+
+  - id: c_opencode
+    tool: opencode
+    access: read
+    prompt: |
+      「opencode ok」とだけ出力してください。
+
+  - id: d_grok
+    tool: grok
+    access: read
+    effort: low
+    prompt: |
+      「grok ok」とだけ出力してください。
+
+  - id: e_agy
+    tool: agy
+    access: read
+    model: gemini-3.6-flash-low
+    prompt: |
+      「agy ok」とだけ出力してください。
+
+  - id: done
+    cmd: "echo all-presets-ok [{{steps.c_opencode.output | head:1}}] [{{steps.d_grok.output | head:1}}] [{{steps.e_agy.output | head:1}}]"

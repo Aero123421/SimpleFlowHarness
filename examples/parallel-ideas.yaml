@@ -1,0 +1,43 @@
+# 並列アイデア出し -> 統合報告
+#   sfh run examples/parallel-ideas.yaml --var theme="研究データ管理の自動化"
+# 3体が別々の観点・別々のツールで同時にアイデアを出し、全員終わったら1体が統合する。
+name: ideas
+
+vars:
+  theme: "(お題を --var theme=... で渡す)"
+
+profiles:
+  smart:    { tool: codex, effort: high, access: read }
+  cheap:    { tool: opencode, access: read }
+  reviewer: { tool: claude, access: read }
+
+defaults:
+  timeout_sec: 1800
+  max_parallel: 3
+
+steps:
+  - id: ideas
+    parallel:
+      - id: idea_tech
+        use: smart
+        prompt: |
+          「{{vars.theme}}」について技術的実現性の観点からアイデアを5つ出してください。
+          各アイデアは見出し1行+説明2行以内。
+      - id: idea_cost
+        use: cheap
+        prompt: |
+          「{{vars.theme}}」についてコスト効率の観点からアイデアを5つ出してください。
+          各アイデアは見出し1行+説明2行以内。
+      - id: idea_ux
+        use: reviewer
+        prompt: |
+          「{{vars.theme}}」についてユーザー体験の観点からアイデアを5つ出してください。
+          各アイデアは見出し1行+説明2行以内。
+
+  - id: report
+    use: cheap
+    prompt: |
+      以下の3系統のアイデア({{steps.ideas.outputs | head:200}} 参照)を重複排除・統合し、
+      有望順トップ5として報告してください。各案に出典観点(技術/コスト/UX)を添えること。
+
+      {{steps.ideas.outputs}}

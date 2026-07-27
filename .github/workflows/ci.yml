@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release
+      - name: Smoke tests (no AI calls)
+        shell: bash
+        run: |
+          ./target/release/sfh --version
+          ./target/release/sfh run examples/smoke.yaml -q
+          ./target/release/sfh run examples/smoke-parallel.yaml -q
+          for f in examples/*.yaml; do ./target/release/sfh validate "$f"; done

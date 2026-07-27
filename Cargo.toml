@@ -1,0 +1,21 @@
+[package]
+name = "sfh"
+version = "0.2.0"
+edition = "2021"
+description = "SimpleFlowHarness - chain AI CLI agents (codex / claude / opencode / grok / agy / any command) into staged flows"
+license = "MIT"
+repository = "https://github.com/Aero123421/SimpleFlowHarness"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+regex = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

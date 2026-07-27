@@ -1,0 +1,50 @@
+# 複数仮説の並列検証
+#   sfh run examples/hypotheses.yaml --var question="なぜXのビルドが遅いのか"
+# 賢いモデルが仮説を出し、その行数ぶんだけ安いワーカーが並列検証、最後に統合。
+name: hypotheses
+
+vars:
+  question: "(調査課題を --var question=... で渡す)"
+
+profiles:
+  smart:  { tool: codex, effort: high }
+  worker: { tool: opencode }
+
+defaults:
+  timeout_sec: 1800
+
+steps:
+  - id: generate
+    use: smart
+    access: read
+    prompt: |
+      課題: {{vars.question}}
+      検証可能な原因仮説を最大5個、1行1個で出力してください。
+      番号・記号・仮説以外の文章は一切書かないこと。
+
+  # generateの出力行数ぶんワーカーが立ち上がる(実行時に個数が決まる)
+  - id: verify
+    foreach:
+      from: "{{steps.generate.output}}"
+      split: lines
+    max_parallel: 3
+    use: worker
+    access: full
+    on_error: continue        # 1本失敗しても残りの検証は生かす
+    prompt: |
+      次の仮説を、利用可能な手段(ファイル調査・コマンド実行・Web検索)で実際に検証してください。
+
+      仮説 {{item_index}}: {{item}}
+
+      根拠を示し、最後の行は必ず CONFIRMED / REJECTED / INCONCLUSIVE のいずれか1語のみにすること。
+
+  - id: report
+    use: worker
+    access: read
+    notes: append
+    prompt: |
+      仮説検証の結果を統合し、課題「{{vars.question}}」への現時点の答えを報告してください。
+      CONFIRMEDされた仮説を優先し、INCONCLUSIVEは追加で必要な調査を添えること。
+
+      # 検証結果
+      {{steps.verify.outputs}}

@@ -1,0 +1,111 @@
+# sfh フロー定義の例: リサーチ・パイプライン (v0.2)
+#   plan(計画) -> review_plan(レビュー、NGなら差し戻し)
+#   -> execute(実行) -> review_execute(レビュー、NGなら差し戻し) -> summarize(要約)
+#
+# 使い方:
+#   sfh run research.yaml --var topic="調査したいテーマ"
+#
+# 成果物は .sfh/runs/<日時>-research/ に全部残る。stdoutには最後のステップの出力だけが出る。
+# 並列版のパターンは examples/parallel-ideas.yaml / examples/hypotheses.yaml を参照。
+
+name: research
+
+vars:
+  topic: "(調査テーマを --var topic=... で渡す)"
+
+# ツール構成はここを差し替えるだけ。マシン固有設定(bin:等)は ~/.sfh/profiles.yaml へ。
+profiles:
+  planner:  { tool: codex, effort: high }
+  reviewer: { tool: claude, access: read }
+  worker:   { tool: opencode }
+  cheap:    { tool: opencode, access: read }
+
+defaults:
+  timeout_sec: 3600
+  max_visits: 3
+
+steps:
+  # 1) プランナー: フルアクセスで下調べして調査計画を立てる
+  - id: plan
+    use: planner
+    access: full
+    prompt: |
+      あなたはリサーチプランナーです。次のテーマについて、必要ならWeb検索・ファイル調査を行い、
+      実行可能な調査計画を作成してください。
+
+      # テーマ
+      {{vars.topic}}
+
+      # 前回の計画(初回は空)
+      {{steps.plan.output}}
+
+      # レビュアーからの指摘(初回は空。指摘があれば必ず反映すること)
+      {{steps.review_plan.output}}
+
+      出力: 調査計画(目的 / 手順 / 成果物 / 検証方法)をMarkdownで。
+
+  # 2) 計画レビュー: 別モデルで審査。NGなら plan へ差し戻し
+  - id: review_plan
+    use: reviewer
+    prompt: |
+      以下の調査計画をレビューしてください。過不足・実行可能性・スコープのずれを具体的に指摘すること。
+
+      # テーマ
+      {{vars.topic}}
+
+      # 計画
+      {{steps.plan.output}}
+
+      最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
+    route:
+      - when_contains: "VERDICT: REVISE"
+        goto: plan
+      - goto: execute
+
+  # 3) 実行者: 計画に従って調査を実行し、レポートを書く。
+  #    巨大レポートは compact で自動要約してから下流に流す(原文は {{steps.execute.outputs}})。
+  - id: execute
+    use: worker
+    access: full
+    notes: append
+    compact:
+      when_over: 30000
+      use: cheap
+      target_chars: 6000
+    prompt: |
+      次の調査計画を実行してください。結果は {{run_dir}}/report.md に保存しつつ、
+      本文にもレポート全文を出力してください。
+
+      # 差し戻し時のレビュアー指摘(初回は空。あれば必ず反映)
+      {{steps.review_execute.output}}
+
+      # 調査計画
+      {{steps.plan.output}}
+
+  # 4) 結果レビュー: NGなら execute へ差し戻し
+  - id: review_execute
+    use: reviewer
+    prompt: |
+      調査レポートをレビューしてください。計画との整合性・根拠の妥当性・抜け漏れを確認し、
+      問題があれば具体的な修正指示を書くこと。
+
+      # 計画
+      {{steps.plan.output}}
+
+      # レポート
+      {{steps.execute.output}}
+
+      最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
+    route:
+      - when_contains: "VERDICT: REVISE"
+        goto: execute
+      - goto: summarize
+
+  # 5) 要約: 呼び出し元エージェントに返す短いサマリだけを stdout へ
+  - id: summarize
+    use: cheap
+    prompt: |
+      次のレポートを、呼び出し元のAIエージェントに渡すための要約にしてください。
+      重要な結論・成果物のファイルパス({{run_dir}} 配下)・未解決事項のみを400字程度で。
+
+      {{steps.execute.output}}

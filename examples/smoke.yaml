@@ -1,0 +1,22 @@
+# AIを一切呼ばないスモークテスト。ループ・テンプレート・ルーティングの動作確認用。
+#   sfh run examples/smoke.yaml
+# draft が2回実行され(visitループ)、verdict が VERDICT: OK を検出して end する。
+name: smoke
+
+vars:
+  topic: hello
+
+steps:
+  - id: draft
+    cmd: "echo draft v{{visit}} for {{vars.topic}}"
+    route:
+      - when_contains: "v2"
+        goto: verdict
+      - goto: draft
+
+  - id: verdict
+    cmd: "echo checked [{{steps.draft.output}}] VERDICT: OK"
+    route:
+      - when_contains: "VERDICT: OK"
+        goto: end
+      - goto: fail
