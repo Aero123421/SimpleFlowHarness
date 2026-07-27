@@ -14,12 +14,50 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Format check
+        run: cargo fmt --check
+        continue-on-error: true
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+        continue-on-error: true
+      - name: Unit tests
+        run: cargo test --release
       - name: Build
         run: cargo build --release
-      - name: Smoke tests (no AI calls)
+      - name: Smoke flows (no AI calls)
         shell: bash
         run: |
+          set -e
           ./target/release/sfh --version
           ./target/release/sfh run examples/smoke.yaml -q
           ./target/release/sfh run examples/smoke-parallel.yaml -q
           for f in examples/*.yaml; do ./target/release/sfh validate "$f"; done
+      - name: Engine behaviour (fake tools, no AI calls)
+        shell: bash
+        run: bash tests/engine_behaviour.sh ./target/release/sfh
+      - name: Flow schema is valid JSON
+        shell: bash
+        run: python3 -c "import json;json.load(open('schema/flow.schema.json'))"
+
+  install-docs:
+    # The README's install commands must actually work on a clean machine.
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package the way release.yml does
+        shell: bash
+        run: |
+          cargo build --release
+          mkdir pkg && cp target/release/sfh README.md LICENSE pkg/
+          tar czf sfh-test.tar.gz -C pkg sfh README.md LICENSE
+      - name: Extract exactly like the README says
+        shell: bash
+        run: |
+          mkdir extract && cd extract
+          tar xzf ../sfh-test.tar.gz sfh
+          ./sfh --version

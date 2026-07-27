@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use serde_yaml_ng as yaml;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -7,7 +8,7 @@ use std::path::Path;
 pub struct Flow {
     pub name: Option<String>,
     #[serde(default)]
-    pub vars: BTreeMap<String, serde_yaml::Value>,
+    pub vars: BTreeMap<String, yaml::Value>,
     #[serde(default)]
     pub defaults: Defaults,
     /// Named bundles of tool settings referenced by steps via `use:`.
@@ -29,8 +30,23 @@ pub struct Defaults {
     pub max_total_steps: Option<u32>,
     /// Default concurrency for parallel: / foreach: steps (default 4).
     pub max_parallel: Option<u32>,
+    /// Extra ceiling per tool name, e.g. {opencode: 1}. Applies across a fan-out.
+    #[serde(default)]
+    pub tool_max_parallel: BTreeMap<String, u32>,
     /// Fail before spawning if a rendered prompt exceeds this many chars.
     pub max_prompt_chars: Option<u64>,
+    /// Hard ceiling on what sfh prints to stdout (default 200000).
+    pub max_emit_chars: Option<u64>,
+    /// Abort the flow once accumulated reported cost exceeds this (USD).
+    pub max_cost_usd: Option<f64>,
+    /// Abort the flow after this many wall-clock seconds.
+    pub wall_clock_sec: Option<u64>,
+    pub retry: Option<Retry>,
+    /// transient (default) | any | never
+    pub retry_on: Option<String>,
+    /// Env applied to every child process.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -46,6 +62,17 @@ pub struct Profile {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub timeout_sec: Option<u64>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct Retry {
+    /// Extra attempts after the first (0 = no retry).
+    pub max: u32,
+    /// First backoff delay; doubles each attempt (default 5).
+    pub backoff_sec: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -61,11 +88,11 @@ pub struct Step {
     pub bin: Option<String>,
     pub model: Option<String>,
     /// Reasoning effort. codex: model_reasoning_effort, claude: --effort,
-    /// opencode: --variant, grok: --reasoning-effort.
+    /// opencode: --variant, grok: --reasoning-effort, agy: --effort.
     pub effort: Option<String>,
     /// read | write | full (default: write)
     pub access: Option<String>,
-    /// Agent name (opencode/claude/grok --agent).
+    /// Agent name (opencode/claude/grok/agy --agent).
     pub agent: Option<String>,
     /// Extra raw args appended to the preset command line.
     #[serde(default)]
@@ -74,14 +101,15 @@ pub struct Step {
     /// String = run through cmd /C (Windows) or sh -c (Unix).
     pub cmd: Option<Cmd>,
     pub prompt: Option<String>,
-    /// For custom `cmd` only: "prompt" pipes the rendered prompt to stdin. Default: none.
+    /// For custom `cmd` only: "prompt" pipes the rendered prompt to stdin.
     pub stdin: Option<String>,
     pub cwd: Option<String>,
     pub timeout_sec: Option<u64>,
     pub max_visits: Option<u32>,
-    /// fail (default) | continue | goto:<id> - what to do when the command exits non-zero
-    /// or times out. Inside parallel children only fail/continue are allowed.
+    /// fail (default) | continue | goto:<id> - on non-zero exit or timeout.
     pub on_error: Option<String>,
+    /// fail (default) | continue | goto:<id> - when max_visits is exhausted.
+    pub on_max_visits: Option<String>,
     #[serde(default)]
     pub route: Vec<Route>,
     /// Run these child steps concurrently; the step's output is the aggregation.
@@ -97,6 +125,17 @@ pub struct Step {
     pub compact: Option<Compact>,
     /// Resume the session of a previously executed preset step instead of starting fresh.
     pub continue_from: Option<String>,
+    pub retry: Option<Retry>,
+    pub retry_on: Option<String>,
+    /// Profiles to try (in order) if the step still fails after its retries.
+    #[serde(default)]
+    pub fallback: Vec<String>,
+    /// Accept an empty final message instead of failing the step.
+    pub allow_empty: Option<bool>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub env_remove: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +163,9 @@ pub struct Compact {
     pub instruction: Option<String>,
     /// Target size hint used in the default instruction (default: when_over / 2).
     pub target_chars: Option<u64>,
+    /// Never feed the summarizer more than this many chars (default 120000);
+    /// larger inputs are head+tail sampled first.
+    pub max_input_chars: Option<u64>,
     pub timeout_sec: Option<u64>,
 }
 
@@ -139,6 +181,10 @@ pub enum Cmd {
 pub struct Route {
     pub when_contains: Option<String>,
     pub when_matches: Option<String>,
+    /// Same as when_contains but only the LAST non-empty line is searched -
+    /// the deterministic way to read a "VERDICT: OK" trailer.
+    pub when_last_line_contains: Option<String>,
+    pub when_last_line_matches: Option<String>,
     /// Step id, or "end" (finish flow, success) or "fail" (finish flow, failure).
     pub goto: String,
 }
@@ -149,7 +195,7 @@ pub fn load(path: &Path) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut flow: Flow =
-        serde_yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     merge_global_profiles(&mut flow);
     validate(&flow)?;
     Ok(flow)
@@ -159,11 +205,9 @@ pub fn load(path: &Path) -> Result<Flow, String> {
 /// Flow-level profiles win on name conflicts. This keeps flow files portable while
 /// machine-specific things (bin: paths, provider/model choices) live outside the repo.
 fn merge_global_profiles(flow: &mut Flow) {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
-    let Some(h) = home else { return };
-    let p = std::path::PathBuf::from(h).join(".sfh").join("profiles.yaml");
+    let Some(p) = global_profiles_path() else { return };
     let Ok(text) = std::fs::read_to_string(&p) else { return };
-    match serde_yaml::from_str::<BTreeMap<String, Profile>>(&text) {
+    match yaml::from_str::<BTreeMap<String, Profile>>(&text) {
         Ok(globals) => {
             for (k, v) in globals {
                 flow.profiles.entry(k).or_insert(v);
@@ -173,15 +217,20 @@ fn merge_global_profiles(flow: &mut Flow) {
     }
 }
 
+pub fn global_profiles_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(std::path::PathBuf::from(home).join(".sfh").join("profiles.yaml"))
+}
+
 impl Flow {
     pub fn vars_string_map(&self) -> Result<BTreeMap<String, String>, String> {
         let mut out = BTreeMap::new();
         for (k, v) in &self.vars {
             let s = match v {
-                serde_yaml::Value::String(s) => s.clone(),
-                serde_yaml::Value::Number(n) => n.to_string(),
-                serde_yaml::Value::Bool(b) => b.to_string(),
-                serde_yaml::Value::Null => String::new(),
+                yaml::Value::String(s) => s.clone(),
+                yaml::Value::Number(n) => n.to_string(),
+                yaml::Value::Bool(b) => b.to_string(),
+                yaml::Value::Null => String::new(),
                 _ => return Err(format!("var '{k}' must be a scalar")),
             };
             out.insert(k.clone(), s);
@@ -222,6 +271,46 @@ impl Flow {
             }
         }
         None
+    }
+
+    fn step_tool(&self, s: &Step) -> Option<String> {
+        if s.cmd.is_some() {
+            return None;
+        }
+        s.tool
+            .clone()
+            .or_else(|| {
+                s.use_
+                    .as_ref()
+                    .and_then(|u| self.profiles.get(u))
+                    .and_then(|p| p.tool.clone())
+            })
+            .or_else(|| self.defaults.tool.clone())
+    }
+
+    /// Every preset tool this flow could invoke (for version stamping).
+    pub fn tools_used(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for s in &self.steps {
+            out.extend(self.step_tool(s));
+            for f in &s.fallback {
+                out.extend(self.profiles.get(f).and_then(|p| p.tool.clone()));
+            }
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    out.extend(self.step_tool(c));
+                }
+            }
+            if let Some(c) = &s.compact {
+                out.extend(c.tool.clone().or_else(|| {
+                    c.use_
+                        .as_ref()
+                        .and_then(|u| self.profiles.get(u))
+                        .and_then(|p| p.tool.clone())
+                }));
+            }
+        }
+        out
     }
 }
 
@@ -286,17 +375,25 @@ fn validate(flow: &Flow) -> Result<(), String> {
             }
         }
     }
-    let check_on_error = |s: &Step, is_child: bool| -> Result<(), String> {
-        if let Some(oe) = &s.on_error {
-            if let Some(g) = oe.strip_prefix("goto:") {
-                if g == "end" || g == "fail" {
-                    // handled by the engine's on_error arm
-                } else if !is_child {
-                    check_goto(&format!("step '{}' on_error", s.id), g)?;
-                }
-            } else if oe != "fail" && oe != "continue" {
-                return Err(format!("step '{}': on_error must be fail/continue/goto:<id>", s.id));
+    if let Some(r) = &flow.defaults.retry_on {
+        check_retry_on("defaults", r)?;
+    }
+    let action = |what: &str, s: &Step, v: &Option<String>, is_child: bool| -> Result<(), String> {
+        let Some(oe) = v else { return Ok(()) };
+        if let Some(g) = oe.strip_prefix("goto:") {
+            if g == "end" || g == "fail" {
+                return Ok(());
             }
+            if is_child {
+                return Err(format!(
+                    "step '{}': {what} goto is not allowed inside parallel: (use fail or continue)",
+                    s.id
+                ));
+            }
+            return check_goto(&format!("step '{}' {what}", s.id), g);
+        }
+        if oe != "fail" && oe != "continue" {
+            return Err(format!("step '{}': {what} must be fail/continue/goto:<id>", s.id));
         }
         Ok(())
     };
@@ -330,7 +427,8 @@ fn validate(flow: &Flow) -> Result<(), String> {
     };
     for s in &flow.steps {
         validate_step(flow, s, false)?;
-        check_on_error(s, false)?;
+        action("on_error", s, &s.on_error, false)?;
+        action("on_max_visits", s, &s.on_max_visits, false)?;
         check_continue_from(s)?;
         if let Some(children) = &s.parallel {
             if children.is_empty() {
@@ -341,7 +439,7 @@ fn validate(flow: &Flow) -> Result<(), String> {
                 std::collections::HashMap::new();
             for c in children {
                 validate_step(flow, c, true)?;
-                check_on_error(c, true)?;
+                action("on_error", c, &c.on_error, true)?;
                 check_continue_from(c)?;
                 if let Some(cf) = &c.continue_from {
                     if child_ids.contains(cf) {
@@ -361,7 +459,7 @@ fn validate(flow: &Flow) -> Result<(), String> {
         }
         for (i, r) in s.route.iter().enumerate() {
             check_goto(&format!("step '{}' route[{i}]", s.id), &r.goto)?;
-            if let Some(rx) = &r.when_matches {
+            for rx in [&r.when_matches, &r.when_last_line_matches].into_iter().flatten() {
                 if !rx.contains("{{") {
                     regex::Regex::new(rx)
                         .map_err(|e| format!("step '{}' route[{i}]: bad regex: {e}", s.id))?;
@@ -370,6 +468,14 @@ fn validate(flow: &Flow) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn check_retry_on(ctx: &str, v: &str) -> Result<(), String> {
+    if ["transient", "any", "never"].contains(&v) {
+        Ok(())
+    } else {
+        Err(format!("{ctx}: retry_on must be transient/any/never"))
+    }
 }
 
 fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
@@ -381,14 +487,11 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         if s.parallel.is_some() || s.foreach.is_some() {
             return Err(format!("step '{sid}': parallel/foreach cannot be nested"));
         }
-        if let Some(oe) = &s.on_error {
-            if oe.starts_with("goto:") {
-                return Err(format!("step '{sid}': on_error goto is not allowed inside parallel: (use fail or continue)"));
-            }
-        }
-        if s.notes.is_some() || s.compact.is_some() || s.max_visits.is_some() {
+        if s.notes.is_some() || s.compact.is_some() || s.max_visits.is_some()
+            || s.on_max_visits.is_some()
+        {
             return Err(format!(
-                "step '{sid}': notes/compact/max_visits are not supported inside parallel: (notes/max_visits go on the group; compact a downstream step)"
+                "step '{sid}': notes/compact/max_visits/on_max_visits are not supported inside parallel: (put them on the group)"
             ));
         }
     }
@@ -398,10 +501,11 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             || s.stdin.is_some() || s.agent.is_some() || s.compact.is_some()
             || s.bin.is_some() || s.effort.is_some() || s.access.is_some()
             || !s.args.is_empty() || s.cwd.is_some() || s.timeout_sec.is_some()
-            || s.max_prompt_chars.is_some()
+            || s.max_prompt_chars.is_some() || s.retry.is_some() || !s.fallback.is_empty()
+            || !s.env.is_empty() || !s.env_remove.is_empty() || s.allow_empty.is_some()
         {
             return Err(format!(
-                "step '{sid}': a parallel: group carries only id/max_parallel/route/on_error/max_visits/notes (tool settings go on the children)"
+                "step '{sid}': a parallel: group carries only id/max_parallel/route/on_error/max_visits/on_max_visits/notes (tool settings go on the children)"
             ));
         }
         return group_common(s);
@@ -411,6 +515,14 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         if !flow.profiles.contains_key(u) {
             return Err(format!("step '{sid}': unknown profile '{u}' in use:"));
         }
+    }
+    for f in &s.fallback {
+        if !flow.profiles.contains_key(f) {
+            return Err(format!("step '{sid}': unknown profile '{f}' in fallback:"));
+        }
+    }
+    if let Some(r) = &s.retry_on {
+        check_retry_on(&format!("step '{sid}'"), r)?;
     }
     if let Some(t) = &s.tool {
         if !TOOLS.contains(&t.as_str()) {
@@ -453,8 +565,16 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             return Err(format!("step '{sid}': cmd string is empty"));
         }
     }
+    if s.cmd.is_some() && !s.fallback.is_empty() {
+        return Err(format!("step '{sid}': fallback: works only with preset tools"));
+    }
     if s.continue_from.is_some() && s.cmd.is_some() {
         return Err(format!("step '{sid}': continue_from works only with preset tools, not cmd:"));
+    }
+    if s.continue_from.is_some() && !s.fallback.is_empty() {
+        return Err(format!(
+            "step '{sid}': fallback: cannot be combined with continue_from (a session belongs to one tool)"
+        ));
     }
     if let Some(f) = &s.foreach {
         if let Some(sp) = &f.split {
@@ -504,4 +624,58 @@ fn group_common(s: &Step) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Returns Err(message) so tests can assert on validation text.
+    fn parse(y: &str) -> Result<(), String> {
+        let f: Flow = yaml::from_str(y).map_err(|e| e.to_string())?;
+        validate(&f)
+    }
+
+    #[test]
+    fn rejects_group_with_tool_settings() {
+        let e = parse("name: t\nsteps:\n  - id: g\n    access: read\n    parallel:\n      - id: c\n        cmd: echo hi\n").unwrap_err();
+        assert!(e.contains("carries only"), "{e}");
+    }
+
+    #[test]
+    fn rejects_child_notes_and_compact() {
+        let e = parse("name: t\nsteps:\n  - id: g\n    parallel:\n      - id: c\n        cmd: echo hi\n        notes: append\n").unwrap_err();
+        assert!(e.contains("not supported inside parallel"), "{e}");
+    }
+
+    #[test]
+    fn rejects_continue_from_foreach_and_self() {
+        let e = parse("name: t\nsteps:\n  - id: a\n    foreach: {from: x}\n    cmd: echo hi\n  - id: b\n    tool: claude\n    continue_from: a\n    prompt: x\n").unwrap_err();
+        assert!(e.contains("foreach step"), "{e}");
+        let e = parse("name: t\nsteps:\n  - id: b\n    tool: claude\n    continue_from: b\n    prompt: x\n").unwrap_err();
+        assert!(e.contains("itself"), "{e}");
+    }
+
+    #[test]
+    fn rejects_sibling_and_duplicate_resume_targets() {
+        let y = "name: t\nsteps:\n  - id: seed\n    tool: claude\n    prompt: x\n  - id: g\n    parallel:\n      - id: c1\n        tool: claude\n        continue_from: seed\n        prompt: x\n      - id: c2\n        tool: claude\n        continue_from: seed\n        prompt: x\n";
+        let e = parse(y).unwrap_err();
+        assert!(e.contains("two concurrent resumes"), "{e}");
+    }
+
+    #[test]
+    fn accepts_on_max_visits_end() {
+        let y = "name: t\nsteps:\n  - id: a\n    cmd: echo hi\n    max_visits: 2\n    on_max_visits: goto:end\n";
+        assert!(parse(y).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_tool_and_bad_retry_on() {
+        assert!(parse("name: t\nsteps:\n  - id: a\n    tool: gemini\n    prompt: x\n")
+            .unwrap_err()
+            .contains("unknown tool"));
+        assert!(parse("name: t\nsteps:\n  - id: a\n    cmd: echo hi\n    retry_on: sometimes\n")
+            .unwrap_err()
+            .contains("retry_on"));
+    }
 }

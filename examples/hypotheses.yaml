@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/main/schema/flow.schema.json
 # 複数仮説の並列検証
 #   sfh run examples/hypotheses.yaml --var question="なぜXのビルドが遅いのか"
 # 賢いモデルが仮説を出し、その行数ぶんだけ安いワーカーが並列検証、最後に統合。

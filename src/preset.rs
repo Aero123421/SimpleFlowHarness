@@ -3,18 +3,21 @@
 //! Grounded in live-verified research (2026-07-27) against:
 //!   codex-cli 0.146.0-alpha.3.1, claude 2.1.220, opencode 1.18.3,
 //!   grok 0.2.112, agy 1.0.8.
-//! Key facts encoded here:
-//! - codex: stdin '-' prompt; -o last-message file; `exec resume` has no -s flag,
-//!   sandbox must be re-specified via -c sandbox_mode=...; session id parsed from stderr.
-//! - claude: stdin prompt; plan mode is a soft guarantee -> read uses dontAsk + --tools
-//!   whitelist; --session-id preassign + `-p -r <uuid>` resume; scrub CLAUDE_* env.
-//! - opencode: stdin prompt; --auto is REQUIRED headless (permission "ask" hangs forever);
-//!   banner goes to stderr (stdout clean); session id on every --format json line.
-//! - grok: prompt ONLY via --prompt-file (stdin opens the TUI and hangs); --permission-mode
-//!   plan is compat-only -> read uses dontAsk + --deny; --session-id preassign + --resume.
-//! - agy: prompt ONLY as the value of -p (Go flag, must be adjacent); hidden
-//!   --output-format json exposes conversation_id/status/response; --print-timeout
-//!   defaults to 5m and kills long runs; unknown --conversation id silently starts new.
+//!
+//! Every preset runs in the tool's machine-readable output mode, which gives
+//! three things at once: a clean final message, the session id, and token/cost
+//! usage. Key per-tool facts encoded here:
+//! - codex: prompt on stdin via '-'; final text from --output-last-message;
+//!   `--json` stdout carries thread.started/turn.completed; `exec resume` has
+//!   no -s flag, so the sandbox is re-specified with -c sandbox_mode=...
+//! - claude: prompt on stdin; --output-format json gives .result/.session_id/
+//!   .total_cost_usd; plan mode is only advisory, so read = dontAsk + --tools.
+//! - opencode: prompt on stdin; --auto is mandatory headless (an "ask" hangs
+//!   forever); --format json emits NDJSON with sessionID on every line.
+//! - grok: prompt ONLY via --prompt-file (stdin opens the TUI and hangs);
+//!   --output-format json gives .text/.sessionId; read = dontAsk + --deny.
+//! - agy: prompt ONLY as the value of a trailing -p; --output-format json gives
+//!   .response/.status/.conversation_id; --print-timeout defaults to 5m.
 
 use std::path::{Path, PathBuf};
 
@@ -36,51 +39,52 @@ impl Access {
     }
 }
 
-/// How to turn the raw process output into the step's chain output.
+/// How to turn the raw process output into text + session id + usage.
+#[derive(Clone)]
 pub enum OutputParse {
+    /// Plain stdout (custom cmd: steps).
     Stdout,
-    /// codex --output-last-message file; fall back to stdout if missing/empty.
-    LastMsgFile(PathBuf),
-    /// opencode --format json NDJSON: concat text events of the last message.
+    /// codex: text from the --output-last-message file, metadata from JSONL stdout.
+    CodexJsonl(PathBuf),
+    /// claude --output-format json: single-line envelope.
+    ClaudeJson,
+    /// opencode --format json: NDJSON event stream.
     OpencodeNdjson,
-    /// agy --output-format json single-line envelope: .response / .status / .conversation_id.
+    /// grok --output-format json: one pretty-printed object.
+    GrokJson,
+    /// agy --output-format json: single-line envelope.
     AgyJson,
 }
 
 /// How the rendered prompt reaches the tool.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Delivery {
     Stdin,
     /// Passed via a file flag (grok --prompt-file); nothing on stdin.
     PromptFile,
     /// Appended as the final argv element, adjacent to a preceding value-taking
-    /// flag or as a positional (agy -p <prompt>). Size-capped by the caller.
+    /// flag (agy -p <prompt>). Size-capped by the caller.
     Arg,
     None,
 }
 
-/// How to obtain the session id after a run (for continue_from).
-#[derive(Clone, PartialEq)]
-pub enum SessionCapture {
-    /// We passed the id ourselves (claude --session-id, grok --session-id, any resume).
-    Preassigned(String),
-    /// codex: parse "session id: <uuid>" from the stderr transcript.
-    CodexStderr,
-    /// opencode --format json: top-level sessionID on every NDJSON line.
-    OpencodeNdjson,
-    /// agy --output-format json: top-level conversation_id.
-    AgyJson,
-    Unsupported,
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
 }
+
 
 pub struct Built {
     pub argv: Vec<String>,
     pub parse: OutputParse,
     pub delivery: Delivery,
-    pub session: SessionCapture,
+    /// Session id sfh assigned itself (claude/grok); otherwise parsed from output.
+    pub preassigned_session: Option<String>,
     /// Env vars to remove from the child (claude: nested-session vars).
     pub env_remove: Vec<String>,
-    /// Env vars to set on the child (opencode: read-hardening config).
+    /// Env vars to set on the child (opencode: permission hardening).
     pub env_set: Vec<(String, String)>,
     /// When resuming: the session id the tool MUST echo back (agy silently
     /// starts a new conversation on an unknown id - detect that as failure).
@@ -105,7 +109,7 @@ pub struct BuildPaths<'a> {
     pub prompt_file: &'a Path,
 }
 
-/// True when this tool needs a pre-assigned session id to make the run resumable.
+/// True when this tool lets sfh choose the session id up front.
 pub fn wants_preassign(tool: &str) -> bool {
     matches!(tool, "claude" | "grok")
 }
@@ -128,6 +132,16 @@ const CLAUDE_READ_TOOLS: &str = "Read,Glob,Grep,WebSearch,WebFetch,TodoWrite";
 /// or a -p run aborts on first denial.
 const CLAUDE_WRITE_ALLOWED: &str = "Bash,WebSearch,WebFetch";
 
+/// Flags a user could put in `args:` that silently escalate past `access:`.
+pub const ESCALATION_FLAGS: [&str; 6] = [
+    "--dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "bypassPermissions",
+    "danger-full-access",
+    "--always-approve",
+    "--yolo",
+];
+
 fn push(a: &mut Vec<String>, items: &[&str]) {
     a.extend(items.iter().map(|s| s.to_string()));
 }
@@ -142,22 +156,52 @@ fn agy_model_has_effort_suffix(model: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-fn finish(mut b: Built, bin: Option<String>) -> Built {
-    if let Some(bin) = bin {
-        b.argv[0] = bin;
+fn opencode_agent(a: &mut Vec<String>, inp: &PresetInput) -> String {
+    match (&inp.agent, inp.access) {
+        (Some(ag), _) => {
+            push(a, &["--agent"]);
+            a.push(ag.clone());
+            ag.clone()
+        }
+        (None, Access::Read) => {
+            push(a, &["--agent", "plan"]);
+            "plan".to_string()
+        }
+        (None, _) => {
+            // Pin the agent so write/full don't inherit the user's default.
+            push(a, &["--agent", "build"]);
+            "build".to_string()
+        }
     }
-    b
+}
+
+fn opencode_env(agent_name: &str, access: Access) -> Vec<(String, String)> {
+    match access {
+        // The stock plan agent denies edits but NOT bash (1.18.3), so a read step
+        // could still write via shell redirection. OPENCODE_CONFIG_CONTENT is the
+        // highest-precedence config layer and merges with the user's config.
+        Access::Read => vec![(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            format!(
+                "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"edit\":\"deny\",\"bash\":\"deny\"}}}}}}}}"
+            ),
+        )],
+        // Best-effort workspace boundary: --auto would otherwise auto-approve
+        // out-of-tree access.
+        Access::Write => vec![(
+            "OPENCODE_CONFIG_CONTENT".to_string(),
+            "{\"permission\":{\"external_directory\":\"deny\"}}".to_string(),
+        )],
+        Access::Full => Vec::new(),
+    }
 }
 
 /// Build the command line for a fresh (non-resumed) preset run.
-/// `preassign_session`: uuid to preassign when the tool supports it.
-/// `want_capture`: this step is a continue_from target, so the run must yield a session id.
 pub fn build(
     tool: &str,
     inp: PresetInput,
     paths: &BuildPaths,
     preassign_session: Option<&str>,
-    want_capture: bool,
 ) -> Result<Built, String> {
     let mut a: Vec<String> = Vec::new();
     let mut warnings = Vec::new();
@@ -165,10 +209,10 @@ pub fn build(
     let mut env_set = Vec::new();
     let parse;
     let delivery;
-    let mut session = SessionCapture::Unsupported;
+    let mut preassigned = None;
     match tool {
         "codex" => {
-            push(&mut a, &["codex", "exec", "--skip-git-repo-check", "--color", "never"]);
+            push(&mut a, &["codex", "exec", "--skip-git-repo-check", "--color", "never", "--json"]);
             // The user's config may set approval_policy loosely; pin it for headless.
             push(&mut a, &["-c", "approval_policy=\"never\""]);
             if let Some(m) = &inp.model {
@@ -192,12 +236,11 @@ pub fn build(
             push(&mut a, &["--output-last-message"]);
             a.push(paths.last_msg.display().to_string());
             push(&mut a, &["-"]);
-            parse = OutputParse::LastMsgFile(paths.last_msg.to_path_buf());
+            parse = OutputParse::CodexJsonl(paths.last_msg.to_path_buf());
             delivery = Delivery::Stdin;
-            session = SessionCapture::CodexStderr;
         }
         "claude" => {
-            push(&mut a, &["claude", "-p", "--output-format", "text"]);
+            push(&mut a, &["claude", "-p", "--output-format", "json"]);
             if let Some(m) = &inp.model {
                 push(&mut a, &["--model"]);
                 a.push(m.clone());
@@ -223,15 +266,15 @@ pub fn build(
             if let Some(id) = preassign_session {
                 push(&mut a, &["--session-id"]);
                 a.push(id.to_string());
-                session = SessionCapture::Preassigned(id.to_string());
+                preassigned = Some(id.to_string());
             }
             a.extend(inp.extra.iter().cloned());
             env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
-            parse = OutputParse::Stdout;
+            parse = OutputParse::ClaudeJson;
             delivery = Delivery::Stdin;
         }
         "opencode" => {
-            push(&mut a, &["opencode", "run"]);
+            push(&mut a, &["opencode", "run", "--format", "json"]);
             if let Some(m) = &inp.model {
                 push(&mut a, &["-m"]);
                 a.push(m.clone());
@@ -240,61 +283,18 @@ pub fn build(
                 push(&mut a, &["--variant"]);
                 a.push(e.clone());
             }
-            let agent_name = match (&inp.agent, inp.access) {
-                (Some(ag), _) => {
-                    push(&mut a, &["--agent"]);
-                    a.push(ag.clone());
-                    ag.clone()
-                }
-                (None, Access::Read) => {
-                    push(&mut a, &["--agent", "plan"]);
-                    "plan".to_string()
-                }
-                (None, _) => {
-                    // Pin the agent so write/full don't inherit whatever default
-                    // agent the user's opencode config names.
-                    push(&mut a, &["--agent", "build"]);
-                    "build".to_string()
-                }
-            };
+            let agent_name = opencode_agent(&mut a, &inp);
             // --auto is mandatory headless: any permission that resolves to "ask"
             // has no UI in `opencode run` and hangs forever. Explicit deny rules
             // are still enforced with --auto.
             push(&mut a, &["--auto"]);
-            match inp.access {
-                Access::Read => {
-                    // The stock plan agent denies edits but NOT bash (1.18.3), so a read
-                    // step could still write via shell redirection. Merge a per-run deny
-                    // through OPENCODE_CONFIG_CONTENT (highest-precedence config layer).
-                    env_set.push((
-                        "OPENCODE_CONFIG_CONTENT".to_string(),
-                        format!(
-                            "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"edit\":\"deny\",\"bash\":\"deny\"}}}}}}}}"
-                        ),
-                    ));
-                }
-                Access::Write => {
-                    // Best-effort workspace boundary: --auto would otherwise
-                    // auto-approve out-of-tree access. full omits this.
-                    env_set.push((
-                        "OPENCODE_CONFIG_CONTENT".to_string(),
-                        "{\"permission\":{\"external_directory\":\"deny\"}}".to_string(),
-                    ));
-                }
-                Access::Full => {}
-            }
+            env_set = opencode_env(&agent_name, inp.access);
             a.extend(inp.extra.iter().cloned());
-            if want_capture {
-                push(&mut a, &["--format", "json"]);
-                parse = OutputParse::OpencodeNdjson;
-                session = SessionCapture::OpencodeNdjson;
-            } else {
-                parse = OutputParse::Stdout;
-            }
+            parse = OutputParse::OpencodeNdjson;
             delivery = Delivery::Stdin;
         }
         "grok" => {
-            push(&mut a, &["grok", "--output-format", "plain"]);
+            push(&mut a, &["grok", "--output-format", "json"]);
             if let Some(m) = &inp.model {
                 push(&mut a, &["-m"]);
                 a.push(m.clone());
@@ -325,12 +325,12 @@ pub fn build(
             if let Some(id) = preassign_session {
                 push(&mut a, &["--session-id"]);
                 a.push(id.to_string());
-                session = SessionCapture::Preassigned(id.to_string());
+                preassigned = Some(id.to_string());
             }
             a.extend(inp.extra.iter().cloned());
             push(&mut a, &["--prompt-file"]);
             a.push(paths.prompt_file.display().to_string());
-            parse = OutputParse::Stdout;
+            parse = OutputParse::GrokJson;
             delivery = Delivery::PromptFile;
         }
         "agy" => {
@@ -365,16 +365,11 @@ pub fn build(
                 Access::Full => push(&mut a, &["--dangerously-skip-permissions"]),
             }
             a.extend(inp.extra.iter().cloned());
-            // Always JSON: the envelope's status field corrects agy's unreliable
-            // exit codes (valid completions can exit 1, errors can exit 0).
+            // The envelope's status field corrects agy's unreliable exit codes.
             push(&mut a, &["--output-format", "json"]);
-            parse = OutputParse::AgyJson;
-            if want_capture {
-                session = SessionCapture::AgyJson;
-            }
             // -p is a Go string flag: the prompt MUST be the next argv element.
-            // Keep this last; Delivery::Arg appends the prompt right after it.
             push(&mut a, &["-p"]);
+            parse = OutputParse::AgyJson;
             delivery = Delivery::Arg;
         }
         other => {
@@ -384,19 +379,19 @@ pub fn build(
             ))
         }
     }
-    Ok(finish(
-        Built {
-            argv: a,
-            parse,
-            delivery,
-            session,
-            env_remove,
-            env_set,
-            expect_session: None,
-            warnings,
-        },
-        inp.bin,
-    ))
+    if let Some(bin) = inp.bin {
+        a[0] = bin;
+    }
+    Ok(Built {
+        argv: a,
+        parse,
+        delivery,
+        preassigned_session: preassigned,
+        env_remove,
+        env_set,
+        expect_session: None,
+        warnings,
+    })
 }
 
 /// Build the command line to RESUME a previous session with a new prompt.
@@ -417,7 +412,7 @@ pub fn build_resume(
         "codex" => {
             push(&mut a, &["codex", "exec", "resume"]);
             a.push(session_id.to_string());
-            push(&mut a, &["--skip-git-repo-check", "-c", "approval_policy=\"never\""]);
+            push(&mut a, &["--skip-git-repo-check", "--json", "-c", "approval_policy=\"never\""]);
             if let Some(m) = &inp.model {
                 push(&mut a, &["-m"]);
                 a.push(m.clone());
@@ -443,11 +438,11 @@ pub fn build_resume(
             push(&mut a, &["--output-last-message"]);
             a.push(paths.last_msg.display().to_string());
             push(&mut a, &["-"]);
-            parse = OutputParse::LastMsgFile(paths.last_msg.to_path_buf());
+            parse = OutputParse::CodexJsonl(paths.last_msg.to_path_buf());
             delivery = Delivery::Stdin;
         }
         "claude" => {
-            push(&mut a, &["claude", "-p", "--output-format", "text", "-r"]);
+            push(&mut a, &["claude", "-p", "--output-format", "json", "-r"]);
             a.push(session_id.to_string());
             if let Some(m) = &inp.model {
                 push(&mut a, &["--model"]);
@@ -473,11 +468,12 @@ pub fn build_resume(
             }
             a.extend(inp.extra.iter().cloned());
             env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
-            parse = OutputParse::Stdout;
+            expect_session = Some(session_id.to_string());
+            parse = OutputParse::ClaudeJson;
             delivery = Delivery::Stdin;
         }
         "opencode" => {
-            push(&mut a, &["opencode", "run", "-s"]);
+            push(&mut a, &["opencode", "run", "--format", "json", "-s"]);
             a.push(session_id.to_string());
             if let Some(m) = &inp.model {
                 push(&mut a, &["-m"]);
@@ -487,45 +483,16 @@ pub fn build_resume(
                 push(&mut a, &["--variant"]);
                 a.push(e.clone());
             }
-            let agent_name = match (&inp.agent, inp.access) {
-                (Some(ag), _) => {
-                    push(&mut a, &["--agent"]);
-                    a.push(ag.clone());
-                    ag.clone()
-                }
-                (None, Access::Read) => {
-                    push(&mut a, &["--agent", "plan"]);
-                    "plan".to_string()
-                }
-                (None, _) => {
-                    push(&mut a, &["--agent", "build"]);
-                    "build".to_string()
-                }
-            };
+            let agent_name = opencode_agent(&mut a, &inp);
             push(&mut a, &["--auto"]);
-            match inp.access {
-                Access::Read => {
-                    env_set.push((
-                        "OPENCODE_CONFIG_CONTENT".to_string(),
-                        format!(
-                            "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"edit\":\"deny\",\"bash\":\"deny\"}}}}}}}}"
-                        ),
-                    ));
-                }
-                Access::Write => {
-                    env_set.push((
-                        "OPENCODE_CONFIG_CONTENT".to_string(),
-                        "{\"permission\":{\"external_directory\":\"deny\"}}".to_string(),
-                    ));
-                }
-                Access::Full => {}
-            }
+            env_set = opencode_env(&agent_name, inp.access);
             a.extend(inp.extra.iter().cloned());
-            parse = OutputParse::Stdout;
+            expect_session = Some(session_id.to_string());
+            parse = OutputParse::OpencodeNdjson;
             delivery = Delivery::Stdin;
         }
         "grok" => {
-            push(&mut a, &["grok", "--output-format", "plain", "--resume"]);
+            push(&mut a, &["grok", "--output-format", "json", "--resume"]);
             a.push(session_id.to_string());
             if let Some(m) = &inp.model {
                 push(&mut a, &["-m"]);
@@ -555,7 +522,8 @@ pub fn build_resume(
             a.extend(inp.extra.iter().cloned());
             push(&mut a, &["--prompt-file"]);
             a.push(paths.prompt_file.display().to_string());
-            parse = OutputParse::Stdout;
+            expect_session = Some(session_id.to_string());
+            parse = OutputParse::GrokJson;
             delivery = Delivery::PromptFile;
         }
         "agy" => {
@@ -588,8 +556,8 @@ pub fn build_resume(
                 Access::Full => push(&mut a, &["--dangerously-skip-permissions"]),
             }
             a.extend(inp.extra.iter().cloned());
-            // Resume MUST use json output: agy silently starts a NEW conversation on an
-            // unknown id, and only the JSON envelope lets us detect that (expect_session).
+            // agy silently starts a NEW conversation on an unknown id; only the
+            // JSON envelope lets us detect that (expect_session).
             push(&mut a, &["--output-format", "json"]);
             expect_session = Some(session_id.to_string());
             push(&mut a, &["-p"]);
@@ -598,17 +566,149 @@ pub fn build_resume(
         }
         other => return Err(format!("tool '{other}' does not support continue_from")),
     }
-    Ok(finish(
-        Built {
-            argv: a,
-            parse,
-            delivery,
-            session: SessionCapture::Preassigned(session_id.to_string()),
-            env_remove,
-            env_set,
-            expect_session,
-            warnings,
-        },
-        inp.bin,
-    ))
+    if let Some(bin) = inp.bin {
+        a[0] = bin;
+    }
+    Ok(Built {
+        argv: a,
+        parse,
+        delivery,
+        preassigned_session: Some(session_id.to_string()),
+        env_remove,
+        env_set,
+        expect_session,
+        warnings,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn inp<'a>(access: Access, extra: &'a [String]) -> PresetInput<'a> {
+        PresetInput {
+            model: None,
+            effort: None,
+            access,
+            agent: None,
+            extra,
+            bin: None,
+            timeout_sec: Some(900),
+        }
+    }
+
+    fn paths() -> (PathBuf, PathBuf) {
+        (PathBuf::from("/tmp/last.txt"), PathBuf::from("/tmp/p.txt"))
+    }
+
+    fn build_argv(tool: &str, access: Access) -> Vec<String> {
+        let (l, p) = paths();
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        build(tool, inp(access, &[]), &bp, None).unwrap().argv
+    }
+
+    #[test]
+    fn agy_prompt_flag_is_last_so_delivery_binds_it() {
+        let argv = build_argv("agy", Access::Read);
+        assert_eq!(argv.last().unwrap(), "-p", "prompt must attach to -p as its value");
+        assert!(argv.windows(2).any(|w| w[0] == "--print-timeout" && w[1] == "900s"));
+        assert!(argv.windows(2).any(|w| w[0] == "--mode" && w[1] == "plan"));
+    }
+
+    #[test]
+    fn grok_uses_prompt_file_never_stdin() {
+        let (l, p) = paths();
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let b = build("grok", inp(Access::Read, &[]), &bp, None).unwrap();
+        assert_eq!(b.delivery, Delivery::PromptFile);
+        assert_eq!(b.argv.last().unwrap(), &p.display().to_string());
+        assert!(b.argv.iter().any(|x| x == "dontAsk"));
+        assert_eq!(b.argv.iter().filter(|x| *x == "--deny").count(), 3);
+    }
+
+    #[test]
+    fn codex_always_pins_sandbox_and_ends_with_stdin_marker() {
+        for (acc, needle) in [
+            (Access::Read, "read-only"),
+            (Access::Write, "workspace-write"),
+            (Access::Full, "--dangerously-bypass-approvals-and-sandbox"),
+        ] {
+            let argv = build_argv("codex", acc);
+            assert!(argv.iter().any(|x| x == needle), "{needle} missing");
+            assert_eq!(argv.last().unwrap(), "-", "codex reads the prompt from stdin");
+        }
+    }
+
+    #[test]
+    fn codex_resume_rebuilds_sandbox_via_config_override() {
+        let (l, p) = paths();
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let b = build_resume("codex", "sess-1", inp(Access::Read, &[]), &bp).unwrap();
+        assert!(b.argv.iter().any(|x| x == "sandbox_mode=\"read-only\""));
+        assert!(!b.argv.iter().any(|x| x == "-s"), "exec resume has no -s flag");
+        assert_eq!(b.argv.last().unwrap(), "-");
+    }
+
+    #[test]
+    fn opencode_is_always_auto_and_hardened_per_access() {
+        let read = build("opencode", inp(Access::Read, &[]), &BuildPaths { last_msg: &paths().0, prompt_file: &paths().1 }, None).unwrap();
+        assert!(read.argv.iter().any(|x| x == "--auto"), "ask-permission hangs headless");
+        assert!(read.argv.windows(2).any(|w| w[0] == "--agent" && w[1] == "plan"));
+        let cfg = &read.env_set[0].1;
+        assert!(serde_json::from_str::<serde_json::Value>(cfg).is_ok(), "config env must be valid JSON: {cfg}");
+        assert!(cfg.contains("\"bash\":\"deny\""));
+
+        let write = build("opencode", inp(Access::Write, &[]), &BuildPaths { last_msg: &paths().0, prompt_file: &paths().1 }, None).unwrap();
+        assert!(write.argv.windows(2).any(|w| w[0] == "--agent" && w[1] == "build"));
+        assert!(write.env_set[0].1.contains("external_directory"));
+
+        let full = build("opencode", inp(Access::Full, &[]), &BuildPaths { last_msg: &paths().0, prompt_file: &paths().1 }, None).unwrap();
+        assert!(full.env_set.is_empty(), "full imposes no extra denies");
+    }
+
+    #[test]
+    fn claude_scrubs_nested_session_env_and_uses_json() {
+        let (l, p) = paths();
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let b = build("claude", inp(Access::Read, &[]), &bp, Some("uuid-1")).unwrap();
+        assert!(b.argv.windows(2).any(|w| w[0] == "--output-format" && w[1] == "json"));
+        assert!(b.argv.windows(2).any(|w| w[0] == "--session-id" && w[1] == "uuid-1"));
+        assert_eq!(b.preassigned_session.as_deref(), Some("uuid-1"));
+        assert!(b.env_remove.iter().any(|v| v == "CLAUDE_CODE_SESSION_ID"));
+        assert!(b.env_remove.iter().any(|v| v == "ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn agy_effort_is_dropped_when_the_model_id_encodes_it() {
+        let (l, p) = paths();
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let mut i = inp(Access::Read, &[]);
+        i.model = Some("gemini-3.1-pro-high".into());
+        i.effort = Some("high".into());
+        let b = build("agy", i, &bp, None).unwrap();
+        assert!(!b.argv.iter().any(|x| x == "--effort"));
+        assert!(b.warnings.iter().any(|w| w.contains("already encodes")));
+    }
+
+    #[test]
+    fn bin_override_replaces_argv0_only() {
+        let (l, p) = paths();
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let mut i = inp(Access::Read, &[]);
+        i.bin = Some("/opt/codex.exe".into());
+        let b = build("codex", i, &bp, None).unwrap();
+        assert_eq!(b.argv[0], "/opt/codex.exe");
+        assert_eq!(b.argv[1], "exec");
+    }
+
+    #[test]
+    fn resume_sets_expect_session_for_tools_that_can_silently_start_new() {
+        let (l, p) = paths();
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        for t in ["claude", "opencode", "grok", "agy"] {
+            let b = build_resume(t, "sid", inp(Access::Read, &[]), &bp).unwrap();
+            assert_eq!(b.expect_session.as_deref(), Some("sid"), "{t}");
+        }
+    }
 }

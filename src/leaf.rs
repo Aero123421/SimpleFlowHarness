@@ -1,7 +1,7 @@
 use crate::{execute, flow, preset, template};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Session recorded for an executed step (continue_from source).
@@ -13,8 +13,29 @@ pub struct SessionInfo {
     pub cwd: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum RetryMode {
+    Transient,
+    Any,
+    Never,
+}
+
+#[derive(Clone, Copy)]
+pub struct RetryCfg {
+    pub max: u32,
+    pub backoff_sec: u64,
+    pub mode: RetryMode,
+}
+
+impl Default for RetryCfg {
+    fn default() -> Self {
+        RetryCfg { max: 0, backoff_sec: 5, mode: RetryMode::Transient }
+    }
+}
+
 /// Everything the engine resolves on the main thread before a leaf runs.
 /// Workers only execute; they never touch shared flow state.
+#[derive(Clone)]
 pub struct Prepared {
     pub tag: String,
     pub inv: execute::Invocation,
@@ -22,13 +43,16 @@ pub struct Prepared {
     pub stdin_payload: Option<Vec<u8>>,
     pub cwd: Option<PathBuf>,
     pub timeout: Option<Duration>,
-    pub session: preset::SessionCapture,
+    pub preassigned_session: Option<String>,
     pub expect_session: Option<String>,
     pub env_remove: Vec<String>,
     pub env_set: Vec<(String, String)>,
     pub out_file: PathBuf,
     pub err_file: PathBuf,
+    pub chain_file: PathBuf,
     pub tool: Option<String>,
+    pub allow_empty: bool,
+    pub retry: RetryCfg,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -37,13 +61,23 @@ pub struct LeafDone {
     pub tag: String,
     pub exit_code: i32,
     pub timed_out: bool,
+    pub interrupted: bool,
     pub dur_ms: u128,
+    pub attempts: u32,
     pub chain_output: String,
     pub stderr_clean: String,
     pub out_file: PathBuf,
     pub session_id: Option<String>,
     pub tool: Option<String>,
     pub cwd: Option<String>,
+    pub usage: preset::Usage,
+    pub cmd: String,
+}
+
+impl LeafDone {
+    pub fn ok(&self) -> bool {
+        self.exit_code == 0 && !self.timed_out && !self.interrupted
+    }
 }
 
 /// Tool settings after merging step > profile (use:) > defaults. Unrendered.
@@ -57,11 +91,18 @@ pub struct Effective {
     pub args: Vec<String>,
     pub cwd: Option<String>,
     pub timeout_sec: Option<u64>,
+    pub env: BTreeMap<String, String>,
 }
 
-pub fn effective(flow: &flow::Flow, step: &flow::Step) -> Result<Effective, String> {
+/// `profile_override` replaces the step's `use:` (used by fallback:).
+pub fn effective_with(
+    flow: &flow::Flow,
+    step: &flow::Step,
+    profile_override: Option<&str>,
+) -> Result<Effective, String> {
     let empty = flow::Profile::default();
-    let prof = match &step.use_ {
+    let pname = profile_override.map(String::from).or_else(|| step.use_.clone());
+    let prof = match &pname {
         Some(u) => flow
             .profiles
             .get(u)
@@ -76,17 +117,58 @@ pub fn effective(flow: &flow::Flow, step: &flow::Step) -> Result<Effective, Stri
         .or(d.access.as_deref());
     let mut args = prof.args.clone();
     args.extend(step.args.iter().cloned());
+    let mut env = d.env.clone();
+    env.extend(prof.env.clone());
+    env.extend(step.env.clone());
+    // A fallback profile must be able to replace the tool wholesale.
+    let tool = if profile_override.is_some() {
+        prof.tool.clone().or_else(|| step.tool.clone()).or_else(|| d.tool.clone())
+    } else {
+        step.tool.clone().or_else(|| prof.tool.clone()).or_else(|| d.tool.clone())
+    };
+    let model = if profile_override.is_some() {
+        prof.model.clone().or_else(|| step.model.clone()).or_else(|| d.model.clone())
+    } else {
+        step.model.clone().or_else(|| prof.model.clone()).or_else(|| d.model.clone())
+    };
     Ok(Effective {
-        tool: step.tool.clone().or_else(|| prof.tool.clone()).or_else(|| d.tool.clone()),
-        bin: step.bin.clone().or_else(|| prof.bin.clone()),
-        model: step.model.clone().or_else(|| prof.model.clone()).or_else(|| d.model.clone()),
+        tool,
+        bin: if profile_override.is_some() {
+            prof.bin.clone().or_else(|| step.bin.clone())
+        } else {
+            step.bin.clone().or_else(|| prof.bin.clone())
+        },
+        model,
         effort: step.effort.clone().or_else(|| prof.effort.clone()).or_else(|| d.effort.clone()),
         access: preset::Access::parse(access_str).map_err(|e| format!("step '{}': {e}", step.id))?,
         agent: step.agent.clone().or_else(|| prof.agent.clone()),
         args,
         cwd: step.cwd.clone().or_else(|| prof.cwd.clone()).or_else(|| d.cwd.clone()),
         timeout_sec: step.timeout_sec.or(prof.timeout_sec).or(d.timeout_sec),
+        env,
     })
+}
+
+pub fn effective(flow: &flow::Flow, step: &flow::Step) -> Result<Effective, String> {
+    effective_with(flow, step, None)
+}
+
+pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
+    let r = step.retry.or(flow.defaults.retry);
+    let mode = match step
+        .retry_on
+        .as_deref()
+        .or(flow.defaults.retry_on.as_deref())
+        .unwrap_or("transient")
+    {
+        "any" => RetryMode::Any,
+        "never" => RetryMode::Never,
+        _ => RetryMode::Transient,
+    };
+    match r {
+        Some(r) => RetryCfg { max: r.max, backoff_sec: r.backoff_sec.unwrap_or(5), mode },
+        None => RetryCfg { max: 0, backoff_sec: 5, mode },
+    }
 }
 
 pub struct PrepCtx<'a> {
@@ -138,6 +220,7 @@ pub fn prepare_leaf(
     visit: u32,
     tag: &str,
     extras: &[(&str, String)],
+    profile_override: Option<&str>,
 ) -> Result<Prepared, String> {
     let prompt_file = cx.run_dir.join(format!("{tag}.prompt.txt"));
     let builtins = make_builtins(cx, &step.id, visit, &prompt_file, extras);
@@ -177,7 +260,7 @@ pub fn prepare_leaf(
             .map_err(|e| format!("cannot write {}: {e}", prompt_file.display()))?;
     }
 
-    let eff = effective(cx.flow, step)?;
+    let eff = effective_with(cx.flow, step, profile_override)?;
     let model = opt_rend(&eff.model, &ctx)?;
     let effort = opt_rend(&eff.effort, &ctx)?;
     let agent = opt_rend(&eff.agent, &ctx)?;
@@ -194,6 +277,7 @@ pub fn prepare_leaf(
 
     let out_file = cx.run_dir.join(format!("{tag}.out.txt"));
     let err_file = cx.run_dir.join(format!("{tag}.err.txt"));
+    let chain_file = cx.run_dir.join(format!("{tag}.chain.txt"));
     let last_file = cx.run_dir.join(format!("{tag}.last.txt"));
     let paths = preset::BuildPaths {
         last_msg: &last_file,
@@ -242,6 +326,14 @@ pub fn prepare_leaf(
                     }
                 }
             }
+            for a in &args {
+                if preset::ESCALATION_FLAGS.iter().any(|f| a.contains(f)) {
+                    eprintln!(
+                        "sfh: warning: step '{}': args: contains '{a}', which overrides the declared access level",
+                        step.id
+                    );
+                }
+            }
             let inp = preset::PresetInput {
                 model,
                 effort,
@@ -273,13 +365,12 @@ pub fn prepare_leaf(
                 }
                 preset::build_resume(&tool, &info.id, inp, &paths)?
             } else {
-                let want_capture = cx.needed_sessions.contains(&step.id);
-                let preassign = if want_capture && preset::wants_preassign(&tool) {
+                let preassign = if cx.needed_sessions.contains(&step.id) && preset::wants_preassign(&tool) {
                     Some(gen_uuid())
                 } else {
                     None
                 };
-                preset::build(&tool, inp, &paths, preassign.as_deref(), want_capture)?
+                preset::build(&tool, inp, &paths, preassign.as_deref())?
             };
             for w in &b.warnings {
                 eprintln!("sfh: warning: step '{}': {w}", step.id);
@@ -290,24 +381,28 @@ pub fn prepare_leaf(
         }
     };
 
-    let (parse, delivery, session, expect_session, env_remove, env_set) = match built {
-        Some(b) => (b.parse, b.delivery, b.session, b.expect_session, b.env_remove, b.env_set),
+    let (parse, delivery, preassigned, expect_session, mut env_remove, mut env_set) = match built {
+        Some(b) => (
+            b.parse,
+            b.delivery,
+            b.preassigned_session,
+            b.expect_session,
+            b.env_remove,
+            b.env_set,
+        ),
         None => {
             let d = if step.stdin.as_deref() == Some("prompt") {
                 preset::Delivery::Stdin
             } else {
                 preset::Delivery::None
             };
-            (
-                preset::OutputParse::Stdout,
-                d,
-                preset::SessionCapture::Unsupported,
-                None,
-                Vec::new(),
-                Vec::new(),
-            )
+            (preset::OutputParse::Stdout, d, None, None, Vec::new(), Vec::new())
         }
     };
+    env_remove.extend(step.env_remove.iter().cloned());
+    for (k, v) in &eff.env {
+        env_set.push((k.clone(), rend("env", v)?));
+    }
 
     let (inv, stdin_payload) = match delivery {
         preset::Delivery::Stdin => {
@@ -344,6 +439,7 @@ pub fn prepare_leaf(
         preset::Delivery::None => (inv, None),
     };
 
+    let is_preset = tool_used.is_some();
     Ok(Prepared {
         tag: tag.to_string(),
         inv,
@@ -351,13 +447,17 @@ pub fn prepare_leaf(
         stdin_payload,
         cwd,
         timeout: timeout_sec.map(Duration::from_secs),
-        session,
+        preassigned_session: preassigned,
         expect_session,
         env_remove,
         env_set,
         out_file,
         err_file,
+        chain_file,
         tool: tool_used,
+        // Custom commands may legitimately print nothing; agent steps may not.
+        allow_empty: step.allow_empty.unwrap_or(!is_preset),
+        retry: retry_cfg(cx.flow, step),
         quiet: cx.quiet,
         verbose: cx.verbose,
     })
@@ -370,14 +470,92 @@ fn opt_rend(v: &Option<String>, ctx: &template::Ctx) -> Result<Option<String>, S
     }
 }
 
-/// Execute one prepared leaf. Thread-safe: touches only its own files.
-pub fn exec_leaf(p: Prepared) -> LeafDone {
+/// Parsed view of one tool run.
+#[derive(Default)]
+pub struct ParsedOut {
+    pub text: String,
+    pub session: Option<String>,
+    pub usage: preset::Usage,
+    /// In-band failure the exit code may not reflect.
+    pub failed: bool,
+}
+
+pub fn parse_output(parse: &preset::OutputParse, stdout: &str, stderr: &str) -> ParsedOut {
+    match parse {
+        preset::OutputParse::Stdout => ParsedOut {
+            text: stdout.trim().to_string(),
+            ..Default::default()
+        },
+        preset::OutputParse::CodexJsonl(f) => {
+            let mut o = parse_codex_jsonl(stdout);
+            let file_text = std::fs::read_to_string(f).unwrap_or_default();
+            if !file_text.trim().is_empty() {
+                o.text = file_text.trim().to_string();
+            } else if o.text.is_empty() {
+                o.text = stdout.trim().to_string();
+            }
+            if o.session.is_none() {
+                o.session = codex_session_from_stderr(stderr);
+            }
+            o
+        }
+        preset::OutputParse::ClaudeJson => parse_claude_json(stdout),
+        preset::OutputParse::OpencodeNdjson => parse_opencode_ndjson(stdout),
+        preset::OutputParse::GrokJson => parse_grok_json(stdout),
+        preset::OutputParse::AgyJson => parse_agy_json(stdout),
+    }
+}
+
+/// Execute one prepared leaf, honouring its retry policy.
+pub fn exec_leaf(prep: Prepared) -> LeafDone {
+    let cfg = prep.retry;
+    let mut attempt = 0u32;
+    loop {
+        let mut done = exec_once(prep.clone());
+        done.attempts = attempt + 1;
+        if done.ok() || done.interrupted || attempt >= cfg.max {
+            return done;
+        }
+        let retryable = match cfg.mode {
+            RetryMode::Never => false,
+            RetryMode::Any => true,
+            RetryMode::Transient => {
+                done.timed_out == false
+                    && execute::is_transient_failure(&done.stderr_clean, &done.chain_output)
+            }
+        };
+        if !retryable {
+            return done;
+        }
+        let wait = cfg.backoff_sec.saturating_mul(1u64 << attempt.min(5));
+        if !prep.quiet {
+            eprintln!(
+                "sfh: [{}] transient failure (exit={}), retrying in {wait}s ({}/{})",
+                prep.tag,
+                done.exit_code,
+                attempt + 1,
+                cfg.max
+            );
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        while std::time::Instant::now() < deadline {
+            if execute::interrupted() {
+                return done;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        attempt += 1;
+    }
+}
+
+fn exec_once(p: Prepared) -> LeafDone {
     if !p.quiet {
         eprintln!("sfh: [{}] start", p.tag);
         if p.verbose {
             eprintln!("sfh: [{}] cmd: {}", p.tag, p.inv.describe());
         }
     }
+    let cmd_desc = p.inv.describe();
     let cwd_str = p.cwd.as_ref().map(|c| c.display().to_string());
     let outcome = match execute::run_cmd(
         &p.inv,
@@ -397,13 +575,17 @@ pub fn exec_leaf(p: Prepared) -> LeafDone {
                 tag: p.tag,
                 exit_code: -1,
                 timed_out: false,
+                interrupted: execute::interrupted(),
                 dur_ms: 0,
+                attempts: 1,
                 chain_output: String::new(),
                 stderr_clean: e,
                 out_file: p.out_file,
                 session_id: None,
                 tool: p.tool,
                 cwd: cwd_str,
+                usage: preset::Usage::default(),
+                cmd: cmd_desc,
             };
         }
     };
@@ -412,76 +594,58 @@ pub fn exec_leaf(p: Prepared) -> LeafDone {
     let _ = std::fs::write(&p.out_file, &stdout_clean);
     let _ = std::fs::write(&p.err_file, &stderr_clean);
 
+    let parsed = parse_output(&p.parse, &stdout_clean, &stderr_clean);
     let mut exit_code = outcome.exit_code;
-    let mut session_from_parse: Option<String> = None;
-    let chain_output = match &p.parse {
-        preset::OutputParse::Stdout => stdout_clean.trim().to_string(),
-        preset::OutputParse::LastMsgFile(f) => match std::fs::read_to_string(f) {
-            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => stdout_clean.trim().to_string(),
-        },
-        preset::OutputParse::OpencodeNdjson => {
-            let (text, sid) = parse_opencode_ndjson(&stdout_clean);
-            session_from_parse = sid;
-            text
+    // Several tools report success/failure in-band and get the exit code wrong.
+    if parsed.failed && exit_code == 0 {
+        exit_code = 1;
+    } else if !parsed.failed && exit_code != 0 && !outcome.timed_out && !parsed.text.is_empty() {
+        if matches!(p.parse, preset::OutputParse::AgyJson) {
+            exit_code = 0;
         }
-        preset::OutputParse::AgyJson => match parse_agy_json(&stdout_clean) {
-            Some((resp, status, cid)) => {
-                session_from_parse = cid;
-                // agy can exit 1 while still producing a valid completion, and
-                // json mode reports errors in-band; trust the envelope status.
-                if status == "SUCCESS" && exit_code != 0 && !outcome.timed_out {
-                    exit_code = 0;
-                }
-                if status == "ERROR" && exit_code == 0 {
-                    exit_code = 1;
-                }
-                resp
-            }
-            None => stdout_clean.trim().to_string(),
-        },
-    };
+    }
+    let chain_output = parsed.text;
 
-    let ok = exit_code == 0 && !outcome.timed_out;
-    let mut session_id = if ok {
-        match &p.session {
-            // For codex resumes prefer a freshly parsed id when the tool printed
-            // one (resume keeps its id today, but don't build a chain on that
-            // assumption). Other tools' ids are trusted verbatim - the codex
-            // scraper must never override them.
-            preset::SessionCapture::Preassigned(id) => {
-                if p.tool.as_deref() == Some("codex") {
-                    Some(codex_session_from_stderr(&stderr_clean).unwrap_or_else(|| id.clone()))
-                } else {
-                    Some(id.clone())
-                }
-            }
-            preset::SessionCapture::CodexStderr => codex_session_from_stderr(&stderr_clean),
-            preset::SessionCapture::OpencodeNdjson | preset::SessionCapture::AgyJson => {
-                session_from_parse.clone()
-            }
-            preset::SessionCapture::Unsupported => None,
-        }
+    let mut session_id = if exit_code == 0 && !outcome.timed_out {
+        parsed
+            .session
+            .clone()
+            .or_else(|| p.preassigned_session.clone())
     } else {
         None
     };
-    if ok {
+    if exit_code == 0 && !outcome.timed_out {
         if let Some(exp) = &p.expect_session {
-            let got = session_from_parse.clone().unwrap_or_default();
-            if got != *exp {
-                exit_code = 1;
-                session_id = None;
-                stderr_clean.push_str(&format!(
-                    "\nsfh: resume mismatch: expected conversation '{exp}' but the tool reported '{got}' (it silently started a new conversation)\n"
-                ));
-                let _ = std::fs::write(&p.err_file, &stderr_clean);
+            let got = parsed.session.clone();
+            if let Some(got) = got {
+                if got != *exp {
+                    exit_code = 1;
+                    session_id = None;
+                    stderr_clean.push_str(&format!(
+                        "\nsfh: resume mismatch: expected session '{exp}' but the tool reported '{got}' (it silently started a new session)\n"
+                    ));
+                    let _ = std::fs::write(&p.err_file, &stderr_clean);
+                }
             }
         }
+        if chain_output.trim().is_empty() && !p.allow_empty {
+            exit_code = if exit_code == 0 { 1 } else { exit_code };
+            stderr_clean.push_str(
+                "\nsfh: the tool exited successfully but produced no final message (set allow_empty: true if that is expected)\n",
+            );
+            let _ = std::fs::write(&p.err_file, &stderr_clean);
+        }
     }
+    let _ = std::fs::write(&p.chain_file, &chain_output);
 
     if !p.quiet {
+        let cost = parsed
+            .usage
+            .cost_usd
+            .map(|c| format!(" ${c:.4}"))
+            .unwrap_or_default();
         eprintln!(
-            "sfh: [{}] exit={}{} {:.1}s output={}ch -> {}",
+            "sfh: [{}] exit={}{} {:.1}s output={}ch{cost} -> {}",
             p.tag,
             exit_code,
             if outcome.timed_out { " TIMEOUT" } else { "" },
@@ -494,13 +658,17 @@ pub fn exec_leaf(p: Prepared) -> LeafDone {
         tag: p.tag,
         exit_code,
         timed_out: outcome.timed_out,
+        interrupted: outcome.interrupted,
         dur_ms: outcome.dur_ms,
+        attempts: 1,
         chain_output,
         stderr_clean,
         out_file: p.out_file,
         session_id,
         tool: p.tool,
         cwd: cwd_str,
+        usage: parsed.usage,
+        cmd: cmd_desc,
     }
 }
 
@@ -518,92 +686,253 @@ fn codex_session_from_stderr(stderr: &str) -> Option<String> {
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
+fn num(v: Option<&serde_json::Value>) -> Option<u64> {
+    v.and_then(|x| x.as_u64())
+}
+
+/// codex --json: JSONL events. thread.started carries the session id,
+/// turn.completed the usage; the final text comes from --output-last-message.
+fn parse_codex_jsonl(stdout: &str) -> ParsedOut {
+    let mut o = ParsedOut::default();
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match v.get("type").and_then(|x| x.as_str()) {
+            Some("thread.started") => {
+                if let Some(id) = v.get("thread_id").and_then(|x| x.as_str()) {
+                    o.session = Some(id.to_string());
+                }
+            }
+            Some("turn.completed") => {
+                if let Some(u) = v.get("usage") {
+                    o.usage.input_tokens = num(u.get("input_tokens"));
+                    o.usage.output_tokens = num(u.get("output_tokens"));
+                }
+            }
+            Some("turn.failed") => o.failed = true,
+            Some("item.completed") => {
+                if let Some(item) = v.get("item") {
+                    if item.get("type").and_then(|x| x.as_str()) == Some("agent_message") {
+                        if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
+                            o.text = t.trim().to_string();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    o
+}
+
+/// claude --output-format json: one envelope with .result/.session_id/.total_cost_usd.
+fn parse_claude_json(stdout: &str) -> ParsedOut {
+    let mut o = ParsedOut::default();
+    let t = stdout.trim();
+    let Some(v) = serde_json::from_str::<serde_json::Value>(t)
+        .ok()
+        .or_else(|| t.lines().rev().find_map(|l| serde_json::from_str(l.trim()).ok()))
+    else {
+        o.text = t.to_string();
+        return o;
+    };
+    o.text = v
+        .get("result")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    o.session = v.get("session_id").and_then(|x| x.as_str()).map(String::from);
+    o.usage.cost_usd = v.get("total_cost_usd").and_then(|x| x.as_f64());
+    if let Some(u) = v.get("usage") {
+        o.usage.input_tokens = num(u.get("input_tokens"));
+        o.usage.output_tokens = num(u.get("output_tokens"));
+    }
+    o.failed = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+    o
+}
+
 /// opencode --format json: NDJSON events; final answer = concat of `text` events
 /// belonging to the last message (dedupe by part id, keep last occurrence).
-fn parse_opencode_ndjson(stdout: &str) -> (String, Option<String>) {
-    let mut session: Option<String> = None;
+fn parse_opencode_ndjson(stdout: &str) -> ParsedOut {
+    let mut o = ParsedOut::default();
     let mut texts: Vec<(String, String, String)> = Vec::new(); // (part_id, message_id, text)
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
-        if session.is_none() {
+        if o.session.is_none() {
             if let Some(s) = v.get("sessionID").and_then(|x| x.as_str()) {
-                session = Some(s.to_string());
+                o.session = Some(s.to_string());
             }
         }
-        if v.get("type").and_then(|x| x.as_str()) == Some("text") {
-            let part = v.get("part");
-            let get = |k: &str| {
-                part.and_then(|p| p.get(k))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            let (pid, mid, txt) = (get("id"), get("messageID"), get("text"));
-            if let Some(e) = texts
-                .iter_mut()
-                .find(|(id, _, _)| !pid.is_empty() && *id == pid)
-            {
-                *e = (pid, mid, txt);
-            } else {
-                texts.push((pid, mid, txt));
+        match v.get("type").and_then(|x| x.as_str()) {
+            Some("text") => {
+                let part = v.get("part");
+                let get = |k: &str| {
+                    part.and_then(|p| p.get(k))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let (pid, mid, txt) = (get("id"), get("messageID"), get("text"));
+                if let Some(e) = texts
+                    .iter_mut()
+                    .find(|(id, _, _)| !pid.is_empty() && *id == pid)
+                {
+                    *e = (pid, mid, txt);
+                } else {
+                    texts.push((pid, mid, txt));
+                }
             }
+            Some("step_finish") => {
+                if let Some(part) = v.get("part") {
+                    if let Some(tk) = part.get("tokens") {
+                        o.usage.input_tokens = num(tk.get("input"));
+                        o.usage.output_tokens = num(tk.get("output"));
+                    }
+                    if let Some(c) = part.get("cost").and_then(|x| x.as_f64()) {
+                        o.usage.cost_usd = Some(o.usage.cost_usd.unwrap_or(0.0) + c);
+                    }
+                }
+            }
+            Some("error") => o.failed = true,
+            _ => {}
         }
     }
     let last_mid = texts.last().map(|(_, m, _)| m.clone()).unwrap_or_default();
-    let text = texts
+    o.text = texts
         .iter()
         .filter(|(_, m, _)| *m == last_mid)
         .map(|(_, _, t)| t.as_str())
         .collect::<Vec<_>>()
-        .join("");
-    (text.trim().to_string(), session)
+        .join("")
+        .trim()
+        .to_string();
+    o
 }
 
-/// agy --output-format json: one JSON envelope {response, status, conversation_id, ...};
-/// stream-json wraps it as {"event":"result","result":{...}}.
-fn parse_agy_json(stdout: &str) -> Option<(String, String, Option<String>)> {
+/// grok --output-format json: one pretty-printed object with .text/.sessionId.
+fn parse_grok_json(stdout: &str) -> ParsedOut {
+    let mut o = ParsedOut::default();
     let t = stdout.trim();
-    let v: serde_json::Value = serde_json::from_str(t).ok().or_else(|| {
-        t.lines()
-            .rev()
-            .find_map(|l| serde_json::from_str(l.trim()).ok())
-    })?;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
+        o.text = t.to_string();
+        return o;
+    };
+    if v.get("type").and_then(|x| x.as_str()) == Some("error") {
+        o.failed = true;
+        o.text = v
+            .get("message")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        return o;
+    }
+    o.text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    o.session = v.get("sessionId").and_then(|x| x.as_str()).map(String::from);
+    o.usage.cost_usd = v.get("total_cost_usd").and_then(|x| x.as_f64());
+    if let Some(u) = v.get("usage") {
+        o.usage.input_tokens = num(u.get("input_tokens"));
+        o.usage.output_tokens = num(u.get("output_tokens"));
+    }
+    o
+}
+
+/// agy --output-format json: {response, status, conversation_id, usage};
+/// stream-json wraps it as {"event":"result","result":{...}}.
+fn parse_agy_json(stdout: &str) -> ParsedOut {
+    let mut o = ParsedOut::default();
+    let t = stdout.trim();
+    let Some(v) = serde_json::from_str::<serde_json::Value>(t)
+        .ok()
+        .or_else(|| t.lines().rev().find_map(|l| serde_json::from_str(l.trim()).ok()))
+    else {
+        o.text = t.to_string();
+        return o;
+    };
     let obj = if v.get("event").is_some() {
-        v.get("result")?.clone()
+        v.get("result").cloned().unwrap_or(v)
     } else {
         v
     };
-    let resp = obj
+    o.text = obj
         .get("response")
         .and_then(|x| x.as_str())
         .unwrap_or("")
-        .trim_end()
+        .trim()
         .to_string();
-    let status = obj
-        .get("status")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let cid = obj
+    o.session = obj
         .get("conversation_id")
         .and_then(|x| x.as_str())
         .map(String::from);
-    Some((resp, status, cid))
+    o.failed = obj.get("status").and_then(|x| x.as_str()) == Some("ERROR");
+    if let Some(u) = obj.get("usage") {
+        o.usage.input_tokens = num(u.get("input_tokens"));
+        o.usage.output_tokens = num(u.get("output_tokens"));
+    }
+    o
+}
+
+/// Bounds how many leaves of one tool may run at once across a fan-out.
+pub struct ToolGate {
+    limits: HashMap<String, u32>,
+    state: Mutex<HashMap<String, u32>>,
+    cv: Condvar,
+}
+
+impl ToolGate {
+    pub fn new(limits: HashMap<String, u32>) -> Arc<ToolGate> {
+        Arc::new(ToolGate {
+            limits,
+            state: Mutex::new(HashMap::new()),
+            cv: Condvar::new(),
+        })
+    }
+    fn acquire(&self, tool: &Option<String>) -> Option<String> {
+        let t = tool.as_ref()?;
+        let limit = *self.limits.get(t)?;
+        let mut g = self.state.lock().ok()?;
+        loop {
+            let cur = g.entry(t.clone()).or_insert(0);
+            if *cur < limit {
+                *cur += 1;
+                return Some(t.clone());
+            }
+            g = self.cv.wait(g).ok()?;
+        }
+    }
+    fn release(&self, held: Option<String>) {
+        let Some(t) = held else { return };
+        if let Ok(mut g) = self.state.lock() {
+            if let Some(c) = g.get_mut(&t) {
+                *c = c.saturating_sub(1);
+            }
+        }
+        self.cv.notify_all();
+    }
 }
 
 /// Run prepared leaves on a bounded worker pool. The result Vec ALWAYS has the
 /// same length and order as the input: a slot whose worker died is filled with
 /// a synthetic failure instead of being dropped (positional consumers zip these
 /// against child/item lists).
-pub fn run_pool(preps: Vec<Prepared>, max_parallel: usize) -> Vec<LeafDone> {
+pub fn run_pool(preps: Vec<Prepared>, max_parallel: usize, gate: Arc<ToolGate>) -> Vec<LeafDone> {
     let n = preps.len();
     if n == 0 {
         return Vec::new();
     }
     if n == 1 || max_parallel <= 1 {
-        return preps.into_iter().map(exec_leaf).collect();
+        return preps
+            .into_iter()
+            .map(|p| {
+                let held = gate.acquire(&p.tool);
+                let d = exec_leaf(p);
+                gate.release(held);
+                d
+            })
+            .collect();
     }
     let queue: Arc<Mutex<VecDeque<(usize, Prepared)>>> =
         Arc::new(Mutex::new(preps.into_iter().enumerate().collect()));
@@ -614,14 +943,16 @@ pub fn run_pool(preps: Vec<Prepared>, max_parallel: usize) -> Vec<LeafDone> {
     for _ in 0..workers {
         let q = Arc::clone(&queue);
         let r = Arc::clone(&results);
+        let g = Arc::clone(&gate);
         handles.push(std::thread::spawn(move || loop {
             let job = q.lock().unwrap().pop_front();
             let Some((idx, p)) = job else { break };
-            let done =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec_leaf(p)))
-                    .unwrap_or_else(|_| synthetic_failure(idx));
+            let held = g.acquire(&p.tool);
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec_leaf(p)))
+                .unwrap_or_else(|_| synthetic_failure(idx));
+            g.release(held);
             match r.lock() {
-                Ok(mut g) => g[idx] = Some(done),
+                Ok(mut guard) => guard[idx] = Some(done),
                 Err(mut poisoned) => poisoned.get_mut()[idx] = Some(done),
             }
         }));
@@ -644,13 +975,17 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         tag: format!("slot-{idx}"),
         exit_code: -1,
         timed_out: false,
+        interrupted: false,
         dur_ms: 0,
+        attempts: 1,
         chain_output: String::new(),
         stderr_clean: "sfh: internal error: worker thread died before producing a result".into(),
-        out_file: std::path::PathBuf::new(),
+        out_file: PathBuf::new(),
         session_id: None,
         tool: None,
         cwd: None,
+        usage: preset::Usage::default(),
+        cmd: String::new(),
     }
 }
 
@@ -681,7 +1016,7 @@ pub fn clean_text(b: &[u8]) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)").unwrap()
+        regex::Regex::new(r"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>MDEHc78]").unwrap()
     });
     let s = String::from_utf8_lossy(b);
     let s = re.replace_all(&s, "");
@@ -705,4 +1040,150 @@ pub fn tail_lines(s: &str, n: usize) -> Vec<&str> {
     let lines: Vec<&str> = s.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].to_vec()
+}
+
+/// Last non-empty line, for deterministic verdict trailers.
+pub fn last_line(s: &str) -> &str {
+    s.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_text_strips_ansi_and_collapses_progress_frames() {
+        let raw = b"\x1b[32mgreen\x1b[0m\nload 10%\rload 50%\rload 100%\ndone\n";
+        assert_eq!(clean_text(raw), "green\nload 100%\ndone\n");
+        assert_eq!(clean_text(b"\x1b[38:2:255:0:0mtruecolor\x1b[0m\n"), "truecolor\n");
+        assert_eq!(clean_text(b"a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(clean_text(b"   \n\n"), "");
+    }
+
+    #[test]
+    fn clean_text_survives_invalid_utf8() {
+        assert!(clean_text(&[0xff, 0xfe, b'h', b'i']).contains("hi"));
+    }
+
+    #[test]
+    fn last_line_ignores_trailing_blanks() {
+        assert_eq!(last_line("a\nVERDICT: OK\n\n  \n"), "VERDICT: OK");
+        assert_eq!(last_line(""), "");
+    }
+
+    #[test]
+    fn parses_claude_envelope() {
+        let s = r#"{"type":"result","result":"hello","session_id":"abc","is_error":false,"total_cost_usd":0.25,"usage":{"input_tokens":10,"output_tokens":3}}"#;
+        let o = parse_claude_json(s);
+        assert_eq!(o.text, "hello");
+        assert_eq!(o.session.as_deref(), Some("abc"));
+        assert_eq!(o.usage.cost_usd, Some(0.25));
+        assert_eq!(o.usage.input_tokens, Some(10));
+        assert!(!o.failed);
+        assert!(parse_claude_json(r#"{"result":"x","is_error":true}"#).failed);
+    }
+
+    #[test]
+    fn parses_opencode_ndjson_and_keeps_last_message_only() {
+        let s = concat!(
+            r#"{"type":"step_start","sessionID":"ses_1","part":{}}"#, "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old"}}"#, "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new "}}"#, "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer"}}"#, "\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"tokens":{"input":171,"output":6},"cost":0.5}}"#,
+        );
+        let o = parse_opencode_ndjson(s);
+        assert_eq!(o.text, "new answer");
+        assert_eq!(o.session.as_deref(), Some("ses_1"));
+        assert_eq!(o.usage.input_tokens, Some(171));
+        assert_eq!(o.usage.cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn opencode_dedupes_streamed_part_updates() {
+        let s = concat!(
+            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"par"}}"#, "\n",
+            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"partial full"}}"#,
+        );
+        assert_eq!(parse_opencode_ndjson(s).text, "partial full");
+    }
+
+    #[test]
+    fn parses_grok_and_agy_envelopes() {
+        let g = parse_grok_json(r#"{"text":"BANANA","sessionId":"9ac","total_cost_usd":0.012,"usage":{"input_tokens":5,"output_tokens":2}}"#);
+        assert_eq!(g.text, "BANANA");
+        assert_eq!(g.session.as_deref(), Some("9ac"));
+        assert_eq!(g.usage.cost_usd, Some(0.012));
+        assert!(parse_grok_json(r#"{"type":"error","message":"boom"}"#).failed);
+
+        let a = parse_agy_json(r#"{"conversation_id":"e3c","status":"SUCCESS","response":"OK\n","usage":{"input_tokens":16913,"output_tokens":38}}"#);
+        assert_eq!(a.text, "OK");
+        assert_eq!(a.session.as_deref(), Some("e3c"));
+        assert_eq!(a.usage.input_tokens, Some(16913));
+        assert!(!a.failed);
+        assert!(parse_agy_json(r#"{"status":"ERROR","error":"empty prompt","response":""}"#).failed);
+        // stream-json wrapper
+        let w = parse_agy_json(r#"{"event":"result","result":{"response":"hi","status":"SUCCESS","conversation_id":"c1"}}"#);
+        assert_eq!(w.text, "hi");
+        assert_eq!(w.session.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn parses_codex_jsonl_session_and_usage() {
+        let s = concat!(
+            r#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}"#, "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":20224,"output_tokens":12}}"#,
+        );
+        let o = parse_codex_jsonl(s);
+        assert_eq!(o.session.as_deref(), Some("019fa375-ae0f-7962-bcf6-8682ff388db6"));
+        assert_eq!(o.text, "final answer");
+        assert_eq!(o.usage.input_tokens, Some(20224));
+        assert!(!o.failed);
+        assert!(parse_codex_jsonl(r#"{"type":"turn.failed"}"#).failed);
+    }
+
+    #[test]
+    fn codex_stderr_regex_requires_a_real_uuid_on_its_own_line() {
+        let ok = "  session id: 019fa375-ae0f-7962-bcf6-8682ff388db6  \n";
+        assert!(codex_session_from_stderr(ok).is_some());
+        // A prose mention must not be scraped.
+        assert!(codex_session_from_stderr("the session id: not-a-uuid here\n").is_none());
+        assert!(codex_session_from_stderr("session id:\n019fa375-ae0f-7962-bcf6-8682ff388db6\n").is_none());
+    }
+
+    #[test]
+    fn gen_uuid_is_v4_shaped_and_unique() {
+        let a = gen_uuid();
+        assert_eq!(a.len(), 36);
+        assert_eq!(&a[14..15], "4");
+        let mut set = std::collections::HashSet::new();
+        for _ in 0..200 {
+            assert!(set.insert(gen_uuid()), "uuid collision");
+        }
+    }
+
+    #[test]
+    fn tool_gate_bounds_concurrency_per_tool() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let gate = ToolGate::new(HashMap::from([("t".to_string(), 2u32)]));
+        let live = Arc::new(AtomicU32::new(0));
+        let peak = Arc::new(AtomicU32::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..8 {
+            let (g, l, p) = (Arc::clone(&gate), Arc::clone(&live), Arc::clone(&peak));
+            hs.push(std::thread::spawn(move || {
+                let held = g.acquire(&Some("t".to_string()));
+                let cur = l.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                l.fetch_sub(1, Ordering::SeqCst);
+                g.release(held);
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2, "gate exceeded its limit");
+    }
 }

@@ -1,4 +1,5 @@
-# sfh フロー定義の例: リサーチ・パイプライン (v0.2)
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/main/schema/flow.schema.json
+# sfh フロー定義の例: リサーチ・パイプライン
 #   plan(計画) -> review_plan(レビュー、NGなら差し戻し)
 #   -> execute(実行) -> review_execute(レビュー、NGなら差し戻し) -> summarize(要約)
 #
@@ -23,6 +24,9 @@ profiles:
 defaults:
   timeout_sec: 3600
   max_visits: 3
+  retry: { max: 2, backoff_sec: 10 }   # 一過性の429/切断は自動で再試行
+  max_cost_usd: 5.0                    # 無人運転の金額ガード(報告されたコストの累計)
+  wall_clock_sec: 7200
 
 steps:
   # 1) プランナー: フルアクセスで下調べして調査計画を立てる
@@ -58,7 +62,8 @@ steps:
 
       最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
     route:
-      - when_contains: "VERDICT: REVISE"
+      # 最終行だけを見るので、本文中で REVISE に言及しても誤爆しない
+      - when_last_line_contains: "VERDICT: REVISE"
         goto: plan
       - goto: execute
 
@@ -96,8 +101,11 @@ steps:
       {{steps.execute.output}}
 
       最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
+    max_visits: 3
+    # 3回差し戻しても収束しなければ、全部捨てずに現状のレポートを要約して返す
+    on_max_visits: goto:summarize
     route:
-      - when_contains: "VERDICT: REVISE"
+      - when_last_line_contains: "VERDICT: REVISE"
         goto: execute
       - goto: summarize
 

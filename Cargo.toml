@@ -1,6 +1,6 @@
 [package]
 name = "sfh"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "SimpleFlowHarness - chain AI CLI agents (codex / claude / opencode / grok / agy / any command) into staged flows"
 license = "MIT"
@@ -8,12 +8,21 @@ repository = "https://github.com/Aero123421/SimpleFlowHarness"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 serde_json = "1"
 regex = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+] }
 
 [profile.release]
 opt-level = 3

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 /// Latest captured result of a step, exposed to templates.
+#[derive(Clone, Debug)]
 pub struct StepOutput {
     /// Chain output. For parallel/foreach steps this is the aggregated output.
     pub output: String,
@@ -151,5 +152,95 @@ fn apply_filter(val: String, f: &str) -> Result<String, String> {
                 .join("\n"))
         }
         other => Err(format!("unknown filter '{other}' (head/tail/truncate/lines/trim)")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx_with(outputs: BTreeMap<String, StepOutput>) -> (BTreeMap<String, String>, HashSet<String>, BTreeMap<String, StepOutput>) {
+        let vars = BTreeMap::from([("topic".to_string(), "rust".to_string())]);
+        let ids: HashSet<String> = outputs.keys().cloned().chain(["gen".to_string()]).collect();
+        (vars, ids, outputs)
+    }
+
+    fn out(text: &str) -> StepOutput {
+        StepOutput {
+            output: text.to_string(),
+            outputs: text.to_string(),
+            output_file: "/run/gen.out.txt".to_string(),
+        }
+    }
+
+    fn render_with(tpl: &str, outputs: BTreeMap<String, StepOutput>) -> Result<String, String> {
+        let (vars, ids, outputs) = ctx_with(outputs);
+        let ctx = Ctx {
+            vars: &vars,
+            outputs: &outputs,
+            step_ids: &ids,
+            builtins: BTreeMap::from([("run_dir".to_string(), "/run".to_string())]),
+        };
+        render(tpl, &ctx)
+    }
+
+    #[test]
+    fn renders_vars_steps_and_builtins() {
+        let o = BTreeMap::from([("gen".to_string(), out("a\nb\nc"))]);
+        assert_eq!(render_with("{{vars.topic}}", o.clone()).unwrap(), "rust");
+        assert_eq!(render_with("{{steps.gen.output}}", o.clone()).unwrap(), "a\nb\nc");
+        assert_eq!(render_with("{{run_dir}}", o.clone()).unwrap(), "/run");
+        assert_eq!(render_with("{{steps.gen.output_file}}", o).unwrap(), "/run/gen.out.txt");
+    }
+
+    #[test]
+    fn unrun_step_renders_empty_but_unknown_step_errors() {
+        assert_eq!(render_with("[{{steps.gen.output}}]", BTreeMap::new()).unwrap(), "[]");
+        let e = render_with("{{steps.nope.output}}", BTreeMap::new()).unwrap_err();
+        assert!(e.contains("unknown step id"), "{e}");
+    }
+
+    #[test]
+    fn filters_slice_text() {
+        let o = BTreeMap::from([("gen".to_string(), out("l1\nl2\nl3\nl4"))]);
+        assert_eq!(render_with("{{steps.gen.output | head:2}}", o.clone()).unwrap(), "l1\nl2");
+        assert_eq!(render_with("{{steps.gen.output | tail:2}}", o.clone()).unwrap(), "l3\nl4");
+        assert_eq!(render_with("{{steps.gen.output | lines:2-3}}", o.clone()).unwrap(), "l2\nl3");
+        assert_eq!(render_with("{{steps.gen.output | head:0}}", o.clone()).unwrap(), "");
+        assert_eq!(render_with("{{steps.gen.output | tail:99}}", o.clone()).unwrap(), "l1\nl2\nl3\nl4");
+        assert!(render_with("{{steps.gen.output | truncate:5}}", o.clone()).unwrap().starts_with("l1\nl2"));
+        assert!(render_with("{{steps.gen.output | truncate:5}}", o.clone()).unwrap().contains("truncated"));
+        // chaining, and trim
+        assert_eq!(render_with("{{steps.gen.output | head:1 | trim}}", o).unwrap(), "l1");
+    }
+
+    #[test]
+    fn filter_errors_are_reported_with_context() {
+        let o = BTreeMap::from([("gen".to_string(), out("x"))]);
+        assert!(render_with("{{steps.gen.output | nope:1}}", o.clone()).unwrap_err().contains("unknown filter"));
+        assert!(render_with("{{steps.gen.output | head:x}}", o.clone()).unwrap_err().contains("must be a number"));
+        assert!(render_with("{{steps.gen.output | lines:3-1}}", o).unwrap_err().contains("1 <= A <= B"));
+    }
+
+    #[test]
+    fn undefined_var_and_unclosed_brace_error() {
+        assert!(render_with("{{vars.missing}}", BTreeMap::new()).unwrap_err().contains("undefined variable"));
+        assert!(render_with("{{vars.topic", BTreeMap::new()).unwrap_err().contains("unclosed"));
+    }
+
+    #[test]
+    fn render_checked_can_reject_substituted_values() {
+        let (vars, ids, outputs) = ctx_with(BTreeMap::from([("gen".to_string(), out("evil & rm"))]));
+        let ctx = Ctx { vars: &vars, outputs: &outputs, step_ids: &ids, builtins: BTreeMap::new() };
+        let e = render_checked("echo {{steps.gen.output}}", &ctx, &|_, v| {
+            if v.contains('&') { Err("metachar".to_string()) } else { Ok(()) }
+        })
+        .unwrap_err();
+        assert!(e.contains("metachar"));
+        // The author's own text is never checked, only substitutions.
+        assert!(render_checked("echo a & b", &ctx, &|_, v| {
+            if v.contains('&') { Err("metachar".to_string()) } else { Ok(()) }
+        })
+        .is_ok());
     }
 }
