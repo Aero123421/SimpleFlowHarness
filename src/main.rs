@@ -5,6 +5,7 @@ mod leaf;
 mod preset;
 mod runs;
 mod template;
+mod watch;
 
 use std::path::PathBuf;
 
@@ -15,6 +16,8 @@ sfh - SimpleFlowHarness: chain AI CLI agents into staged flows
 
 USAGE:
   sfh run <flow.yaml> [options]          Run a flow
+  sfh status [run-dir] [--json]          Is a run still going? (default: newest run)
+  sfh wait [run-dir] [--timeout SEC]     Block until a run finishes, then print its result
   sfh validate <flow.yaml> [--var k=v]   Parse and static-check a flow file
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
   sfh runs list|show|clean [...]         Browse or prune past runs
@@ -23,6 +26,9 @@ RUN OPTIONS:
   --var key=value     Override a flow variable (repeatable)
   --emit <step-id>    Print this step's output at the end (default: last executed step)
   --runs-dir <dir>    Where to store run artifacts (default: .sfh/runs)
+  --detach            Run in the background, print the run dir, and exit at once.
+                      The run survives this shell and its parent; poll it with
+                      `sfh status` and collect it with `sfh wait`.
   --resume <run-dir>  Continue a previous run, reusing its finished steps
   --resume-latest     Same, picking the newest run dir
   --force-resume      Resume even though the flow file changed
@@ -30,6 +36,13 @@ RUN OPTIONS:
   --dry-run           Render prompts/commands without executing anything
   -v, --verbose       Print full command lines
   -q, --quiet         Suppress progress output (stdout gets the result only)
+
+STATUS / WAIT OPTIONS:
+  status [run-dir] [--runs-dir d] [--json]
+  wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
+  status exit codes: 0 = done, 1 = failed or dead, 2 = cannot tell, 3 = running
+  wait exits with the flow's own code, or 3 if --timeout elapsed first
+  (a wait timeout does NOT cancel the run)
 
 RUNS OPTIONS:
   runs list [--runs-dir d] [-n N]
@@ -53,6 +66,8 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
+        Some("status") => cmd_watch(&args[1..], false),
+        Some("wait") => cmd_watch(&args[1..], true),
         Some("validate") => cmd_validate(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
         Some("runs") => cmd_runs(&args[1..]),
@@ -110,6 +125,8 @@ fn cmd_run(rest: &[String]) -> i32 {
         resume_latest: false,
         force_resume: false,
         no_partial_emit: false,
+        detach: false,
+        run_dir: None,
     };
     let mut i = 0;
     while i < rest.len() {
@@ -133,6 +150,15 @@ fn cmd_run(rest: &[String]) -> i32 {
             "--no-partial-emit" => {
                 opts.no_partial_emit = true;
                 Ok(())
+            }
+            "--detach" => {
+                opts.detach = true;
+                Ok(())
+            }
+            // Set by --detach when it hands off to the background copy; also
+            // usable directly to pin a run to a known directory.
+            "--run-dir" => {
+                need(rest, &mut i, "--run-dir").map(|v| opts.run_dir = Some(PathBuf::from(v)))
             }
             "--dry-run" => {
                 opts.dry_run = true;
@@ -165,7 +191,62 @@ fn cmd_run(rest: &[String]) -> i32 {
         return usage_err("usage: sfh run <flow.yaml> [--var k=v]... [--emit id] [--resume dir] [--dry-run] [-v] [-q]");
     };
     opts.flow_path = fp;
+    if opts.detach && opts.dry_run {
+        return usage_err(
+            "--detach and --dry-run do nothing together (a dry run has nothing to detach)",
+        );
+    }
     engine::run(opts)
+}
+
+fn cmd_watch(rest: &[String], is_wait: bool) -> i32 {
+    let mut runs_dir = PathBuf::from(".sfh").join("runs");
+    let mut target: Option<PathBuf> = None;
+    let mut as_json = false;
+    let mut quiet = false;
+    let mut timeout: Option<u64> = None;
+    let mut interval = 3u64;
+    let mut i = 0;
+    while i < rest.len() {
+        let r: Result<(), String> = match rest[i].as_str() {
+            "--runs-dir" => need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v)),
+            "--json" if !is_wait => {
+                as_json = true;
+                Ok(())
+            }
+            "--timeout" if is_wait => need(rest, &mut i, "--timeout")
+                .and_then(|v| v.parse().map_err(|_| "--timeout needs seconds".to_string()))
+                .map(|v| timeout = Some(v)),
+            "--interval" if is_wait => need(rest, &mut i, "--interval")
+                .and_then(|v| {
+                    v.parse()
+                        .map_err(|_| "--interval needs seconds".to_string())
+                })
+                .map(|v| interval = v),
+            "-q" | "--quiet" => {
+                quiet = true;
+                Ok(())
+            }
+            s if s.starts_with('-') => Err(format!("unknown flag '{s}'")),
+            s => {
+                if target.is_some() {
+                    Err("more than one run dir given".to_string())
+                } else {
+                    target = Some(PathBuf::from(s));
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = r {
+            return usage_err(&e);
+        }
+        i += 1;
+    }
+    if is_wait {
+        watch::wait(target.as_deref(), &runs_dir, timeout, interval, quiet)
+    } else {
+        watch::status(target.as_deref(), &runs_dir, as_json)
+    }
 }
 
 fn cmd_validate(rest: &[String]) -> i32 {

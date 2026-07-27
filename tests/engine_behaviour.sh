@@ -172,6 +172,63 @@ else
   fail=$((fail + 1))
 fi
 
+# --- detach / status / wait ---------------------------------------------------
+# The whole point of --detach is that the run outlives whoever started it, so
+# these checks care about two things: the launcher returns at once, and the run
+# is still there afterwards.
+cat > detach.yaml <<'YAML'
+name: detach
+steps:
+  - id: think
+    cmd: ["sh", "-c", "sleep 6; echo SLOW-STEP-DONE"]
+  - id: answer
+    cmd: ["echo", "DETACHED:{{steps.think.output | trim}}"]
+YAML
+start=$(date +%s)
+# Captured through $(...) on purpose: a child holding this pipe open would make
+# the substitution block for the whole run, which is the bug this guards.
+RUN_DIR="$("$SFH" run detach.yaml --detach -q 2>d.err)"
+launch_secs=$(( $(date +%s) - start ))
+if [ "$launch_secs" -le 2 ] && [ -n "$RUN_DIR" ]; then
+  echo "ok   - --detach returns immediately (${launch_secs}s)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - --detach blocked for ${launch_secs}s (run dir: '$RUN_DIR')"
+  sed -n '1,20p' d.err
+  fail=$((fail + 1))
+fi
+
+"$SFH" status "$RUN_DIR" > st1.out 2>&1
+check "status reports a live run as running" 3 $?
+contains "status names the current step" "running" st1.out
+
+"$SFH" status "$RUN_DIR" --json > st1.json 2>/dev/null
+contains "status --json is machine readable" '"state": "running"' st1.json
+
+"$SFH" wait "$RUN_DIR" > w.out 2>w.err
+check "wait blocks until the run finishes" 0 $?
+contains "wait prints the flow result" "DETACHED:SLOW-STEP-DONE" w.out
+
+"$SFH" status "$RUN_DIR" > st2.out 2>&1
+check "status reports a finished run as done" 0 $?
+
+# A run whose process is gone must read as dead, not as still running: this is
+# what tells a caller its work was killed rather than merely slow.
+RUN_DIR2="$("$SFH" run detach.yaml --detach -q 2>/dev/null)"
+DPID="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$RUN_DIR2/status.json")"
+if [ -n "$DPID" ]; then
+  kill -9 "$DPID" 2>/dev/null || taskkill //PID "$DPID" //T //F >/dev/null 2>&1
+  sleep 1
+  "$SFH" status "$RUN_DIR2" > st3.out 2>&1
+  check "a killed run reports dead, not running" 1 $?
+  contains "dead status explains how to resume" "--resume" st3.out
+  "$SFH" wait "$RUN_DIR2" > w2.out 2>&1
+  check "wait on a dead run returns instead of hanging" 1 $?
+else
+  echo "FAIL - could not read the detached pid from status.json"
+  fail=$((fail + 1))
+fi
+
 # --- runs subcommands ---------------------------------------------------------
 "$SFH" runs list > runs.out 2>&1
 check "runs list works" 0 $?

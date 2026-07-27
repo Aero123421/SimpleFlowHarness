@@ -4,7 +4,7 @@
 [![release](https://img.shields.io/github/v/release/Aero123421/SimpleFlowHarness)](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**EN**: `sfh` chains AI coding CLIs — **Codex, Claude Code, opencode, Grok, Antigravity (`agy`), Pi, Cursor**, or any command — into YAML-defined multi-stage flows: review/retry loops, parallel fan-out, per-step model/effort/permission control, tool **session resume**, cost accounting with spend caps, and **crash-resume** of a whole run. It keeps your main agent's context window clean: stdout carries only the final step's output, everything else lands in a run directory. Single static binary for Windows / macOS / Linux. The docs below are in Japanese, but the YAML reference tables are language-neutral — and your favorite AI can translate the rest. A JSON Schema for flow files lives in [schema/flow.schema.json](schema/flow.schema.json).
+**EN**: `sfh` chains AI coding CLIs — **Codex, Claude Code, opencode, Grok, Antigravity (`agy`), Pi, Cursor**, or any command — into YAML-defined multi-stage flows: review/retry loops, parallel fan-out, per-step model/effort/permission control, tool **session resume**, cost accounting with spend caps, and **crash-resume** of a whole run. It keeps your main agent's context window clean: stdout carries only the final step's output, everything else lands in a run directory. Long flows can be **detached** (`--detach`) so they outlive the caller that started them, then polled with `sfh status` and collected with `sfh wait`. Single static binary for Windows / macOS / Linux. The docs below are in Japanese, but the YAML reference tables are language-neutral — and your favorite AI can translate the rest. A JSON Schema for flow files lives in [schema/flow.schema.json](schema/flow.schema.json).
 
 ---
 
@@ -16,6 +16,7 @@ AI CLI(codex / claude / opencode / grok / agy / pi / cursor / 任意コマンド
 - 全ステップのプロンプト・出力・ログ・**トークン/コスト**は run ディレクトリに保存
 - 差し戻しループ(`route:`)、**並列実行(`parallel:` / `foreach:`)**、**セッション再開(`continue_from:`)**、**自動要約(`compact:`)** を宣言的に書ける
 - ステップごとにツール・モデル・reasoning effort・権限を自由に組み替え、`profiles:` で名前付きプリセット化
+- **投げっぱなし実行(`--detach`)**: 呼び出し元エージェントが落ちても実行は生き残る。`sfh status` で生死確認、`sfh wait` で結果回収
 - 無人運転前提の安全弁: **中断した実行の再開(`--resume`)**、**金額上限(`max_cost_usd`)**、リトライ/フォールバック、Ctrl+Cや強制終了でも**子AIプロセスを道連れに終了**
 
 ## インストール / Install
@@ -64,10 +65,20 @@ sfh run flow.yaml --var topic="Rustの非同期ランタイム比較"
 sfh run research.yaml --var topic="..." -q
 ```
 
+長いフローは**投げっぱなしにできる**。呼び出し元(codex app等)がタイムアウトで落ちても実行は続く:
+
+```bash
+RUN=$(sfh run research.yaml --var topic="..." --detach)   # run dirだけ返して即終了
+sfh status "$RUN"                                          # 生きてる? 今どこ? いくら使った?
+sfh wait   "$RUN"                                          # 終わるまで待って結果をstdoutへ
+```
+
 ## CLI
 
 ```
 sfh run <flow.yaml> [options]          フローを実行
+sfh status [run-dir] [--json]          実行がまだ生きているか確認(既定: 最新run)
+sfh wait [run-dir] [--timeout SEC]     終了まで待って結果をstdoutへ
 sfh validate <flow.yaml> [--var k=v]   実行せずに検査
 sfh init [file] [--force]              例のフローファイルを生成
 sfh runs list|show|clean [...]         過去の実行を一覧/詳細/掃除
@@ -76,6 +87,8 @@ run options:
   --var key=value     フロー変数の上書き(複数可)
   --emit <step-id>    最後にstdoutへ出すステップを指定(既定: 最後に実行されたステップ)
   --runs-dir <dir>    成果物の保存先(既定: .sfh/runs)
+  --detach            バックグラウンドで実行し、run dirだけ出して即終了。
+                      呼び出したシェルやその親が死んでも実行は続く
   --resume <run-dir>  途中で落ちた実行を再開(完了済みステップは再課金しない)
   --resume-latest     同上。そのフローの最新runを自動で選ぶ
   --force-resume      フローファイルが変わっていても再開する
@@ -83,6 +96,13 @@ run options:
   --dry-run           コマンドとプロンプトをrun dirに展開して表示するだけ(実行しない)
   -v, --verbose       実行コマンドラインを表示
   -q, --quiet         進捗表示を抑制
+
+status / wait options:
+  status [run-dir] [--runs-dir d] [--json]
+  wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
+  status exit code: 0=完了 / 1=失敗または死亡 / 2=判定不能 / 3=実行中
+  wait はフロー自身の終了コードを返す(--timeout 到達時のみ 3)。
+  **wait のタイムアウトは実行をキャンセルしない**
 
 runs options:
   runs list [--runs-dir d] [-n N]                       状態・ステップ数・コスト付き一覧
@@ -284,16 +304,46 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 - **フォールバック**: `fallback: [profile_a, profile_b]` — リトライ後も落ちたら別プロファイル(別プロバイダ・別モデルでも可)で再挑戦
 - **差し戻しループの降格**: `on_max_visits: goto:summarize` — 3回REVISEされたら諦めて要約に進む、が書ける(既定はフロー失敗)
 
+### 投げっぱなし実行: `--detach`(親の寿命から切り離す)
+
+呼び出し元のAIエージェントは、シェルツールのタイムアウトやセッション終了で数十分後には落ちる。フォアグラウンドで待たせているとそこで巻き添えになるので、`--detach` で**親のジョブオブジェクト(Windows)/セッション(Unix)の外**へ実行を追い出せる:
+
+```bash
+RUN=$(sfh run research.yaml --var topic="..." --detach)
+# → stdoutにはrun dirのパスだけ。呼び出し元は即座に解放される
+```
+
+以降は好きなタイミングで問い合わせる:
+
+```bash
+sfh status "$RUN"          # running / done / failed / dead
+sfh status "$RUN" --json   # 同じ内容を機械可読で(親エージェント向け)
+sfh wait   "$RUN"          # 終了まで待ち、フォアグラウンド実行と同じ結果をstdoutへ
+```
+
+**`dead` が肝心**。`status.json` が `running` のまま残っていても、記録されたpidが消えていれば(=親ごと殺された)、sfhはそれを `running` ではなく `dead` と報告し、再開コマンドを出す:
+
+```
+dead     3 steps, $0.1240 - process 64012 is gone
+sfh: this run was killed before it finished. resume with: sfh run research.yaml --resume .sfh/runs/...
+```
+
+pidの生存確認と**ハートビートの鮮度**の両方を見る(pidは再利用されるため片方だけでは信用できない)。
+
+> Windowsでは、呼び出し元プロセスがブレイクアウェイを許可しないjob objectを張っていると切り離しに失敗する。その場合sfhは黙って諦めず、**「起動はしたが親と心中する可能性がある」と警告を出して実行する**。
+
 ### 実行中の監視(無人運転)
 
-run dir の `status.json` が3秒ごとに更新される。親エージェントはこれをポーリングすれば「生きているか」「今どのステップか」「いくら使ったか」が分かる:
+run dir の `status.json` が3秒ごとに更新される。`sfh status` を使わず直接読んでもいい:
 
 ```json
 { "state": "running", "current_step": "execute", "heartbeat_utc": "20260727-135338",
   "steps_done": 5, "cost_usd": 0.0974, "pid": 64012 }
 ```
 
-Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済みのAI CLIプロセスは道連れで終了する**(Windowsはjob object、Linuxは`PR_SET_PDEATHSIG`+プロセスグループkill)。放置されたエージェントが課金し続ける事故を防ぐ。
+終了時には `exit_code` / `emit_step` / `emit_file` / `error` が追記される(`sfh wait` はこれを見て結果を返す)。
+
+Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済みのAI CLIプロセスは道連れで終了する**(Windowsはjob object、Linuxは`PR_SET_PDEATHSIG`+プロセスグループkill)。放置されたエージェントが課金し続ける事故を防ぐ。`--detach` で起動した実行だけがこの規則の例外で、これは明示的に要求された場合に限られる。
 
 ### テンプレート変数
 
@@ -362,6 +412,8 @@ codex-local:
   meta.json        実行時の変数・sfhバージョン・各CLIの実バイナリとバージョン・合計コスト
   log.jsonl        ステップ毎のexit/所要時間/トークン/コスト/セッションID/コマンドライン
   status.json      3秒ごとに更新される生存信号(state/current_step/cost_usd/pid)
+                   終了時に exit_code / emit_step / emit_file / error が入る
+  detached.*.txt   --detach 実行のstdout/stderr(sfh wait はここを返す)
   notes.md         notes: append の蓄積
   <id>.prompt.txt  レンダリング済みプロンプト
   <id>.out.txt     生stdout(ANSI除去済み)
@@ -385,6 +437,7 @@ codex-local:
 
 - **検証済みバージョン**(全て実AI呼び出しで確認): codex-cli 0.146.0-alpha.3.1 / claude 2.1.220 / opencode 1.18.3 / grok 0.2.112 / agy 1.0.8 / pi 0.82.1 / cursor-agent 2026.05.28。エージェントCLIのフラグは変わりやすい。ズレたら `args:` で足すか `cmd:` で全部書けば逃げられる。
 - **タイムアウト**: Windowsは`taskkill /T /F`、Unixはprocess group killで子孫ごと落とす。子の終了後にパイプを握り続ける孫プロセスがいてもドレイン期限で先に進む。出力は1ストリーム32MBでキャップ。
+- **`--detach` の切り離しが効かない場合がある**: Windowsで呼び出し元がブレイクアウェイ禁止のjob objectを張っていると、切り離せずに親と心中する(sfhは警告を出す)。その場合でも `--resume` で続きから再開できる。Unix(`setsid`)には制約なし。
 - **opencodeのread**は`OPENCODE_CONFIG_CONTENT`でedit/bashを拒否注入(1.18.3のplan agentはbashを塞がないため。実機でBLOCKED確認済み)。完全な保証が要る変更はwrite/fullレビューを挟むこと。
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。
 - **AIステップが空の最終メッセージを返したら失敗扱い**(既定)。空文字が下流のプロンプトに流れ込む事故を防ぐため。意図的なら `allow_empty: true`。

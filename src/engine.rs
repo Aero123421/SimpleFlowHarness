@@ -23,6 +23,12 @@ pub struct RunOpts {
     pub force_resume: bool,
     /// Suppress printing the best available output when the flow fails.
     pub no_partial_emit: bool,
+    /// Re-launch this run outside the caller's process group / job object,
+    /// print the run dir and exit, so a parent agent need not stay attached.
+    pub detach: bool,
+    /// Use exactly this run directory instead of a fresh timestamped one.
+    /// Set by `--detach` when it hands the run off to the background copy.
+    pub run_dir: Option<PathBuf>,
 }
 
 pub fn run(opts: RunOpts) -> i32 {
@@ -369,6 +375,91 @@ fn latest_run_dir(root: &Path, flow_path: &Path) -> Option<PathBuf> {
     dirs.pop()
 }
 
+/// Hand this run to a background copy of sfh, print the run dir, and return.
+/// The child's command line is rebuilt from RunOpts rather than filtered out of
+/// argv, so it does not depend on how the caller spelled the flags.
+fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot locate the sfh executable to detach: {e}"))?;
+
+    let mut args: Vec<String> = vec!["run".into(), abs(&opts.flow_path).display().to_string()];
+    for (k, v) in &opts.vars {
+        args.push("--var".into());
+        args.push(format!("{k}={v}"));
+    }
+    if let Some(e) = &opts.emit {
+        args.push("--emit".into());
+        args.push(e.clone());
+    }
+    if let Some(d) = &opts.runs_dir {
+        args.push("--runs-dir".into());
+        args.push(d.display().to_string());
+    }
+    if opts.no_partial_emit {
+        args.push("--no-partial-emit".into());
+    }
+    if opts.verbose {
+        args.push("--verbose".into());
+    }
+    // --resume-latest is pinned to a concrete directory here, so a run started
+    // in between cannot become the child's target.
+    if is_resume {
+        args.push("--resume".into());
+        args.push(run_dir.display().to_string());
+        if opts.force_resume {
+            args.push("--force-resume".into());
+        }
+    }
+    args.push("--run-dir".into());
+    args.push(run_dir.display().to_string());
+
+    let status_path = run_dir.join("status.json");
+    // A resumed run dir still holds the previous attempt's terminal status;
+    // drop it so a stale "done" cannot be mistaken for this attempt's result.
+    let _ = std::fs::remove_file(&status_path);
+
+    let d = execute::spawn_detached(
+        &exe,
+        &args,
+        &run_dir.join("detached.out.txt"),
+        &run_dir.join("detached.err.txt"),
+    )?;
+    if let Some(w) = &d.warning {
+        eprintln!("sfh: warning: {w}");
+    }
+    // Seed status.json only if the child has not already written its own, so
+    // `sfh status` has something to report either way and neither clobbers.
+    if !status_path.exists() {
+        write_status(
+            &status_path,
+            &Status {
+                state: "running",
+                step: String::new(),
+                started: utc_stamp(),
+                steps_done: 0,
+                cost_usd: 0.0,
+                run_dir: run_dir.display().to_string(),
+                flow: abs(&opts.flow_path).display().to_string(),
+                pid: d.pid,
+                exit_code: None,
+                emit_step: None,
+                emit_file: None,
+                error: None,
+            },
+        );
+    }
+    if !opts.quiet {
+        eprintln!(
+            "sfh: detached (pid {}). poll with: sfh status {}",
+            d.pid,
+            run_dir.display()
+        );
+    }
+    // stdout gets the run dir and nothing else, so a caller can capture it.
+    println!("{}", run_dir.display());
+    Ok(0)
+}
+
 /// Cheap change-detection fingerprint (FNV-1a); not a security hash.
 fn fingerprint(s: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -386,6 +477,16 @@ struct Status {
     steps_done: u32,
     cost_usd: f64,
     run_dir: String,
+    flow: String,
+    /// Which process owns this run; `sfh status` checks it is still alive so a
+    /// run killed along with its parent reads as dead, not as running.
+    pid: u32,
+    /// Set once the run reaches a terminal state, so `sfh wait` can hand the
+    /// result back with the same exit code a foreground run would have used.
+    exit_code: Option<i32>,
+    emit_step: Option<String>,
+    emit_file: Option<String>,
+    error: Option<String>,
 }
 
 fn write_status(path: &Path, s: &Status) {
@@ -397,8 +498,13 @@ fn write_status(path: &Path, s: &Status) {
         "steps_done": s.steps_done,
         "cost_usd": s.cost_usd,
         "run_dir": s.run_dir,
-        "pid": std::process::id(),
+        "flow": s.flow,
+        "pid": s.pid,
         "sfh_version": VERSION,
+        "exit_code": s.exit_code,
+        "emit_step": s.emit_step,
+        "emit_file": s.emit_file,
+        "error": s.error,
     });
     let _ = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default());
 }
@@ -485,6 +591,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         }
         run_dir = dir;
         is_resume = true;
+    } else if let Some(d) = &opts.run_dir {
+        // The detaching parent already picked (and created) this directory so
+        // it could print the path before the background copy came up.
+        let d = abs(d);
+        std::fs::create_dir_all(&d)
+            .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
+        run_dir = d;
     } else {
         let base = format!("{}-{}", utc_stamp(), name);
         let mut d = runs_root.join(&base);
@@ -508,6 +621,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             &notes_file,
             &needed_sessions,
         );
+    }
+
+    // ---- hand the run off to a detached copy of ourselves ----
+    // Everything above this point is validation, so a broken flow still fails
+    // in the caller's face instead of dying silently in the background.
+    if opts.detach {
+        return detach_run(opts, &run_dir, is_resume);
     }
 
     let mut log = std::fs::OpenOptions::new()
@@ -563,6 +683,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         steps_done: resumed.total,
         cost_usd: resumed.cost_usd,
         run_dir: run_dir.display().to_string(),
+        flow: abs(&opts.flow_path).display().to_string(),
+        pid: std::process::id(),
+        exit_code: None,
+        emit_step: None,
+        emit_file: None,
+        error: None,
     }));
     {
         let s = Arc::clone(&status);
@@ -1180,13 +1306,23 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     })();
 
     let max_emit = flow.defaults.max_emit_chars.unwrap_or(200_000) as usize;
-    let finish = |state: &'static str, cost: f64| {
-        let mut g = status.lock().unwrap();
-        g.state = state;
-        g.steps_done = total;
-        g.cost_usd = cost;
-        write_status(&status_path, &g);
-    };
+    let finish =
+        |state: &'static str, cost: f64, code: i32, emit: Option<&str>, err: Option<&str>| {
+            let mut g = status.lock().unwrap();
+            g.state = state;
+            g.steps_done = total;
+            g.cost_usd = cost;
+            g.exit_code = Some(code);
+            g.emit_step = emit.map(String::from);
+            g.emit_file = emit.map(|id| {
+                run_dir
+                    .join(format!("{id}.chain.txt"))
+                    .display()
+                    .to_string()
+            });
+            g.error = err.map(String::from);
+            write_status(&status_path, &g);
+        };
     let mut meta_final = meta.clone();
     if let Some(m) = meta_final.as_object_mut() {
         m.insert("finished_utc".into(), json!(utc_stamp()));
@@ -1208,17 +1344,20 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
             );
-            finish("done", cost_usd);
-            let emit_id = opts
-                .emit
-                .clone()
-                .or(last_executed)
-                .ok_or("no step was executed")?;
+            let Some(emit_id) = opts.emit.clone().or(last_executed) else {
+                // Rare, but leaving status.json on "running" would make this
+                // look like a run that got killed rather than one that ended.
+                finish("failed", cost_usd, 1, None, Some("no step was executed"));
+                return Err("no step was executed".into());
+            };
             let out = outputs
                 .get(&emit_id)
                 .map(|s| s.output.clone())
                 .unwrap_or_default();
+            // Emit first: `sfh wait` treats a terminal status.json as "the
+            // output is ready", so the status must not go terminal before it.
             print_emit(&out, max_emit, &run_dir, &emit_id);
+            finish("done", cost_usd, 0, Some(&emit_id), None);
             if !opts.quiet {
                 eprintln!(
                     "sfh: done. {} leaf runs, ${cost_usd:.4} reported. run dir: {}",
@@ -1233,32 +1372,33 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
             );
-            finish("failed", cost_usd);
             eprintln!("sfh: FLOW FAILED: {msg}");
             // Hand the caller whatever finished work exists - a failed run is
             // exactly when the parent agent most needs something to act on.
-            if !opts.no_partial_emit {
+            let pick = if opts.no_partial_emit {
+                None
+            } else {
                 let nonempty = |id: &String| {
                     outputs
                         .get(id)
                         .map(|o| !o.output.trim().is_empty())
                         .unwrap_or(false)
                 };
-                let pick = opts
-                    .emit
+                opts.emit
                     .clone()
                     .filter(&nonempty)
                     .or_else(|| last_success.filter(&nonempty))
-                    .or_else(|| last_executed.filter(&nonempty));
-                if let Some(id) = pick {
-                    if let Some(o) = outputs.get(&id) {
-                        if !o.output.trim().is_empty() {
-                            eprintln!("sfh: emitting partial result from step '{id}'");
-                            print_emit(&o.output, max_emit, &run_dir, &id);
-                        }
+                    .or_else(|| last_executed.filter(&nonempty))
+            };
+            if let Some(id) = &pick {
+                if let Some(o) = outputs.get(id) {
+                    if !o.output.trim().is_empty() {
+                        eprintln!("sfh: emitting partial result from step '{id}'");
+                        print_emit(&o.output, max_emit, &run_dir, id);
                     }
                 }
             }
+            finish("failed", cost_usd, 1, pick.as_deref(), Some(&msg));
             eprintln!("sfh: run dir: {}", run_dir.display());
             eprintln!(
                 "sfh: resume with: sfh run {} --resume {}",

@@ -1,6 +1,6 @@
 [package]
 name = "sfh"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "SimpleFlowHarness - chain AI CLI agents (codex / claude / opencode / grok / agy / pi / cursor / any command) into staged flows"
 license = "MIT"

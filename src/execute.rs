@@ -128,7 +128,7 @@ mod windows_guard {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
     static JOB: OnceLock<usize> = OnceLock::new();
@@ -144,13 +144,26 @@ mod windows_guard {
         unsafe {
             SetConsoleCtrlHandler(Some(ctrl_handler), 1);
         }
+        // CreateProcess is called with bInheritHandles=TRUE, so without this
+        // every child - and every grandchild - gets a duplicate of whatever
+        // pipe our caller handed us. Anything reading that pipe then waits for
+        // the deepest descendant instead of for sfh, which is how a detached
+        // run ends up blocking the very caller it was supposed to free.
+        // Redirected stdio is unaffected: Rust marks those handles itself.
+        super::windows_no_inherit_std();
         JOB.get_or_init(|| unsafe {
             let job: HANDLE = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
                 return 0;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // KILL_ON_JOB_CLOSE: children never outlive sfh.
+            // BREAKAWAY_OK: except one that explicitly asks, which is only ever
+            // a nested `sfh run --detach`. A job that forbids breakaway makes
+            // CreateProcess fail outright, so without this a flow could not
+            // launch a background run of its own.
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
@@ -170,6 +183,167 @@ mod windows_guard {
         unsafe {
             AssignProcessToJobObject(job as HANDLE, child.as_raw_handle() as HANDLE);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Detached launch: the exact opposite of the ownership above. `--detach` hands
+// a run to a copy of sfh that must OUTLIVE this process and its caller, so the
+// child deliberately leaves the job object / session instead of joining it.
+// ---------------------------------------------------------------------------
+
+pub struct Detached {
+    pub pid: u32,
+    /// Set when the OS refused to let the child leave the caller's job object,
+    /// meaning it still dies if the caller's process tree is torn down.
+    pub warning: Option<String>,
+}
+
+/// stdout/stderr to the given files (truncating), stdin closed: nothing is
+/// lost and no console is held open.
+fn detached_command(
+    exe: &Path,
+    args: &[String],
+    out_file: &Path,
+    err_file: &Path,
+) -> Result<Command, String> {
+    let mk = |p: &Path| {
+        std::fs::File::create(p).map_err(|e| format!("cannot create {}: {e}", p.display()))
+    };
+    let mut c = Command::new(exe);
+    c.args(args);
+    c.stdin(Stdio::null());
+    c.stdout(Stdio::from(mk(out_file)?));
+    c.stderr(Stdio::from(mk(err_file)?));
+    Ok(c)
+}
+
+/// Spawn `exe args...` in the background, disowned.
+#[cfg(windows)]
+pub fn spawn_detached(
+    exe: &Path,
+    args: &[String],
+    out_file: &Path,
+    err_file: &Path,
+) -> Result<Detached, String> {
+    use std::os::windows::process::CommandExt;
+    // Win32 process-creation flags. CREATE_BREAKAWAY_FROM_JOB is the one that
+    // matters: without it the child joins the caller's job object and dies with
+    // it, which is exactly what --detach exists to avoid.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const BASE: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+
+    let mut c = detached_command(exe, args, out_file, err_file)?;
+    c.creation_flags(BASE | CREATE_BREAKAWAY_FROM_JOB);
+    match c.spawn() {
+        Ok(child) => Ok(Detached {
+            pid: child.id(),
+            warning: None,
+        }),
+        // A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK rejects the flag outright.
+        // Running anyway beats not running, but say so plainly.
+        Err(e) => {
+            let mut c = detached_command(exe, args, out_file, err_file)?;
+            c.creation_flags(BASE);
+            let child = c
+                .spawn()
+                .map_err(|e2| format!("cannot start the detached run: {e2}"))?;
+            Ok(Detached {
+                pid: child.id(),
+                warning: Some(format!(
+                    "the calling process is inside a job object that forbids breakaway ({e}); \
+                     the run was started anyway but will still be killed if that process \
+                     tree is torn down"
+                )),
+            })
+        }
+    }
+}
+
+/// Spawn `exe args...` in the background, disowned.
+#[cfg(unix)]
+pub fn spawn_detached(
+    exe: &Path,
+    args: &[String],
+    out_file: &Path,
+    err_file: &Path,
+) -> Result<Detached, String> {
+    use std::os::unix::process::CommandExt;
+    let mut c = detached_command(exe, args, out_file, err_file)?;
+    unsafe {
+        // New session: no controlling terminal, so closing the caller's
+        // terminal does not SIGHUP the run. Deliberately no PR_SET_PDEATHSIG -
+        // this child is meant to outlive us.
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = c
+        .spawn()
+        .map_err(|e| format!("cannot start the detached run: {e}"))?;
+    Ok(Detached {
+        pid: child.id(),
+        warning: None,
+    })
+}
+
+/// Clear HANDLE_FLAG_INHERIT on our own standard handles so the next child
+/// cannot hold a caller's pipe open. Safe to call late: it does not affect this
+/// process's own use of those handles, only what a child inherits.
+#[cfg(windows)]
+fn windows_no_inherit_std() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let h = GetStdHandle(id);
+            if !h.is_null() {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+/// Is this pid still running? Pid reuse makes it advisory, so callers pair it
+/// with a heartbeat freshness check before declaring a run dead.
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    // EPERM: it exists, it just is not ours to signal.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Is this pid still running? Pid reuse makes it advisory, so callers pair it
+/// with a heartbeat freshness check before declaring a run dead.
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE
     }
 }
 
