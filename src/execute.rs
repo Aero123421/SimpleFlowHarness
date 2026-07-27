@@ -54,6 +54,7 @@ pub struct ExecOutcome {
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 const MAX_TRACKED: usize = 512;
 static TRACKED: [AtomicI32; MAX_TRACKED] = {
+    #[allow(clippy::declare_interior_mutable_const)]
     const Z: AtomicI32 = AtomicI32::new(0);
     [Z; MAX_TRACKED]
 };
@@ -64,7 +65,10 @@ pub fn interrupted() -> bool {
 
 fn track(pid: i32) {
     for slot in TRACKED.iter() {
-        if slot.compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        if slot
+            .compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             return;
         }
     }
@@ -118,8 +122,8 @@ mod windows_guard {
     use windows_sys::Win32::Foundation::{BOOL, HANDLE};
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
@@ -280,7 +284,11 @@ pub fn run_cmd(
     let (mut stderr, err_trunc) = recv(&rx_err);
     if out_trunc || err_trunc {
         stderr.extend_from_slice(
-            format!("\n[sfh: captured output truncated at {} MB]\n", MAX_CAPTURE / 1024 / 1024).as_bytes(),
+            format!(
+                "\n[sfh: captured output truncated at {} MB]\n",
+                MAX_CAPTURE / 1024 / 1024
+            )
+            .as_bytes(),
         );
     }
     if drain_expired {
@@ -346,7 +354,9 @@ pub fn probe_version(program: &str) -> Option<String> {
     } else {
         &out.stdout
     });
-    text.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string())
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
 }
 
 #[cfg(windows)]

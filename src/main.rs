@@ -83,7 +83,11 @@ fn need<'a>(rest: &'a [String], i: &mut usize, what: &str) -> Result<&'a String,
     rest.get(*i).ok_or_else(|| format!("{what} needs a value"))
 }
 
-fn parse_vars_flag(rest: &[String], i: &mut usize, out: &mut Vec<(String, String)>) -> Result<(), String> {
+fn parse_vars_flag(
+    rest: &[String],
+    i: &mut usize,
+    out: &mut Vec<(String, String)>,
+) -> Result<(), String> {
     let kv = need(rest, i, "--var")?;
     let (k, v) = kv
         .split_once('=')
@@ -205,7 +209,10 @@ fn cmd_init(rest: &[String]) -> i32 {
     match std::fs::write(&path, EXAMPLE) {
         Ok(()) => {
             eprintln!("wrote {}", path.display());
-            eprintln!("next: edit it, then `sfh validate {0}` and `sfh run {0}`", path.display());
+            eprintln!(
+                "next: edit it, then `sfh validate {0}` and `sfh run {0}`",
+                path.display()
+            );
             0
         }
         Err(e) => usage_err(&format!("cannot write {}: {e}", path.display())),
@@ -259,6 +266,8 @@ fn cmd_runs(rest: &[String]) -> i32 {
             None => usage_err("usage: sfh runs show <run-dir>"),
         },
         "clean" => runs::clean(&runs_dir, days, keep, dry),
-        other => usage_err(&format!("unknown runs subcommand '{other}' (list/show/clean)")),
+        other => usage_err(&format!(
+            "unknown runs subcommand '{other}' (list/show/clean)"
+        )),
     }
 }

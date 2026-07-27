@@ -39,7 +39,10 @@ pub fn list(root: &Path, limit: usize) -> i32 {
         eprintln!("no runs under {}", root.display());
         return 0;
     }
-    println!("{:<10} {:<16} {:>6} {:>10}  {}", "STATUS", "STARTED(UTC)", "STEPS", "COST_USD", "RUN DIR");
+    println!(
+        "{:<10} {:<16} {:>6} {:>10}  RUN DIR",
+        "STATUS", "STARTED(UTC)", "STEPS", "COST_USD"
+    );
     for d in dirs.iter().rev().take(limit) {
         let m = meta(d);
         let s = status(d);
@@ -87,10 +90,15 @@ pub fn show(dir: &Path) -> i32 {
         }
     }
     println!();
-    println!("{:<26} {:>5} {:>8} {:>9} {:>10}", "STEP", "EXIT", "SECS", "CHARS", "COST_USD");
+    println!(
+        "{:<26} {:>5} {:>8} {:>9} {:>10}",
+        "STEP", "EXIT", "SECS", "CHARS", "COST_USD"
+    );
     let log = std::fs::read_to_string(dir.join("log.jsonl")).unwrap_or_default();
     for line in log.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         let ev = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
         if ev != "step_end" {
             continue;

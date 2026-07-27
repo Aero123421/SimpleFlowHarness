@@ -194,8 +194,7 @@ pub const TOOLS: [&str; 5] = ["codex", "claude", "opencode", "grok", "agy"];
 pub fn load(path: &Path) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut flow: Flow =
-        yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     merge_global_profiles(&mut flow);
     validate(&flow)?;
     Ok(flow)
@@ -205,8 +204,12 @@ pub fn load(path: &Path) -> Result<Flow, String> {
 /// Flow-level profiles win on name conflicts. This keeps flow files portable while
 /// machine-specific things (bin: paths, provider/model choices) live outside the repo.
 fn merge_global_profiles(flow: &mut Flow) {
-    let Some(p) = global_profiles_path() else { return };
-    let Ok(text) = std::fs::read_to_string(&p) else { return };
+    let Some(p) = global_profiles_path() else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return;
+    };
     match yaml::from_str::<BTreeMap<String, Profile>>(&text) {
         Ok(globals) => {
             for (k, v) in globals {
@@ -219,7 +222,11 @@ fn merge_global_profiles(flow: &mut Flow) {
 
 pub fn global_profiles_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
-    Some(std::path::PathBuf::from(home).join(".sfh").join("profiles.yaml"))
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".sfh")
+            .join("profiles.yaml"),
+    )
 }
 
 impl Flow {
@@ -324,7 +331,10 @@ impl Step {
 }
 
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
 }
 
 fn validate(flow: &Flow) -> Result<(), String> {
@@ -334,7 +344,10 @@ fn validate(flow: &Flow) -> Result<(), String> {
     let mut seen = HashSet::new();
     for s in &flow.steps {
         if !valid_id(&s.id) {
-            return Err(format!("step id '{}' must be non-empty and use only [A-Za-z0-9_-]", s.id));
+            return Err(format!(
+                "step id '{}' must be non-empty and use only [A-Za-z0-9_-]",
+                s.id
+            ));
         }
         if !seen.insert(s.id.clone()) {
             return Err(format!("duplicate step id '{}'", s.id));
@@ -342,7 +355,10 @@ fn validate(flow: &Flow) -> Result<(), String> {
         if let Some(children) = &s.parallel {
             for c in children {
                 if !valid_id(&c.id) {
-                    return Err(format!("step id '{}' must be non-empty and use only [A-Za-z0-9_-]", c.id));
+                    return Err(format!(
+                        "step id '{}' must be non-empty and use only [A-Za-z0-9_-]",
+                        c.id
+                    ));
                 }
                 if !seen.insert(c.id.clone()) {
                     return Err(format!("duplicate step id '{}'", c.id));
@@ -393,17 +409,28 @@ fn validate(flow: &Flow) -> Result<(), String> {
             return check_goto(&format!("step '{}' {what}", s.id), g);
         }
         if oe != "fail" && oe != "continue" {
-            return Err(format!("step '{}': {what} must be fail/continue/goto:<id>", s.id));
+            return Err(format!(
+                "step '{}': {what} must be fail/continue/goto:<id>",
+                s.id
+            ));
         }
         Ok(())
     };
     let check_continue_from = |s: &Step| -> Result<(), String> {
-        let Some(cf) = &s.continue_from else { return Ok(()) };
+        let Some(cf) = &s.continue_from else {
+            return Ok(());
+        };
         if cf == &s.id {
-            return Err(format!("step '{}': continue_from cannot reference itself", s.id));
+            return Err(format!(
+                "step '{}': continue_from cannot reference itself",
+                s.id
+            ));
         }
         let target = flow.find_step(cf).ok_or_else(|| {
-            format!("step '{}': continue_from target '{cf}' is not a step id", s.id)
+            format!(
+                "step '{}': continue_from target '{cf}' is not a step id",
+                s.id
+            )
         })?;
         if target.is_group() {
             return Err(format!(
@@ -432,7 +459,10 @@ fn validate(flow: &Flow) -> Result<(), String> {
         check_continue_from(s)?;
         if let Some(children) = &s.parallel {
             if children.is_empty() {
-                return Err(format!("step '{}': parallel: needs at least one child", s.id));
+                return Err(format!(
+                    "step '{}': parallel: needs at least one child",
+                    s.id
+                ));
             }
             let child_ids: HashSet<&String> = children.iter().map(|c| &c.id).collect();
             let mut targets_seen: std::collections::HashMap<&String, &String> =
@@ -459,7 +489,10 @@ fn validate(flow: &Flow) -> Result<(), String> {
         }
         for (i, r) in s.route.iter().enumerate() {
             check_goto(&format!("step '{}' route[{i}]", s.id), &r.goto)?;
-            for rx in [&r.when_matches, &r.when_last_line_matches].into_iter().flatten() {
+            for rx in [&r.when_matches, &r.when_last_line_matches]
+                .into_iter()
+                .flatten()
+            {
                 if !rx.contains("{{") {
                     regex::Regex::new(rx)
                         .map_err(|e| format!("step '{}' route[{i}]: bad regex: {e}", s.id))?;
@@ -482,12 +515,16 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
     let sid = &s.id;
     if is_child {
         if !s.route.is_empty() {
-            return Err(format!("step '{sid}': route: is not allowed inside parallel: (put it on the group)"));
+            return Err(format!(
+                "step '{sid}': route: is not allowed inside parallel: (put it on the group)"
+            ));
         }
         if s.parallel.is_some() || s.foreach.is_some() {
             return Err(format!("step '{sid}': parallel/foreach cannot be nested"));
         }
-        if s.notes.is_some() || s.compact.is_some() || s.max_visits.is_some()
+        if s.notes.is_some()
+            || s.compact.is_some()
+            || s.max_visits.is_some()
             || s.on_max_visits.is_some()
         {
             return Err(format!(
@@ -496,13 +533,28 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         }
     }
     if s.is_group() {
-        if s.tool.is_some() || s.cmd.is_some() || s.prompt.is_some() || s.foreach.is_some()
-            || s.continue_from.is_some() || s.use_.is_some() || s.model.is_some()
-            || s.stdin.is_some() || s.agent.is_some() || s.compact.is_some()
-            || s.bin.is_some() || s.effort.is_some() || s.access.is_some()
-            || !s.args.is_empty() || s.cwd.is_some() || s.timeout_sec.is_some()
-            || s.max_prompt_chars.is_some() || s.retry.is_some() || !s.fallback.is_empty()
-            || !s.env.is_empty() || !s.env_remove.is_empty() || s.allow_empty.is_some()
+        if s.tool.is_some()
+            || s.cmd.is_some()
+            || s.prompt.is_some()
+            || s.foreach.is_some()
+            || s.continue_from.is_some()
+            || s.use_.is_some()
+            || s.model.is_some()
+            || s.stdin.is_some()
+            || s.agent.is_some()
+            || s.compact.is_some()
+            || s.bin.is_some()
+            || s.effort.is_some()
+            || s.access.is_some()
+            || !s.args.is_empty()
+            || s.cwd.is_some()
+            || s.timeout_sec.is_some()
+            || s.max_prompt_chars.is_some()
+            || s.retry.is_some()
+            || !s.fallback.is_empty()
+            || !s.env.is_empty()
+            || !s.env_remove.is_empty()
+            || s.allow_empty.is_some()
         {
             return Err(format!(
                 "step '{sid}': a parallel: group carries only id/max_parallel/route/on_error/max_visits/on_max_visits/notes (tool settings go on the children)"
@@ -537,12 +589,17 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         .as_ref()
         .and_then(|u| flow.profiles.get(u))
         .and_then(|p| p.tool.clone());
-    if s.tool.is_none() && s.cmd.is_none() && profile_tool.is_none() && flow.defaults.tool.is_none() {
-        return Err(format!("step '{sid}': needs 'tool' or 'cmd' (or a profile/defaults tool)"));
+    if s.tool.is_none() && s.cmd.is_none() && profile_tool.is_none() && flow.defaults.tool.is_none()
+    {
+        return Err(format!(
+            "step '{sid}': needs 'tool' or 'cmd' (or a profile/defaults tool)"
+        ));
     }
     if let Some(a) = &s.access {
         if !["read", "write", "full"].contains(&a.as_str()) {
-            return Err(format!("step '{sid}': access must be read/write/full, got '{a}'"));
+            return Err(format!(
+                "step '{sid}': access must be read/write/full, got '{a}'"
+            ));
         }
     }
     if let Some(st) = &s.stdin {
@@ -566,10 +623,14 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         }
     }
     if s.cmd.is_some() && !s.fallback.is_empty() {
-        return Err(format!("step '{sid}': fallback: works only with preset tools"));
+        return Err(format!(
+            "step '{sid}': fallback: works only with preset tools"
+        ));
     }
     if s.continue_from.is_some() && s.cmd.is_some() {
-        return Err(format!("step '{sid}': continue_from works only with preset tools, not cmd:"));
+        return Err(format!(
+            "step '{sid}': continue_from works only with preset tools, not cmd:"
+        ));
     }
     if s.continue_from.is_some() && !s.fallback.is_empty() {
         return Err(format!(
@@ -586,7 +647,9 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             }
         }
         if s.continue_from.is_some() {
-            return Err(format!("step '{sid}': continue_from cannot be combined with foreach"));
+            return Err(format!(
+                "step '{sid}': continue_from cannot be combined with foreach"
+            ));
         }
     }
     if let Some(c) = &s.compact {
@@ -605,7 +668,9 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
                 .and_then(|p| p.tool.as_ref())
                 .is_some();
         if !has_tool {
-            return Err(format!("step '{sid}': compact needs use: <profile> or tool:"));
+            return Err(format!(
+                "step '{sid}': compact needs use: <profile> or tool:"
+            ));
         }
     }
     group_common(s)
@@ -652,7 +717,10 @@ mod tests {
     fn rejects_continue_from_foreach_and_self() {
         let e = parse("name: t\nsteps:\n  - id: a\n    foreach: {from: x}\n    cmd: echo hi\n  - id: b\n    tool: claude\n    continue_from: a\n    prompt: x\n").unwrap_err();
         assert!(e.contains("foreach step"), "{e}");
-        let e = parse("name: t\nsteps:\n  - id: b\n    tool: claude\n    continue_from: b\n    prompt: x\n").unwrap_err();
+        let e = parse(
+            "name: t\nsteps:\n  - id: b\n    tool: claude\n    continue_from: b\n    prompt: x\n",
+        )
+        .unwrap_err();
         assert!(e.contains("itself"), "{e}");
     }
 
@@ -671,11 +739,15 @@ mod tests {
 
     #[test]
     fn rejects_unknown_tool_and_bad_retry_on() {
-        assert!(parse("name: t\nsteps:\n  - id: a\n    tool: gemini\n    prompt: x\n")
-            .unwrap_err()
-            .contains("unknown tool"));
-        assert!(parse("name: t\nsteps:\n  - id: a\n    cmd: echo hi\n    retry_on: sometimes\n")
-            .unwrap_err()
-            .contains("retry_on"));
+        assert!(
+            parse("name: t\nsteps:\n  - id: a\n    tool: gemini\n    prompt: x\n")
+                .unwrap_err()
+                .contains("unknown tool")
+        );
+        assert!(
+            parse("name: t\nsteps:\n  - id: a\n    cmd: echo hi\n    retry_on: sometimes\n")
+                .unwrap_err()
+                .contains("retry_on")
+        );
     }
 }

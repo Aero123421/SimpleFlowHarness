@@ -75,7 +75,6 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
 }
 
-
 pub struct Built {
     pub argv: Vec<String>,
     pub parse: OutputParse,
@@ -212,7 +211,17 @@ pub fn build(
     let mut preassigned = None;
     match tool {
         "codex" => {
-            push(&mut a, &["codex", "exec", "--skip-git-repo-check", "--color", "never", "--json"]);
+            push(
+                &mut a,
+                &[
+                    "codex",
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    "--json",
+                ],
+            );
             // The user's config may set approval_policy loosely; pin it for headless.
             push(&mut a, &["-c", "approval_policy=\"never\""]);
             if let Some(m) = &inp.model {
@@ -254,12 +263,18 @@ pub fn build(
                 a.push(ag.clone());
             }
             match inp.access {
-                Access::Read => {
-                    push(&mut a, &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS])
-                }
+                Access::Read => push(
+                    &mut a,
+                    &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS],
+                ),
                 Access::Write => push(
                     &mut a,
-                    &["--permission-mode", "acceptEdits", "--allowedTools", CLAUDE_WRITE_ALLOWED],
+                    &[
+                        "--permission-mode",
+                        "acceptEdits",
+                        "--allowedTools",
+                        CLAUDE_WRITE_ALLOWED,
+                    ],
                 ),
                 Access::Full => push(&mut a, &["--dangerously-skip-permissions"]),
             }
@@ -312,7 +327,16 @@ pub fn build(
             match inp.access {
                 Access::Read => push(
                     &mut a,
-                    &["--permission-mode", "dontAsk", "--deny", "Edit", "--deny", "Write", "--deny", "Bash"],
+                    &[
+                        "--permission-mode",
+                        "dontAsk",
+                        "--deny",
+                        "Edit",
+                        "--deny",
+                        "Write",
+                        "--deny",
+                        "Bash",
+                    ],
                 ),
                 Access::Write => {
                     push(&mut a, &["--permission-mode", "acceptEdits"]);
@@ -412,7 +436,15 @@ pub fn build_resume(
         "codex" => {
             push(&mut a, &["codex", "exec", "resume"]);
             a.push(session_id.to_string());
-            push(&mut a, &["--skip-git-repo-check", "--json", "-c", "approval_policy=\"never\""]);
+            push(
+                &mut a,
+                &[
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-c",
+                    "approval_policy=\"never\"",
+                ],
+            );
             if let Some(m) = &inp.model {
                 push(&mut a, &["-m"]);
                 a.push(m.clone());
@@ -457,12 +489,18 @@ pub fn build_resume(
                 a.push(ag.clone());
             }
             match inp.access {
-                Access::Read => {
-                    push(&mut a, &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS])
-                }
+                Access::Read => push(
+                    &mut a,
+                    &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS],
+                ),
                 Access::Write => push(
                     &mut a,
-                    &["--permission-mode", "acceptEdits", "--allowedTools", CLAUDE_WRITE_ALLOWED],
+                    &[
+                        "--permission-mode",
+                        "acceptEdits",
+                        "--allowedTools",
+                        CLAUDE_WRITE_ALLOWED,
+                    ],
                 ),
                 Access::Full => push(&mut a, &["--dangerously-skip-permissions"]),
             }
@@ -509,7 +547,16 @@ pub fn build_resume(
             match inp.access {
                 Access::Read => push(
                     &mut a,
-                    &["--permission-mode", "dontAsk", "--deny", "Edit", "--deny", "Write", "--deny", "Bash"],
+                    &[
+                        "--permission-mode",
+                        "dontAsk",
+                        "--deny",
+                        "Edit",
+                        "--deny",
+                        "Write",
+                        "--deny",
+                        "Bash",
+                    ],
                 ),
                 Access::Write => {
                     push(&mut a, &["--permission-mode", "acceptEdits"]);
@@ -604,22 +651,34 @@ mod tests {
 
     fn build_argv(tool: &str, access: Access) -> Vec<String> {
         let (l, p) = paths();
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         build(tool, inp(access, &[]), &bp, None).unwrap().argv
     }
 
     #[test]
     fn agy_prompt_flag_is_last_so_delivery_binds_it() {
         let argv = build_argv("agy", Access::Read);
-        assert_eq!(argv.last().unwrap(), "-p", "prompt must attach to -p as its value");
-        assert!(argv.windows(2).any(|w| w[0] == "--print-timeout" && w[1] == "900s"));
+        assert_eq!(
+            argv.last().unwrap(),
+            "-p",
+            "prompt must attach to -p as its value"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--print-timeout" && w[1] == "900s"));
         assert!(argv.windows(2).any(|w| w[0] == "--mode" && w[1] == "plan"));
     }
 
     #[test]
     fn grok_uses_prompt_file_never_stdin() {
         let (l, p) = paths();
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         let b = build("grok", inp(Access::Read, &[]), &bp, None).unwrap();
         assert_eq!(b.delivery, Delivery::PromptFile);
         assert_eq!(b.argv.last().unwrap(), &p.display().to_string());
@@ -636,44 +695,102 @@ mod tests {
         ] {
             let argv = build_argv("codex", acc);
             assert!(argv.iter().any(|x| x == needle), "{needle} missing");
-            assert_eq!(argv.last().unwrap(), "-", "codex reads the prompt from stdin");
+            assert_eq!(
+                argv.last().unwrap(),
+                "-",
+                "codex reads the prompt from stdin"
+            );
         }
     }
 
     #[test]
     fn codex_resume_rebuilds_sandbox_via_config_override() {
         let (l, p) = paths();
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         let b = build_resume("codex", "sess-1", inp(Access::Read, &[]), &bp).unwrap();
         assert!(b.argv.iter().any(|x| x == "sandbox_mode=\"read-only\""));
-        assert!(!b.argv.iter().any(|x| x == "-s"), "exec resume has no -s flag");
+        assert!(
+            !b.argv.iter().any(|x| x == "-s"),
+            "exec resume has no -s flag"
+        );
         assert_eq!(b.argv.last().unwrap(), "-");
     }
 
     #[test]
     fn opencode_is_always_auto_and_hardened_per_access() {
-        let read = build("opencode", inp(Access::Read, &[]), &BuildPaths { last_msg: &paths().0, prompt_file: &paths().1 }, None).unwrap();
-        assert!(read.argv.iter().any(|x| x == "--auto"), "ask-permission hangs headless");
-        assert!(read.argv.windows(2).any(|w| w[0] == "--agent" && w[1] == "plan"));
+        let read = build(
+            "opencode",
+            inp(Access::Read, &[]),
+            &BuildPaths {
+                last_msg: &paths().0,
+                prompt_file: &paths().1,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            read.argv.iter().any(|x| x == "--auto"),
+            "ask-permission hangs headless"
+        );
+        assert!(read
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--agent" && w[1] == "plan"));
         let cfg = &read.env_set[0].1;
-        assert!(serde_json::from_str::<serde_json::Value>(cfg).is_ok(), "config env must be valid JSON: {cfg}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(cfg).is_ok(),
+            "config env must be valid JSON: {cfg}"
+        );
         assert!(cfg.contains("\"bash\":\"deny\""));
 
-        let write = build("opencode", inp(Access::Write, &[]), &BuildPaths { last_msg: &paths().0, prompt_file: &paths().1 }, None).unwrap();
-        assert!(write.argv.windows(2).any(|w| w[0] == "--agent" && w[1] == "build"));
+        let write = build(
+            "opencode",
+            inp(Access::Write, &[]),
+            &BuildPaths {
+                last_msg: &paths().0,
+                prompt_file: &paths().1,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(write
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--agent" && w[1] == "build"));
         assert!(write.env_set[0].1.contains("external_directory"));
 
-        let full = build("opencode", inp(Access::Full, &[]), &BuildPaths { last_msg: &paths().0, prompt_file: &paths().1 }, None).unwrap();
+        let full = build(
+            "opencode",
+            inp(Access::Full, &[]),
+            &BuildPaths {
+                last_msg: &paths().0,
+                prompt_file: &paths().1,
+            },
+            None,
+        )
+        .unwrap();
         assert!(full.env_set.is_empty(), "full imposes no extra denies");
     }
 
     #[test]
     fn claude_scrubs_nested_session_env_and_uses_json() {
         let (l, p) = paths();
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         let b = build("claude", inp(Access::Read, &[]), &bp, Some("uuid-1")).unwrap();
-        assert!(b.argv.windows(2).any(|w| w[0] == "--output-format" && w[1] == "json"));
-        assert!(b.argv.windows(2).any(|w| w[0] == "--session-id" && w[1] == "uuid-1"));
+        assert!(b
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "json"));
+        assert!(b
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--session-id" && w[1] == "uuid-1"));
         assert_eq!(b.preassigned_session.as_deref(), Some("uuid-1"));
         assert!(b.env_remove.iter().any(|v| v == "CLAUDE_CODE_SESSION_ID"));
         assert!(b.env_remove.iter().any(|v| v == "ANTHROPIC_MODEL"));
@@ -682,7 +799,10 @@ mod tests {
     #[test]
     fn agy_effort_is_dropped_when_the_model_id_encodes_it() {
         let (l, p) = paths();
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         let mut i = inp(Access::Read, &[]);
         i.model = Some("gemini-3.1-pro-high".into());
         i.effort = Some("high".into());
@@ -694,7 +814,10 @@ mod tests {
     #[test]
     fn bin_override_replaces_argv0_only() {
         let (l, p) = paths();
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         let mut i = inp(Access::Read, &[]);
         i.bin = Some("/opt/codex.exe".into());
         let b = build("codex", i, &bp, None).unwrap();
@@ -705,7 +828,10 @@ mod tests {
     #[test]
     fn resume_sets_expect_session_for_tools_that_can_silently_start_new() {
         let (l, p) = paths();
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         for t in ["claude", "opencode", "grok", "agy"] {
             let b = build_resume(t, "sid", inp(Access::Read, &[]), &bp).unwrap();
             assert_eq!(b.expect_session.as_deref(), Some("sid"), "{t}");

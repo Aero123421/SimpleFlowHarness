@@ -65,7 +65,10 @@ pub fn validate(path: &Path, var_overrides: &[(String, String)]) -> i32 {
 
 fn describe_kind(flow: &flow::Flow, s: &flow::Step) -> String {
     if s.is_group() {
-        return format!("parallel x{}", s.parallel.as_ref().map(|c| c.len()).unwrap_or(0));
+        return format!(
+            "parallel x{}",
+            s.parallel.as_ref().map(|c| c.len()).unwrap_or(0)
+        );
     }
     let base = if s.cmd.is_some() {
         "cmd".to_string()
@@ -96,7 +99,15 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
     }
     let mk_builtins = |with_item: bool| {
         let mut b = BTreeMap::new();
-        for k in ["run_dir", "flow_dir", "step_id", "visit", "os", "prompt_file", "notes"] {
+        for k in [
+            "run_dir",
+            "flow_dir",
+            "step_id",
+            "visit",
+            "os",
+            "prompt_file",
+            "notes",
+        ] {
             b.insert(k.to_string(), String::new());
         }
         if with_item {
@@ -200,7 +211,9 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
 /// Effort level names differ per CLI; warn early instead of failing mid-flow.
 fn effort_vocab_warning(tool: &str, e: &str) -> Option<String> {
     let known: &[&str] = match tool {
-        "codex" => &["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+        "codex" => &[
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ],
         "claude" => &["low", "medium", "high", "xhigh", "max", "ultracode"],
         "grok" => &["low", "medium", "high"],
         "agy" => &["low", "medium", "high"],
@@ -237,9 +250,15 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
     let mut st = ResumeState::default();
     let mut last_step: Option<String> = None;
     for line in log.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         let ev = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
-        let step = v.get("step").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let step = v
+            .get("step")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         match ev {
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
@@ -256,7 +275,10 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     last_step = Some(step.clone());
                 }
                 let ok = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) == 0
-                    && !v.get("timed_out").and_then(|x| x.as_bool()).unwrap_or(false)
+                    && !v
+                        .get("timed_out")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false)
                     && !v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false);
                 if ok {
                     let rd = |k: &str| -> Option<String> {
@@ -427,7 +449,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or(json!({}));
-        let old_fp = meta.get("flow_fingerprint").and_then(|x| x.as_str()).unwrap_or("");
+        let old_fp = meta
+            .get("flow_fingerprint")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         if old_fp != flow_fp && !opts.force_resume {
             return Err(format!(
                 "{} was produced by a different version of {} (use --force-resume to override)",
@@ -437,10 +462,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         }
         resumed = load_resume(&dir)?;
         if resumed.completed {
-            return Err(format!("{} already completed - nothing to resume", dir.display()));
+            return Err(format!(
+                "{} already completed - nothing to resume",
+                dir.display()
+            ));
         }
         if resumed.start.is_none() {
-            return Err(format!("{}: cannot tell where to resume from", dir.display()));
+            return Err(format!(
+                "{}: cannot tell where to resume from",
+                dir.display()
+            ));
         }
         run_dir = dir;
         is_resume = true;
@@ -459,7 +490,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let notes_file = run_dir.join("notes.md");
 
     if opts.dry_run {
-        return dry_run(&flow, &vars, &run_dir, &flow_dir, &notes_file, &needed_sessions);
+        return dry_run(
+            &flow,
+            &vars,
+            &run_dir,
+            &flow_dir,
+            &notes_file,
+            &needed_sessions,
+        );
     }
 
     let mut log = std::fs::OpenOptions::new()
@@ -611,7 +649,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         step.id
                     );
                 }
-                log_event(&mut log, json!({"ts": utc_stamp(), "event": "max_visits", "step": step.id, "action": action}));
+                log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "max_visits", "step": step.id, "action": action}),
+                );
                 match action {
                     "continue" => {
                         log_position(&mut log, &step.id, next_label(cur + 1, &flow));
@@ -673,222 +714,73 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // ---- execute the step (leaf / parallel / foreach) ----
             // route_text: what route conditions match against - always the
             // pre-compact text, without sfh's "--- id ---" aggregate headers.
-            let (mut chain_output, route_text, errored): (String, String, bool) =
-                if let Some(children) = &step.parallel {
-                    let cx = mk_cx!(&outputs, &sessions);
-                    let mut preps = Vec::new();
-                    for c in children {
-                        let ctag = if visit == 1 {
-                            c.id.clone()
-                        } else {
-                            format!("{}.v{visit}", c.id)
-                        };
-                        preps.push(leaf::prepare_leaf(&cx, c, visit, &ctag, &[], None)?);
-                    }
-                    if total + preps.len() as u32 > max_total {
-                        return Err(format!(
+            let (mut chain_output, route_text, errored): (String, String, bool) = if let Some(
+                children,
+            ) =
+                &step.parallel
+            {
+                let cx = mk_cx!(&outputs, &sessions);
+                let mut preps = Vec::new();
+                for c in children {
+                    let ctag = if visit == 1 {
+                        c.id.clone()
+                    } else {
+                        format!("{}.v{visit}", c.id)
+                    };
+                    preps.push(leaf::prepare_leaf(&cx, c, visit, &ctag, &[], None)?);
+                }
+                if total + preps.len() as u32 > max_total {
+                    return Err(format!(
                             "step '{}' would bring total leaf runs to {} over max_total_steps ({max_total})",
                             step.id,
                             total + preps.len() as u32
                         ));
-                    }
-                    total += preps.len() as u32;
-                    let mp = step
-                        .max_parallel
-                        .or(flow.defaults.max_parallel)
-                        .unwrap_or(4) as usize;
-                    if !opts.quiet {
-                        eprintln!(
-                            "sfh: [{}] parallel: {} children, max_parallel={mp}",
-                            step.id,
-                            preps.len()
-                        );
-                    }
-                    log_event(&mut log, json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}));
-                    let dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
-                    let mut agg = String::new();
-                    let mut plain = String::new();
-                    let mut hard_fail = false;
-                    for (c, d) in children.iter().zip(dones.iter()) {
-                        if !d.ok() {
-                            eprintln!(
-                                "sfh: [{}] failed (exit={}, timed_out={})",
-                                d.tag, d.exit_code, d.timed_out
-                            );
-                            for line in leaf::tail_lines(&d.stderr_clean, 10) {
-                                eprintln!("sfh: [{}] stderr| {line}", d.tag);
-                            }
-                            if c.on_error.as_deref() != Some("continue") {
-                                hard_fail = true;
-                            }
-                        }
-                        cost_usd += d.usage.cost_usd.unwrap_or(0.0);
-                        outputs.insert(
-                            c.id.clone(),
-                            template::StepOutput {
-                                output: d.chain_output.clone(),
-                                outputs: d.chain_output.clone(),
-                                output_file: d.out_file.display().to_string(),
-                            },
-                        );
-                        if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
-                            sessions.insert(
-                                c.id.clone(),
-                                leaf::SessionInfo {
-                                    tool: tool.clone(),
-                                    id: sid.clone(),
-                                    cwd: d.cwd.clone(),
-                                },
-                            );
-                        }
-                        log_step_end(&mut log, &c.id, Some(&step.id), visit, d);
-                        agg.push_str(&format!("--- {} ---\n{}\n\n", c.id, d.chain_output.trim_end()));
-                        plain.push_str(&format!("{}\n\n", d.chain_output.trim_end()));
-                    }
-                    let agg = agg.trim_end().to_string();
-                    let plain = plain.trim_end().to_string();
-                    write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
-                    log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
-                    (agg, plain, hard_fail)
-                } else if let Some(fe) = &step.foreach {
-                    let cx = mk_cx!(&outputs, &sessions);
-                    let pf = run_dir.join(format!("{gtag}.from.txt"));
-                    let builtins = leaf::make_builtins(&cx, &step.id, visit, &pf, &[]);
-                    let tctx = template::Ctx {
-                        vars: &vars,
-                        outputs: &outputs,
-                        step_ids: &step_ids,
-                        builtins,
-                    };
-                    let from = template::render(&fe.from, &tctx)
-                        .map_err(|e| format!("step '{}' foreach.from: {e}", step.id))?;
-                    let items = split_items(&from, fe.split.as_deref())
-                        .map_err(|e| format!("step '{}': {e}", step.id))?;
-                    if items.len() > 100 {
-                        return Err(format!(
-                            "step '{}': foreach produced {} items (max 100) - check the split",
-                            step.id,
-                            items.len()
-                        ));
-                    }
-                    if items.is_empty() {
-                        eprintln!("sfh: warning: step '{}': foreach produced 0 items", step.id);
-                    }
-                    let mut preps = Vec::new();
-                    for (i, it) in items.iter().enumerate() {
-                        let tag = if visit == 1 {
-                            format!("{}.i{i}", step.id)
-                        } else {
-                            format!("{}.v{visit}.i{i}", step.id)
-                        };
-                        preps.push(leaf::prepare_leaf(
-                            &cx,
-                            step,
-                            visit,
-                            &tag,
-                            &[("item", it.clone()), ("item_index", i.to_string())],
-                            None,
-                        )?);
-                    }
-                    if total + items.len() as u32 > max_total {
-                        return Err(format!(
-                            "step '{}' would bring total leaf runs to {} over max_total_steps ({max_total})",
-                            step.id,
-                            total + items.len() as u32
-                        ));
-                    }
-                    total += items.len() as u32;
-                    let mp = step
-                        .max_parallel
-                        .or(flow.defaults.max_parallel)
-                        .unwrap_or(4) as usize;
-                    if !opts.quiet {
-                        eprintln!(
-                            "sfh: [{}] foreach: {} items, max_parallel={mp}",
-                            step.id,
-                            items.len()
-                        );
-                    }
-                    log_event(&mut log, json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": items.len()}));
-                    let dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
-                    let mut agg = String::new();
-                    let mut plain = String::new();
-                    let mut any_fail = false;
-                    for (i, d) in dones.iter().enumerate() {
-                        if !d.ok() {
-                            any_fail = true;
-                            eprintln!(
-                                "sfh: [{}] failed (exit={}, timed_out={})",
-                                d.tag, d.exit_code, d.timed_out
-                            );
-                            for line in leaf::tail_lines(&d.stderr_clean, 10) {
-                                eprintln!("sfh: [{}] stderr| {line}", d.tag);
-                            }
-                        }
-                        cost_usd += d.usage.cost_usd.unwrap_or(0.0);
-                        log_step_end(&mut log, &format!("{}[{i}]", step.id), Some(&step.id), visit, d);
-                        agg.push_str(&format!(
-                            "--- {}[{i}] item: {} ---\n{}\n\n",
-                            step.id,
-                            one_line(items.get(i).map(String::as_str).unwrap_or(""), 80),
-                            d.chain_output.trim_end()
-                        ));
-                        plain.push_str(&format!("{}\n\n", d.chain_output.trim_end()));
-                    }
-                    // A single failed item is fatal unless the step opted out.
-                    let hard_fail = any_fail && step.on_error.as_deref() != Some("continue");
-                    let agg = agg.trim_end().to_string();
-                    let plain = plain.trim_end().to_string();
-                    write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
-                    log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
-                    (agg, plain, hard_fail)
-                } else {
-                    if total + 1 > max_total {
-                        return Err(format!("exceeded max_total_steps ({max_total})"));
-                    }
-                    total += 1;
-                    let mut done = {
-                        let cx = mk_cx!(&outputs, &sessions);
-                        let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
-                        log_event(&mut log, json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe()}));
-                        leaf::exec_leaf(prep)
-                    };
-                    // fallback: retry the step with a different profile (tool/model).
-                    if !done.ok() && !done.interrupted && !step.fallback.is_empty() {
-                        for fb in &step.fallback {
-                            if execute::interrupted() {
-                                break;
-                            }
-                            if !opts.quiet {
-                                eprintln!("sfh: [{}] falling back to profile '{fb}'", step.id);
-                            }
-                            let ftag = format!("{gtag}.fb-{fb}");
-                            let cx = mk_cx!(&outputs, &sessions);
-                            let prep = leaf::prepare_leaf(&cx, step, visit, &ftag, &[], Some(fb))?;
-                            log_event(&mut log, json!({"ts": utc_stamp(), "event": "fallback", "step": step.id, "profile": fb, "cmd": prep.inv.describe()}));
-                            total += 1;
-                            let alt = leaf::exec_leaf(prep);
-                            let ok = alt.ok();
-                            done = alt;
-                            if ok {
-                                break;
-                            }
-                        }
-                    }
-                    let d = &done;
+                }
+                total += preps.len() as u32;
+                let mp = step
+                    .max_parallel
+                    .or(flow.defaults.max_parallel)
+                    .unwrap_or(4) as usize;
+                if !opts.quiet {
+                    eprintln!(
+                        "sfh: [{}] parallel: {} children, max_parallel={mp}",
+                        step.id,
+                        preps.len()
+                    );
+                }
+                log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
+                );
+                let dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                let mut agg = String::new();
+                let mut plain = String::new();
+                let mut hard_fail = false;
+                for (c, d) in children.iter().zip(dones.iter()) {
                     if !d.ok() {
                         eprintln!(
                             "sfh: [{}] failed (exit={}, timed_out={})",
                             d.tag, d.exit_code, d.timed_out
                         );
-                        for line in leaf::tail_lines(&d.stderr_clean, 15) {
+                        for line in leaf::tail_lines(&d.stderr_clean, 10) {
                             eprintln!("sfh: [{}] stderr| {line}", d.tag);
+                        }
+                        if c.on_error.as_deref() != Some("continue") {
+                            hard_fail = true;
                         }
                     }
                     cost_usd += d.usage.cost_usd.unwrap_or(0.0);
+                    outputs.insert(
+                        c.id.clone(),
+                        template::StepOutput {
+                            output: d.chain_output.clone(),
+                            outputs: d.chain_output.clone(),
+                            output_file: d.out_file.display().to_string(),
+                        },
+                    );
                     if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
                         sessions.insert(
-                            step.id.clone(),
+                            c.id.clone(),
                             leaf::SessionInfo {
                                 tool: tool.clone(),
                                 id: sid.clone(),
@@ -896,18 +788,192 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             },
                         );
                     }
-                    log_step_end(&mut log, &step.id, None, visit, d);
-                    outputs.insert(
+                    log_step_end(&mut log, &c.id, Some(&step.id), visit, d);
+                    agg.push_str(&format!(
+                        "--- {} ---\n{}\n\n",
+                        c.id,
+                        d.chain_output.trim_end()
+                    ));
+                    plain.push_str(&format!("{}\n\n", d.chain_output.trim_end()));
+                }
+                let agg = agg.trim_end().to_string();
+                let plain = plain.trim_end().to_string();
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
+                (agg, plain, hard_fail)
+            } else if let Some(fe) = &step.foreach {
+                let cx = mk_cx!(&outputs, &sessions);
+                let pf = run_dir.join(format!("{gtag}.from.txt"));
+                let builtins = leaf::make_builtins(&cx, &step.id, visit, &pf, &[]);
+                let tctx = template::Ctx {
+                    vars: &vars,
+                    outputs: &outputs,
+                    step_ids: &step_ids,
+                    builtins,
+                };
+                let from = template::render(&fe.from, &tctx)
+                    .map_err(|e| format!("step '{}' foreach.from: {e}", step.id))?;
+                let items = split_items(&from, fe.split.as_deref())
+                    .map_err(|e| format!("step '{}': {e}", step.id))?;
+                if items.len() > 100 {
+                    return Err(format!(
+                        "step '{}': foreach produced {} items (max 100) - check the split",
+                        step.id,
+                        items.len()
+                    ));
+                }
+                if items.is_empty() {
+                    eprintln!("sfh: warning: step '{}': foreach produced 0 items", step.id);
+                }
+                let mut preps = Vec::new();
+                for (i, it) in items.iter().enumerate() {
+                    let tag = if visit == 1 {
+                        format!("{}.i{i}", step.id)
+                    } else {
+                        format!("{}.v{visit}.i{i}", step.id)
+                    };
+                    preps.push(leaf::prepare_leaf(
+                        &cx,
+                        step,
+                        visit,
+                        &tag,
+                        &[("item", it.clone()), ("item_index", i.to_string())],
+                        None,
+                    )?);
+                }
+                if total + items.len() as u32 > max_total {
+                    return Err(format!(
+                            "step '{}' would bring total leaf runs to {} over max_total_steps ({max_total})",
+                            step.id,
+                            total + items.len() as u32
+                        ));
+                }
+                total += items.len() as u32;
+                let mp = step
+                    .max_parallel
+                    .or(flow.defaults.max_parallel)
+                    .unwrap_or(4) as usize;
+                if !opts.quiet {
+                    eprintln!(
+                        "sfh: [{}] foreach: {} items, max_parallel={mp}",
+                        step.id,
+                        items.len()
+                    );
+                }
+                log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": items.len()}),
+                );
+                let dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                let mut agg = String::new();
+                let mut plain = String::new();
+                let mut any_fail = false;
+                for (i, d) in dones.iter().enumerate() {
+                    if !d.ok() {
+                        any_fail = true;
+                        eprintln!(
+                            "sfh: [{}] failed (exit={}, timed_out={})",
+                            d.tag, d.exit_code, d.timed_out
+                        );
+                        for line in leaf::tail_lines(&d.stderr_clean, 10) {
+                            eprintln!("sfh: [{}] stderr| {line}", d.tag);
+                        }
+                    }
+                    cost_usd += d.usage.cost_usd.unwrap_or(0.0);
+                    log_step_end(
+                        &mut log,
+                        &format!("{}[{i}]", step.id),
+                        Some(&step.id),
+                        visit,
+                        d,
+                    );
+                    agg.push_str(&format!(
+                        "--- {}[{i}] item: {} ---\n{}\n\n",
+                        step.id,
+                        one_line(items.get(i).map(String::as_str).unwrap_or(""), 80),
+                        d.chain_output.trim_end()
+                    ));
+                    plain.push_str(&format!("{}\n\n", d.chain_output.trim_end()));
+                }
+                // A single failed item is fatal unless the step opted out.
+                let hard_fail = any_fail && step.on_error.as_deref() != Some("continue");
+                let agg = agg.trim_end().to_string();
+                let plain = plain.trim_end().to_string();
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
+                (agg, plain, hard_fail)
+            } else {
+                if total + 1 > max_total {
+                    return Err(format!("exceeded max_total_steps ({max_total})"));
+                }
+                total += 1;
+                let mut done = {
+                    let cx = mk_cx!(&outputs, &sessions);
+                    let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe()}),
+                    );
+                    leaf::exec_leaf(prep)
+                };
+                // fallback: retry the step with a different profile (tool/model).
+                if !done.ok() && !done.interrupted && !step.fallback.is_empty() {
+                    for fb in &step.fallback {
+                        if execute::interrupted() {
+                            break;
+                        }
+                        if !opts.quiet {
+                            eprintln!("sfh: [{}] falling back to profile '{fb}'", step.id);
+                        }
+                        let ftag = format!("{gtag}.fb-{fb}");
+                        let cx = mk_cx!(&outputs, &sessions);
+                        let prep = leaf::prepare_leaf(&cx, step, visit, &ftag, &[], Some(fb))?;
+                        log_event(
+                            &mut log,
+                            json!({"ts": utc_stamp(), "event": "fallback", "step": step.id, "profile": fb, "cmd": prep.inv.describe()}),
+                        );
+                        total += 1;
+                        let alt = leaf::exec_leaf(prep);
+                        let ok = alt.ok();
+                        done = alt;
+                        if ok {
+                            break;
+                        }
+                    }
+                }
+                let d = &done;
+                if !d.ok() {
+                    eprintln!(
+                        "sfh: [{}] failed (exit={}, timed_out={})",
+                        d.tag, d.exit_code, d.timed_out
+                    );
+                    for line in leaf::tail_lines(&d.stderr_clean, 15) {
+                        eprintln!("sfh: [{}] stderr| {line}", d.tag);
+                    }
+                }
+                cost_usd += d.usage.cost_usd.unwrap_or(0.0);
+                if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
+                    sessions.insert(
                         step.id.clone(),
-                        template::StepOutput {
-                            output: d.chain_output.clone(),
-                            outputs: d.chain_output.clone(),
-                            output_file: d.out_file.display().to_string(),
+                        leaf::SessionInfo {
+                            tool: tool.clone(),
+                            id: sid.clone(),
+                            cwd: d.cwd.clone(),
                         },
                     );
-                    let rt = d.chain_output.clone();
-                    (d.chain_output.clone(), rt, !d.ok())
-                };
+                }
+                log_step_end(&mut log, &step.id, None, visit, d);
+                outputs.insert(
+                    step.id.clone(),
+                    template::StepOutput {
+                        output: d.chain_output.clone(),
+                        outputs: d.chain_output.clone(),
+                        output_file: d.out_file.display().to_string(),
+                    },
+                );
+                let rt = d.chain_output.clone();
+                (d.chain_output.clone(), rt, !d.ok())
+            };
 
             // ---- compact ----
             if let Some(comp) = &step.compact {
@@ -921,12 +987,25 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         );
                     }
                     total += 1;
-                    log_event(&mut log, json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}));
-                    match run_compact(&flow, comp, &chain_output, &run_dir, &gtag, opts.quiet, opts.verbose)
-                    {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
+                    );
+                    match run_compact(
+                        &flow,
+                        comp,
+                        &chain_output,
+                        &run_dir,
+                        &gtag,
+                        opts.quiet,
+                        opts.verbose,
+                    ) {
                         Ok((sum, usage)) => {
                             cost_usd += usage.cost_usd.unwrap_or(0.0);
-                            log_event(&mut log, json!({"ts": utc_stamp(), "event": "compact_end", "step": step.id, "chars": sum.chars().count(), "cost_usd": usage.cost_usd}));
+                            log_event(
+                                &mut log,
+                                json!({"ts": utc_stamp(), "event": "compact_end", "step": step.id, "chars": sum.chars().count(), "cost_usd": usage.cost_usd}),
+                            );
                             chain_output = sum.clone();
                             if let Some(e) = outputs.get_mut(&step.id) {
                                 e.output = sum;
@@ -937,14 +1016,18 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "sfh: warning: step '{}' compact failed ({e}); using head+tail of the original",
                                 step.id
                             );
-                            log_event(&mut log, json!({"ts": utc_stamp(), "event": "compact_failed", "step": step.id, "error": e}));
+                            log_event(
+                                &mut log,
+                                json!({"ts": utc_stamp(), "event": "compact_failed", "step": step.id, "error": e}),
+                            );
                             chain_output = head_tail(&chain_output, comp.when_over as usize);
                             if let Some(en) = outputs.get_mut(&step.id) {
                                 en.output = chain_output.clone();
                             }
                         }
                     }
-                    let _ = std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), &chain_output);
+                    let _ =
+                        std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), &chain_output);
                 }
             }
 
@@ -955,7 +1038,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     .append(true)
                     .open(&notes_file)
                     .map_err(|e| format!("cannot open notes: {e}"))?;
-                let _ = writeln!(f, "## {} (visit {visit})\n{}\n", step.id, chain_output.trim_end());
+                let _ = writeln!(
+                    f,
+                    "## {} (visit {visit})\n{}\n",
+                    step.id,
+                    chain_output.trim_end()
+                );
             }
 
             last_executed = Some(step.id.clone());
@@ -979,7 +1067,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         }
                         "fail" => {
                             log_position(&mut log, &step.id, "fail".into());
-                            return Err(format!("step '{}' failed and on_error routed to fail", step.id));
+                            return Err(format!(
+                                "step '{}' failed and on_error routed to fail",
+                                step.id
+                            ));
                         }
                         id => match index_of.get(id) {
                             Some(i) => {
@@ -1020,24 +1111,25 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let last = leaf::last_line(&route_text).to_string();
                 for r in &step.route {
                     let mut ok = true;
-                    let mut check = |needle: &Option<String>, hay: &str, is_rx: bool| -> Result<(), String> {
-                        if !ok {
-                            return Ok(());
-                        }
-                        let Some(t) = needle else { return Ok(()) };
-                        let t = template::render(t, &ctx)?;
-                        let hit = if is_rx {
-                            regex::Regex::new(&t)
-                                .map_err(|e| format!("step '{}' route regex: {e}", step.id))?
-                                .is_match(hay)
-                        } else {
-                            hay.contains(&t)
+                    let mut check =
+                        |needle: &Option<String>, hay: &str, is_rx: bool| -> Result<(), String> {
+                            if !ok {
+                                return Ok(());
+                            }
+                            let Some(t) = needle else { return Ok(()) };
+                            let t = template::render(t, &ctx)?;
+                            let hit = if is_rx {
+                                regex::Regex::new(&t)
+                                    .map_err(|e| format!("step '{}' route regex: {e}", step.id))?
+                                    .is_match(hay)
+                            } else {
+                                hay.contains(&t)
+                            };
+                            if !hit {
+                                ok = false;
+                            }
+                            Ok(())
                         };
-                        if !hit {
-                            ok = false;
-                        }
-                        Ok(())
-                    };
                     check(&r.when_contains, &route_text, false)?;
                     check(&r.when_matches, &route_text, true)?;
                     check(&r.when_last_line_contains, &last, false)?;
@@ -1088,7 +1180,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         m.insert("finished_utc".into(), json!(utc_stamp()));
         m.insert("leaf_runs".into(), json!(total));
         m.insert("cost_usd".into(), json!(cost_usd));
-        m.insert("status".into(), json!(if result.is_ok() { "ok" } else { "failed" }));
+        m.insert(
+            "status".into(),
+            json!(if result.is_ok() { "ok" } else { "failed" }),
+        );
     }
     let _ = std::fs::write(
         run_dir.join("meta.json"),
@@ -1097,7 +1192,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
     match result {
         Ok(()) => {
-            log_event(&mut log, json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}));
+            log_event(
+                &mut log,
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
+            );
             finish("done", cost_usd);
             let emit_id = opts
                 .emit
@@ -1119,7 +1217,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             Ok(0)
         }
         Err(msg) => {
-            log_event(&mut log, json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}));
+            log_event(
+                &mut log,
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
+            );
             finish("failed", cost_usd);
             eprintln!("sfh: FLOW FAILED: {msg}");
             // Hand the caller whatever finished work exists - a failed run is
@@ -1184,13 +1285,15 @@ fn resume_target(opts: &RunOpts, runs_root: &Path) -> Result<Option<PathBuf>, St
         return Ok(Some(d.clone()));
     }
     if opts.resume_latest {
-        return latest_run_dir(runs_root, &opts.flow_path).map(Some).ok_or_else(|| {
-            format!(
-                "no previous run of {} found under {}",
-                opts.flow_path.display(),
-                runs_root.display()
-            )
-        });
+        return latest_run_dir(runs_root, &opts.flow_path)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "no previous run of {} found under {}",
+                    opts.flow_path.display(),
+                    runs_root.display()
+                )
+            });
     }
     Ok(None)
 }
@@ -1249,9 +1352,18 @@ fn run_compact(
         .clone()
         .or_else(|| prof.and_then(|p| p.tool.clone()))
         .ok_or("compact: no tool resolved")?;
-    let bin = comp.bin.clone().or_else(|| prof.and_then(|p| p.bin.clone()));
-    let model = comp.model.clone().or_else(|| prof.and_then(|p| p.model.clone()));
-    let effort = comp.effort.clone().or_else(|| prof.and_then(|p| p.effort.clone()));
+    let bin = comp
+        .bin
+        .clone()
+        .or_else(|| prof.and_then(|p| p.bin.clone()));
+    let model = comp
+        .model
+        .clone()
+        .or_else(|| prof.and_then(|p| p.model.clone()));
+    let effort = comp
+        .effort
+        .clone()
+        .or_else(|| prof.and_then(|p| p.effort.clone()));
     let target = comp.target_chars.unwrap_or(comp.when_over / 2).max(200);
     // Never ship an unbounded blob to the summarizer - the feature exists to
     // save money, not to spend it.
@@ -1316,7 +1428,10 @@ fn run_compact(
     };
     let d = leaf::exec_leaf(prep);
     if !d.ok() {
-        return Err(format!("summarizer exit={} timed_out={}", d.exit_code, d.timed_out));
+        return Err(format!(
+            "summarizer exit={} timed_out={}",
+            d.exit_code, d.timed_out
+        ));
     }
     let s = d.chain_output.trim().to_string();
     if s.is_empty() {
@@ -1341,7 +1456,9 @@ fn split_items(s: &str, mode: Option<&str>) -> Result<Vec<String>, String> {
                 Ok(v) => v,
                 Err(_) => {
                     let start = t.find('[').ok_or("foreach: no JSON array found in input")?;
-                    let end = t.rfind(']').ok_or("foreach: no JSON array found in input")?;
+                    let end = t
+                        .rfind(']')
+                        .ok_or("foreach: no JSON array found in input")?;
                     if end <= start {
                         return Err("foreach: no JSON array found in input".into());
                     }
@@ -1363,8 +1480,7 @@ fn split_items(s: &str, mode: Option<&str>) -> Result<Vec<String>, String> {
             if sep.is_empty() {
                 return Err("foreach: empty separator".into());
             }
-            Ok(s
-                .split(sep)
+            Ok(s.split(sep)
                 .map(|p| p.trim())
                 .filter(|p| !p.is_empty())
                 .map(String::from)
@@ -1451,7 +1567,10 @@ fn dry_run(
                 s,
                 1,
                 &format!("{}.i0", s.id),
-                &[("item", "<item>".to_string()), ("item_index", "0".to_string())],
+                &[
+                    ("item", "<item>".to_string()),
+                    ("item_index", "0".to_string()),
+                ],
                 None,
             )?;
             println!("  cmd (per item): {}", p.inv.describe());
@@ -1497,7 +1616,10 @@ fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
 }
 
 fn log_position(f: &mut std::fs::File, after: &str, next: String) {
-    log_event(f, json!({"ts": utc_stamp(), "event": "position", "after": after, "next": next}));
+    log_event(
+        f,
+        json!({"ts": utc_stamp(), "event": "position", "after": after, "next": next}),
+    );
 }
 
 fn log_step_end(

@@ -29,7 +29,11 @@ pub struct RetryCfg {
 
 impl Default for RetryCfg {
     fn default() -> Self {
-        RetryCfg { max: 0, backoff_sec: 5, mode: RetryMode::Transient }
+        RetryCfg {
+            max: 0,
+            backoff_sec: 5,
+            mode: RetryMode::Transient,
+        }
     }
 }
 
@@ -101,7 +105,9 @@ pub fn effective_with(
     profile_override: Option<&str>,
 ) -> Result<Effective, String> {
     let empty = flow::Profile::default();
-    let pname = profile_override.map(String::from).or_else(|| step.use_.clone());
+    let pname = profile_override
+        .map(String::from)
+        .or_else(|| step.use_.clone());
     let prof = match &pname {
         Some(u) => flow
             .profiles
@@ -122,14 +128,26 @@ pub fn effective_with(
     env.extend(step.env.clone());
     // A fallback profile must be able to replace the tool wholesale.
     let tool = if profile_override.is_some() {
-        prof.tool.clone().or_else(|| step.tool.clone()).or_else(|| d.tool.clone())
+        prof.tool
+            .clone()
+            .or_else(|| step.tool.clone())
+            .or_else(|| d.tool.clone())
     } else {
-        step.tool.clone().or_else(|| prof.tool.clone()).or_else(|| d.tool.clone())
+        step.tool
+            .clone()
+            .or_else(|| prof.tool.clone())
+            .or_else(|| d.tool.clone())
     };
     let model = if profile_override.is_some() {
-        prof.model.clone().or_else(|| step.model.clone()).or_else(|| d.model.clone())
+        prof.model
+            .clone()
+            .or_else(|| step.model.clone())
+            .or_else(|| d.model.clone())
     } else {
-        step.model.clone().or_else(|| prof.model.clone()).or_else(|| d.model.clone())
+        step.model
+            .clone()
+            .or_else(|| prof.model.clone())
+            .or_else(|| d.model.clone())
     };
     Ok(Effective {
         tool,
@@ -139,11 +157,20 @@ pub fn effective_with(
             step.bin.clone().or_else(|| prof.bin.clone())
         },
         model,
-        effort: step.effort.clone().or_else(|| prof.effort.clone()).or_else(|| d.effort.clone()),
-        access: preset::Access::parse(access_str).map_err(|e| format!("step '{}': {e}", step.id))?,
+        effort: step
+            .effort
+            .clone()
+            .or_else(|| prof.effort.clone())
+            .or_else(|| d.effort.clone()),
+        access: preset::Access::parse(access_str)
+            .map_err(|e| format!("step '{}': {e}", step.id))?,
         agent: step.agent.clone().or_else(|| prof.agent.clone()),
         args,
-        cwd: step.cwd.clone().or_else(|| prof.cwd.clone()).or_else(|| d.cwd.clone()),
+        cwd: step
+            .cwd
+            .clone()
+            .or_else(|| prof.cwd.clone())
+            .or_else(|| d.cwd.clone()),
         timeout_sec: step.timeout_sec.or(prof.timeout_sec).or(d.timeout_sec),
         env,
     })
@@ -166,8 +193,16 @@ pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
         _ => RetryMode::Transient,
     };
     match r {
-        Some(r) => RetryCfg { max: r.max, backoff_sec: r.backoff_sec.unwrap_or(5), mode },
-        None => RetryCfg { max: 0, backoff_sec: 5, mode },
+        Some(r) => RetryCfg {
+            max: r.max,
+            backoff_sec: r.backoff_sec.unwrap_or(5),
+            mode,
+        },
+        None => RetryCfg {
+            max: 0,
+            backoff_sec: 5,
+            mode,
+        },
     }
 }
 
@@ -365,11 +400,12 @@ pub fn prepare_leaf(
                 }
                 preset::build_resume(&tool, &info.id, inp, &paths)?
             } else {
-                let preassign = if cx.needed_sessions.contains(&step.id) && preset::wants_preassign(&tool) {
-                    Some(gen_uuid())
-                } else {
-                    None
-                };
+                let preassign =
+                    if cx.needed_sessions.contains(&step.id) && preset::wants_preassign(&tool) {
+                        Some(gen_uuid())
+                    } else {
+                        None
+                    };
                 preset::build(&tool, inp, &paths, preassign.as_deref())?
             };
             for w in &b.warnings {
@@ -396,7 +432,14 @@ pub fn prepare_leaf(
             } else {
                 preset::Delivery::None
             };
-            (preset::OutputParse::Stdout, d, None, None, Vec::new(), Vec::new())
+            (
+                preset::OutputParse::Stdout,
+                d,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
         }
     };
     env_remove.extend(step.env_remove.iter().cloned());
@@ -520,7 +563,7 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
             RetryMode::Never => false,
             RetryMode::Any => true,
             RetryMode::Transient => {
-                done.timed_out == false
+                !done.timed_out
                     && execute::is_transient_failure(&done.stderr_clean, &done.chain_output)
             }
         };
@@ -599,10 +642,13 @@ fn exec_once(p: Prepared) -> LeafDone {
     // Several tools report success/failure in-band and get the exit code wrong.
     if parsed.failed && exit_code == 0 {
         exit_code = 1;
-    } else if !parsed.failed && exit_code != 0 && !outcome.timed_out && !parsed.text.is_empty() {
-        if matches!(p.parse, preset::OutputParse::AgyJson) {
-            exit_code = 0;
-        }
+    } else if !parsed.failed
+        && exit_code != 0
+        && !outcome.timed_out
+        && !parsed.text.is_empty()
+        && matches!(p.parse, preset::OutputParse::AgyJson)
+    {
+        exit_code = 0;
     }
     let chain_output = parsed.text;
 
@@ -732,7 +778,11 @@ fn parse_claude_json(stdout: &str) -> ParsedOut {
     let t = stdout.trim();
     let Some(v) = serde_json::from_str::<serde_json::Value>(t)
         .ok()
-        .or_else(|| t.lines().rev().find_map(|l| serde_json::from_str(l.trim()).ok()))
+        .or_else(|| {
+            t.lines()
+                .rev()
+                .find_map(|l| serde_json::from_str(l.trim()).ok())
+        })
     else {
         o.text = t.to_string();
         return o;
@@ -743,7 +793,10 @@ fn parse_claude_json(stdout: &str) -> ParsedOut {
         .unwrap_or("")
         .trim()
         .to_string();
-    o.session = v.get("session_id").and_then(|x| x.as_str()).map(String::from);
+    o.session = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .map(String::from);
     o.usage.cost_usd = v.get("total_cost_usd").and_then(|x| x.as_f64());
     if let Some(u) = v.get("usage") {
         o.usage.input_tokens = num(u.get("input_tokens"));
@@ -830,8 +883,16 @@ fn parse_grok_json(stdout: &str) -> ParsedOut {
             .to_string();
         return o;
     }
-    o.text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    o.session = v.get("sessionId").and_then(|x| x.as_str()).map(String::from);
+    o.text = v
+        .get("text")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    o.session = v
+        .get("sessionId")
+        .and_then(|x| x.as_str())
+        .map(String::from);
     o.usage.cost_usd = v.get("total_cost_usd").and_then(|x| x.as_f64());
     if let Some(u) = v.get("usage") {
         o.usage.input_tokens = num(u.get("input_tokens"));
@@ -847,7 +908,11 @@ fn parse_agy_json(stdout: &str) -> ParsedOut {
     let t = stdout.trim();
     let Some(v) = serde_json::from_str::<serde_json::Value>(t)
         .ok()
-        .or_else(|| t.lines().rev().find_map(|l| serde_json::from_str(l.trim()).ok()))
+        .or_else(|| {
+            t.lines()
+                .rev()
+                .find_map(|l| serde_json::from_str(l.trim()).ok())
+        })
     else {
         o.text = t.to_string();
         return o;
@@ -1009,7 +1074,14 @@ pub fn gen_uuid() -> String {
     let h = |r: std::ops::Range<usize>| -> String {
         bytes[r].iter().map(|b| format!("{b:02x}")).collect()
     };
-    format!("{}-{}-{}-{}-{}", h(0..4), h(4..6), h(6..8), h(8..10), h(10..16))
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(0..4),
+        h(4..6),
+        h(6..8),
+        h(8..10),
+        h(10..16)
+    )
 }
 
 pub fn clean_text(b: &[u8]) -> String {
@@ -1044,7 +1116,11 @@ pub fn tail_lines(s: &str, n: usize) -> Vec<&str> {
 
 /// Last non-empty line, for deterministic verdict trailers.
 pub fn last_line(s: &str) -> &str {
-    s.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("")
+    s.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
 }
 
 #[cfg(test)]
@@ -1055,7 +1131,10 @@ mod tests {
     fn clean_text_strips_ansi_and_collapses_progress_frames() {
         let raw = b"\x1b[32mgreen\x1b[0m\nload 10%\rload 50%\rload 100%\ndone\n";
         assert_eq!(clean_text(raw), "green\nload 100%\ndone\n");
-        assert_eq!(clean_text(b"\x1b[38:2:255:0:0mtruecolor\x1b[0m\n"), "truecolor\n");
+        assert_eq!(
+            clean_text(b"\x1b[38:2:255:0:0mtruecolor\x1b[0m\n"),
+            "truecolor\n"
+        );
         assert_eq!(clean_text(b"a\r\nb\r\n"), "a\nb\n");
         assert_eq!(clean_text(b"   \n\n"), "");
     }
@@ -1086,10 +1165,14 @@ mod tests {
     #[test]
     fn parses_opencode_ndjson_and_keeps_last_message_only() {
         let s = concat!(
-            r#"{"type":"step_start","sessionID":"ses_1","part":{}}"#, "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old"}}"#, "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new "}}"#, "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer"}}"#, "\n",
+            r#"{"type":"step_start","sessionID":"ses_1","part":{}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old"}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new "}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer"}}"#,
+            "\n",
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"tokens":{"input":171,"output":6},"cost":0.5}}"#,
         );
         let o = parse_opencode_ndjson(s);
@@ -1102,7 +1185,8 @@ mod tests {
     #[test]
     fn opencode_dedupes_streamed_part_updates() {
         let s = concat!(
-            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"par"}}"#, "\n",
+            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"par"}}"#,
+            "\n",
             r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"partial full"}}"#,
         );
         assert_eq!(parse_opencode_ndjson(s).text, "partial full");
@@ -1110,20 +1194,28 @@ mod tests {
 
     #[test]
     fn parses_grok_and_agy_envelopes() {
-        let g = parse_grok_json(r#"{"text":"BANANA","sessionId":"9ac","total_cost_usd":0.012,"usage":{"input_tokens":5,"output_tokens":2}}"#);
+        let g = parse_grok_json(
+            r#"{"text":"BANANA","sessionId":"9ac","total_cost_usd":0.012,"usage":{"input_tokens":5,"output_tokens":2}}"#,
+        );
         assert_eq!(g.text, "BANANA");
         assert_eq!(g.session.as_deref(), Some("9ac"));
         assert_eq!(g.usage.cost_usd, Some(0.012));
         assert!(parse_grok_json(r#"{"type":"error","message":"boom"}"#).failed);
 
-        let a = parse_agy_json(r#"{"conversation_id":"e3c","status":"SUCCESS","response":"OK\n","usage":{"input_tokens":16913,"output_tokens":38}}"#);
+        let a = parse_agy_json(
+            r#"{"conversation_id":"e3c","status":"SUCCESS","response":"OK\n","usage":{"input_tokens":16913,"output_tokens":38}}"#,
+        );
         assert_eq!(a.text, "OK");
         assert_eq!(a.session.as_deref(), Some("e3c"));
         assert_eq!(a.usage.input_tokens, Some(16913));
         assert!(!a.failed);
-        assert!(parse_agy_json(r#"{"status":"ERROR","error":"empty prompt","response":""}"#).failed);
+        assert!(
+            parse_agy_json(r#"{"status":"ERROR","error":"empty prompt","response":""}"#).failed
+        );
         // stream-json wrapper
-        let w = parse_agy_json(r#"{"event":"result","result":{"response":"hi","status":"SUCCESS","conversation_id":"c1"}}"#);
+        let w = parse_agy_json(
+            r#"{"event":"result","result":{"response":"hi","status":"SUCCESS","conversation_id":"c1"}}"#,
+        );
         assert_eq!(w.text, "hi");
         assert_eq!(w.session.as_deref(), Some("c1"));
     }
@@ -1131,12 +1223,17 @@ mod tests {
     #[test]
     fn parses_codex_jsonl_session_and_usage() {
         let s = concat!(
-            r#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}"#, "\n",
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}"#, "\n",
+            r#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}"#,
+            "\n",
             r#"{"type":"turn.completed","usage":{"input_tokens":20224,"output_tokens":12}}"#,
         );
         let o = parse_codex_jsonl(s);
-        assert_eq!(o.session.as_deref(), Some("019fa375-ae0f-7962-bcf6-8682ff388db6"));
+        assert_eq!(
+            o.session.as_deref(),
+            Some("019fa375-ae0f-7962-bcf6-8682ff388db6")
+        );
         assert_eq!(o.text, "final answer");
         assert_eq!(o.usage.input_tokens, Some(20224));
         assert!(!o.failed);
@@ -1149,7 +1246,10 @@ mod tests {
         assert!(codex_session_from_stderr(ok).is_some());
         // A prose mention must not be scraped.
         assert!(codex_session_from_stderr("the session id: not-a-uuid here\n").is_none());
-        assert!(codex_session_from_stderr("session id:\n019fa375-ae0f-7962-bcf6-8682ff388db6\n").is_none());
+        assert!(
+            codex_session_from_stderr("session id:\n019fa375-ae0f-7962-bcf6-8682ff388db6\n")
+                .is_none()
+        );
     }
 
     #[test]
