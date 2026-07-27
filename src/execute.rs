@@ -93,7 +93,7 @@ pub fn install_process_guard() {
 mod unix_guard {
     use super::*;
 
-    extern "C" fn on_signal(_sig: i32) {
+    extern "C" fn on_signal(_sig: libc::c_int) {
         INTERRUPTED.store(true, Ordering::SeqCst);
         // Async-signal-safe: only kill(2) on a lock-free pid table.
         for slot in TRACKED.iter() {
@@ -107,10 +107,14 @@ mod unix_guard {
     }
 
     pub fn install() {
+        // Go through a typed fn pointer: casting the fn *item* straight to an
+        // integer is a clippy error and easy to get wrong.
+        let handler: extern "C" fn(libc::c_int) = on_signal;
+        let handler = handler as libc::sighandler_t;
         unsafe {
-            libc::signal(libc::SIGINT, on_signal as usize);
-            libc::signal(libc::SIGTERM, on_signal as usize);
-            libc::signal(libc::SIGHUP, on_signal as usize);
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGHUP, handler);
         }
     }
 }
