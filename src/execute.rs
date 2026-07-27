@@ -342,10 +342,11 @@ pub fn kill_pid_tree(pid: u32) -> bool {
 ///
 /// SIGTERM first, deliberately. Every child sfh spawns gets its OWN session
 /// (setsid, so a timeout can kill its subtree), which means the children are
-/// not in the detached run's process group and `kill(-pid)` never reaches them
-/// - it kills sfh and leaves the agents running. Signalling sfh instead lets
-/// its own handler kill each tracked child's group, which is where the
-/// grandchildren live. SIGKILL is only the backstop for a wedged process.
+/// not in the detached run's process group. `kill(-pid)` therefore never
+/// reaches them: it kills sfh and leaves the agents running. Signalling sfh
+/// instead lets its own handler kill each tracked child's group, which is
+/// where the grandchildren live. SIGKILL is only the backstop for a process
+/// too wedged to handle a signal.
 #[cfg(unix)]
 pub fn kill_pid_tree(pid: u32) -> bool {
     unsafe {
