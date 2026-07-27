@@ -435,10 +435,38 @@ pub fn prepare_leaf(
                     preset::session_is_cwd_scoped(&tool)
                 };
                 if cwd_scoped && info.cwd != new_cwd {
+                    // For tools that silently create on a lookup miss, a cwd
+                    // change is not a risk to warn about - it guarantees a cold
+                    // session wearing the right id.
+                    if !is_fork && preset::resume_requires_same_cwd(&tool) {
+                        return Err(format!(
+                            "step '{}': {tool} looks sessions up per directory, and a miss silently starts a NEW chat; '{target}' ran in {:?} but this step uses {:?}",
+                            step.id, info.cwd, new_cwd
+                        ));
+                    }
                     eprintln!(
                         "sfh: warning: step '{}': {tool} sessions are cwd-scoped; original ran in {:?}, this step uses {:?} - the session may not be found",
                         step.id, info.cwd, new_cwd
                     );
+                }
+                // cursor's marker is the chat store path: if it is gone, the
+                // resume would quietly become a fresh chat.
+                if !is_fork && tool == "cursor" {
+                    match info.marker.as_deref() {
+                        Some(p) if std::path::Path::new(p).is_file() => {}
+                        Some(p) => {
+                            return Err(format!(
+                                "step '{}': cursor chat store for '{target}' is gone ({p}); resuming would silently start a NEW chat",
+                                step.id
+                            ))
+                        }
+                        None => {
+                            return Err(format!(
+                                "step '{}': cursor chat store for '{target}' was never located, so a resume cannot be verified",
+                                step.id
+                            ))
+                        }
+                    }
                 }
                 if is_fork {
                     let child = gen_uuid();
@@ -849,6 +877,14 @@ fn exec_once(p: Prepared) -> LeafDone {
     } else {
         None
     };
+    // cursor has no in-band proof that a chat exists, so record where it landed
+    // on disk; a later resume checks that path before spending anything.
+    let mut session_marker = parsed.session_marker.clone();
+    if p.tool.as_deref() == Some("cursor") {
+        if let Some(id) = &session_id {
+            session_marker = preset::cursor_chat_store(id).map(|p| p.display().to_string());
+        }
+    }
     if exit_code == 0 && !outcome.timed_out {
         let mut resume_mismatch = |what: &str, exp: &str, got: &str| {
             exit_code = 1;
@@ -936,7 +972,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         stderr_clean,
         out_file: p.out_file,
         session_id,
-        session_marker: parsed.session_marker,
+        session_marker,
         tool: p.tool,
         cwd: cwd_str,
         usage: parsed.usage,

@@ -214,6 +214,7 @@ steps:
 | grok | sfhがUUIDを`--session-id`で事前割当 | `--resume <id>` | cwdスコープ |
 | agy | JSONの`conversation_id` | `--conversation <id>` | 不正IDは黙って新規会話→sfhがID照合して失敗検出 |
 | pi | sfhがIDを`--session-id`で事前割当 | 同じ`--session-id`(作成と再開が同一フラグ) | cwdスコープ。**IDが一致しても別セッションでありうる**ため、sfhはヘッダのタイムスタンプ(マーカー)も照合する |
+| cursor | sfhがIDを`--resume`で事前割当 | 同じ`--resume`(作成と再開が同一フラグ) | cwdスコープ。存在しないIDは黙って新規チャットになるため、sfhはチャット実体の存在を事前確認し、cwdが違えば拒否する |
 
 ### セッション分岐: `fork_from:`(fan-outのコンテキスト再利用)
 
@@ -325,8 +326,8 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 - **effortの語彙はツール毎に違う**: codex(none/minimal/low/medium/high/xhigh/max/ultra)、claude(low〜max)、grok/agy(low/medium/high)、pi(off〜max、`--thinking`)、opencodeは`--variant`(モデル毎)。範囲外はvalidateで警告。
 - **pi(`@earendil-works/pi-coding-agent`)にはサンドボックスも権限プロンプトも存在しない**(設計思想として意図的)。素の`pi`は既にread+bash+edit+writeが有効なので、sfhは`--tools`の許可リストで権限を表現する。`read`はツール登録レベルで確実だが、`write`は**書き込み先を制限しない**(ワークスペース境界がない)。またwriteではシェルを登録しない — サンドボックスがない以上bashはfullと同義だから。必要なら`args: ["-t", "read,bash,edit,write,grep,find,ls"]`で明示的に足す。
 - **piの`agent:`は無効**(`--agent`が無い)。ペルソナは`args: ["--append-system-prompt", "..."]`で。
-- **cursor(`cursor-agent`)の権限は非対話モードでは2段階しかない**: `--force`なしは全拒否、ありは全承認。したがって`write`は実質`full`と同等で、sfhは警告を出します。中間段階が必要なら別ツールを使ってください。`effort:`と`agent:`も非対応(effortはモデルID側に`-thinking`等で埋め込む)。`continue_from`は**意図的に非対応** — 存在しないチャットIDでの再開が黙って新規チャットになり、しかもそのIDをそのまま返すため、sfhが「本当に再開できたか」を判定できないからです。
-- **cursorだけは実AI検証ができていません**(この開発機の認証が2026-07-19に期限切れのため)。フラグはインストール済みバンドルの逆コンパイルとargv解析の実挙動で確認済みで、認証が切れている場合は上記の通り**明確なエラーで落ちます**(黙って壊れない)。`cursor-agent login` 後に実呼び出しで検証すれば正式対応になります。
+- **cursor(`cursor-agent`)の権限は非対話モードでは2段階しかない**: `--force`なしは全拒否、ありは全承認。したがって`write`は実質`full`と同等で、sfhは警告を出します。中間段階が必要なら別ツールを使ってください。`effort:`と`agent:`も非対応(effortはモデルID側に`-thinking`等で埋め込む)。
+- **cursorの`continue_from`は再開先の実在をsfhが検証してから実行します。** cursorは`--resume`が「作成も再開も兼ねる」ため、存在しないIDを渡すと**黙って新規チャットを作り、そのIDをそのまま返します**。そこでsfhはチャット実体(`~/.cursor/chats/<cwdハッシュ>/<id>/store.db`)のパスを記録し、再開前に存在を確認します。加えてcursorのセッションは**cwd単位**なので、作成時と違うディレクトリからの再開は警告ではなく**エラーで拒否**します(そのまま走らせると文脈ゼロの別チャットになるため)。実測では再開時の入力トークンが 19,817 → 876 まで下がり、非常に効率的です。
 - **opencodeのmodelは`provider/model`形式必須**。effortは`--variant`に渡る。
 - **agy**: モデルIDにeffortサフィックスがある(例: gemini-3.1-pro-high)場合は`effort:`を併用しない(agyが衝突エラーを出す)。
 - **claude**のネスト実行対策として`CLAUDE_CODE_SESSION_ID`等の環境変数は自動除去。
@@ -382,7 +383,7 @@ codex-local:
 
 ## 既知の注意点
 
-- **検証済みバージョン**: codex-cli 0.146.0-alpha.3.1 / claude 2.1.220 / opencode 1.18.3 / grok 0.2.112 / agy 1.0.8 / pi 0.82.1。エージェントCLIのフラグは変わりやすい。ズレたら `args:` で足すか `cmd:` で全部書けば逃げられる。
+- **検証済みバージョン**(全て実AI呼び出しで確認): codex-cli 0.146.0-alpha.3.1 / claude 2.1.220 / opencode 1.18.3 / grok 0.2.112 / agy 1.0.8 / pi 0.82.1 / cursor-agent 2026.05.28。エージェントCLIのフラグは変わりやすい。ズレたら `args:` で足すか `cmd:` で全部書けば逃げられる。
 - **タイムアウト**: Windowsは`taskkill /T /F`、Unixはprocess group killで子孫ごと落とす。子の終了後にパイプを握り続ける孫プロセスがいてもドレイン期限で先に進む。出力は1ストリーム32MBでキャップ。
 - **opencodeのread**は`OPENCODE_CONFIG_CONTENT`でedit/bashを拒否注入(1.18.3のplan agentはbashを塞がないため。実機でBLOCKED確認済み)。完全な保証が要る変更はwrite/fullレビューを挟むこと。
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。

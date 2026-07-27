@@ -23,8 +23,9 @@
 //!   sandbox at all, so access levels are expressed as a --tools allowlist.
 //! - cursor: prompt on stdin, but ONLY when no positional prompt is given;
 //!   --output-format json returns one .result envelope; headless permissions are
-//!   binary (deny-all without --force, approve-all with it); resume is refused
-//!   because an unknown chat id silently becomes a new chat.
+//!   binary (deny-all without --force, approve-all with it); --resume creates or
+//!   resumes, so a resume is only trustworthy once sfh has checked that the
+//!   chat's store.db still exists in the same directory bucket.
 
 use std::path::{Path, PathBuf};
 
@@ -124,13 +125,42 @@ pub struct BuildPaths<'a> {
 
 /// True when this tool lets sfh choose the session id up front.
 pub fn wants_preassign(tool: &str) -> bool {
-    matches!(tool, "claude" | "grok" | "pi")
+    matches!(tool, "claude" | "grok" | "pi" | "cursor")
+}
+
+/// Tools where a resume MUST run in the same directory as the original, because
+/// a lookup miss silently creates a fresh session instead of failing. For these
+/// sfh refuses rather than warns.
+pub fn resume_requires_same_cwd(tool: &str) -> bool {
+    tool == "cursor"
+}
+
+/// Where cursor keeps a chat: <config>/chats/<hash of cwd>/<chat-id>/store.db.
+/// sfh records the resolved path when a chat is created and re-checks it before
+/// resuming: `--resume <unknown id>` silently CREATES a chat and echoes the id
+/// back, so the store's existence is the only proof a resume is real.
+pub fn cursor_chat_store(session_id: &str) -> Option<PathBuf> {
+    let root = std::env::var_os("CURSOR_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(|x| PathBuf::from(x).join("cursor")))
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|h| PathBuf::from(h).join(".cursor"))
+        })?
+        .join("chats");
+    for bucket in std::fs::read_dir(root).ok()?.flatten() {
+        let db = bucket.path().join(session_id).join("store.db");
+        if db.is_file() {
+            return Some(db);
+        }
+    }
+    None
 }
 
 /// Tools whose RESUME lookup is scoped to the working directory (verified live
 /// for pi: the same --session-id in another cwd silently creates a new session).
 pub fn session_is_cwd_scoped(tool: &str) -> bool {
-    matches!(tool, "claude" | "grok" | "agy" | "pi")
+    matches!(tool, "claude" | "grok" | "agy" | "pi" | "cursor")
 }
 
 /// Fork resolution is more tolerant than resume: pi's --fork looks up the id
@@ -609,6 +639,13 @@ pub fn build(
                 }
                 Access::Full => push(&mut a, &["--force"]),
             }
+            // --resume both creates and resumes, so naming the chat up front is
+            // what makes it findable later.
+            if let Some(id) = preassign_session {
+                push(&mut a, &["--resume"]);
+                a.push(id.to_string());
+                preassigned = Some(id.to_string());
+            }
             a.extend(inp.extra.iter().cloned());
             parse = OutputParse::CursorJson;
             delivery = Delivery::Stdin;
@@ -857,15 +894,35 @@ pub fn build_resume(
             delivery = Delivery::Stdin;
         }
         "cursor" => {
-            // `--resume <id>` CREATES the chat store when the id is unknown and
-            // echoes the id sfh passed in either way, so a failed resume is
-            // indistinguishable from a successful one - the exact silent-wrong
-            // failure sfh exists to prevent. Refuse until sfh can pre-flight the
-            // chat store (<config>/chats/<md5(cwd)>/<id>/store.db).
-            return Err(
-                "tool 'cursor' does not support continue_from yet: a resume of an unknown chat id silently starts a NEW chat and reports that id back, so sfh cannot tell a real resume from a cold start. Pass the needed context in the prompt instead."
-                    .into(),
+            // Same argv as a fresh run: --resume creates or resumes. The caller
+            // has already pre-flighted the chat store, because an unknown id
+            // silently starts a NEW chat and echoes the id back either way.
+            push(
+                &mut a,
+                &[
+                    "cursor-agent",
+                    "-p",
+                    "--output-format",
+                    "json",
+                    "--trust",
+                    "--disable-auto-update",
+                    "--disable-project-configs",
+                ],
             );
+            if let Some(m) = &inp.model {
+                push(&mut a, &["--model"]);
+                a.push(m.clone());
+            }
+            match inp.access {
+                Access::Read => push(&mut a, &["--mode", "plan"]),
+                Access::Write | Access::Full => push(&mut a, &["--force"]),
+            }
+            push(&mut a, &["--resume"]);
+            a.push(session_id.to_string());
+            a.extend(inp.extra.iter().cloned());
+            expect_session = Some(session_id.to_string());
+            parse = OutputParse::CursorJson;
+            delivery = Delivery::Stdin;
         }
         other => return Err(format!("tool '{other}' does not support continue_from")),
     }
@@ -1224,16 +1281,22 @@ mod tests {
     }
 
     #[test]
-    fn cursor_refuses_resume_because_it_cannot_be_verified() {
+    fn cursor_resume_reuses_the_resume_flag_and_expects_its_id_back() {
         let (l, p) = paths();
         let bp = BuildPaths {
             last_msg: &l,
             prompt_file: &p,
         };
-        let e = build_resume("cursor", "chat-1", inp(Access::Read, &[]), &bp)
-            .err()
-            .unwrap();
-        assert!(e.contains("silently starts a NEW chat"), "{e}");
+        let b = build_resume("cursor", "chat-1", inp(Access::Read, &[]), &bp).unwrap();
+        assert!(b
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--resume" && w[1] == "chat-1"));
+        assert_eq!(b.expect_session.as_deref(), Some("chat-1"));
+        assert_eq!(b.delivery, Delivery::Stdin);
+        // A miss silently creates a chat, so sfh pins the directory too.
+        assert!(resume_requires_same_cwd("cursor"));
+        assert!(!resume_requires_same_cwd("claude"));
         assert!(!supports_fork("cursor"));
     }
 
