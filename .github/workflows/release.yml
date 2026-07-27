@@ -19,9 +19,12 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: sfh-macos-arm64.tar.gz
-          - os: macos-13
+          # Intel Mac is cross-built from the arm64 runner: the macos-13
+          # runner pool queues for tens of minutes or never starts.
+          - os: macos-latest
             target: x86_64-apple-darwin
             asset: sfh-macos-x64.tar.gz
+            cross: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: sfh-linux-x64.tar.gz
@@ -48,7 +51,9 @@ jobs:
           tar czf ${{ matrix.asset }} -C pkg sfh README.md LICENSE
           shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
           # Verify the archive the way the README tells users to extract it.
-          mkdir verify && tar xzf ${{ matrix.asset }} -C verify sfh && ./verify/sfh --version
+          # A cross-built binary cannot run on this host, so only unpack it.
+          mkdir verify && tar xzf ${{ matrix.asset }} -C verify sfh
+          if [ "${{ matrix.cross }}" != "true" ]; then ./verify/sfh --version; else file verify/sfh; fi
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
