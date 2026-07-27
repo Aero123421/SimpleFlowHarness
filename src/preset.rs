@@ -21,6 +21,10 @@
 //! - pi: prompt on stdin; --mode json emits JSONL (session header, then
 //!   message_end events); --session-id both creates and resumes; there is no
 //!   sandbox at all, so access levels are expressed as a --tools allowlist.
+//! - cursor: prompt on stdin, but ONLY when no positional prompt is given;
+//!   --output-format json returns one .result envelope; headless permissions are
+//!   binary (deny-all without --force, approve-all with it); resume is refused
+//!   because an unknown chat id silently becomes a new chat.
 
 use std::path::{Path, PathBuf};
 
@@ -59,6 +63,8 @@ pub enum OutputParse {
     AgyJson,
     /// pi --mode json: JSONL events (session header + message_end per turn).
     PiJsonl,
+    /// cursor-agent --output-format json: single-line result envelope.
+    CursorJson,
 }
 
 /// How the rendered prompt reaches the tool.
@@ -121,9 +127,31 @@ pub fn wants_preassign(tool: &str) -> bool {
     matches!(tool, "claude" | "grok" | "pi")
 }
 
-/// Tools whose session lookup is scoped to the working directory.
+/// Tools whose RESUME lookup is scoped to the working directory (verified live
+/// for pi: the same --session-id in another cwd silently creates a new session).
 pub fn session_is_cwd_scoped(tool: &str) -> bool {
     matches!(tool, "claude" | "grok" | "agy" | "pi")
+}
+
+/// Fork resolution is more tolerant than resume: pi's --fork looks up the id
+/// project-locally then globally, and opencode session ids are global.
+pub fn fork_is_cwd_scoped(tool: &str) -> bool {
+    matches!(tool, "claude" | "grok")
+}
+
+/// Tools that can branch a session headlessly into a NEW independent session.
+/// codex's `fork` is TUI-only and `exec resume` appends to the parent; agy has
+/// no fork at all.
+pub fn supports_fork(tool: &str) -> bool {
+    matches!(tool, "claude" | "opencode" | "grok" | "pi")
+}
+
+/// Forking pays off because the child's prompt prefix is byte-identical to the
+/// parent's, so the provider's prompt cache can hit - but N children racing the
+/// first cache write all miss it. Measured on claude: one warm-up child first
+/// turned $0.0337 per child into $0.0026. Only claude showed a real saving.
+pub fn fork_warmup_pays(tool: &str) -> bool {
+    tool == "claude"
 }
 
 /// pi has no sandbox and no permission prompts: the only real lever is which
@@ -179,6 +207,80 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
     }
 }
 
+/// model/effort/agent/access flags shared by claude's fresh, resume and fork paths.
+fn claude_common(a: &mut Vec<String>, inp: &PresetInput) {
+    if let Some(m) = &inp.model {
+        push(a, &["--model"]);
+        a.push(m.clone());
+    }
+    if let Some(e) = &inp.effort {
+        push(a, &["--effort"]);
+        a.push(e.clone());
+    }
+    if let Some(ag) = &inp.agent {
+        push(a, &["--agent"]);
+        a.push(ag.clone());
+    }
+    match inp.access {
+        // plan mode is only advisory when bypass is available, so read is a
+        // dontAsk + builtin-tool whitelist instead.
+        Access::Read => push(
+            a,
+            &["--permission-mode", "dontAsk", "--tools", CLAUDE_READ_TOOLS],
+        ),
+        Access::Write => push(
+            a,
+            &[
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                CLAUDE_WRITE_ALLOWED,
+            ],
+        ),
+        Access::Full => push(a, &["--dangerously-skip-permissions"]),
+    }
+}
+
+/// model/effort/agent/access flags shared by grok's fresh, resume and fork paths.
+fn grok_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>) {
+    if let Some(m) = &inp.model {
+        push(a, &["-m"]);
+        a.push(m.clone());
+    }
+    if let Some(e) = &inp.effort {
+        push(a, &["--reasoning-effort"]);
+        a.push(e.clone());
+    }
+    if let Some(ag) = &inp.agent {
+        push(a, &["--agent"]);
+        a.push(ag.clone());
+    }
+    // --permission-mode plan is compat-only in headless and --sandbox is a no-op
+    // on Windows, so read = dontAsk + hard deny rules (deny always wins).
+    match inp.access {
+        Access::Read => push(
+            a,
+            &[
+                "--permission-mode",
+                "dontAsk",
+                "--deny",
+                "Edit",
+                "--deny",
+                "Write",
+                "--deny",
+                "Bash",
+            ],
+        ),
+        Access::Write => {
+            push(a, &["--permission-mode", "acceptEdits"]);
+            warnings.push(
+                "grok write auto-approves edits only; shell commands are not auto-approved (add args: [\"--allow\", \"Bash(...)\"] if the step must run commands)".into(),
+            );
+        }
+        Access::Full => push(a, &["--permission-mode", "bypassPermissions"]),
+    }
+}
+
 const CLAUDE_ENV_SCRUB: [&str; 8] = [
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_CHILD_SESSION",
@@ -198,13 +300,14 @@ const CLAUDE_READ_TOOLS: &str = "Read,Glob,Grep,WebSearch,WebFetch,TodoWrite";
 const CLAUDE_WRITE_ALLOWED: &str = "Bash,WebSearch,WebFetch";
 
 /// Flags a user could put in `args:` that silently escalate past `access:`.
-pub const ESCALATION_FLAGS: [&str; 6] = [
+pub const ESCALATION_FLAGS: [&str; 7] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
     "bypassPermissions",
     "danger-full-access",
     "--always-approve",
     "--yolo",
+    "--force",
 ];
 
 fn push(a: &mut Vec<String>, items: &[&str]) {
@@ -462,6 +565,54 @@ pub fn build(
             parse = OutputParse::AgyJson;
             delivery = Delivery::Arg;
         }
+        "cursor" => {
+            // --trust: headless refuses to run in an untrusted directory.
+            // --disable-project-configs: a repo-supplied .cursor/cli.json can set
+            // approvalMode "unrestricted", which silently equals --force.
+            // --disable-auto-update: the launcher can otherwise swap the binary
+            // mid-flow by piping an installer into PowerShell.
+            push(
+                &mut a,
+                &[
+                    "cursor-agent",
+                    "-p",
+                    "--output-format",
+                    "json",
+                    "--trust",
+                    "--disable-auto-update",
+                    "--disable-project-configs",
+                ],
+            );
+            if let Some(m) = &inp.model {
+                push(&mut a, &["--model"]);
+                a.push(m.clone());
+            }
+            if inp.effort.is_some() {
+                warnings.push(
+                    "cursor preset ignores 'effort' (encode it in the model id, e.g. sonnet-4-thinking)"
+                        .into(),
+                );
+            }
+            if inp.agent.is_some() {
+                warnings.push("cursor preset ignores 'agent' (no --agent flag)".into());
+            }
+            match inp.access {
+                // Headless has exactly two tiers: without --force every gated
+                // operation is denied outright; with it, everything is approved.
+                Access::Read => push(&mut a, &["--mode", "plan"]),
+                Access::Write => {
+                    push(&mut a, &["--force"]);
+                    warnings.push(
+                        "cursor headless has no middle permission tier: 'write' is as permissive as 'full' (--force approves shell commands too)"
+                            .into(),
+                    );
+                }
+                Access::Full => push(&mut a, &["--force"]),
+            }
+            a.extend(inp.extra.iter().cloned());
+            parse = OutputParse::CursorJson;
+            delivery = Delivery::Stdin;
+        }
         "pi" => {
             // --mode json already forces non-interactive; -p is avoided because
             // it swallows the next argv token.
@@ -705,6 +856,17 @@ pub fn build_resume(
             parse = OutputParse::PiJsonl;
             delivery = Delivery::Stdin;
         }
+        "cursor" => {
+            // `--resume <id>` CREATES the chat store when the id is unknown and
+            // echoes the id sfh passed in either way, so a failed resume is
+            // indistinguishable from a successful one - the exact silent-wrong
+            // failure sfh exists to prevent. Refuse until sfh can pre-flight the
+            // chat store (<config>/chats/<md5(cwd)>/<id>/store.db).
+            return Err(
+                "tool 'cursor' does not support continue_from yet: a resume of an unknown chat id silently starts a NEW chat and reports that id back, so sfh cannot tell a real resume from a cold start. Pass the needed context in the prompt instead."
+                    .into(),
+            );
+        }
         other => return Err(format!("tool '{other}' does not support continue_from")),
     }
     if let Some(bin) = inp.bin {
@@ -718,6 +880,108 @@ pub fn build_resume(
         env_remove,
         env_set,
         expect_session,
+        expect_marker: None,
+        warnings,
+    })
+}
+
+/// Build the command line to FORK a session: the child inherits the parent's
+/// history but writes to its own session, so N children can diverge from one
+/// context concurrently without corrupting each other or the parent.
+///
+/// All four supporting tools refuse loudly (exit 1, before any model call) when
+/// the parent id does not exist, so - unlike pi's create-or-resume --session-id -
+/// a fork cannot silently degrade into a cold session. The remaining risk is the
+/// fork flag being ignored, which the caller detects by requiring child != parent.
+pub fn build_fork(
+    tool: &str,
+    parent_session_id: &str,
+    child_session_id: &str,
+    inp: PresetInput,
+    paths: &BuildPaths,
+) -> Result<Built, String> {
+    let mut a: Vec<String> = Vec::new();
+    let mut warnings = Vec::new();
+    let mut env_remove = Vec::new();
+    let mut env_set = Vec::new();
+    let parse;
+    let delivery;
+    // opencode mints the child id itself; the others let sfh name it.
+    let mut preassigned = Some(child_session_id.to_string());
+    match tool {
+        "claude" => {
+            push(&mut a, &["claude", "-p", "--output-format", "json", "-r"]);
+            a.push(parent_session_id.to_string());
+            push(&mut a, &["--fork-session", "--session-id"]);
+            a.push(child_session_id.to_string());
+            claude_common(&mut a, &inp);
+            a.extend(inp.extra.iter().cloned());
+            env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
+            parse = OutputParse::ClaudeJson;
+            delivery = Delivery::Stdin;
+        }
+        "opencode" => {
+            push(&mut a, &["opencode", "run", "--format", "json", "-s"]);
+            a.push(parent_session_id.to_string());
+            push(&mut a, &["--fork"]);
+            if let Some(m) = &inp.model {
+                push(&mut a, &["-m"]);
+                a.push(m.clone());
+            }
+            if let Some(e) = &inp.effort {
+                push(&mut a, &["--variant"]);
+                a.push(e.clone());
+            }
+            let agent_name = opencode_agent(&mut a, &inp);
+            push(&mut a, &["--auto"]);
+            env_set = opencode_env(&agent_name, inp.access);
+            a.extend(inp.extra.iter().cloned());
+            preassigned = None; // the child id only exists in the output stream
+            parse = OutputParse::OpencodeNdjson;
+            delivery = Delivery::Stdin;
+        }
+        "grok" => {
+            push(&mut a, &["grok", "--output-format", "json", "--resume"]);
+            a.push(parent_session_id.to_string());
+            push(&mut a, &["--fork-session", "--session-id"]);
+            a.push(child_session_id.to_string());
+            grok_common(&mut a, &inp, &mut warnings);
+            a.extend(inp.extra.iter().cloned());
+            push(&mut a, &["--prompt-file"]);
+            a.push(paths.prompt_file.display().to_string());
+            parse = OutputParse::GrokJson;
+            delivery = Delivery::PromptFile;
+        }
+        "pi" => {
+            push(&mut a, &["pi", "--mode", "json", "--offline", "--fork"]);
+            a.push(parent_session_id.to_string());
+            pi_common(&mut a, &inp, &mut warnings);
+            push(&mut a, &["--session-id"]);
+            a.push(child_session_id.to_string());
+            a.extend(inp.extra.iter().cloned());
+            parse = OutputParse::PiJsonl;
+            delivery = Delivery::Stdin;
+        }
+        other => {
+            return Err(format!(
+                "tool '{other}' cannot fork a session headlessly (only {}); use continue_from to chain serially, or give this step its own context",
+                ["claude", "opencode", "grok", "pi"].join("/")
+            ))
+        }
+    }
+    if let Some(bin) = inp.bin {
+        a[0] = bin;
+    }
+    Ok(Built {
+        argv: a,
+        parse,
+        delivery,
+        preassigned_session: preassigned,
+        env_remove,
+        env_set,
+        // A fork must NOT come back as the parent - that would mean the fork flag
+        // was ignored and this run appended to the shared parent instead.
+        expect_session: None,
         expect_marker: None,
         warnings,
     })
@@ -918,6 +1182,104 @@ mod tests {
         let b = build("codex", i, &bp, None).unwrap();
         assert_eq!(b.argv[0], "/opt/codex.exe");
         assert_eq!(b.argv[1], "exec");
+    }
+
+    #[test]
+    fn cursor_pins_trust_and_disables_config_escalation() {
+        let read = build_argv("cursor", Access::Read);
+        assert!(read
+            .windows(2)
+            .any(|w| w[0] == "--output-format" && w[1] == "json"));
+        assert!(
+            read.iter().any(|x| x == "--trust"),
+            "headless refuses untrusted dirs"
+        );
+        // A repo-supplied .cursor/cli.json can set approvalMode "unrestricted".
+        assert!(read.iter().any(|x| x == "--disable-project-configs"));
+        assert!(read.iter().any(|x| x == "--disable-auto-update"));
+        assert!(read.windows(2).any(|w| w[0] == "--mode" && w[1] == "plan"));
+        assert!(!read.iter().any(|x| x == "--force"));
+        // The prompt must never become a positional: cursor reads stdin only
+        // when the positional prompt is empty.
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        assert_eq!(
+            build("cursor", inp(Access::Read, &[]), &bp, None)
+                .unwrap()
+                .delivery,
+            Delivery::Stdin
+        );
+
+        for acc in [Access::Write, Access::Full] {
+            assert!(build_argv("cursor", acc).iter().any(|x| x == "--force"));
+        }
+        let w = build("cursor", inp(Access::Write, &[]), &bp, None).unwrap();
+        assert!(w
+            .warnings
+            .iter()
+            .any(|x| x.contains("no middle permission tier")));
+    }
+
+    #[test]
+    fn cursor_refuses_resume_because_it_cannot_be_verified() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        let e = build_resume("cursor", "chat-1", inp(Access::Read, &[]), &bp)
+            .err()
+            .unwrap();
+        assert!(e.contains("silently starts a NEW chat"), "{e}");
+        assert!(!supports_fork("cursor"));
+    }
+
+    #[test]
+    fn fork_builds_a_child_session_for_every_supporting_tool() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        for t in ["claude", "opencode", "grok", "pi"] {
+            assert!(supports_fork(t), "{t}");
+            let b = build_fork(t, "PARENT", "CHILD", inp(Access::Read, &[]), &bp).unwrap();
+            assert!(
+                b.argv.iter().any(|x| x == "PARENT"),
+                "{t}: parent id missing"
+            );
+            match t {
+                // opencode mints the child id itself; it cannot be named.
+                "opencode" => {
+                    assert!(b.preassigned_session.is_none());
+                    assert!(b.argv.iter().any(|x| x == "--fork"));
+                }
+                _ => {
+                    assert_eq!(b.preassigned_session.as_deref(), Some("CHILD"), "{t}");
+                    assert!(b.argv.iter().any(|x| x == "CHILD"), "{t}");
+                }
+            }
+            // A fork must never be asserted to equal the parent session.
+            assert!(b.expect_session.is_none(), "{t}");
+        }
+        for t in ["codex", "agy", "cursor"] {
+            assert!(!supports_fork(t), "{t}");
+            let e = build_fork(t, "P", "C", inp(Access::Read, &[]), &bp)
+                .err()
+                .unwrap();
+            assert!(e.contains("cannot fork"), "{t}: {e}");
+        }
+    }
+
+    #[test]
+    fn only_claude_warms_up_by_default() {
+        assert!(fork_warmup_pays("claude"));
+        for t in ["opencode", "grok", "pi"] {
+            assert!(!fork_warmup_pays(t), "{t} showed no measured saving");
+        }
     }
 
     #[test]

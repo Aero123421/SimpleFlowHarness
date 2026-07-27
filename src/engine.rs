@@ -219,7 +219,8 @@ fn effort_vocab_warning(tool: &str, e: &str) -> Option<String> {
         "agy" => &["low", "medium", "high"],
         // pi warns and silently falls back to its default on an unknown level.
         "pi" => &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
-        _ => return None, // opencode: per-model variants
+        // opencode: per-model variants; cursor: effort lives in the model slug
+        _ => return None,
     };
     if known.contains(&e) {
         None
@@ -427,14 +428,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
     // Which steps must produce resumable sessions (continue_from targets).
     let mut needed_sessions: HashSet<String> = HashSet::new();
-    for s in &flow.steps {
-        if let Some(t) = &s.continue_from {
-            needed_sessions.insert(t.clone());
-        }
-        if let Some(children) = &s.parallel {
-            for c in children {
-                if let Some(t) = &c.continue_from {
-                    needed_sessions.insert(t.clone());
+    {
+        let mut note = |s: &flow::Step| {
+            for t in [&s.continue_from, &s.fork_from].into_iter().flatten() {
+                needed_sessions.insert(t.clone());
+            }
+        };
+        for s in &flow.steps {
+            note(s);
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    note(c);
                 }
             }
         }
@@ -1424,6 +1428,9 @@ fn run_compact(
         preassigned_session: None,
         expect_session: None,
         expect_marker: None,
+        forbid_session: None,
+        expect_parent: None,
+        warmup_key: None,
         env_remove: built.env_remove,
         env_set: built.env_set,
         out_file: run_dir.join(format!("{ctag}.out.txt")),

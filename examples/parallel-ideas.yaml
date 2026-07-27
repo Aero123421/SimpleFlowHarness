@@ -42,3 +42,20 @@ steps:
       有望順トップ5として報告してください。各案に出典観点(技術/コスト/UX)を添えること。
 
       {{steps.ideas.outputs}}
+
+# 補足: 上の例は「観点ごとに別ツール」を並べた形。同じツールで観点だけ変えたい場合は
+# fork_from を使うと、下ごしらえの文脈を1回作るだけで各枝が継承できる(README参照):
+#
+#   - id: brief
+#     tool: claude
+#     prompt: "「{{vars.theme}}」の前提と制約を整理して"
+#   - id: angles
+#     parallel:
+#       - id: a_tech
+#         tool: claude
+#         fork_from: brief
+#         prompt: "技術的実現性の観点で5案"
+#       - id: a_cost
+#         tool: claude
+#         fork_from: brief
+#         prompt: "コスト効率の観点で5案"

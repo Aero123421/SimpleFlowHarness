@@ -27,7 +27,7 @@
   },
   "definitions": {
     "tool": {
-      "enum": ["codex", "claude", "opencode", "grok", "agy", "pi"],
+      "enum": ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"],
       "description": "Preset AI CLI. Omit and use cmd: for anything else."
     },
     "access": {
@@ -73,6 +73,7 @@
         "wall_clock_sec": { "type": "integer", "minimum": 1 },
         "retry": { "$ref": "#/definitions/retry" },
         "retry_on": { "enum": ["transient", "any", "never"], "default": "transient" },
+        "fork_warmup": { "enum": ["auto", "always", "never"], "default": "auto", "description": "Stagger forks of one parent so the provider prompt cache warms first. auto = only where it measurably pays (claude)." },
         "env": { "type": "object", "additionalProperties": { "type": "string" } }
       }
     },
@@ -171,6 +172,7 @@
         "max_prompt_chars": { "type": "integer", "minimum": 1 },
         "compact": { "$ref": "#/definitions/compact" },
         "continue_from": { "type": "string", "description": "Resume that step's tool session instead of starting fresh." },
+        "fork_from": { "type": "string", "description": "Branch that step's session: inherit its context but write to a new session. claude/opencode/grok/pi only; several steps may fork the same parent." },
         "retry": { "$ref": "#/definitions/retry" },
         "retry_on": { "enum": ["transient", "any", "never"] },
         "fallback": {

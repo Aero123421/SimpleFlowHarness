@@ -47,6 +47,10 @@ pub struct Defaults {
     /// Env applied to every child process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// When several steps fork the same parent session in one batch, run the
+    /// first one alone so the provider's prompt cache is warm before the rest
+    /// start. auto (default: only where it measurably pays) | always | never.
+    pub fork_warmup: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -126,6 +130,10 @@ pub struct Step {
     pub compact: Option<Compact>,
     /// Resume the session of a previously executed preset step instead of starting fresh.
     pub continue_from: Option<String>,
+    /// Branch off a previously executed step's session: the child inherits the
+    /// parent's history but gets its own session, so several steps can diverge
+    /// from one context concurrently. claude/opencode/grok/pi only.
+    pub fork_from: Option<String>,
     pub retry: Option<Retry>,
     pub retry_on: Option<String>,
     /// Profiles to try (in order) if the step still fails after its retries.
@@ -190,7 +198,7 @@ pub struct Route {
     pub goto: String,
 }
 
-pub const TOOLS: [&str; 6] = ["codex", "claude", "opencode", "grok", "agy", "pi"];
+pub const TOOLS: [&str; 7] = ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"];
 
 pub fn load(path: &Path) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
@@ -395,6 +403,11 @@ fn validate(flow: &Flow) -> Result<(), String> {
     if let Some(r) = &flow.defaults.retry_on {
         check_retry_on("defaults", r)?;
     }
+    if let Some(w) = &flow.defaults.fork_warmup {
+        if !["auto", "always", "never"].contains(&w.as_str()) {
+            return Err("defaults.fork_warmup must be auto/always/never".into());
+        }
+    }
     let action = |what: &str, s: &Step, v: &Option<String>, is_child: bool| -> Result<(), String> {
         let Some(oe) = v else { return Ok(()) };
         if let Some(g) = oe.strip_prefix("goto:") {
@@ -417,41 +430,47 @@ fn validate(flow: &Flow) -> Result<(), String> {
         }
         Ok(())
     };
-    let check_continue_from = |s: &Step| -> Result<(), String> {
-        let Some(cf) = &s.continue_from else {
+    // continue_from and fork_from share every target rule; they differ only in
+    // whether siblings may aim at the same target (fork: yes - that is the point).
+    let check_ref = |s: &Step, what: &str, id: &Option<String>| -> Result<(), String> {
+        let Some(cf) = id else {
             return Ok(());
         };
         if cf == &s.id {
-            return Err(format!(
-                "step '{}': continue_from cannot reference itself",
-                s.id
-            ));
+            return Err(format!("step '{}': {what} cannot reference itself", s.id));
         }
-        let target = flow.find_step(cf).ok_or_else(|| {
-            format!(
-                "step '{}': continue_from target '{cf}' is not a step id",
-                s.id
-            )
-        })?;
+        let target = flow
+            .find_step(cf)
+            .ok_or_else(|| format!("step '{}': {what} target '{cf}' is not a step id", s.id))?;
         if target.is_group() {
             return Err(format!(
-                "step '{}': continue_from '{cf}' targets a parallel group (sessions belong to its children; target one of them)",
+                "step '{}': {what} '{cf}' targets a parallel group (sessions belong to its children; target one of them)",
                 s.id
             ));
         }
         if target.is_foreach() {
             return Err(format!(
-                "step '{}': continue_from '{cf}' targets a foreach step (it runs many sessions; there is no single one to resume)",
+                "step '{}': {what} '{cf}' targets a foreach step (it runs many sessions; there is no single one to reuse)",
                 s.id
             ));
         }
         if target.cmd.is_some() {
             return Err(format!(
-                "step '{}': continue_from '{cf}' targets a cmd: step, which has no session",
+                "step '{}': {what} '{cf}' targets a cmd: step, which has no session",
                 s.id
             ));
         }
         Ok(())
+    };
+    let check_continue_from = |s: &Step| -> Result<(), String> {
+        if s.continue_from.is_some() && s.fork_from.is_some() {
+            return Err(format!(
+                "step '{}': continue_from and fork_from are mutually exclusive (continue = the same session, fork = a branch of it)",
+                s.id
+            ));
+        }
+        check_ref(s, "continue_from", &s.continue_from)?;
+        check_ref(s, "fork_from", &s.fork_from)
     };
     for s in &flow.steps {
         validate_step(flow, s, false)?;
@@ -472,16 +491,24 @@ fn validate(flow: &Flow) -> Result<(), String> {
                 validate_step(flow, c, true)?;
                 action("on_error", c, &c.on_error, true)?;
                 check_continue_from(c)?;
-                if let Some(cf) = &c.continue_from {
+                for (what, target) in [
+                    ("continue_from", &c.continue_from),
+                    ("fork_from", &c.fork_from),
+                ] {
+                    let Some(cf) = target else { continue };
                     if child_ids.contains(cf) {
                         return Err(format!(
-                            "step '{}': continue_from '{cf}' targets a sibling in the same parallel group (it has not run yet)",
+                            "step '{}': {what} '{cf}' targets a sibling in the same parallel group (it has not run yet)",
                             c.id
                         ));
                     }
+                }
+                // Two children resuming ONE session would interleave writes into
+                // it; two children FORKING one session is exactly the point.
+                if let Some(cf) = &c.continue_from {
                     if let Some(prev) = targets_seen.insert(cf, &c.id) {
                         return Err(format!(
-                            "steps '{prev}' and '{}' both continue_from '{cf}' inside one parallel group - two concurrent resumes of the same session",
+                            "steps '{prev}' and '{}' both continue_from '{cf}' inside one parallel group - two concurrent resumes of the same session (use fork_from to branch instead)",
                             c.id
                         ));
                     }
@@ -539,6 +566,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             || s.prompt.is_some()
             || s.foreach.is_some()
             || s.continue_from.is_some()
+            || s.fork_from.is_some()
             || s.use_.is_some()
             || s.model.is_some()
             || s.stdin.is_some()
@@ -628,15 +656,35 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             "step '{sid}': fallback: works only with preset tools"
         ));
     }
-    if s.continue_from.is_some() && s.cmd.is_some() {
+    if (s.continue_from.is_some() || s.fork_from.is_some()) && s.cmd.is_some() {
         return Err(format!(
-            "step '{sid}': continue_from works only with preset tools, not cmd:"
+            "step '{sid}': continue_from/fork_from work only with preset tools, not cmd:"
         ));
     }
-    if s.continue_from.is_some() && !s.fallback.is_empty() {
+    if (s.continue_from.is_some() || s.fork_from.is_some()) && !s.fallback.is_empty() {
         return Err(format!(
-            "step '{sid}': fallback: cannot be combined with continue_from (a session belongs to one tool)"
+            "step '{sid}': fallback: cannot be combined with continue_from/fork_from (a session belongs to one tool)"
         ));
+    }
+    // Fork support is per-tool; catch it at load time instead of mid-flow.
+    if s.fork_from.is_some() {
+        let tool = s
+            .tool
+            .clone()
+            .or_else(|| {
+                s.use_
+                    .as_ref()
+                    .and_then(|u| flow.profiles.get(u))
+                    .and_then(|p| p.tool.clone())
+            })
+            .or_else(|| flow.defaults.tool.clone());
+        if let Some(t) = tool {
+            if !crate::preset::supports_fork(&t) {
+                return Err(format!(
+                    "step '{sid}': tool '{t}' cannot fork a session headlessly (only claude/opencode/grok/pi can); use continue_from to chain this step serially, or drop fork_from and give it its own context"
+                ));
+            }
+        }
     }
     if let Some(f) = &s.foreach {
         if let Some(sp) = &f.split {
@@ -649,7 +697,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         }
         if s.continue_from.is_some() {
             return Err(format!(
-                "step '{sid}': continue_from cannot be combined with foreach"
+                "step '{sid}': continue_from cannot be combined with foreach (every item would resume the same session)"
             ));
         }
     }
@@ -736,6 +784,33 @@ mod tests {
     fn accepts_on_max_visits_end() {
         let y = "name: t\nsteps:\n  - id: a\n    cmd: echo hi\n    max_visits: 2\n    on_max_visits: goto:end\n";
         assert!(parse(y).is_ok());
+    }
+
+    #[test]
+    fn fork_from_is_rejected_for_tools_without_a_headless_fork() {
+        let e = parse("name: t\nsteps:\n  - id: a\n    tool: codex\n    prompt: x\n  - id: b\n    tool: codex\n    fork_from: a\n    prompt: y\n").unwrap_err();
+        assert!(e.contains("cannot fork a session headlessly"), "{e}");
+        // claude can fork
+        assert!(parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    prompt: x\n  - id: b\n    tool: claude\n    fork_from: a\n    prompt: y\n").is_ok());
+    }
+
+    #[test]
+    fn siblings_may_fork_one_parent_but_may_not_resume_it() {
+        let fork = "name: t\nsteps:\n  - id: seed\n    tool: claude\n    prompt: x\n  - id: g\n    parallel:\n      - id: c1\n        tool: claude\n        fork_from: seed\n        prompt: x\n      - id: c2\n        tool: claude\n        fork_from: seed\n        prompt: y\n";
+        assert!(
+            parse(fork).is_ok(),
+            "forking one parent from two siblings is the point"
+        );
+        let resume = fork.replace("fork_from", "continue_from");
+        assert!(parse(&resume)
+            .unwrap_err()
+            .contains("two concurrent resumes"));
+    }
+
+    #[test]
+    fn fork_from_and_continue_from_are_mutually_exclusive() {
+        let e = parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    prompt: x\n  - id: b\n    tool: claude\n    continue_from: a\n    fork_from: a\n    prompt: y\n").unwrap_err();
+        assert!(e.contains("mutually exclusive"), "{e}");
     }
 
     #[test]

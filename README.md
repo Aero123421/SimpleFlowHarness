@@ -4,11 +4,11 @@
 [![release](https://img.shields.io/github/v/release/Aero123421/SimpleFlowHarness)](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**EN**: `sfh` chains AI coding CLIs — **Codex, Claude Code, opencode, Grok, Antigravity (`agy`), Pi**, or any command — into YAML-defined multi-stage flows: review/retry loops, parallel fan-out, per-step model/effort/permission control, tool **session resume**, cost accounting with spend caps, and **crash-resume** of a whole run. It keeps your main agent's context window clean: stdout carries only the final step's output, everything else lands in a run directory. Single static binary for Windows / macOS / Linux. The docs below are in Japanese, but the YAML reference tables are language-neutral — and your favorite AI can translate the rest. A JSON Schema for flow files lives in [schema/flow.schema.json](schema/flow.schema.json).
+**EN**: `sfh` chains AI coding CLIs — **Codex, Claude Code, opencode, Grok, Antigravity (`agy`), Pi, Cursor**, or any command — into YAML-defined multi-stage flows: review/retry loops, parallel fan-out, per-step model/effort/permission control, tool **session resume**, cost accounting with spend caps, and **crash-resume** of a whole run. It keeps your main agent's context window clean: stdout carries only the final step's output, everything else lands in a run directory. Single static binary for Windows / macOS / Linux. The docs below are in Japanese, but the YAML reference tables are language-neutral — and your favorite AI can translate the rest. A JSON Schema for flow files lives in [schema/flow.schema.json](schema/flow.schema.json).
 
 ---
 
-AI CLI(codex / claude / opencode / grok / agy / pi / 任意コマンド)を **YAML定義の多段フロー** で非対話実行する小さなオーケストレータ。単一バイナリ、実行時依存なし、Windows / macOS / Linux 対応。
+AI CLI(codex / claude / opencode / grok / agy / pi / cursor / 任意コマンド)を **YAML定義の多段フロー** で非対話実行する小さなオーケストレータ。単一バイナリ、実行時依存なし、Windows / macOS / Linux 対応。
 
 メインで使っているエージェント(例: codex app)からサブエージェント群を直接管理するとコンテキストが溶けるので、その管理ループを丸ごとこのCLIに追い出すのが目的。
 
@@ -119,12 +119,13 @@ defaults:                    # 全ステップの既定値(すべて任意)
   wall_clock_sec: 7200       # フロー全体の実時間上限
   retry: { max: 2, backoff_sec: 5 }   # 失敗時のリトライ(指数バックオフ)
   retry_on: transient        # transient(既定,429/5xx/切断など) | any | never
+  fork_warmup: auto          # fork_from時のウォームアップ auto(既定) | always | never
   env: { MY_VAR: value }     # 全子プロセスに渡す環境変数
 
 steps:
   - id: plan                 # 必須・一意 [A-Za-z0-9_-]
     use: smart               # プロファイル参照(ステップ直書きが優先)
-    tool: codex              # codex | claude | opencode | grok | agy | pi
+    tool: codex              # codex | claude | opencode | grok | agy | pi | cursor
     # bin: /path/to/tool     # 実行ファイル差し替え(PATHが古い時など)
     model: gpt-5-codex
     effort: high             # codex/claude/grok/agy/opencodeで意味が対応(下表)
@@ -214,6 +215,41 @@ steps:
 | agy | JSONの`conversation_id` | `--conversation <id>` | 不正IDは黙って新規会話→sfhがID照合して失敗検出 |
 | pi | sfhがIDを`--session-id`で事前割当 | 同じ`--session-id`(作成と再開が同一フラグ) | cwdスコープ。**IDが一致しても別セッションでありうる**ため、sfhはヘッダのタイムスタンプ(マーカー)も照合する |
 
+### セッション分岐: `fork_from:`(fan-outのコンテキスト再利用)
+
+`continue_from` は1本の会話を伸ばしますが、`fork_from` は**親の会話を枝分かれ**させます。子はそれぞれ独立したセッションを持つので、**同じ親から何本でも同時に分岐**できます(`continue_from` を兄弟で共有するのはバリデーションで禁止 — 1つのセッションに同時書き込みするため)。
+
+```yaml
+  - id: plan
+    tool: claude
+    prompt: "この課題の前提と制約を整理して"
+
+  - id: fan
+    parallel:
+      - id: angle_a
+        tool: claude
+        fork_from: plan        # 親の文脈を継承しつつ独立
+        prompt: "技術的リスクの観点で深掘りして"
+      - id: angle_b
+        tool: claude
+        fork_from: plan
+        prompt: "コストの観点で深掘りして"
+```
+
+対応: **claude / opencode / grok / pi**。codex(forkがTUI専用で`exec resume`は親に追記される)と agy(fork機能なし)は**バリデーションで拒否**します — 黙って冷たいセッションで走らせると、子は親の文脈を失ったまま自信のある誤答を返してexit 0になるためです。
+
+**重要 — なぜ安くなるのか、いつ安くならないのか。** forkそれ自体はトークンを減らしません。子のプロンプト先頭が親と**バイト単位で同一**になることで、プロバイダのプロンプトキャッシュがヒットするのが実体です。したがって**N本を同時に投げると全員がキャッシュ書き込みを競合して全員ミス**します。sfhは既定で**1本目だけ先に走らせてから残りを解放**します(ウォームアップ)。実測(claude、3分岐):
+
+| | コスト |
+|---|---|
+| 親(cold) | $0.0673 |
+| 1本目(ウォームアップ) | $0.0340 |
+| 2本目・3本目(ウォーム後) | **各 $0.0065**(5.2倍安い) |
+
+3本同時なら約$0.102 → ウォームアップ経由で$0.047(**54%削減**)。fan-outが広く文脈が大きいほど差が開きます。この待ち時間が惜しい場合は `defaults.fork_warmup: never`、逆に全ツールで常に行うなら `always`(既定 `auto` = 実測で効果のあったclaudeのみ)。
+
+fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び出し前にexit 1**で落ちます。加えてsfhは、子が**親のセッションIDを返してきたら失敗扱い**にします(forkフラグが無視されて親に追記された状態)。piはさらに`parentSession`で親を明示するので、それも照合します。
+
 ### コンテキスト管理
 
 | 機構 | 書き方 | 効果 |
@@ -272,7 +308,7 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 
 ## プリセット → 実コマンド対応(2026-07-27 実機検証)
 
-プロンプトの渡し方はツール毎に安全な経路を自動選択: **stdin**(codex/claude/opencode/pi)、**--prompt-file**(grok ※stdin渡しはTUIが開いてハングする)、**argv**(agy ※stdin非対応、25,000字上限)。
+プロンプトの渡し方はツール毎に安全な経路を自動選択: **stdin**(codex/claude/opencode/pi/cursor)、**--prompt-file**(grok ※stdin渡しはTUIが開いてハングする)、**argv**(agy ※stdin非対応、25,000字上限)。
 
 | tool | ベース | read | write | full |
 |---|---|---|---|---|
@@ -282,12 +318,15 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | grok | `--output-format plain --prompt-file <f>` | `--permission-mode dontAsk --deny Edit/Write/Bash` | `--permission-mode acceptEdits` | `--permission-mode bypassPermissions` |
 | agy | `--print-timeout <t>s --output-format json -p <prompt>` | `--mode plan` | `--mode accept-edits` | `--dangerously-skip-permissions` |
 | pi | `--mode json --offline` | `--tools read,grep,find,ls` +拡張/スキル無効化 | `--tools read,edit,write,grep,find,ls` | `--tools read,bash,edit,write,grep,find,ls --approve` |
+| cursor | `-p --output-format json --trust --disable-auto-update --disable-project-configs` | `--mode plan`(全承認要求を拒否) | `--force` ※ | `--force` |
 
 補足:
 - **Geminiモデルは `tool: agy` で使う**(gemini-3.6-flash-low 等)。旧gemini CLIには非対応(個人無料枠廃止でAntigravityに統合されたため)。
 - **effortの語彙はツール毎に違う**: codex(none/minimal/low/medium/high/xhigh/max/ultra)、claude(low〜max)、grok/agy(low/medium/high)、pi(off〜max、`--thinking`)、opencodeは`--variant`(モデル毎)。範囲外はvalidateで警告。
 - **pi(`@earendil-works/pi-coding-agent`)にはサンドボックスも権限プロンプトも存在しない**(設計思想として意図的)。素の`pi`は既にread+bash+edit+writeが有効なので、sfhは`--tools`の許可リストで権限を表現する。`read`はツール登録レベルで確実だが、`write`は**書き込み先を制限しない**(ワークスペース境界がない)。またwriteではシェルを登録しない — サンドボックスがない以上bashはfullと同義だから。必要なら`args: ["-t", "read,bash,edit,write,grep,find,ls"]`で明示的に足す。
 - **piの`agent:`は無効**(`--agent`が無い)。ペルソナは`args: ["--append-system-prompt", "..."]`で。
+- **cursor(`cursor-agent`)の権限は非対話モードでは2段階しかない**: `--force`なしは全拒否、ありは全承認。したがって`write`は実質`full`と同等で、sfhは警告を出します。中間段階が必要なら別ツールを使ってください。`effort:`と`agent:`も非対応(effortはモデルID側に`-thinking`等で埋め込む)。`continue_from`は**意図的に非対応** — 存在しないチャットIDでの再開が黙って新規チャットになり、しかもそのIDをそのまま返すため、sfhが「本当に再開できたか」を判定できないからです。
+- **cursorだけは実AI検証ができていません**(この開発機の認証が2026-07-19に期限切れのため)。フラグはインストール済みバンドルの逆コンパイルとargv解析の実挙動で確認済みで、認証が切れている場合は上記の通り**明確なエラーで落ちます**(黙って壊れない)。`cursor-agent login` 後に実呼び出しで検証すれば正式対応になります。
 - **opencodeのmodelは`provider/model`形式必須**。effortは`--variant`に渡る。
 - **agy**: モデルIDにeffortサフィックスがある(例: gemini-3.1-pro-high)場合は`effort:`を併用しない(agyが衝突エラーを出す)。
 - **claude**のネスト実行対策として`CLAUDE_CODE_SESSION_ID`等の環境変数は自動除去。

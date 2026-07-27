@@ -55,6 +55,15 @@ pub struct Prepared {
     pub expect_session: Option<String>,
     /// On resume: the session marker the tool must report back (see SessionInfo).
     pub expect_marker: Option<String>,
+    /// On fork: the parent's session id, which the child must NOT report as its
+    /// own - that would mean the fork flag was ignored and this run appended to
+    /// the shared parent instead of branching.
+    pub forbid_session: Option<String>,
+    /// On fork, where the tool reports its parent (pi): positive proof of a branch.
+    pub expect_parent: Option<String>,
+    /// Steps sharing this key are staggered: the first runs alone so the
+    /// provider's prompt cache is warm before the rest start.
+    pub warmup_key: Option<String>,
     pub env_remove: Vec<String>,
     pub env_set: Vec<(String, String)>,
     pub out_file: PathBuf,
@@ -185,6 +194,17 @@ pub fn effective_with(
 
 pub fn effective(flow: &flow::Flow, step: &flow::Step) -> Result<Effective, String> {
     effective_with(flow, step, None)
+}
+
+/// Should a batch of forks off one parent be staggered? Forking only saves money
+/// when the provider's prompt cache is already warm, and concurrent children all
+/// race the first cache write and miss it.
+fn fork_warmup_enabled(flow: &flow::Flow, tool: &str) -> bool {
+    match flow.defaults.fork_warmup.as_deref().unwrap_or("auto") {
+        "always" => true,
+        "never" => false,
+        _ => preset::fork_warmup_pays(tool),
+    }
 }
 
 pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
@@ -327,6 +347,9 @@ pub fn prepare_leaf(
     };
 
     let mut built: Option<preset::Built> = None;
+    let mut forbid_session: Option<String> = None;
+    let mut expect_parent: Option<String> = None;
+    let mut warmup_key: Option<String> = None;
     let (inv, tool_used) = match &step.cmd {
         Some(flow::Cmd::Shell(s)) => {
             // Substituted values land in a cmd /C | sh -c string; reject anything
@@ -385,29 +408,58 @@ pub fn prepare_leaf(
                 bin,
                 timeout_sec,
             };
-            let b = if let Some(target) = &step.continue_from {
+            let session_ref = step.continue_from.as_ref().or(step.fork_from.as_ref());
+            let b = if let Some(target) = session_ref {
+                let is_fork = step.fork_from.is_some();
+                let what = if is_fork {
+                    "fork_from"
+                } else {
+                    "continue_from"
+                };
                 let info = cx.sessions.get(target).ok_or_else(|| {
                     format!(
-                        "step '{}': continue_from '{target}' but that step has not produced a session id",
+                        "step '{}': {what} '{target}' but that step has not produced a session id",
                         step.id
                     )
                 })?;
                 if info.tool != tool {
                     return Err(format!(
-                        "step '{}': continue_from '{target}' used tool '{}', this step resolves to '{tool}'",
+                        "step '{}': {what} '{target}' used tool '{}', this step resolves to '{tool}'",
                         step.id, info.tool
                     ));
                 }
                 let new_cwd = cwd.as_ref().map(|c| c.display().to_string());
-                if preset::session_is_cwd_scoped(&tool) && info.cwd != new_cwd {
+                let cwd_scoped = if is_fork {
+                    preset::fork_is_cwd_scoped(&tool)
+                } else {
+                    preset::session_is_cwd_scoped(&tool)
+                };
+                if cwd_scoped && info.cwd != new_cwd {
                     eprintln!(
                         "sfh: warning: step '{}': {tool} sessions are cwd-scoped; original ran in {:?}, this step uses {:?} - the session may not be found",
                         step.id, info.cwd, new_cwd
                     );
                 }
-                let mut b = preset::build_resume(&tool, &info.id, inp, &paths)?;
-                b.expect_marker = info.marker.clone();
-                b
+                if is_fork {
+                    let child = gen_uuid();
+                    let mut b = preset::build_fork(&tool, &info.id, &child, inp, &paths)?;
+                    // Detect a fork flag that was ignored (the run would have
+                    // appended to the shared parent) and, on pi, demand the
+                    // positive proof it prints.
+                    forbid_session = Some(info.id.clone());
+                    if tool == "pi" {
+                        expect_parent = Some(info.id.clone());
+                    }
+                    if fork_warmup_enabled(cx.flow, &tool) {
+                        warmup_key = Some(format!("{tool}:{}", info.id));
+                    }
+                    b.expect_marker = None;
+                    b
+                } else {
+                    let mut b = preset::build_resume(&tool, &info.id, inp, &paths)?;
+                    b.expect_marker = info.marker.clone();
+                    b
+                }
             } else {
                 let preassign =
                     if cx.needed_sessions.contains(&step.id) && preset::wants_preassign(&tool) {
@@ -513,6 +565,9 @@ pub fn prepare_leaf(
         preassigned_session: preassigned,
         expect_session,
         expect_marker,
+        forbid_session,
+        expect_parent,
+        warmup_key,
         env_remove,
         env_set,
         out_file,
@@ -541,6 +596,8 @@ pub struct ParsedOut {
     pub session: Option<String>,
     /// Secondary session identity (pi: header timestamp).
     pub session_marker: Option<String>,
+    /// Where the tool says this session came from (pi: parent session path).
+    pub session_parent: Option<String>,
     pub usage: preset::Usage,
     /// In-band failure the exit code may not reflect.
     pub failed: bool,
@@ -570,7 +627,44 @@ pub fn parse_output(parse: &preset::OutputParse, stdout: &str, stderr: &str) -> 
         preset::OutputParse::GrokJson => parse_grok_json(stdout),
         preset::OutputParse::AgyJson => parse_agy_json(stdout),
         preset::OutputParse::PiJsonl => parse_pi_jsonl(stdout),
+        preset::OutputParse::CursorJson => parse_cursor_json(stdout),
     }
+}
+
+/// cursor-agent --output-format json: one result envelope. A model/API failure
+/// emits NO envelope at all and exits non-zero, and `is_error` is always false,
+/// so absence of the line is the failure signal - not that field.
+fn parse_cursor_json(stdout: &str) -> ParsedOut {
+    let mut o = ParsedOut::default();
+    let t = stdout.trim();
+    let Some(v) = t
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+    else {
+        o.text = t.to_string();
+        o.failed = !t.is_empty();
+        return o;
+    };
+    o.text = v
+        .get("result")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    o.session = v
+        .get("session_id")
+        .and_then(|x| x.as_str())
+        .map(String::from);
+    if let Some(u) = v.get("usage") {
+        // cumulative, already final - never sum these
+        o.usage.input_tokens = num(u.get("inputTokens"));
+        o.usage.output_tokens = num(u.get("outputTokens"));
+    }
+    if v.get("subtype").and_then(|x| x.as_str()) == Some("error") {
+        o.failed = true;
+    }
+    o
 }
 
 /// pi --mode json: JSONL. Line 1 is the session header; each turn ends with a
@@ -588,6 +682,11 @@ fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
                 o.session = v.get("id").and_then(|x| x.as_str()).map(String::from);
                 o.session_marker = v
                     .get("timestamp")
+                    .and_then(|x| x.as_str())
+                    .map(String::from);
+                // Present only on a forked session: the parent's file path.
+                o.session_parent = v
+                    .get("parentSession")
                     .and_then(|x| x.as_str())
                     .map(String::from);
             }
@@ -769,6 +868,35 @@ fn exec_once(p: Prepared) -> LeafDone {
         if let (Some(exp), Some(got)) = (&p.expect_marker, &parsed.session_marker) {
             if got != exp {
                 resume_mismatch("session marker", exp, got);
+            }
+        }
+        // A fork that came back as the parent means the fork flag was ignored:
+        // this run appended to the session its siblings are also using.
+        if let (Some(parent), Some(got)) = (&p.forbid_session, &parsed.session) {
+            if got == parent {
+                exit_code = 1;
+                session_id = None;
+                stderr_clean.push_str(&format!(
+                    "\nsfh: fork failed: the tool reported the PARENT session '{parent}' instead of a new one, so this run appended to the parent instead of branching\n"
+                ));
+                let _ = std::fs::write(&p.err_file, &stderr_clean);
+            }
+        }
+        // pi names the parent it branched from - positive proof of a fork.
+        if let Some(parent) = &p.expect_parent {
+            let ok = parsed
+                .session_parent
+                .as_deref()
+                .map(|sp| sp.contains(parent.as_str()))
+                .unwrap_or(false);
+            if !ok {
+                exit_code = 1;
+                session_id = None;
+                stderr_clean.push_str(&format!(
+                    "\nsfh: fork failed: the new session does not name '{parent}' as its parent (got {:?}), so it did not inherit the parent's context\n",
+                    parsed.session_parent
+                ));
+                let _ = std::fs::write(&p.err_file, &stderr_clean);
             }
         }
         if chain_output.trim().is_empty() && !p.allow_empty {
@@ -1077,6 +1205,80 @@ impl ToolGate {
     }
 }
 
+/// Staggers leaves that fork the same parent: the first runs alone so the
+/// provider's prompt cache is written, then the rest are released together.
+/// Without this, N concurrent forks all race the cache write and all miss it
+/// (measured on claude: $0.0337 each concurrently vs $0.0026 once warm).
+struct Warmup {
+    keys: HashSet<String>,
+    state: Mutex<HashMap<String, (bool, bool)>>, // key -> (leader_taken, leader_done)
+    cv: Condvar,
+    quiet: bool,
+}
+
+enum WarmRole {
+    None,
+    Leader(String),
+    Follower,
+}
+
+impl Warmup {
+    fn from(preps: &[Prepared], quiet: bool) -> Warmup {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for p in preps {
+            if let Some(k) = &p.warmup_key {
+                *counts.entry(k.as_str()).or_insert(0) += 1;
+            }
+        }
+        Warmup {
+            keys: counts
+                .into_iter()
+                .filter(|(_, n)| *n > 1)
+                .map(|(k, _)| k.to_string())
+                .collect(),
+            state: Mutex::new(HashMap::new()),
+            cv: Condvar::new(),
+            quiet,
+        }
+    }
+
+    fn enter(&self, p: &Prepared) -> WarmRole {
+        let Some(key) = p.warmup_key.as_ref().filter(|k| self.keys.contains(*k)) else {
+            return WarmRole::None;
+        };
+        let Ok(mut g) = self.state.lock() else {
+            return WarmRole::None;
+        };
+        let e = g.entry(key.clone()).or_insert((false, false));
+        if !e.0 {
+            e.0 = true;
+            if !self.quiet {
+                eprintln!(
+                    "sfh: [{}] warming the fork cache for '{key}' - siblings start when it finishes",
+                    p.tag
+                );
+            }
+            return WarmRole::Leader(key.clone());
+        }
+        while !g.get(key).map(|s| s.1).unwrap_or(true) {
+            match self.cv.wait(g) {
+                Ok(next) => g = next,
+                Err(_) => return WarmRole::None,
+            }
+        }
+        WarmRole::Follower
+    }
+
+    fn leave(&self, role: WarmRole) {
+        if let WarmRole::Leader(key) = role {
+            if let Ok(mut g) = self.state.lock() {
+                g.entry(key).or_insert((true, false)).1 = true;
+            }
+            self.cv.notify_all();
+        }
+    }
+}
+
 /// Run prepared leaves on a bounded worker pool. The result Vec ALWAYS has the
 /// same length and order as the input: a slot whose worker died is filled with
 /// a synthetic failure instead of being dropped (positional consumers zip these
@@ -1086,6 +1288,10 @@ pub fn run_pool(preps: Vec<Prepared>, max_parallel: usize, gate: Arc<ToolGate>) 
     if n == 0 {
         return Vec::new();
     }
+    let warmup = Arc::new(Warmup::from(
+        &preps,
+        preps.first().map(|p| p.quiet).unwrap_or(true),
+    ));
     if n == 1 || max_parallel <= 1 {
         return preps
             .into_iter()
@@ -1107,13 +1313,16 @@ pub fn run_pool(preps: Vec<Prepared>, max_parallel: usize, gate: Arc<ToolGate>) 
         let q = Arc::clone(&queue);
         let r = Arc::clone(&results);
         let g = Arc::clone(&gate);
+        let w = Arc::clone(&warmup);
         handles.push(std::thread::spawn(move || loop {
             let job = q.lock().unwrap().pop_front();
             let Some((idx, p)) = job else { break };
+            let role = w.enter(&p);
             let held = g.acquire(&p.tool);
             let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec_leaf(p)))
                 .unwrap_or_else(|_| synthetic_failure(idx));
             g.release(held);
+            w.leave(role);
             match r.lock() {
                 Ok(mut guard) => guard[idx] = Some(done),
                 Err(mut poisoned) => poisoned.get_mut()[idx] = Some(done),
@@ -1364,6 +1573,27 @@ mod tests {
         let o = parse_pi_jsonl(empty);
         assert!(o.text.is_empty());
         assert_eq!(o.usage.input_tokens, None);
+    }
+
+    #[test]
+    fn parses_cursor_envelope_and_treats_a_missing_one_as_failure() {
+        let s = r#"{"type":"result","subtype":"success","is_error":false,"result":"hi there","session_id":"c-1","usage":{"inputTokens":120,"outputTokens":7,"cacheReadTokens":900}}"#;
+        let o = parse_cursor_json(s);
+        assert_eq!(o.text, "hi there");
+        assert_eq!(o.session.as_deref(), Some("c-1"));
+        assert_eq!(o.usage.input_tokens, Some(120));
+        assert_eq!(o.usage.output_tokens, Some(7));
+        assert_eq!(o.usage.cost_usd, None, "cursor reports no cost");
+        assert!(!o.failed);
+        // A model failure prints no envelope at all.
+        assert!(parse_cursor_json("Error: something went wrong").failed);
+        assert!(
+            !parse_cursor_json("").failed,
+            "empty output is caught by allow_empty"
+        );
+        // Leading noise (e.g. the worktree banner) must not hide the envelope.
+        let noisy = format!("Using worktree: C:\\tmp\n{s}");
+        assert_eq!(parse_cursor_json(&noisy).text, "hi there");
     }
 
     #[test]
