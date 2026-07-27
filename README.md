@@ -25,17 +25,21 @@ AI CLI(codex / claude / opencode / grok / agy / 任意コマンド)を **YAML定
 
 ```powershell
 irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-windows-x64.zip -OutFile sfh.zip
-Expand-Archive sfh.zip -DestinationPath . ; Remove-Item sfh.zip
-.\sfh.exe --version
+Expand-Archive sfh.zip -DestinationPath sfh-bin -Force ; Remove-Item sfh.zip
+.\sfh-bin\sfh.exe --version
 ```
 
-**macOS (Apple Silicon) / Linux (x64):**
+SmartScreenに止められたら「詳細情報 → 実行」。
+
+**Linux (x64) / macOS (Apple Silicon):**
 
 ```bash
-curl -fsSL https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-macos-arm64.tar.gz | tar xz sfh
-# Linux: .../sfh-linux-x64.tar.gz  (arm64: sfh-linux-arm64.tar.gz / Intel Mac: sfh-macos-x64.tar.gz)
+curl -fsSL https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-linux-x64.tar.gz | tar xz sfh
+# macOS arm64: sfh-macos-arm64.tar.gz / Intel Mac: sfh-macos-x64.tar.gz / Linux arm64: sfh-linux-arm64.tar.gz
 ./sfh --version
 ```
+
+各アセットには`.sha256`が併置してある。macOSで**ブラウザから**落とした場合は `xattr -dr com.apple.quarantine ./sfh` が必要(curlなら不要)。
 
 **Rustがあるなら:**
 

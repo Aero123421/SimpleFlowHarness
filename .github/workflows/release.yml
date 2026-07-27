@@ -44,7 +44,11 @@ jobs:
           mkdir pkg
           cp target/${{ matrix.target }}/release/sfh pkg/
           cp README.md LICENSE pkg/
-          tar -C pkg -czf ${{ matrix.asset }} .
+          # Flat member names ("sfh", not "./sfh") so `tar xz sfh` works with GNU tar too.
+          tar czf ${{ matrix.asset }} -C pkg sfh README.md LICENSE
+          shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          # Verify the archive the way the README tells users to extract it.
+          mkdir verify && tar xzf ${{ matrix.asset }} -C verify sfh && ./verify/sfh --version
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -52,9 +56,15 @@ jobs:
           New-Item -ItemType Directory pkg | Out-Null
           Copy-Item target/${{ matrix.target }}/release/sfh.exe pkg/
           Copy-Item README.md, LICENSE pkg/
-          Compress-Archive -Path pkg/* -DestinationPath ${{ matrix.asset }}
+          Compress-Archive -Path pkg/* -DestinationPath ${{ matrix.asset }} -Force
+          $h = (Get-FileHash ${{ matrix.asset }} -Algorithm SHA256).Hash.ToLower()
+          "$h  ${{ matrix.asset }}" | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
+          Expand-Archive ${{ matrix.asset }} -DestinationPath verify -Force
+          ./verify/sfh.exe --version
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
           fail_on_unmatched_files: true
