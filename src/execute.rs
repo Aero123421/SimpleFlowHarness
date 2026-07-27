@@ -339,16 +339,29 @@ pub fn kill_pid_tree(pid: u32) -> bool {
 
 /// Kill a process and its descendants by pid. Used by `sfh stop` on a detached
 /// run, which by construction is not our child, so `kill_tree` does not apply.
+///
+/// SIGTERM first, deliberately. Every child sfh spawns gets its OWN session
+/// (setsid, so a timeout can kill its subtree), which means the children are
+/// not in the detached run's process group and `kill(-pid)` never reaches them
+/// - it kills sfh and leaves the agents running. Signalling sfh instead lets
+/// its own handler kill each tracked child's group, which is where the
+/// grandchildren live. SIGKILL is only the backstop for a wedged process.
 #[cfg(unix)]
 pub fn kill_pid_tree(pid: u32) -> bool {
-    // A detached run is its own session leader (setsid), so the negative pid
-    // reaches the agents it spawned too. Fall back to the bare pid if not.
     unsafe {
-        if libc::kill(-(pid as i32), libc::SIGKILL) == 0 {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..50 {
+        if !pid_alive(pid) {
             return true;
         }
-        libc::kill(pid as i32, libc::SIGKILL) == 0
+        std::thread::sleep(Duration::from_millis(100));
     }
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    !pid_alive(pid)
 }
 
 /// Is this pid still running? Pid reuse makes it advisory, so callers pair it
