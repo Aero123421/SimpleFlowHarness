@@ -1,0 +1,231 @@
+# v1.0.0 に何を入れるべきかを、3ツール8体に並列で聞く。
+# 回答は統合せず、8本ぜんぶそのまま回収する。
+#
+#   sfh run examples/v1-council.yaml --detach
+name: v1-council
+
+profiles:
+  qwen:
+    tool: opencode
+    model: alibaba-token-plan/qwen3.8-max-preview
+    access: read
+  grok:
+    tool: grok
+    effort: high
+    access: read
+  codex:
+    tool: codex
+    bin: 'C:\Users\nanoc\AppData\Local\OpenAI\Codex\bin\69066b736e1e17a4\codex.exe'
+    model: gpt-5.6-sol
+    effort: high
+    access: read
+
+defaults:
+  timeout_sec: 2400
+  max_cost_usd: 30.0
+  wall_clock_sec: 7200
+  max_emit_chars: 400000
+  # ツールごとの同時実行数。8体すべて同時に走る。
+  tool_max_parallel:
+    opencode: 2
+    grok: 4
+    codex: 2
+
+steps:
+  - id: council
+    max_parallel: 8
+    parallel:
+
+      # ---- codex x2: セキュリティ / 多OS安定 / 堅牢性 / エラー処理 ----
+      - id: codex_security
+        use: codex
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness, v0.9.0, Rust単一バイナリ, MIT,
+          github.com/Aero123421/SimpleFlowHarness) のセキュリティレビュアーです。
+          リポジトリを実際に読んでから答えてください(src/, README.md, tests/)。
+
+          sfh は AI コーディング CLI(codex/claude/opencode/grok/agy/pi/cursor/任意コマンド)を
+          非対話で多段フロー実行するオーケストレータです。思想は
+          **「sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない」**。
+          独自の抽象層・独自の会話履歴・独自の認証を持たず、各CLIのネイティブなargvを組み立てて
+          ネイティブな機械可読出力をパースするだけ。ユーザーのログイン済みCLIをそのまま起動します。
+
+          # あなたへの問い
+          **v1.0.0 として世に出す前に、セキュリティ上どうしても直すべきものは何か。**
+
+          v1.0 は「ここから先は互換性を守る」という約束です。今のうちに直さないと
+          一生引きずるもの、を優先してください。
+
+          最低限これらを検討すること(これ以外の発見も歓迎):
+          - access: read/write/full の翻訳が各ツールで本当に主張通りか(src/preset.rs)
+          - 文字列形式 cmd: のシェルインジェクション対策の穴
+          - run ディレクトリに平文で残るもの(プロンプト、出力、セッションID)の扱い
+          - サブエージェント出力を信頼できない入力として扱えているか(プロンプトインジェクション経路)
+          - --detach したプロセスの権限とライフサイクル
+          - ~/.sfh/profiles.yaml や bin: 経由の任意バイナリ実行
+          - ESCALATION_FLAGS の検知漏れ
+
+          # 答え方
+          **必ずコードの file:line を根拠にすること。** 一般論は要りません。
+          各項目に「実際に起きる具体的な悪用シナリオ」を書くこと。
+          最後に、v1.0 のブロッカー(直さないと出せない)と、v1.1 でよいものを分けて列挙。
+
+      - id: codex_robust
+        use: codex
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness, v0.9.0, Rust単一バイナリ) の
+          信頼性レビュアーです。リポジトリを実際に読んでから答えてください。
+
+          sfh は AI CLI を非対話で多段フロー実行するオーケストレータ。
+          Windows / macOS / Linux の**完全同一挙動が絶対条件**です。
+          CI は3OSで単体72本 + 挙動125本 + README のインストール手順自体を実行しています。
+
+          # あなたへの問い
+          **v1.0.0 として世に出す前に、安定性の観点でどうしても直すべきものは何か。**
+
+          最低限これらを検討すること(これ以外の発見も歓迎):
+          - 3OS 間で挙動が割れる箇所(パス、改行、シェル、シグナル、プロセス生成)
+          - エラーハンドリング: 失敗が黙って握り潰される箇所、`let _ =` で捨てている箇所
+          - エラーメッセージが「次に何をすればいいか」を伝えているか
+          - プロセスツリー所有(Windows job object / Unix setsid+PDEATHSIG)の穴
+          - --resume の状態復元がライブ実行と食い違う箇所
+          - 並列実行(parallel/foreach)の競合・デッドロック・部分失敗
+          - タイムアウト、リトライ、フォールバックの相互作用
+          - テストが無い危険な経路
+
+          # 答え方
+          **必ずコードの file:line を根拠にすること。** 一般論は要りません。
+          各項目に「実際に壊れる具体的なシナリオ」を書くこと。
+          最後に、v1.0 のブロッカーと v1.1 送りを分けて列挙。
+
+      # ---- grok x4: 機能追加・改善(角度を変えて) ----
+      - id: grok_dx
+        use: grok
+        prompt: |
+          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください
+          (README.md, examples/, src/guide.txt, schema/flow.schema.json)。
+
+          # あなたへの問い
+          **フローを「書く人」の体験として、v1.0.0 までに何を足す/直すべきか。**
+
+          考えてほしい観点:
+          - YAML を書き始めてから動くまでの摩擦
+          - エラーメッセージ・validate・--dry-run が十分に親切か
+          - 書き間違えやすい所、黙って壊れる所
+          - `sfh guide` / `sfh init` が本当に出発点として機能するか
+          - 既存の機能で「あるのに誰も気づかない」もの
+
+          注意: sfh の思想は「能力を足さず、順番と分岐だけ」に近いものです。
+          正確には **「自分の配管については判断してよいが、仕事の中身については判断しない」**。
+          この線を越える提案(sfh が出力の良し悪しを判定する等)は避けてください。
+
+          具体的に。YAML の実例を添えて。優先順位を付けて。
+
+      - id: grok_features
+        use: grok
+        prompt: |
+          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください。
+
+          既にあるもの: route/goto の循環、parallel、foreach、profiles、
+          テンプレートフィルタ、compact(自動要約)、notes、continue_from(セッション再開)、
+          fork_from(セッション分岐)、retry、fallback、max_visits/on_max_visits、
+          コスト上限、--resume(クラッシュ再開)、--detach/status/wait/stop、
+          doctor(プリセット腐敗検知)、guide、runs list/show --json。
+
+          # あなたへの問い
+          **機能として何が足りないか。v1.0.0 に入れるべき新機能を提案してください。**
+
+          既にあるものを再提案しないこと(上のリストと実際のコードを確認すること)。
+          「あったら便利」ではなく「無いと詰む」を優先してください。
+
+          思想の制約: sfh は仕事の中身を判断しません。独自の会話履歴も持ちません
+          (セッションは各ツール側に委譲。これがプロンプトキャッシュを効かせている)。
+          この線を越える提案は避けてください。
+
+          具体的に。YAML の実例を添えて。優先順位を付けて。
+
+      - id: grok_ecosystem
+        use: grok
+        prompt: |
+          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI(codex/claude/opencode/
+          grok/agy/pi/cursor)を YAML の多段フローで非対話実行する Rust 製 CLI です。
+          リポジトリを読んでください(特に src/preset.rs)。
+
+          # あなたへの問い
+          **エコシステムとの接続として、v1.0.0 までに何をすべきか。**
+
+          考えてほしい観点:
+          - 対応ツールの過不足。追加すべき CLI はあるか
+          - 各 CLI が自前のサブエージェント機能を持ち始めた今、sfh の存在意義はどこか
+          - MCP、エージェント間プロトコル、CI(GitHub Actions 等)との関係
+          - sfh を「呼ぶ側」(codex app のような親エージェント)にとっての使い勝手
+          - 配布・インストール(現在は単一バイナリ + GitHub Releases)
+
+          忌憚なく。sfh が不要になる筋書きがあるならそれも書いてください。
+          具体的に、優先順位を付けて。
+
+      - id: grok_v1meaning
+        use: grok
+        prompt: |
+          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください。
+
+          # あなたへの問い
+          **「v1.0.0」という宣言として、何を固定し、何を未確定のまま残すべきか。**
+
+          v1.0 は互換性の約束です。以下を判断してください:
+          - YAML スキーマのどこが安定していて、どこがまだ変わりうるか
+          - 今のうちに名前を変える/削るべきキーはあるか(後方互換の負債になる前に)
+          - 出力の契約(stdout、終了コード、log.jsonl、status.json)のうち
+            公開 API として約束してよいものはどれか
+          - experimental として明示的に切り離すべき機能はあるか
+            (例: cursor プリセットは非公開のパス構造に依存している)
+          - v1.0 に「入れない」と決めるべきものは何か
+
+          具体的に。削除・改名の提案には移行方法も添えてください。
+
+      # ---- opencode x2 ----
+      - id: qwen_onboarding
+        use: qwen
+        prompt: |
+          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          非対話実行する Rust 製単一バイナリの CLI です。
+          README.md と src/guide.txt と examples/ を読んでください。
+
+          # あなたへの問い
+          **初めて触る人(および、これを使う AI エージェント)が詰まる所はどこか。
+          v1.0.0 までにドキュメント・オンボーディングとして何を直すべきか。**
+
+          考えてほしい観点:
+          - README の構成と過不足。英語話者にとってどうか(本文は日本語)
+          - `sfh guide` (80行、英語、AI が読む前提)の内容は適切か
+          - `sfh init` が書き出す雛形は出発点として正しいか
+          - 最初の5分で何ができれば「分かった」と思えるか
+          - 学習コストが高い概念はどれか
+
+          具体的に、優先順位を付けて。
+
+      - id: qwen_ops
+        use: qwen
+        prompt: |
+          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください
+          (src/runs.rs, src/watch.rs, src/engine.rs の log_event 周辺)。
+
+          # あなたへの問い
+          **無人で長時間動かす道具として、v1.0.0 までに運用面で何を足すべきか。**
+
+          考えてほしい観点:
+          - 今 log.jsonl / status.json / meta.json に記録されているもので足りるか
+          - 実行中・実行後に「何が起きたか」を知る手段は十分か
+          - コストとトークンの可視化
+          - 複数の実行をまたいだ集計(sfh runs list --json は既にある)
+          - 失敗した実行のデバッグ体験
+          - run ディレクトリの肥大化とライフサイクル
+
+          注意: sfh は採点者の結果を持っていないので、「検証済み成功率」のような
+          知らないことを知っているふりをする指標は作れません。その制約の中で答えてください。
+
+          具体的に、優先順位を付けて。
