@@ -6,7 +6,21 @@ set -uo pipefail
 SFH="${1:-./target/release/sfh}"
 SFH="$(cd "$(dirname "$SFH")" && pwd)/$(basename "$SFH")"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Windows holds a directory busy while any process still has a handle inside
+# it, and this suite deliberately starts DETACHED runs that outlive it - that
+# is the feature under test, not a leak. A cleanup that loses the race used to
+# turn an all-green run red, because a failing command in an EXIT trap replaces
+# the script's exit status. Retry briefly, then give up quietly, and always
+# hand back the status the tests actually produced.
+cleanup() {
+  rc=$?
+  for _ in 1 2 3 4 5; do
+    rm -rf "$WORK" 2>/dev/null && break
+    sleep 1
+  done
+  exit "$rc"
+}
+trap cleanup EXIT
 cd "$WORK"
 
 pass=0
@@ -350,7 +364,12 @@ steps:
     cmd: "echo {{vars.evil}}"
 YAML
 "$SFH" run guard.yaml -q > guard.out 2> guard.err
-check "shell metacharacters in substitutions are rejected" 1 $?
+# Exit 2, not 1. The hardening moved this rejection into step preparation, so
+# nothing is executed and the run never becomes a "flow that ran and failed".
+# 2 is what every other rejection in this file expects - traversal flow names,
+# string-cmd templating, unclosed raw blocks, an AI step without access - and
+# this line was the one holdout still asserting the pre-hardening code.
+check "shell metacharacters in substitutions are rejected" 2 $?
 contains "explains why" "metacharacters" guard.err
 
 # --- failure: partial emit + resume ------------------------------------------
@@ -852,6 +871,10 @@ cat > s11-run/status.json <<JSON
   "nonce": "deadbeef"
 }
 JSON
+# The run dir needs a matching sfh-nonce, or F-6's tamper check refuses first
+# and this test never reaches the containment check it is named for. The nonce
+# file is "<pid> <nonce>"; F-6 has its own tests for the mismatch cases.
+printf '99999 deadbeef\n' > s11-run/sfh-nonce
 "$SFH" wait s11-run > s11.out 2>s11.err
 s11_rc=$?
 if grep -qF "TOP-SECRET-S11" s11.out; then
@@ -1282,7 +1305,18 @@ steps:
     prompt: "y"
 YAML
 "$SFH" run s24-override.yaml -q > s24-override.out 2> s24-override.err
-check "S2-4: allow_access_override permits the escalation" 0 $?
+# Judged by the refusal MESSAGE, not the exit code. `bin: "echo"` reports no
+# session id, so F-11's "resume unverified" check now fails every one of these
+# runs on its own - real claude does report one, so that guard is correct and
+# the stub simply cannot satisfy it. An exit-code assertion here would be
+# testing F-11, not the access decision this block is about.
+if grep -q "refusing to resume" s24-override.err; then
+  echo "FAIL - S2-4: allow_access_override did not permit the escalation"
+  fail=$((fail + 1))
+else
+  echo "ok   - S2-4: allow_access_override permits the escalation"
+  pass=$((pass + 1))
+fi
 cat > s24-same.yaml <<'YAML'
 name: s24-same
 steps:
@@ -1298,8 +1332,14 @@ steps:
     continue_from: low
     prompt: "y"
 YAML
-"$SFH" run s24-same.yaml -q > s24-same.out 2>&1
-check "S2-4: resuming at the same access level is allowed" 0 $?
+"$SFH" run s24-same.yaml -q > s24-same.out 2> s24-same.err
+if grep -q "refusing to resume" s24-same.err; then
+  echo "FAIL - S2-4: resuming at the same access level was refused"
+  fail=$((fail + 1))
+else
+  echo "ok   - S2-4: resuming at the same access level is allowed"
+  pass=$((pass + 1))
+fi
 cat > s24-fork.yaml <<'YAML'
 name: s24-fork
 steps:
@@ -1582,6 +1622,140 @@ echo "FA-A" > rfan-run/fa.out.txt
 check "a crash before aggregate_end resumes instead of 'cannot tell where'" 0 $?
 contains "the unfinished fan-out is reported, not lost" "never recorded an end" rfan.err
 contains "the resumed fan-out ran through to the end" "fan-done" rfan.out
+
+# --- F-2: a resumed fan-out must not re-run members that already completed ----
+# A crash mid-parallel leaves step_end events for the finished children but no
+# aggregate_end. The resume must reuse their recorded outputs instead of running
+# them again: the old code rebuilt the whole batch, billing completed children
+# twice, opening duplicate sessions, and - with max_total_steps sized for the
+# live run - counting the restored child PLUS a full fresh batch against the
+# cap, so the resume wedged and could never finish. max_total_steps: 2 is
+# exactly "one restored + one fresh": only a resume that skips the completed
+# child fits under it.
+cat > rskip.yaml <<'YAML'
+name: rskip
+defaults:
+  max_total_steps: 2
+steps:
+  - id: fan
+    parallel:
+      - id: fa
+        cmd: ["echo", "FA-A"]
+      - id: fb
+        cmd: ["echo", "FA-B"]
+YAML
+mkdir -p rskip-run
+cat > rskip-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"x","name":"rskip","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > rskip-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}
+{"ts":"20250101-000002","event":"step_end","step":"fa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":4,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"fa.chain.txt","out_file":"fa.out.txt","cmd":"echo FA-A","session":null}
+JSON
+echo "FA-A" > rskip-run/fa.chain.txt
+echo "FA-A" > rskip-run/fa.out.txt
+"$SFH" run rskip.yaml --resume rskip-run --force-resume > rskip.out 2>rskip.err
+check "F-2: resume fits max_total_steps when completed members are skipped" 0 $?
+contains "F-2: the completed child is reported restored, not prepared again" "1 restored" rskip.err
+# sfh writes log JSON with the keys in ALPHABETICAL order, so "event" is
+# followed by "exit", never by "step". A fixed-string needle that assumes the
+# two are adjacent matches only the hand-written fixture line above and never
+# anything sfh emits - which is exactly how this test could report "not
+# executed a second time" while the member was in fact re-running.
+FA_ENDS=$(grep -c '"event":"step_end".*"step":"fa"' rskip-run/log.jsonl)
+if [ "$FA_ENDS" = "1" ]; then
+  echo "ok   - F-2: the completed parallel child was not executed a second time"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F-2: child 'fa' has $FA_ENDS step_end events, expected 1 (the resume re-ran it)"
+  fail=$((fail + 1))
+fi
+contains "F-2: the unfinished child still runs" '"step":"fb"' rskip-run/log.jsonl
+contains "F-2: the aggregate reuses the restored child's recorded output" "FA-A" rskip-run/fan.chain.txt
+contains "F-2: the aggregate carries the fresh child's output" "FA-B" rskip-run/fan.chain.txt
+
+# --- F-2: the same skip applies to foreach items -------------------------------
+# Items log under their "id[i]" label; the one the crash completed must be
+# rebuilt from its recorded output, not re-run. Same cap arithmetic as above.
+cat > rfeskip.yaml <<'YAML'
+name: rfeskip
+defaults:
+  max_total_steps: 2
+steps:
+  - id: each
+    foreach: { from: "alpha\nbeta" }
+    cmd: ["echo", "item-{{item}}"]
+YAML
+mkdir -p rfeskip-run
+cat > rfeskip-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"x","name":"rfeskip","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > rfeskip-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"foreach_start","step":"each","visit":1,"items":2}
+{"ts":"20250101-000002","event":"step_end","step":"each[0]","parent":"each","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":10,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"each.i0.chain.txt","out_file":"each.i0.out.txt","cmd":"echo item-alpha","session":null}
+JSON
+echo "item-alpha" > rfeskip-run/each.i0.chain.txt
+echo "item-alpha" > rfeskip-run/each.i0.out.txt
+"$SFH" run rfeskip.yaml --resume rfeskip-run --force-resume > rfeskip.out 2>rfeskip.err
+check "F-2: foreach resume fits max_total_steps when completed items are skipped" 0 $?
+contains "F-2: the completed item is reported restored, not prepared again" "1 restored" rfeskip.err
+FE_ENDS=$(grep -c '"event":"step_end".*"step":"each\[0\]"' rfeskip-run/log.jsonl)
+if [ "$FE_ENDS" = "1" ]; then
+  echo "ok   - F-2: the completed foreach item was not executed a second time"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F-2: item 'each[0]' has $FE_ENDS step_end events, expected 1 (the resume re-ran it)"
+  fail=$((fail + 1))
+fi
+contains "F-2: the unfinished item still runs" '"step":"each[1]"' rfeskip-run/log.jsonl
+contains "F-2: the foreach aggregate reuses the restored item's output" "item-alpha" rfeskip-run/each.chain.txt
+contains "F-2: the foreach aggregate carries the fresh item's output" "item-beta" rfeskip-run/each.chain.txt
+
+# --- F-2: a REAL crash and a REAL resume, not a hand-built log ----------------
+# The two tests above assemble their own log.jsonl at visit 1 and resume with
+# --force-resume, which is precisely the case the bug did NOT affect - which is
+# why they passed while the double billing was still there. A fan-out that
+# fails logs an aggregate_end, so a genuine resume re-enters the group at visit
+# 2 while its finished members are recorded under visit 1. The lookup missed
+# every one of them and the whole batch re-ran, and re-billed.
+#
+# Members run in the SHARED work dir and append a line each, so the tally is a
+# direct count of executions. m3 fails once and arms its own tripwire, so the
+# resume must run exactly m3 and reuse m1/m2.
+cat > rreal.yaml <<'YAML'
+name: rreal
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: m1
+        cmd: ["sh", "-c", "echo m1 >> rreal-tally.txt; echo out1"]
+      - id: m2
+        cmd: ["sh", "-c", "echo m2 >> rreal-tally.txt; echo out2"]
+      - id: m3
+        cmd: ["sh", "-c", "echo m3 >> rreal-tally.txt; if [ -f rreal-trip ]; then echo out3; else touch rreal-trip; exit 7; fi"]
+  - id: after
+    cmd: ["echo", "fan-finished"]
+YAML
+"$SFH" run rreal.yaml --runs-dir rreal-runs -q > rreal1.out 2> rreal1.err
+check "F-2: the first pass fails on the one bad member" 1 $?
+RREAL_DIR="$(ls -d rreal-runs/*/ | head -1 | sed 's:/*$::')"
+"$SFH" run rreal.yaml --resume "$RREAL_DIR" --runs-dir rreal-runs -q > rreal2.out 2> rreal2.err
+check "F-2: the real resume runs to the end" 0 $?
+RM1=$(grep -c '^m1$' rreal-tally.txt)
+RM2=$(grep -c '^m2$' rreal-tally.txt)
+RM3=$(grep -c '^m3$' rreal-tally.txt)
+if [ "$RM1" = "1" ] && [ "$RM2" = "1" ] && [ "$RM3" = "2" ]; then
+  echo "ok   - F-2: a real resume reused both finished members and re-ran only the failed one"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F-2: executions were m1=$RM1 m2=$RM2 m3=$RM3, expected 1 1 2 (finished members re-ran = double billing)"
+  fail=$((fail + 1))
+fi
+contains "F-2: the resumed aggregate still carries the reused member's output" "out1" "$RREAL_DIR/fan.v2.chain.txt"
+contains "F-2: the flow continued past the fan-out" "fan-finished" rreal2.out
 
 # --- resume regression: fan-out routing matches live (headerless plain) -------
 # Live routing tests conditions against the headerless plain concatenation; the

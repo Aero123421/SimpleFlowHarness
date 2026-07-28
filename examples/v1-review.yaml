@@ -1,0 +1,221 @@
+# v1.0.0 の最終レビュー。**レビュアーは探すだけ。直すのは人間側。**
+#
+# これまでのラウンドは「AIが直す → AIがレビューする」を自動で回そうとして、
+# 実装側が遅すぎる・止まる、という理由で3回とも時間を溶かした。
+# レビュー自体は機能していた(閉じたリストを与えると 3→4→0 と収束した)ので、
+# **価値のある部分だけ**を残す:
+#   - 3体が独立に、閉じた11項目だけを判定する
+#   - 最終行の REVIEW-PASS を grep が数える。LLM に合議させない
+#   - 不足があっても自動で差し戻さない。所見を出して終わる
+#
+#   sfh run examples/v1-review.yaml --detach
+name: v1-review
+
+profiles:
+  rev:
+    tool: codex
+    bin: 'C:\Users\nanoc\AppData\Local\OpenAI\Codex\bin\69066b736e1e17a4\codex.exe'
+    model: gpt-5.6-sol
+    effort: high
+    access: read
+
+defaults:
+  timeout_sec: 3600
+  max_cost_usd: 40.0
+  wall_clock_sec: 14400
+  max_emit_chars: 200000
+  retry: { max: 2, backoff_sec: 30 }
+  retry_on: any
+  tool_max_parallel:
+    codex: 3
+
+steps:
+  - id: stage
+    cmd: ["git", "add", "-A"]
+    retry_on: never
+    route: [{ goto: review }]
+
+  - id: review
+    max_parallel: 3
+    parallel:
+      - id: rev_impl
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) のレビュアーです。
+          自分たちのオープンソースプロジェクトの v1.0.0 リリース前レビューです。
+
+          ## 環境の制約
+          読み取り専用で動いています。**テストは実行できませんし、する必要もありません。**
+          cargo fmt / clippy -D warnings / 123個のユニットテスト / 挙動テスト /
+          全 examples の validate は、決定論的ゲートが既に通しています。
+          **コードを読んでください。** 差分は `git --no-pager diff main` です。
+
+          ## 判定対象(この11項目**だけ**)
+          F-1  セッション access が欠落・不正のとき read への再開も拒否する
+               (「キー自体が無い旧形式(meta.json の sfh_version が 0.x)」とは区別すること)
+          F-2  parallel / foreach の resume で完了済みメンバーを再実行しない
+          F-3  旧 run(0.x、access 記録なし)の continue_from / fork_from が write/full で再開できる
+          F-4  旧 run の再開時、文字列 cmd: のテンプレート制限が警告に落ちる
+          F-5  bin: / cwd: のテンプレート検査が validate にもある + escape hatch がある
+          F-6  status / wait の全終端状態で nonce を検査し、検査を出力より前に行う
+          F-7  セッション access を未信頼ログの自己申告値だけで判定していない
+          F-8  run 由来値(vars/notes/item)も特権テンプレート(bin/cwd/argv[0])で拒否する
+          F-9  argv[0] が既知のシェルなら、文字列形式と同じ検査を通す
+          F-10 resume ログの timed_out / interrupted / failed が欠落・型不正なら成功としない
+          F-11 セッション再開確認で、期待値があるのに報告が無い場合は失敗にする
+
+          ## 特に見てほしい直近の2つの修正
+          この2つは他の項目より後に入ったので、レビューを受けていません。
+
+          **(a) F-2 の本当の原因** — `src/engine.rs` の `load_resume` 末尾。
+          失敗した fan-out も aggregate_end を書くので `visits[group]` が確定し、
+          再開はグループに visit+1 で入る。しかし完了メンバーは**クラッシュした
+          visit** のキーで記録されていたので、照合が永久に一致しなかった。
+          最後の visit の集合を visit+1 にも複製して直してある。
+          加えて、完了メンバーの記録を `ok` で絞った(以前は**失敗した**メンバーも
+          「完了」として記録され、再開時に唯一直すべきメンバーがスキップされていた)。
+          → この2つが正しいか、他の経路を壊していないかを見てください。
+            特に「意図的に route で同じグループに戻るループ」で、
+            メンバーが誤ってスキップされないこと。
+
+          **(b) F-9 の穴** — `src/leaf.rs` の `shell_script_start`。
+          `powershell` / `pwsh` が一覧に無く、
+          {{raw}}`["pwsh","-Command","...{{untrusted}}..."]`{{endraw}} が
+          素通りしていた。pwsh は macOS/Linux にも入るので Windows 限定ではない。
+          あわせて `Path::file_stem` をやめ、区切り文字を手で処理するようにした
+          (Linux 上では `C:\...\cmd.exe` に区切り文字が無く、判定が OS で変わっていた)。
+          → PowerShell のスイッチ接頭辞照合が過剰拒否していないか。
+            `-ExecutionPolicy` や `-ConfigurationName` を誤検出しないか。
+
+          ## 判定の仕方
+          各項目を **完了 / 不足** で判定し、根拠となる file:line を挙げてください。
+          「完了」と判定するには、**その挙動を確認できるコードとテストの両方**を
+          指せること。テストが**修正前のコードでも通る**なら「不足」です。
+
+          実例: F-2 に追加されていたテストのうち2つは、手書きの log.jsonl と
+          `--force-resume` を使っていて、**バグが起きない経路**を試していました。
+          `tests/engine_behaviour.sh` の `rreal` はその後に足した、本物の実行と
+          再開を使うテストです。同じ穴が他の項目にも無いか見てください。
+
+          ## 重要: 判定範囲の制限
+          上の11項目以外の問題を見つけた場合、「## 追加所見」として末尾に書いてください。
+          **それを理由に FAIL にしないでください。** 追加所見は v1.1 に回します。
+
+          ## 出力
+          11項目の判定表 → 不足の詳細(file:line と、どう直すべきか)→ 追加所見。
+          **最後の行に `REVIEW-PASS`(11項目すべて完了)か
+          `REVIEW-FAIL`(不足あり)を単独で書くこと。** 他の語を最後の行に書かないこと。
+
+      - id: rev_tests
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**テスト品質**レビュアーです。
+
+          ## 環境の制約
+          読み取り専用です。テストは実行できませんし、する必要もありません。
+          決定論的ゲートが既に通しています。**テストのソースを読んでください。**
+          差分は `git --no-pager diff main` です。
+
+          ## あなたの仕事
+          F-1〜F-11 に対して足されたテストが、**本当にその修正を検証しているか**
+          だけを判定します。実装の正しさは別のレビュアーが見ます。
+
+          F-1 セッション access 欠落・不正 → read への再開も拒否
+          F-2 parallel / foreach resume で完了済みメンバーを再実行しない
+          F-3 旧 run(0.x)の continue_from / fork_from が write/full で再開できる
+          F-4 旧 run 再開時の文字列 cmd: 制限が警告に落ちる
+          F-5 bin: / cwd: テンプレート検査が validate にもある
+          F-6 status / wait の全終端状態で nonce 検査、検査が出力より前
+          F-7 セッション access を自己申告値だけで判定していない
+          F-8 run 由来値も特権テンプレートで拒否
+          F-9 argv[0] が既知のシェルなら文字列形式と同じ検査
+          F-10 resume ログの成功フィールド欠落を成功としない
+          F-11 セッション再開確認で報告欠落を失敗にする
+
+          ## 判定基準(これだけ)
+          各項目のテストについて:
+          - **修正前のコードで、そのテストは落ちるか。** 落ちないなら「不足」
+          - 攻撃が**防がれること**を確認しているか、単に正常系が通るだけか
+          - 判定に使う出力先は正しいか(stderr に出るメッセージを stdout で探していないか)
+          - **失敗の理由を取り違えていないか。** 実例: セッション系のテストは
+            `bin: "echo"` を使うが、echo はセッション ID を報告しないので
+            F-11 の「resume unverified」で必ず落ちる。終了コードだけで
+            「アクセス昇格を防いだ」と判定しているテストは、**別の理由で
+            落ちたものを成功と数えている**。メッセージで判定すべき
+
+          実例(既知): `tests/engine_behaviour.sh` の `rskip` / `rfeskip` は
+          手書きの log.jsonl と `--force-resume` を使っており、F-2 のバグが
+          起きない経路を試していた。同じ種類の空振りが他に無いか探してください。
+
+          ## 重要: 判定範囲の制限
+          11項目のテスト品質**だけ**を判定してください。
+          他は「## 追加所見」に書き、**FAIL の理由にしないこと。**
+
+          ## 出力
+          11項目それぞれについて「テストは修正を検証している / していない」の判定表と理由。
+          **最後の行に `REVIEW-PASS` か `REVIEW-FAIL` を単独で書くこと。**
+
+      - id: rev_portable
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**移植性**レビュアーです。
+
+          ## 環境の制約
+          読み取り専用です。テストは実行できません。**コードを読んでください。**
+          差分は `git --no-pager diff main` です。
+
+          ## 絶対条件
+          **Windows / macOS / Linux で完全に同じ挙動**。これは sfh の絶対条件です。
+          同じフローファイルは、どの OS でも同じ判定を受けなければいけません。
+
+          ## 判定対象(この観点**だけ**)
+          F-1〜F-11 の修正が 3 OS で同じ挙動になるか。特に:
+
+          - **F-9 のシェル判定**: `src/leaf.rs` の `shell_script_start` は
+            `Path::file_stem` をやめて区切り文字を手で処理するようにした。
+            理由は、Linux 上で `C:\Windows\System32\cmd.exe` に区切り文字が無く、
+            同じフローが OS によって別の判定を受けていたから。
+            → この書き換えが本当に 3 OS で同一か。大文字小文字、拡張子、
+              UNC パス、末尾の区切り文字、空文字列を確認すること
+          - **F-2 の resume**: `src/engine.rs` の `load_resume`。
+            visit の複製とメンバー照合が、パス表現や HashMap の反復順に
+            依存していないか(反復順が結果を変えるなら OS 以前に非決定的)
+          - パス比較(大文字小文字、区切り文字、UNC、シンボリックリンク、canonicalize)
+          - プロセス識別(/proc は Linux のみ。macOS と Windows はどうしているか)
+          - パーミッション(Unix のモードビットに依存していないか)
+          - `cfg!(windows)` で**判定結果そのもの**が変わっていないか
+            (セキュリティ検査は、どの OS でも同じ答えを出すべき)
+          - 行末、文字エンコーディング
+
+          ## 重要: 判定範囲の制限
+          上の観点**だけ**で判定してください。他は「## 追加所見」に書き、
+          **FAIL の理由にしないこと。**
+
+          ## 出力
+          項目ごとに「3 OS で同一 / OS 依存あり」の判定と根拠(file:line)。
+          **最後の行に `REVIEW-PASS` か `REVIEW-FAIL` を単独で書くこと。**
+
+  # 3体の最終行を機械的に数える。末尾の空白と CR を許容する。
+  - id: verdict
+    cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS[[:space:]]*$' - || true); echo \"PASSES=$n\""]
+    stdin: prompt
+    prompt: "{{steps.review.outputs}}"
+    on_error: continue
+    retry_on: never
+    route:
+      - when_last_line_is: "PASSES=3"
+        goto: wrap
+      - goto: report
+
+  # 自動で差し戻さない。所見を出して終わる。直すのは人間側。
+  - id: report
+    cmd: ["sh", "-c", "echo 'NOT UNANIMOUS - see review outputs above'; git --no-pager diff --stat main | tail -3"]
+    retry_on: never
+    route: [{ goto: end }]
+
+  - id: wrap
+    cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED THE 11-ITEM CHECKLIST'; git --no-pager diff --stat main | tail -3"]
+    retry_on: never

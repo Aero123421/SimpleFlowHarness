@@ -304,34 +304,79 @@ pub fn exec_template_check<'a>(
     move |key: &str, _: &str| -> Result<(), String> { exec_path_key_check(key, tainted_vars) }
 }
 
-/// True when `argv` is really a shell invocation in argv clothing: argv[0] is a
-/// known shell and the next argument is its "run this string" flag. The string
-/// after that flag is re-parsed by the shell, so it needs the SAME template
-/// treatment as a string-form cmd - the argv branch's ordinary "data is safe"
-/// reasoning does not apply to it (rev_break #13: `cmd: ["sh","-c","...{{x}}..."]`
-/// bypassed the shell-template defence entirely). Returns the index of the
-/// first shell-script argument (everything from there on is shell text).
-pub fn shell_script_start(argv: &[String]) -> Option<usize> {
+/// Which arguments of `argv` are shell TEXT, when argv[0] is a shell and one of
+/// its "run this string" flags is present. That text is re-parsed by the shell,
+/// so it needs the same template treatment as a string-form cmd - the argv
+/// branch's ordinary "data is safe" reasoning does not apply to it (rev_break
+/// #13: `cmd: ["sh","-c","...{{x}}..."]` bypassed the shell-template defence).
+///
+/// A RANGE, not a start index, because the shells disagree about what follows
+/// the flag and the difference decides whether the safest way to write this is
+/// allowed or refused:
+///
+/// - `sh -c SCRIPT name arg1 arg2` - only SCRIPT is shell text. The rest become
+///   `$0 $1 $2` INSIDE the script and are never re-parsed. That is the standard
+///   way to hand untrusted data to a shell safely, and treating the whole tail
+///   as script text refused exactly the flows that were doing the right thing.
+///   The value still arrives as one word whatever it contains; the script has
+///   to write `"$1"` rather than `$1` to keep it that way, which is the same
+///   trust the documented `cmd: ["program", "--flag", "{{x}}"]` form already
+///   places in the program being handed the argument.
+/// - `cmd /c ...` and `powershell -Command ...` - the remaining arguments are
+///   joined back into one command line, so all of them are shell text.
+/// - `powershell -EncodedCommand B64` - one argument, like sh.
+pub fn shell_script_span(argv: &[String]) -> Option<std::ops::Range<usize>> {
     let prog = argv.first()?;
-    let stem = Path::new(prog)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
+    // Split on BOTH separators by hand rather than using Path::file_stem. A
+    // security check must give the same answer on every OS, and file_stem does
+    // not: on Linux, `C:\Windows\System32\cmd.exe` has no separator at all, so
+    // the whole string is the file name and the shell goes unrecognised. The
+    // flow file is the same on all three platforms, so the verdict must be too.
+    let base = prog
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(prog)
+        .to_lowercase();
+    let stem = base.rsplit_once('.').map_or(base.as_str(), |(s, _)| s);
     let sh_family = matches!(
-        stem.as_str(),
+        stem,
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "busybox"
     );
     let cmd_exe = stem == "cmd";
-    if !sh_family && !cmd_exe {
+    // PowerShell was the one shell family this check did not know about, so
+    // `cmd: ["pwsh","-Command","...{{untrusted}}..."]` walked straight past it.
+    // pwsh ships for macOS and Linux too, so this is not a Windows-only gap.
+    let powershell = matches!(stem, "powershell" | "pwsh");
+    if !sh_family && !cmd_exe && !powershell {
         return None;
     }
     for (i, a) in argv.iter().enumerate().skip(1) {
         let low = a.to_lowercase();
         if sh_family && (low == "-c" || low == "-lc" || low == "-ec") {
-            return Some(i + 1);
+            return Some(i + 1..(i + 2).min(argv.len()));
         }
         if cmd_exe && (low == "/c" || low == "/k" || low == "/r") {
-            return Some(i + 1);
+            return Some(i + 1..argv.len());
+        }
+        // PowerShell takes any unambiguous prefix of a switch name and either
+        // introducer, so -c, -Com and /Command all mean -Command. Match the
+        // same way instead of listing spellings - a list would miss -Comm and
+        // let it through. The other switches do not collide: "executionpolicy"
+        // and "configurationname" are not prefixes of either name.
+        if powershell && (low.starts_with('-') || low.starts_with('/')) {
+            let bare = low.trim_start_matches(['-', '/']);
+            if bare.is_empty() {
+                continue;
+            }
+            // -EncodedCommand takes exactly one base64 argument; -Command takes
+            // everything left. Check the longer name first: "c" is a prefix of
+            // "command" only, so the order matters just for the "e..." spellings.
+            if "encodedcommand".starts_with(bare) && bare.starts_with('e') {
+                return Some(i + 1..(i + 2).min(argv.len()));
+            }
+            if "command".starts_with(bare) {
+                return Some(i + 1..argv.len());
+            }
         }
     }
     None
@@ -518,10 +563,10 @@ pub fn prepare_leaf(
             // (rev_break #13).
             let mut head = nv.clone();
             head.extend(v.iter().skip(1).cloned());
-            let script_from = shell_script_start(&head);
+            let script_span = shell_script_span(&head);
             for (i, x) in v.iter().enumerate().skip(1) {
-                let rendered = match script_from {
-                    Some(start) if i >= start => {
+                let rendered = match &script_span {
+                    Some(span) if span.contains(&i) => {
                         if step.unsafe_shell_template.unwrap_or(false) {
                             template::render_checked(x, &ctx, &shell_metachar_check)
                         } else {
@@ -2588,30 +2633,57 @@ mod tests {
     }
 
     #[test]
-    fn shell_script_start_detects_wrapped_shells() {
+    fn shell_script_span_detects_wrapped_shells() {
+        let s =
+            |a: &[&str]| shell_script_span(&a.iter().map(|x| x.to_string()).collect::<Vec<_>>());
         // rev_break #13: the argv form can wrap a shell; the script argument
         // after the -c / /C flag is re-parsed by that shell.
-        assert_eq!(
-            shell_script_start(&["sh".into(), "-c".into(), "echo hi".into()]),
-            Some(2)
-        );
-        assert_eq!(
-            shell_script_start(&["bash".into(), "-c".into(), "x".into()]),
-            Some(2)
-        );
-        assert_eq!(
-            shell_script_start(&["cmd".into(), "/C".into(), "dir".into()]),
-            Some(2)
-        );
+        assert_eq!(s(&["sh", "-c", "echo hi"]), Some(2..3));
+        assert_eq!(s(&["bash", "-c", "x"]), Some(2..3));
         // Flags before -c: the script is still the element after -c.
+        assert_eq!(s(&["sh", "-l", "-c", "x"]), Some(3..4));
+
+        // sh -c SCRIPT name arg1: only SCRIPT is shell text. The trailing
+        // arguments arrive as $0/$1 inside the script and are NOT re-parsed -
+        // this is the recommended way to pass an untrusted value to a shell,
+        // and a span that swallowed the tail refused it.
         assert_eq!(
-            shell_script_start(&["sh".into(), "-l".into(), "-c".into(), "x".into()]),
-            Some(3)
+            s(&["sh", "-c", "cat \"$1\"", "name", "/some/path"]),
+            Some(2..3)
         );
+
+        // cmd.exe and PowerShell -Command re-join everything that follows into
+        // one command line, so the whole tail is shell text.
+        assert_eq!(s(&["cmd", "/C", "dir"]), Some(2..3));
+        assert_eq!(s(&["cmd", "/C", "echo", "a", "b"]), Some(2..5));
+        assert_eq!(s(&["powershell", "-Command", "echo", "a"]), Some(2..4));
+        assert_eq!(s(&["pwsh", "-c", "echo", "a"]), Some(2..4));
+        assert_eq!(s(&["pwsh", "-NoProfile", "-Command", "x"]), Some(3..4));
+        // -EncodedCommand takes exactly one base64 argument.
+        assert_eq!(s(&["pwsh", "-EncodedCommand", "eABiAA==", "x"]), Some(2..3));
+        // Either introducer, and a path- or extension-qualified name, on every
+        // OS: this is parsed by hand rather than with Path so that a Windows
+        // path is still recognised when the check runs on Linux.
+        assert_eq!(s(&["pwsh", "/Command", "x"]), Some(2..3));
+        assert_eq!(s(&["/bin/sh", "-c", "x"]), Some(2..3));
+        assert_eq!(
+            s(&["C:\\Windows\\System32\\cmd.exe", "/c", "x"]),
+            Some(2..3)
+        );
+        assert_eq!(s(&["/usr/bin/pwsh", "-Command", "x"]), Some(2..3));
+
+        // PowerShell switches that merely LOOK close must not be mistaken for
+        // -Command or -EncodedCommand, or their operand would be refused.
+        assert_eq!(s(&["pwsh", "-ExecutionPolicy", "Bypass"]), None);
+        assert_eq!(s(&["pwsh", "-ConfigurationName", "n"]), None);
+        assert_eq!(s(&["pwsh", "-NoProfile", "-File", "s.ps1"]), None);
+
         // Not a shell, or no run-string flag: no shell text.
-        assert_eq!(shell_script_start(&["echo".into(), "hi".into()]), None);
-        assert_eq!(shell_script_start(&["sh".into(), "script.sh".into()]), None);
-        assert_eq!(shell_script_start(&[]), None);
+        assert_eq!(s(&["echo", "hi"]), None);
+        assert_eq!(s(&["sh", "script.sh"]), None);
+        assert_eq!(shell_script_span(&[]), None);
+        // A flag with nothing after it must not produce an out-of-range span.
+        assert_eq!(s(&["sh", "-c"]), Some(2..2));
     }
 
     #[test]

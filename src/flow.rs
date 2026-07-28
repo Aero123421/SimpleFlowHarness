@@ -943,8 +943,8 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
         // the old code saw only "the argv branch" and skipped every shell
         // defence (rev_break #13). legacy flows predate the rule (load_lenient).
         if !legacy && !s.unsafe_shell_template.unwrap_or(false) {
-            if let Some(start) = crate::leaf::shell_script_start(v) {
-                for x in &v[start..] {
+            if let Some(span) = crate::leaf::shell_script_span(v) {
+                for x in &v[span.start.min(v.len())..span.end.min(v.len())] {
                     if crate::template::contains_template(x) {
                         return Err(format!(
                             "step '{sid}': cmd wraps a shell and its shell text contains a template, which is disabled by default for the same reason as a string-form cmd (the value is re-parsed by the shell). Avoid the shell:\n  cmd: [\"program\", \"--flag\", \"{{{{steps.x.output}}}}\"]\nor set unsafe_shell_template: true on this step to accept shell templating"

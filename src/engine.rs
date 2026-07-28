@@ -182,10 +182,10 @@ fn precheck(
                 if let Some(first) = v.first() {
                     exec_chk(body_ctx, "cmd[0]", first)?;
                 }
-                let script_from = leaf::shell_script_start(v);
+                let script_span = leaf::shell_script_span(v);
                 for (i, c) in v.iter().enumerate().skip(1) {
-                    match script_from {
-                        Some(start) if i >= start => shell_chk(body_ctx, c)?,
+                    match &script_span {
+                        Some(span) if span.contains(&i) => shell_chk(body_ctx, c)?,
                         _ => chk(body_ctx, "cmd", c)?,
                     }
                 }
@@ -473,23 +473,6 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 }
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
                 let is_child = v.get("parent").is_some_and(|p| !p.is_null());
-                // A finished fan-out member: remember it under its PARENT group
-                // so a resume that re-enters the group skips it instead of
-                // spending money and sessions a second time (rev_regression:
-                // completed members re-executed). The member key is exactly the
-                // `step` the member logged under - a parallel child's id, or a
-                // foreach item's "id[i]" label - and the group re-derives the
-                // same keys when it rebuilds its batch.
-                if let Some(parent) = v
-                    .get("parent")
-                    .and_then(|p| p.as_str())
-                    .filter(|p| !p.is_empty())
-                {
-                    st.completed_members
-                        .entry((parent.to_string(), visit))
-                        .or_default()
-                        .insert(step.clone());
-                }
                 // step_end clears an unfinished leaf; aggregate_end clears the
                 // fan-out group opened by group_start/foreach_start. A child's
                 // step_end is keyed by the CHILD id, so it cannot clear its
@@ -522,6 +505,31 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     && timed_out_raw == Some(false)
                     && interrupted_raw == Some(false)
                     && failed_absent_or_false;
+                // A SUCCESSFUL fan-out member: remember it under its PARENT
+                // group so a resume that re-enters the group skips it instead
+                // of spending money and sessions a second time (rev_regression:
+                // completed members re-executed). The member key is exactly the
+                // `step` the member logged under - a parallel child's id, or a
+                // foreach item's "id[i]" label - and the group re-derives the
+                // same keys when it rebuilds its batch.
+                //
+                // Gated on `ok`, and it must stay that way: the crash being
+                // resumed from is usually ONE member failing, and recording
+                // that member as complete is how a resume ends up skipping the
+                // only step that still needs to run. It then finishes with the
+                // failure text as the member's output and never retries it.
+                if ok {
+                    if let Some(parent) = v
+                        .get("parent")
+                        .and_then(|p| p.as_str())
+                        .filter(|p| !p.is_empty())
+                    {
+                        st.completed_members
+                            .entry((parent.to_string(), visit))
+                            .or_default()
+                            .insert(step.clone());
+                    }
+                }
                 // A run dir is untrusted input on --resume: the artifact paths
                 // recorded in the log must stay inside it, symlinks resolved.
                 // A path pointing elsewhere used to be swallowed into empty
@@ -683,6 +691,33 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
         } else if st.start.is_none() {
             // A failed step ended without recording its on_error decision.
             st.start = last_step;
+        }
+    }
+    // A fan-out that fails still logs an aggregate_end, so `visits` restores
+    // the crashed visit and the resume re-enters the group at visit + 1 - but
+    // the members that finished were recorded under the CRASHED visit. Without
+    // this the lookup misses every one of them and the resume silently re-runs,
+    // and re-bills, the whole batch. That is the F-2 double-billing bug: the
+    // skip logic below was right, the key it looked under was one lap stale.
+    //
+    // Mirror onto the next visit rather than moving: a group killed hard enough
+    // to leave no aggregate_end restores no visit at all and re-enters at the
+    // SAME number, which the original key already covers. Keeping both makes
+    // the crash-with-aggregate and kill-without-aggregate paths agree.
+    //
+    // Only the last recorded visit is mirrored. An earlier visit's members
+    // belong to a lap that finished, and a flow that deliberately routes back
+    // to the group is asking for a fresh run of every member.
+    let mut last_visit: HashMap<String, u32> = HashMap::new();
+    for (group, visit) in st.completed_members.keys() {
+        let e = last_visit.entry(group.clone()).or_insert(0);
+        *e = (*e).max(*visit);
+    }
+    for (group, visit) in last_visit {
+        if let Some(set) = st.completed_members.get(&(group.clone(), visit)).cloned() {
+            st.completed_members
+                .entry((group, visit + 1))
+                .or_insert(set);
         }
     }
     Ok(st)
@@ -3139,6 +3174,61 @@ mod tests {
             st.outputs.get("a").map(|o| o.exit),
             Some(1),
             "an absent exit restores as a failure code"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_records_completed_fanout_members_under_parent_and_visit() {
+        // F-2: a crash mid-fan-out leaves step_end events for the members that
+        // already finished. load_resume must hand them back keyed by (parent
+        // group id, visit) under the member's own log label - a parallel child
+        // id or a foreach "id[i]" - which is exactly what the group re-derives
+        // on resume, so it skips those members instead of executing them a
+        // second time (double billing, duplicate sessions, and a restored
+        // count plus a full fresh batch that wedges max_total_steps).
+        let dir =
+            std::env::temp_dir().join(format!("sfh-resume-members-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"group_start\",\"step\":\"fan\",\"visit\":1,\"children\":2}\n\
+             {\"event\":\"step_end\",\"step\":\"fa\",\"parent\":\"fan\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"chain_file\":\"fa.chain.txt\",\"out_file\":\"fa.out.txt\"}\n\
+             {\"event\":\"foreach_start\",\"step\":\"each\",\"visit\":2,\"items\":2}\n\
+             {\"event\":\"step_end\",\"step\":\"each[0]\",\"parent\":\"each\",\"visit\":2,\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"chain_file\":\"each.i0.chain.txt\",\"out_file\":\"each.i0.out.txt\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("fa.chain.txt"), "FA-A\n").unwrap();
+        std::fs::write(dir.join("fa.out.txt"), "FA-A\n").unwrap();
+        std::fs::write(dir.join("each.i0.chain.txt"), "item-alpha\n").unwrap();
+        std::fs::write(dir.join("each.i0.out.txt"), "item-alpha\n").unwrap();
+
+        let st = load_resume(&dir).expect("load_resume");
+        let fan = st
+            .completed_members
+            .get(&("fan".to_string(), 1))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            fan.contains("fa"),
+            "a completed parallel child must be recorded under its parent group"
+        );
+        assert!(
+            !fan.contains("fb"),
+            "an unstarted sibling must not be marked completed"
+        );
+        let each = st
+            .completed_members
+            .get(&("each".to_string(), 2))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            each.contains("each[0]"),
+            "a completed foreach item must be recorded under its parent step and visit"
+        );
+        assert!(
+            st.outputs.contains_key("fa") && st.outputs.contains_key("each[0]"),
+            "the recorded outputs the skip lives on must be restored too"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

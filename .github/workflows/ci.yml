@@ -33,6 +33,13 @@ jobs:
       - name: Engine behaviour (fake tools, no AI calls)
         shell: bash
         run: bash tests/engine_behaviour.sh ./target/release/sfh
+      # Written from the attack descriptions alone rather than alongside the
+      # fixes, and kept deliberately separate from the suite above. Its value is
+      # that it was baselined against the PRE-fix binary and failed there - a
+      # check that passes on the unfixed build is not testing anything.
+      - name: Independent security checks
+        shell: bash
+        run: bash tests/independent_checks.sh ./target/release/sfh
       - name: Flow schema is valid JSON
         shell: bash
         run: python3 -c "import json;json.load(open('schema/flow.schema.json'))"
