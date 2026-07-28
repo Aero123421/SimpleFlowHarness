@@ -371,6 +371,8 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | `{{steps.ID.output}}` | 最新出力(compact後)。未実行なら空 |
 | `{{steps.ID.outputs}}` | 集約/原文(parallel・foreach・compact原文) |
 | `{{steps.ID.output_file}}` | 出力ファイルパス |
+| `{{steps.ID.exit}}` | sfhが正規化した終了コード。プロセス終了コードそのものではなく、出力解析・空出力・セッション検証等の結果も反映する。診断用テンプレート値であり `route:` の述語ではない |
+| `{{steps.ID.stderr_file}}` | 標準エラー出力ファイルのパス |
 | `{{item}}` `{{item_index}}` | foreach内のみ |
 | `{{notes}}` | 共有ノートの現在内容 |
 | `{{run_dir}}` `{{flow_dir}}` `{{step_id}}` `{{visit}}` `{{os}}` `{{prompt_file}}` | 実行環境 |

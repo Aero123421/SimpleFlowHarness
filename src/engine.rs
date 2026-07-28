@@ -290,7 +290,7 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     st.cost_usd += c;
                 }
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
-                let is_child = v.get("parent").is_some();
+                let is_child = v.get("parent").is_some_and(|p| !p.is_null());
                 if !is_child {
                     let e = st.visits.entry(step.clone()).or_insert(0);
                     *e = (*e).max(visit);
@@ -302,33 +302,41 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false)
                     && !v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false);
-                if ok {
-                    let rd = |k: &str| -> Option<String> {
-                        v.get(k)
-                            .and_then(|x| x.as_str())
-                            .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
-                    };
-                    let chain = rd("chain_file").unwrap_or_default();
-                    // `outputs` is the pre-compact TEXT, never the raw tool
-                    // output: out_file holds a claude JSON envelope or a codex
-                    // event stream, and restoring that would inject machine
-                    // noise into a resumed prompt. Uncompacted steps have no
-                    // separate original, so chain is the original. A compacted
-                    // step patches this from its compact_end event below.
-                    let outs = chain.clone();
-                    let file = v
-                        .get("out_file")
+                let rd = |k: &str| -> Option<String> {
+                    v.get(k)
                         .and_then(|x| x.as_str())
-                        .map(|p| run_dir.join(p).display().to_string())
-                        .unwrap_or_default();
-                    st.outputs.insert(
-                        step.clone(),
-                        template::StepOutput {
-                            output: chain.trim_end().to_string(),
-                            outputs: outs.trim_end().to_string(),
-                            output_file: file,
-                        },
-                    );
+                        .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
+                };
+                let chain = rd("chain_file").unwrap_or_default();
+                // `outputs` is the pre-compact TEXT, never the raw tool
+                // output: out_file holds a claude JSON envelope or a codex
+                // event stream, and restoring that would inject machine
+                // noise into a resumed prompt. Uncompacted steps have no
+                // separate original, so chain is the original. A compacted
+                // step patches this from its compact_end event below.
+                let outs = chain.clone();
+                let file = v
+                    .get("out_file")
+                    .and_then(|x| x.as_str())
+                    .map(|p| run_dir.join(p).display().to_string())
+                    .unwrap_or_default();
+                let stderr_file = v
+                    .get("out_file")
+                    .and_then(|x| x.as_str())
+                    .map(|p| stderr_file_for(&run_dir.join(p)).display().to_string())
+                    .filter(|p| Path::new(p).exists())
+                    .unwrap_or_default();
+                st.outputs.insert(
+                    step.clone(),
+                    template::StepOutput {
+                        output: chain.trim_end().to_string(),
+                        outputs: outs.trim_end().to_string(),
+                        output_file: file,
+                        exit: v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
+                        stderr_file,
+                    },
+                );
+                if ok {
                     if let Some(s) = v.get("session") {
                         if let (Some(t), Some(id)) = (
                             s.get("tool").and_then(|x| x.as_str()),
@@ -838,7 +846,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 );
                 match action {
                     "continue" => {
-                        log_position(&mut log, &step.id, next_label(cur + 1, &flow));
+                        log_position(
+                            &mut log,
+                            &step.id,
+                            next_label(cur + 1, &flow),
+                            PositionVia::MaxVisits,
+                        );
                         cur += 1;
                         if cur >= n_steps {
                             return Ok(());
@@ -847,15 +860,30 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     }
                     a if a.starts_with("goto:") => match &a[5..] {
                         "end" => {
-                            log_position(&mut log, &step.id, "end".into());
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "end".into(),
+                                PositionVia::MaxVisits,
+                            );
                             return Ok(());
                         }
                         "fail" => {
-                            log_position(&mut log, &step.id, "fail".into());
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "fail".into(),
+                                PositionVia::MaxVisits,
+                            );
                             return Err(format!("step '{}' exhausted max_visits ({max_v})", step.id));
                         }
                         id => {
-                            log_position(&mut log, &step.id, id.to_string());
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                id.to_string(),
+                                PositionVia::MaxVisits,
+                            );
                             cur = index_of[id];
                             continue;
                         }
@@ -906,6 +934,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             if execute::interrupted() {
                                 break;
                             }
+                            cost_usd += $done.usage.cost_usd.unwrap_or(0.0);
+                            log_step_end(
+                                &mut log,
+                                &$label,
+                                Some(&step.id),
+                                visit,
+                                &$done,
+                            );
                             if !opts.quiet {
                                 eprintln!("sfh: [{}] falling back to profile '{fb}'", $label);
                             }
@@ -1003,6 +1039,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             output: d.chain_output.clone(),
                             outputs: d.chain_output.clone(),
                             output_file: d.out_file.display().to_string(),
+                            exit: d.exit_code,
+                            stderr_file: stderr_file_for(&d.out_file).display().to_string(),
                         },
                     );
                     if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
@@ -1026,8 +1064,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 }
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
-                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
                 (agg, plain, hard_fail)
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
@@ -1141,8 +1179,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let hard_fail = any_fail && step.on_error.as_deref() != Some("continue");
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
-                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
                 (agg, plain, hard_fail)
             } else {
                 if total + 1 > max_total {
@@ -1164,6 +1202,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         if execute::interrupted() {
                             break;
                         }
+                        cost_usd += done.usage.cost_usd.unwrap_or(0.0);
+                        log_step_end(&mut log, &step.id, None, visit, &done);
                         if !opts.quiet {
                             eprintln!("sfh: [{}] falling back to profile '{fb}'", step.id);
                         }
@@ -1212,6 +1252,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         output: d.chain_output.clone(),
                         outputs: d.chain_output.clone(),
                         output_file: d.out_file.display().to_string(),
+                        exit: d.exit_code,
+                        stderr_file: stderr_file_for(&d.out_file).display().to_string(),
                     },
                 );
                 let rt = d.chain_output.clone();
@@ -1327,11 +1369,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     "continue" => {}
                     oe if oe.starts_with("goto:") => match &oe[5..] {
                         "end" => {
-                            log_position(&mut log, &step.id, "end".into());
+                            log_position(&mut log, &step.id, "end".into(), PositionVia::OnError);
                             return Ok(());
                         }
                         "fail" => {
-                            log_position(&mut log, &step.id, "fail".into());
+                            log_position(&mut log, &step.id, "fail".into(), PositionVia::OnError);
                             return Err(format!(
                                 "step '{}' failed and on_error routed to fail",
                                 step.id
@@ -1339,7 +1381,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         }
                         id => match index_of.get(id) {
                             Some(i) => {
-                                log_position(&mut log, &step.id, id.to_string());
+                                log_position(
+                                    &mut log,
+                                    &step.id,
+                                    id.to_string(),
+                                    PositionVia::OnError,
+                                );
                                 cur = *i;
                                 continue;
                             }
@@ -1362,7 +1409,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
 
             // ---- routing ----
-            let mut target: Option<String> = None;
+            let mut target: Option<(String, PositionVia)> = None;
             {
                 let pf = run_dir.join(format!("{gtag}.prompt.txt"));
                 let cx = mk_cx!(&outputs, &sessions);
@@ -1400,32 +1447,46 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     check(&r.when_last_line_contains, &last, false)?;
                     check(&r.when_last_line_matches, &last, true)?;
                     if ok {
-                        target = Some(r.goto.clone());
+                        let via = if r.when_contains.is_none()
+                            && r.when_matches.is_none()
+                            && r.when_last_line_contains.is_none()
+                            && r.when_last_line_matches.is_none()
+                        {
+                            PositionVia::CatchAll
+                        } else {
+                            PositionVia::Rule
+                        };
+                        target = Some((r.goto.clone(), via));
                         break;
                     }
                 }
             }
-            match target.as_deref() {
+            match target.as_ref().map(|(target, via)| (target.as_str(), *via)) {
                 None => {
-                    log_position(&mut log, &step.id, next_label(cur + 1, &flow));
+                    log_position(
+                        &mut log,
+                        &step.id,
+                        next_label(cur + 1, &flow),
+                        PositionVia::Fallthrough,
+                    );
                     cur += 1;
                     if cur >= n_steps {
                         return Ok(());
                     }
                 }
-                Some("end") => {
-                    log_position(&mut log, &step.id, "end".into());
+                Some(("end", via)) => {
+                    log_position(&mut log, &step.id, "end".into(), via);
                     return Ok(());
                 }
-                Some("fail") => {
-                    log_position(&mut log, &step.id, "fail".into());
+                Some(("fail", via)) => {
+                    log_position(&mut log, &step.id, "fail".into(), via);
                     return Err(format!("step '{}' routed to fail", step.id));
                 }
-                Some(id) => {
+                Some((id, via)) => {
                     if !opts.quiet {
                         eprintln!("sfh: [{}] -> goto {id}", step.id);
                     }
-                    log_position(&mut log, &step.id, id.to_string());
+                    log_position(&mut log, &step.id, id.to_string(), via);
                     cur = index_of[id];
                 }
             }
@@ -1591,6 +1652,7 @@ fn write_aggregate(
     agg: &str,
     outputs: &mut BTreeMap<String, template::StepOutput>,
     step_id: &str,
+    failed: bool,
 ) {
     let gfile = run_dir.join(format!("{gtag}.out.txt"));
     let _ = std::fs::write(&gfile, agg);
@@ -1601,6 +1663,8 @@ fn write_aggregate(
             output: agg.to_string(),
             outputs: agg.to_string(),
             output_file: gfile.display().to_string(),
+            exit: if failed { 1 } else { 0 },
+            stderr_file: String::new(),
         },
     );
 }
@@ -1903,10 +1967,34 @@ fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
     let _ = writeln!(f, "{v}");
 }
 
-fn log_position(f: &mut std::fs::File, after: &str, next: String) {
+#[derive(Clone, Copy)]
+enum PositionVia {
+    Rule,
+    CatchAll,
+    Fallthrough,
+    OnError,
+    MaxVisits,
+}
+
+impl PositionVia {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::CatchAll => "catch_all",
+            Self::Fallthrough => "fallthrough",
+            Self::OnError => "on_error",
+            Self::MaxVisits => "max_visits",
+        }
+    }
+}
+
+fn log_position(f: &mut std::fs::File, after: &str, next: String, via: PositionVia) {
     log_event(
         f,
-        json!({"ts": utc_stamp(), "event": "position", "after": after, "next": next}),
+        json!({
+            "ts": utc_stamp(), "event": "position", "after": after,
+            "next": next, "via": via.as_str(),
+        }),
     );
 }
 
@@ -1930,6 +2018,7 @@ fn log_step_end(
             "visit": visit, "exit": d.exit_code, "timed_out": d.timed_out,
             "interrupted": d.interrupted, "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
             "output_chars": d.chain_output.chars().count(),
+            "output_hash": fingerprint(&d.chain_output),
             "input_tokens": d.usage.input_tokens, "output_tokens": d.usage.output_tokens,
             "cost_usd": d.usage.cost_usd, "tool": d.tool,
             "chain_file": file_name(&d.out_file).map(|n| n.replace(".out.txt", ".chain.txt")),
@@ -1939,12 +2028,20 @@ fn log_step_end(
     );
 }
 
-fn log_aggregate_end(f: &mut std::fs::File, step: &str, visit: u32, gtag: &str, failed: bool) {
+fn log_aggregate_end(
+    f: &mut std::fs::File,
+    step: &str,
+    visit: u32,
+    gtag: &str,
+    failed: bool,
+    plain: &str,
+) {
     log_event(
         f,
         json!({
             "ts": utc_stamp(), "event": "aggregate_end", "step": step, "visit": visit,
             "failed": failed, "exit": if failed { 1 } else { 0 },
+            "output_hash": fingerprint(plain),
             "chain_file": format!("{gtag}.chain.txt"), "out_file": format!("{gtag}.out.txt"),
         }),
     );
@@ -1952,6 +2049,16 @@ fn log_aggregate_end(f: &mut std::fs::File, step: &str, visit: u32, gtag: &str, 
 
 fn file_name(p: &Path) -> Option<String> {
     p.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
+fn stderr_file_for(out_file: &Path) -> PathBuf {
+    let name = out_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".out.txt"))
+        .map(|n| format!("{n}.err.txt"))
+        .unwrap_or_else(|| "stderr.err.txt".to_string());
+    out_file.with_file_name(name)
 }
 
 fn abs(p: &Path) -> PathBuf {

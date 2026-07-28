@@ -56,9 +56,22 @@ steps:
   - id: last
     cmd: ["echo", "done:{{steps.a.output | trim}}"]
 YAML
-"$SFH" run basic.yaml -q > basic.out 2> basic.err
+"$SFH" run basic.yaml --runs-dir basic-runs -q > basic.out 2> basic.err
 check "parallel+foreach+filters run" 0 $?
 contains "child output is addressable" "done:AAA" basic.out
+BASIC_LOG="$(find basic-runs -type f -name 'log.jsonl' -print -quit)"
+contains "a matched route records via=rule" '"via":"rule"' "$BASIC_LOG"
+contains "an unmatched route records via=fallthrough" '"via":"fallthrough"' "$BASIC_LOG"
+contains "step_end records an output hash" '"output_hash":"fa2bfc19a0708642"' "$BASIC_LOG"
+if grep -F '"event":"aggregate_end"' "$BASIC_LOG" |
+  grep -F '"step":"fan"' |
+  grep -qF '"output_hash":"06b7ba3ef1903648"'; then
+  echo "ok   - aggregate hash is computed from the unlabeled plain output"
+  pass=$((pass + 1))
+else
+  echo "FAIL - aggregate hash did not match plain output AAA\\\\n\\\\nBBB"
+  fail=$((fail + 1))
+fi
 
 # --- verdict trailer routing --------------------------------------------------
 cat > verdict.yaml <<'YAML'
@@ -77,6 +90,24 @@ YAML
 check "last-line routing ignores prose mentions" 0 $?
 contains "took the OK branch" "routed-on-last-line" verdict.out
 
+# --- catch-all routing is distinct from a matched predicate ------------------
+cat > catch-all.yaml <<'YAML'
+name: catch-all
+steps:
+  - id: choose
+    cmd: ["echo", "no predicate matches"]
+    route:
+      - when_contains: "missing"
+        goto: fail
+      - goto: done
+  - id: done
+    cmd: ["echo", "catch-all-ran"]
+YAML
+"$SFH" run catch-all.yaml --runs-dir catch-all-runs -q > catch-all.out 2>&1
+check "a predicate-free route runs as the catch-all" 0 $?
+CATCH_LOG="$(find catch-all-runs -type f -name 'log.jsonl' -print -quit)"
+contains "catch-all routing records its reason" '"via":"catch_all"' "$CATCH_LOG"
+
 # --- max_visits degradation ---------------------------------------------------
 cat > visits.yaml <<'YAML'
 name: visits
@@ -90,9 +121,11 @@ steps:
   - id: after
     cmd: ["echo", "degraded-gracefully"]
 YAML
-"$SFH" run visits.yaml -q > visits.out 2>&1
+"$SFH" run visits.yaml --runs-dir visits-runs -q > visits.out 2>&1
 check "on_max_visits degrades instead of failing the flow" 0 $?
 contains "reached the fallback step" "degraded-gracefully" visits.out
+VISITS_LOG="$(find visits-runs -type f -name 'log.jsonl' -print -quit)"
+contains "max_visits routing records its reason" '"via":"max_visits"' "$VISITS_LOG"
 
 # --- compact instruction rendering + pre-compact notes -----------------------
 # `echo` stands in for codex: it exits successfully without calling an AI, while
@@ -272,6 +305,10 @@ profiles:
   broken: { tool: codex, bin: "false" }
   works:  { tool: codex, bin: "echo" }
 steps:
+  - id: plain
+    use: broken
+    fallback: [works]
+    prompt: "plain"
   - id: fan
     parallel:
       - id: kid
@@ -281,10 +318,21 @@ steps:
   - id: after
     cmd: ["echo", "fanout-survived"]
 YAML
-"$SFH" run fb.yaml > fb.out 2>fb.err
-check "a parallel child falls back instead of failing the group" 0 $?
+"$SFH" run fb.yaml --runs-dir fb-runs > fb.out 2>fb.err
+check "plain and parallel leaves fall back instead of failing the flow" 0 $?
 contains "the flow continued past the fan-out" "fanout-survived" fb.out
 contains "the fallback profile actually ran" "falling back to profile 'works'" fb.err
+FB_LOG="$(find fb-runs -type f -name 'log.jsonl' -print -quit)"
+FB_STEP_ENDS="$(grep -cF '"event":"step_end"' "$FB_LOG")"
+contains "plain fallback logs its failed attempt" '"exit":1' "$FB_LOG"
+if [ "$FB_STEP_ENDS" = "5" ]; then
+  echo "ok   - every fallback attempt has a step_end"
+  pass=$((pass + 1))
+else
+  echo "FAIL - expected 5 step_end events, found $FB_STEP_ENDS"
+  fail=$((fail + 1))
+fi
+contains "meta leaf_runs agrees with step_end count" "\"leaf_runs\": $FB_STEP_ENDS" "$(dirname "$FB_LOG")/meta.json"
 
 # --- {{raw}} lets a prompt talk about templates -------------------------------
 # Checked through validate/--dry-run rather than a command's output: msys2's
@@ -347,6 +395,68 @@ else
   echo "FAIL - grandchild outlived sfh stop: ticks went $TICK_AT_STOP -> $TICK_LATER"
   fail=$((fail + 1))
 fi
+
+# --- normalized exit/stderr templates survive resume -------------------------
+cat > diagnostics.yaml <<'YAML'
+name: diagnostics
+steps:
+  - id: check
+    cmd: ["sh", "-c", "echo DETERMINISTIC-DIAGNOSTIC >&2; exit 7"]
+    on_error: goto:fix
+  - id: fix
+    cmd: ["sh", "-c", "exit 9"]
+YAML
+"$SFH" run diagnostics.yaml --runs-dir diagnostics-runs -q > diagnostics1.out 2>&1
+check "the initial repair flow stops at its deliberately broken fixer" 1 $?
+DIAGNOSTICS_LOG="$(find diagnostics-runs -type f -name 'log.jsonl' -print -quit)"
+DIAGNOSTICS_DIR="$(dirname "$DIAGNOSTICS_LOG")"
+contains "on_error routing records its reason" '"via":"on_error"' "$DIAGNOSTICS_LOG"
+cat > diagnostics.yaml <<'YAML'
+name: diagnostics
+steps:
+  - id: check
+    cmd: ["sh", "-c", "echo DETERMINISTIC-DIAGNOSTIC >&2; exit 7"]
+    on_error: goto:fix
+  - id: fix
+    cmd: ["echo", "exit={{steps.check.exit}} err={{steps.check.stderr_file}}"]
+  - id: read_stderr
+    cmd: ["cat", "{{steps.check.stderr_file}}"]
+YAML
+"$SFH" run diagnostics.yaml --runs-dir diagnostics-runs --resume-latest --force-resume -q > diagnostics2.out 2>&1
+check "resume restores diagnostic template fields" 0 $?
+FIX_OUTPUT="$(find "$DIAGNOSTICS_DIR" -type f -name 'fix.v*.out.txt' -print -quit)"
+contains "resume restores sfh's normalized exit" "exit=7" "$FIX_OUTPUT"
+contains "resume restores the stderr file path" "check.err.txt" "$FIX_OUTPUT"
+contains "the restored stderr file contains the diagnostic" "DETERMINISTIC-DIAGNOSTIC" diagnostics2.out
+
+# --- retries preserve every attempt's artifacts ------------------------------
+cat > retry-once.sh <<'SH'
+#!/usr/bin/env sh
+if [ ! -f retry-marker ]; then
+  echo FIRST-STDOUT
+  echo FIRST-STDERR >&2
+  touch retry-marker
+  exit 1
+fi
+echo SECOND-STDOUT
+echo SECOND-STDERR >&2
+SH
+cat > retry.yaml <<'YAML'
+name: retry
+steps:
+  - id: retry
+    cmd: ["sh", "retry-once.sh"]
+    retry: { max: 1, backoff_sec: 0 }
+    retry_on: any
+YAML
+"$SFH" run retry.yaml --runs-dir retry-runs -q > retry.out 2>&1
+check "a retry can recover the step" 0 $?
+RETRY_DIR="$(dirname "$(find retry-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "the first attempt stdout is preserved" "FIRST-STDOUT" "$RETRY_DIR/retry.out.txt"
+contains "the second attempt stdout has an a2 artifact" "SECOND-STDOUT" "$RETRY_DIR/retry.a2.out.txt"
+contains "the first attempt stderr is preserved" "FIRST-STDERR" "$RETRY_DIR/retry.err.txt"
+contains "the second attempt stderr has an a2 artifact" "SECOND-STDERR" "$RETRY_DIR/retry.a2.err.txt"
+contains "the second attempt chain has an a2 artifact" "SECOND-STDOUT" "$RETRY_DIR/retry.a2.chain.txt"
 
 # --- runs subcommands ---------------------------------------------------------
 "$SFH" runs list > runs.out 2>&1

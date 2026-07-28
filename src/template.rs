@@ -8,6 +8,9 @@ pub struct StepOutput {
     /// Aggregated output ("--- id ---" separated). Equals `output` for plain steps.
     pub outputs: String,
     pub output_file: String,
+    /// Exit code normalized by sfh after parsing and session validation.
+    pub exit: i32,
+    pub stderr_file: String,
 }
 
 pub struct Ctx<'a> {
@@ -21,6 +24,7 @@ pub struct Ctx<'a> {
 ///
 /// Keys:
 ///   vars.NAME | steps.ID.output | steps.ID.outputs | steps.ID.output_file
+///   steps.ID.exit | steps.ID.stderr_file
 ///   run_dir, flow_dir, step_id, visit, os, prompt_file, notes, item, item_index
 /// Filters:
 ///   head:N (first N lines) | tail:N (last N lines) | truncate:N (first N chars)
@@ -101,8 +105,10 @@ fn lookup(key: &str, ctx: &Ctx) -> Result<String, String> {
             "output" => Ok(so.map(|s| s.output.clone()).unwrap_or_default()),
             "outputs" => Ok(so.map(|s| s.outputs.clone()).unwrap_or_default()),
             "output_file" => Ok(so.map(|s| s.output_file.clone()).unwrap_or_default()),
+            "exit" => Ok(so.map(|s| s.exit.to_string()).unwrap_or_default()),
+            "stderr_file" => Ok(so.map(|s| s.stderr_file.clone()).unwrap_or_default()),
             other => Err(format!(
-                "unknown field 'steps.{id}.{other}' (use output, outputs or output_file)"
+                "unknown field 'steps.{id}.{other}' (use output, outputs, output_file, exit or stderr_file)"
             )),
         };
     }
@@ -194,6 +200,8 @@ mod tests {
             output: text.to_string(),
             outputs: text.to_string(),
             output_file: "/run/gen.out.txt".to_string(),
+            exit: 7,
+            stderr_file: "/run/gen.err.txt".to_string(),
         }
     }
 
@@ -245,6 +253,12 @@ mod tests {
         assert_eq!(
             render_with("{{steps.gen.output_file}}", o).unwrap(),
             "/run/gen.out.txt"
+        );
+        let o = BTreeMap::from([("gen".to_string(), out("a\nb\nc"))]);
+        assert_eq!(render_with("{{steps.gen.exit}}", o.clone()).unwrap(), "7");
+        assert_eq!(
+            render_with("{{steps.gen.stderr_file}}", o).unwrap(),
+            "/run/gen.err.txt"
         );
     }
 

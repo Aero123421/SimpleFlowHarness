@@ -67,6 +67,7 @@ EXIT CODES:
 FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the schema):
   Steps run top-to-bottom unless a route: rule redirects. Templates:
   {{vars.name}} {{steps.<id>.output}} {{steps.<id>.outputs}} {{steps.<id>.output_file}}
+  {{steps.<id>.exit}} {{steps.<id>.stderr_file}}
   {{item}} {{item_index}} {{notes}} {{run_dir}} {{flow_dir}} {{step_id}} {{visit}} {{os}}
   Filters: | head:N | tail:N | truncate:N | lines:A-B | trim
   Preset tools: codex, claude, opencode, grok, agy, pi, cursor.
