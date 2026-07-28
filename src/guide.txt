@@ -1,0 +1,80 @@
+DETERMINISTIC GATE — use process exit status for facts, then send diagnostics to AI:
+```yaml
+steps:
+  - id: build
+    cmd: ["cargo", "test"]     # direct spawn; no shell
+    on_error: goto:fix
+  - id: ship
+    cmd: ["sfh", "--version"]
+    route: [{goto: end}]       # always terminate a branch
+  - id: fix
+    tool: codex
+    prompt: "{{steps.build.stderr_file}}: read this file and fix the failure"
+    route: [{goto: build}]
+```
+This is the only form with exactly the same behavior on Windows, macOS, and Linux.
+Use `sh -c` only to join multiple commands; on Windows it requires Git Bash.
+
+MINIMAL TWO-STEP FLOW:
+```yaml
+steps:
+  - {id: inspect, cmd: ["sfh", "--version"]}
+  - {id: check, cmd: ["sfh", "validate", "flow.yaml"]}
+```
+
+AI GOAL VERDICT — require exactly one final-line token and fail closed:
+```yaml
+steps:
+  - id: judge
+    tool: codex
+    prompt: "Assess the goal. Last line: ACHIEVED, UNMET, or UNCLEAR."
+    route:
+      - {when_last_line_is: ACHIEVED, goto: achieved}
+      - {when_last_line_is: UNMET, goto: unmet}
+      - {when_last_line_is: UNCLEAR, goto: unclear}
+      - {goto: unclear}
+  - {id: achieved, cmd: ["sfh", "--version"], route: [{goto: end}]}
+  - {id: unmet, cmd: ["sfh", "--version"], route: [{goto: fail}]}
+  - {id: unclear, cmd: ["sfh", "--version"], route: [{goto: fail}]}
+```
+
+BOUNDED REWORK WITH DEGRADATION:
+```yaml
+steps:
+  - id: revise
+    tool: codex
+    max_visits: 3
+    on_max_visits: goto:degraded
+    prompt: "Revise using: {{steps.review.output}}"
+  - id: review
+    tool: codex
+    prompt: "Review. Last line: PASS or REVISE."
+    route:
+      - {when_last_line_is: PASS, goto: end}
+      - {goto: revise}
+  - {id: degraded, cmd: ["sfh", "--version"]}
+```
+Limits are checked on entry, so the node entered first in a loop reaches its limit first.
+
+PARALLEL MEMBERS / ONE BRANCH PER ITEM:
+```yaml
+vars: {targets: "--version\n--help"}
+steps:
+  - id: fixed
+    parallel:
+      - {id: version, cmd: ["sfh", "--version"]}
+      - {id: help, cmd: ["sfh", "--help"]}
+  - id: per_target
+    foreach: {from: "{{vars.targets}}", split: lines}
+    cmd: ["sfh", "{{item}}"]
+```
+
+HUMAN ANSWER — the command waits; timeout_sec is the deadline:
+```yaml
+steps:
+  - id: approval
+    cmd: ["approval-cli", "wait", "--question", "Ship this build?"]
+    timeout_sec: 3600
+```
+DETACH AND COLLECT: `sfh run flow.yaml --detach` → `sfh status` → `sfh wait` / `sfh stop`
+Details: README. If stuck: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.

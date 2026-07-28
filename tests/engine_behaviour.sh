@@ -31,6 +31,20 @@ contains() { # contains <name> <needle> <file>
   fi
 }
 
+# --- built-in AI guide -------------------------------------------------------
+"$SFH" guide > guide.out 2> guide.err
+check "guide prints without arguments" 0 $?
+GUIDE_LINES="$(awk 'END { print NR }' guide.out)"
+if [ "$GUIDE_LINES" -le 80 ]; then
+  echo "ok   - guide stays within 80 lines"
+  pass=$((pass + 1))
+else
+  echo "FAIL - guide is $GUIDE_LINES lines (maximum 80)"
+  fail=$((fail + 1))
+fi
+"$SFH" guide unexpected > guide-args.out 2>&1
+check "guide rejects arguments" 2 $?
+
 # --- routing, foreach fan-out and filters ------------------------------------
 cat > basic.yaml <<'YAML'
 name: basic
@@ -89,6 +103,92 @@ YAML
 "$SFH" run verdict.yaml -q > verdict.out 2>&1
 check "last-line routing ignores prose mentions" 0 $?
 contains "took the OK branch" "routed-on-last-line" verdict.out
+
+# --- portable string cmd validation ------------------------------------------
+cat > shell-sh-only.yaml <<'YAML'
+steps:
+  - id: check
+    cmd: 'cargo test; echo "$?"'
+YAML
+"$SFH" validate shell-sh-only.yaml > shell-sh-only.out 2>&1
+check "sh-only syntax in a string cmd is rejected on every OS" 2 $?
+contains "the sh-only error identifies the syntax" '`$?`' shell-sh-only.out
+contains "the sh-only error explains the array-form fix" 'cmd: ["sh", "-c", "..."]' shell-sh-only.out
+
+cat > shell-cmd-only.yaml <<'YAML'
+steps:
+  - id: check
+    cmd: 'echo %RESULT% ^> result.txt'
+YAML
+"$SFH" validate shell-cmd-only.yaml > shell-cmd-only.out 2>&1
+check "cmd-only syntax in a string cmd is rejected on every OS" 2 $?
+contains "the cmd-only error identifies the syntax" '`%NAME%`' shell-cmd-only.out
+contains "the cmd-only error explains the array-form fix" 'cmd: ["cmd", "/C", "..."]' shell-cmd-only.out
+
+cat > shell-portable.yaml <<'YAML'
+steps:
+  - id: check
+    cmd: 'echo "quoted;semicolon" && echo ''also;quoted'' | echo ok > result.txt 2>&1'
+YAML
+"$SFH" validate shell-portable.yaml > shell-portable.out 2>&1
+check "portable operators and quoted semicolons are accepted" 0 $?
+
+# --- consecutive branch fallthrough warning ---------------------------------
+cat > branch-fallthrough.yaml <<'YAML'
+steps:
+  - id: choose
+    cmd: ["echo", "MET"]
+    route:
+      - {when_last_line_is: "MET", goto: met}
+      - {when_last_line_is: "UNMET", goto: unmet}
+      - {when_last_line_is: "UNCLEAR", goto: unclear}
+  - id: met
+    cmd: ["echo", "met"]
+  - id: unmet
+    cmd: ["echo", "unmet"]
+  - id: unclear
+    cmd: ["echo", "unclear"]
+YAML
+"$SFH" validate branch-fallthrough.yaml > branch-fallthrough.out 2>&1
+check "unterminated consecutive branches are a warning, not an error" 0 $?
+contains "the first leaking branch is named" "step 'met'" branch-fallthrough.out
+contains "the next branch it leaks into is named" "step 'unmet'" branch-fallthrough.out
+
+# --- overlapping contains verdicts are rejected ------------------------------
+cat > overlapping-verdicts.yaml <<'YAML'
+steps:
+  - id: choose
+    cmd: ["echo", "NOT-ACHIEVED"]
+    route:
+      - {when_last_line_contains: "ACHIEVED", goto: end}
+      - {when_last_line_contains: "NOT-ACHIEVED", goto: fail}
+YAML
+"$SFH" validate overlapping-verdicts.yaml > overlapping-verdicts.out 2>&1
+check "overlapping last-line contains phrases are rejected" 2 $?
+contains "the overlap error gives the exact-match fix" "when_last_line_is" overlapping-verdicts.out
+
+# --- exact last-line routing -------------------------------------------------
+cat > exact-verdict.yaml <<'YAML'
+steps:
+  - id: choose
+    cmd: ["printf", "prose mentions ACHIEVED\n  NOT-ACHIEVED  \n"]
+    route:
+      - {when_last_line_is: "ACHIEVED", goto: achieved}
+      - {when_last_line_is: "NOT-ACHIEVED", goto: not_achieved}
+      - {goto: fail}
+  - id: achieved
+    cmd: ["echo", "wrong-exact-branch"]
+    route: [{goto: fail}]
+  - id: not_achieved
+    cmd: ["echo", "right-exact-branch"]
+    route: [{goto: end}]
+YAML
+"$SFH" run exact-verdict.yaml -q > exact-verdict.out 2>&1
+check "when_last_line_is trims and matches only the whole last line" 0 $?
+contains "exact matching avoids the substring branch" "right-exact-branch" exact-verdict.out
+"$SFH" run exact-verdict.yaml --dry-run > exact-verdict-dry.out 2>&1
+check "dry-run accepts when_last_line_is" 0 $?
+contains "dry-run displays the exact predicate" 'last line is "NOT-ACHIEVED"' exact-verdict-dry.out
 
 # --- catch-all routing is distinct from a matched predicate ------------------
 cat > catch-all.yaml <<'YAML'

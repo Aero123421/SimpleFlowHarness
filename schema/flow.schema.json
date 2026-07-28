@@ -102,6 +102,7 @@
         "when_contains": { "type": "string" },
         "when_matches": { "type": "string", "description": "Rust regex over the whole output." },
         "when_last_line_contains": { "type": "string", "description": "Deterministic verdict trailer check." },
+        "when_last_line_is": { "type": "string", "description": "Exact match against the trimmed last non-empty line." },
         "when_last_line_matches": { "type": "string" },
         "goto": { "type": "string", "description": "step id | end | fail" }
       }
