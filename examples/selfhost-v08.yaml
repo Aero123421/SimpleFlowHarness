@@ -1,0 +1,402 @@
+# sfh 自身の v0.8 実装を sfh で回すフロー。
+#
+# このフローは分析で得た教訓をそのまま適用した見本でもある:
+#   - 検証器は cargo(決定論)であって、LLM の「VERDICT: OK」ではない
+#   - ゲートは fail-closed: 合格だけを明示的に通し、読めなければ差し戻す
+#   - on_max_visits は「ループで最初に入場するノード」= 実装側に置く
+#
+#   sfh run examples/selfhost-v08.yaml --detach
+#   sfh status ; sfh wait
+name: selfhost-v08
+
+vars:
+  branch: "sfh/v0.8-review-fixes"
+
+profiles:
+  # ~/.sfh/profiles.yaml の codex-local(実バイナリを指す)を上書きして model だけ足す
+  dev:
+    tool: codex
+    bin: 'C:\Users\nanoc\AppData\Local\OpenAI\Codex\bin\69066b736e1e17a4\codex.exe'
+    model: gpt-5.6-sol
+    effort: high
+    access: full
+
+defaults:
+  timeout_sec: 3600
+  max_visits: 4
+  max_cost_usd: 40.0
+  wall_clock_sec: 21600
+  max_emit_chars: 20000
+
+# 各実装ステップに貼る共通の制約。sfh の思想を codex に読ませる。
+# codex はオーバーエンジニアリング癖があるので、やらないことを明示する。
+steps:
+  - id: prep
+    cmd: "git switch -c {{vars.branch}} || git switch {{vars.branch}}"
+    on_error: continue
+
+  # ---------------------------------------------------------------- batch A
+  # 順序上いちばん先。雛形を直さないと、あとで測る全ての数字が
+  # 「自分のバグの性質」になる。
+  - id: a_impl
+    use: dev
+    prompt: |
+      あなたは sfh (D:\AI\SimpleFlowHarness) というRust製CLIのメンテナです。
+      独立レビューで確認された欠陥を直します。**指示された範囲だけ**を直してください。
+
+      ## sfh の思想(これに反する変更はしないこと)
+      **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
+      プロセスが exit 7 で落ちた、セッションIDが一致しない、といった配管の事実は
+      sfh が断定してよい。AIの出力が良いか悪いかは絶対に判断しない。
+
+      ## やること(これ以外はやらない)
+
+      ### A-1. examples/research.yaml のゲートを fail-closed にする
+      現状: 2箇所とも `when_last_line_contains: "VERDICT: REVISE"` が先で、
+      catch-all の `- goto: <前進先>` が受理側になっている。
+      つまり判定が読めなければ**合格扱いで前進する**(false acceptance)。
+      レビュアーが markdown フェンスで終わっただけで通ってしまう。
+
+      修正: 極性を反転する。**合格条件を肯定的に書き、catch-all を差し戻し側にする**。
+      - `when_last_line_contains: "VERDICT: OK"` → 前進
+      - catch-all `- goto: <実装ステップ>` → 差し戻し
+      2箇所(review_plan と review_execute)とも。
+
+      ### A-2. on_max_visits を実際に落ちるノードへ移す
+      現状: `on_max_visits: goto:summarize` が review_execute にあるが、
+      訪問上限は src/engine.rs:826 で**入場時**に判定される。
+      ループは execute → review_execute → execute なので毎周 execute が先に入場し、
+      両者とも上限3だと4周目に **execute が先に落ちる**。execute は on_max_visits を
+      持たないのでフロー全体が失敗する。research.yaml:105 のコメントが謳う
+      「全部捨てずに現状のレポートを要約して返す」が**機能していない**。
+
+      修正: `on_max_visits: goto:summarize` を **execute** に付ける。
+      review 側の max_visits は実装側より1小さくし、なぜそうするのかを
+      日本語コメントで説明する(入場順の規則を書く)。
+      同じ問題が examples/ の他のフローにもないか確認して直すこと。
+
+      ### A-3. src/engine.rs:826 付近の max_visits エラーメッセージに入場順の規則を1文足す
+      利用者がこのエラーに当たったとき手元にあるのはこの文字列なので、
+      「ループ内で先に入場するノードが先に上限へ達する。降格フックはそちらに置くこと」
+      と分かる文言を足す。
+
+      ### A-4. compact.instruction が描画されていないバグ
+      src/engine.rs:176 が `chk(body_ctx, "compact.instruction", i)` でテンプレート検証
+      しているのに、:1640 は `comp.instruction.clone()` するだけで `template::render` を
+      呼んでいない。`{{raw}}{{vars.topic}}{{endraw}}` を書くと validate は通り、要約器には
+      リテラル `{{raw}}{{vars.topic}}{{endraw}}` が渡る。**検証が死んだ機能への自信を製造している。**
+      修正: 描画するようにする。run_compact に必要な Ctx を渡すこと。
+
+      ### A-5. notes: append が compact 後のテキストを保存しているバグ
+      src/engine.rs:1258 で compact が chain_output を要約で上書きした後、
+      :1288 の notes append がその chain_output を使っている。
+      **永続する共有記録が一番情報の少ない版**になっており、原文は
+      .precompact.txt にあるのに notes はそこを指さない。
+      修正: notes には compact 前の原文を追記する。
+
+      ### A-6. notes と compact のテストが1本も無い
+      `grep -rn "notes\|compact" tests/` が空。A-4 が v0.7.0 まで生き延びた原因。
+      tests/engine_behaviour.sh に AI を呼ばないテストを足す:
+      - compact.instruction のテンプレートが実際に描画されること
+        (compact に安いツールではなく `cmd:` を使えないなら、
+         --dry-run か .compact.prompt.txt の中身で検証する方法を考えること)
+      - notes: append が compact 前の原文を保存すること
+
+      ## やってはいけないこと
+      - 新しい YAML キーを足さない
+      - route の述語を増やさない(`when_exit:` など)
+      - 「進捗が無い」を sfh が自動判定する仕組みを作らない
+      - リファクタリングのついでをしない。指示された範囲だけ触る
+      - 既存のテストを消したり緩めたりしない
+
+      ## 完了条件
+      `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test &&
+       cargo build --release && bash tests/engine_behaviour.sh` が全部通ること。
+      自分で実行して確認してから終わること。
+
+      前回の検証でこう言われている(初回は空):
+      {{steps.a_check.output | tail:120}}
+
+  - id: a_check
+    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    timeout_sec: 1800
+    route:
+      # 合格だけを明示的に通す。それ以外(落ちた・読めない)は全部差し戻し。
+      - when_last_line_contains: "EXIT=0"
+        goto: b_impl
+      - goto: a_impl
+
+  # ---------------------------------------------------------------- batch B
+  - id: b_impl
+    use: dev
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) の v0.8 実装、2バッチ目です。
+
+      ## sfh の思想
+      **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
+
+      ## やること(これ以外はやらない)
+
+      ### B-1. log.jsonl が「なぜそのエッジを通ったか」を答えられるようにする
+      現状、検証器がマッチして受理されたエッジと、判定が読めず catch-all で
+      素通りしたエッジが log.jsonl 上で**バイト単位で区別できない**。
+      50回実行しても「いくら使ったか」は分かるが「レビュアーが一発で通したか」は分からない。
+
+      `log_position` に `via` フィールドを足す。閉じた語彙:
+      `rule | catch_all | fallthrough | on_error | max_visits`
+      - `rule`: route の述語がマッチした
+      - `catch_all`: 述語なしの route ルール(いわゆる route_default)が採用された
+      - `fallthrough`: route が1つも無く次のステップへ進んだ
+      - `on_error`: on_error: goto: で飛んだ
+      - `max_visits`: on_max_visits で飛んだ
+      log_position は短く呼び出し箇所が多い。resume は `next` しか読まないので安全。
+
+      ### B-2. step_end / aggregate_end に output_hash を足す
+      既存の `fingerprint()`(src/engine.rs:496 付近のFNV-1a)を再利用する。
+      aggregate_end では `agg`(ラベル付き)ではなく `plain` に対して計算すること。
+      route が見たのは plain の方なので。
+
+      **重要**: これは**ログのフィールドであって、分岐条件ではない**。
+      これを見て sfh が自動で停止する仕組みは作らないこと。
+      チェーン出力は「最終メッセージ」であって成果物ではないので、
+      6ターン黙々とリファクタして毎回「完了しました」と返すエージェントは
+      進捗最大でハッシュ変化ゼロになる。判定はユーザーの cmd: に任せる。
+      コミットメッセージにこの区別を書くこと。
+
+      ### B-3. リトライ試行ごとの成果物が上書きされている
+      exec_leaf は exec_once(prep.clone()) をループし、exec_once は p.out_file を
+      無条件に書く。`attempts: 3` と記録されたステップの成果物ファイルは1つしか残らない。
+      2回目以降を `<tag>.a2.out.txt` のようにタグ付けする。
+
+      ### B-4. fallback が救済した失敗試行が記録されていない
+      src/engine.rs:1181 付近で `done = alt` が元の失敗を捨てており、
+      step_end が書かれない。にもかかわらず total += 1 されるので
+      meta.leaf_runs と count(step_end) が食い違い、失敗試行のトークンと
+      所要時間が見えない。9分でタイムアウトして安いフォールバックに救われた実行が
+      「速くて安い成功」として記録される。失敗試行も step_end に記録すること。
+
+      ### B-5. {{raw}}{{steps.X.exit}}{{endraw}} と {{raw}}{{steps.X.stderr_file}}{{endraw}} を足す
+      src/template.rs の lookup に2つアーム(現在3フィールド→5フィールド)。
+      cargo/tsc/go は診断を **stderr** に出すが OutputParse::Stdout は stderr を捨てるので、
+      `on_error: goto:fix` で飛ばした修理ステップのプロンプトが**空になる**。
+      これが sfh 唯一の決定論的検証エッジなのに、修理役に何も渡していない。
+
+      load_resume でも復元すること(exit は step_end の `exit` フィールド、
+      stderr_file は既に書かれている .err.txt から)。
+
+      **重要**: `exit` はプロセスの終了コードそのものではない。src/leaf.rs が
+      補正している(spawn失敗で-1、parsed.failed で1、agyが正常終了でexit≠0のとき0、
+      空の最終メッセージで1、セッション検証失敗で1)。
+      **「sfhが正規化した終了コード」として文書化し、route: の述語には絶対にしないこと。**
+      API化すると次のプリセット修正が黙ってユーザーの分岐を変えてしまう。
+
+      ## やってはいけないこと
+      - `when_exit:` を route の述語にしない
+      - `route_default:` を足さない(述語なしの route ルールが既にそれ)
+      - route[N] のインデックスや matched 配列をログに足さない
+      - 指示された範囲外のリファクタをしない
+
+      ## 完了条件
+      fmt / clippy -D warnings / cargo test / cargo build --release /
+      tests/engine_behaviour.sh が全部通ること。自分で実行して確認すること。
+      新しいログフィールドには挙動テストを足すこと。
+
+      前回の検証結果(初回は空):
+      {{steps.b_check.output | tail:120}}
+
+  - id: b_check
+    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    timeout_sec: 1800
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: c_impl
+      - goto: b_impl
+
+  # ---------------------------------------------------------------- batch C
+  - id: c_impl
+    use: dev
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) の v0.8 実装、3バッチ目。ここが一番大きい。
+
+      ## sfh の思想
+      **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
+      これから足すバナーは「私が起動したプロセスが exit 9 で落ちた」という
+      **純粋な配管の事実**であって、成果物の良し悪しの判断ではない。だから許される。
+
+      ## やること
+
+      ### C-1. 失敗したステップの出力に印を付ける(出力の完全性)
+      **これが sfh 自身の責任である唯一の欠陥クラス。**
+      sfh は下流エージェントに文字列を渡す瞬間、その文字列の信頼性について
+      自分が知っている事実を全部捨てている。
+
+      - src/engine.rs:1209 の `outputs.insert` は `d.ok()` チェックの**外**にある。
+        `on_error: continue` で落ちたワーカーの途中出力が、成功した出力と
+        **区別不能な形**で次のプロンプトに入る。
+      - :1020-1025 と :1132-1137 の fan-out 集約は exit に関係なく全子を連結する。
+        examples/hypotheses.yaml:34 が推奨している並列検証パターンがまさにこれで、
+        フロー自身のプロンプトが「これを研究結果として扱え」と書いている。
+
+      修正: 失敗した値が `outputs` に入るところでバナーを付ける。文言の例:
+
+          [sfh: step 'verify[1]' did not complete (exit=9, timed_out=false).
+           The text below is whatever it produced before failing. It is not a result.]
+
+      fan-out のヘッダにも失敗した要素であることを示す。
+
+      **設計上の注意**:
+      - `<id>.chain.txt` は**生のまま**にする(バナー無しの唯一のきれいなコピー)。
+        平leaf ではディスクにバナーを書かないこと。書くと resume で二重バナーになる。
+      - fan-out は write_aggregate が .out.txt / .chain.txt / outputs を1つの文字列から
+        作るので、きれいなコピーを保てない。**それを隠さず文書化すること。**
+      - バナーは max_prompt_chars に算入される。
+
+      **スコープ外(やらないこと)**:
+      - compact のバナー(resume を跨ぐには新しいログフィールドが要る上、
+        要約器が FAILED マーカーを洗浄しうる)
+      - `{{raw}}{{steps.X.status}}{{endraw}}`(8個中1個失敗した fan-out で意味が定義できない)
+      - `defaults.output_banners` のような無効化スイッチ
+
+      ### C-2. ライブ実行と resume でプロンプトが変わる問題
+      load_resume(src/engine.rs:292付近)は同じ insert を `if ok` で囲んでいるが、
+      ライブ側は無条件。つまり**ライブ実行と再開実行で下流のプロンプトが変わる**。
+      無言で、ログイベントも無く、フローファイルは変わっていないので
+      fingerprint にも掛からない。
+      修正: `if ok` を外し、step_end が既に持っている exit / timed_out フィールドから
+      **同一のバナーを再構成する**。ライブと resume で完全一致させること。
+
+      ### C-3. 成功パスの emit が失敗ステップを結果として印字しうる
+      emit_id は last_executed にフォールバックし outputs[...].output を印字する。
+      `on_error: continue` で落ちた最終ステップが end へ route すると、
+      **部分テキストが exit 0 で stdout に出る**。ガードすること。
+
+      ### C-4. resume の正しさ
+      (a) 最後の step_end が ok で、その後に position イベントが無い場合、
+          現状は :366-370 で `st.start = last_step` にしてステップを**再実行**する。
+          ルーティングはチェーン出力しか読まず、それは load_resume が既に復元している。
+          再実行せずに **route 規則を再評価して決定をログに書く**ようにする。
+          これは3つある二重副作用パスのうち一番安いものを消す
+          (成功した `gh pr create` の直後、分岐が記録される前にマシンが寝た場合)。
+      (b) step_start があって対応する step_end が無い場合を検出する。
+          step_start は spawn 前にコマンドライン付きでバッファリングせず書かれている。
+          再開前にそれを表示し、status.json にも出す:
+
+              sfh: step 'open_pr' started 20260728-031024 and never recorded an end.
+                   resuming will run it again: gh pr create --fill
+
+      ## 完了条件
+      fmt / clippy -D warnings / cargo test / cargo build --release /
+      tests/engine_behaviour.sh。加えて挙動テストを3本足すこと:
+      - 失敗した leaf の出力が下流のプロンプトでバナー付きになる
+      - 8個中1個失敗した fan-out でその要素だけ印が付く
+      - **ライブ実行と resume で下流プロンプトがバイト一致する**
+
+      前回の検証結果(初回は空):
+      {{steps.c_check.output | tail:120}}
+
+  - id: c_check
+    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    timeout_sec: 1800
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: d_impl
+      - goto: c_impl
+
+  # ---------------------------------------------------------------- batch D
+  - id: d_impl
+    use: dev
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) の v0.8 実装、最終バッチ。
+
+      ## sfh の思想
+      **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
+
+      ## やること
+
+      ### D-1. sfh runs --json と正直な派生列
+      `runs list` と `runs show` に `--json` を足す(既に記録されているものを出すだけ)。
+      加えて: ステップごとの最大 visit、連続する同一 output_hash からの繰り返し回数
+      (B-2 で足したもの)、選択した run 群にわたるコスト合計のフッタ。
+      `--runs-dir` を eval 用の出力ディレクトリに向ければ、それがそのまま
+      ケース行列の集計になる。だから `sfh eval` という動詞は作らない。
+
+      **絶対的な制約**: 列名に `verified` / `false acceptance` / `unverified` を
+      **絶対に使わないこと**。sfh は採点者の終了コードを保持していないし、
+      保持しているふりをしてはならない。
+      正直な集合は `exit / ok / failed / visit / repeat / cost` まで。
+      それ以上はユーザーの採点器とユーザーの jq が計算する。
+
+      ### D-2. README に「イディオム集」の章を書く(全部今日のバイナリで動く)
+      これが分析で却下された提案群の本当の価値。日本語で書くこと。
+
+      1. **fail-closed ゲートのイディオム**
+         合格条件を肯定的に書き、catch-all を差し戻し側にする。
+         max_visits + on_max_visits と組み合わせる。入場順の規則を明記する。
+
+      2. **終了コードでルーティングする決定論的検証器**
+         `cmd: ["sh","-c","cargo test 2>&1; echo \"EXIT=$?\""]`
+         + `when_last_line_contains: "EXIT=0"`。
+         cmd.exe 版も併記すること(素の `%errorlevel%` は黙って何も出さないので
+         `call echo %^errorlevel%` が要る)。
+         この書き方だとステップ自体は exit 0 になるのでルーティングが素直になる、と説明する。
+
+      3. **改竄トリップワイヤ**
+         `cmd: ["git","diff","--quiet","--exit-code","--","tests"]` + `on_error: goto:tampered`。
+         未追跡ファイル版も。これは宣言したパスだけのコンテンツハッシュであり、
+         index キャッシュが効き、コピペできる。
+         (sfh に `protect:` キーを作らない理由も書く: `--dry-run` に印字できないので
+          コピペするとトリップワイヤが消え、誠実性の約束が壊れる)
+
+      4. **人間ゲート**
+         ブロックする `cmd:` ステップ。timeout_sec が期限、on_error: goto: が期限切れ時の方針、
+         stdin: prompt で何を見せるかを描画し、人間の入力が chain output で返る。
+
+      5. **ケース行列**
+         `foreach:` で `cmd: ["sfh","run",...,"--run-dir",...]` を回し、
+         外部の採点器の終了コードを ground truth にする。そのあと
+         `sfh runs list --runs-dir evruns --json`。
+
+      6. **ユーザーが所有する停滞検知**
+         `git diff --stat` を見る `cmd:` ステップ。sfh が自動でやらない理由も書く
+         (チェーン出力は最終メッセージであって成果物ではないため)。
+
+      7. **ループの中の fork_from**  ← これがゼロコードで一番価値が高い
+         README:250-283 は fork_from を fan-out とプロンプトキャッシュの話としてしか
+         売っていない。**循環の中では意味が違う**: continue_from は却下された試行を
+         全部1つのセッションに積み上げてリセット不能になるが、fork_from は毎周
+         「試行前の状態」から分岐する。差し戻しループでは fork_from の方が正しい。
+
+      8. **`{{raw}}{{notes | tail:N}}{{endraw}}`**
+         notes.md は無限に増え、要点ではなくチェーン出力**全体**を追記し、
+         唯一の歯止めは12ステップ目での max_prompt_chars 一発失敗
+         (上流に全部課金し終わったあと)。コンテキスト表に対処法が載っていない。
+
+      ### D-3. 思想の再定義を README に書く
+      「能力を足さない、順番と分岐だけ」は**もう正確ではない**。compact: は sfh が
+      選んだモデルで下流の文脈を書き換えるので明確に能力だし、retry_on: transient は
+      18個の文字列マッチで失敗の性質を判断している。
+      実際にこのコードを支配している規則を、エスケープハッチの節の上に書くこと:
+
+      > **sfh は自分の配管については判断する。仕事については絶対に判断しない。**
+
+      ### D-4. バージョンを 0.8.0 に上げ、README のテスト本数を実際の数に合わせる
+
+      ## 完了条件
+      fmt / clippy -D warnings / cargo test / cargo build --release /
+      tests/engine_behaviour.sh が全部通ること。
+      README に書いたイディオムは**実際に動くことを自分で確かめてから**書くこと。
+      動かないイディオムを書くくらいなら書かない方がましです。
+
+      前回の検証結果(初回は空):
+      {{steps.d_check.output | tail:120}}
+
+  - id: d_check
+    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    timeout_sec: 1800
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: wrap
+      - goto: d_impl
+
+  - id: wrap
+    cmd: "git --no-pager diff --stat main...HEAD 2>&1; git --no-pager status --short 2>&1; echo '--- tests ---'; cargo test 2>&1 | tail -3"
