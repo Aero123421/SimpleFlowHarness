@@ -465,6 +465,23 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     },
                 );
             }
+            // A member an earlier resume carried over rather than executed. It
+            // has no output, cost or session of its own to restore - those came
+            // back with the ORIGINAL step_end, which is still in this same log -
+            // so all this records is "do not run it again".
+            "member_restored" => {
+                if let Some(parent) = v
+                    .get("parent")
+                    .and_then(|p| p.as_str())
+                    .filter(|p| !p.is_empty())
+                {
+                    let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                    st.completed_members
+                        .entry((parent.to_string(), visit))
+                        .or_default()
+                        .insert(step.clone());
+                }
+            }
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
                     st.total += 1;
@@ -571,7 +588,13 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     .get("timed_out")
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false);
-                let exposed = if ev == "step_end" && !ok {
+                // Both event types, not just step_end. The LIVE path already
+                // wraps a failed fan-out's text in the same banner, so leaving
+                // aggregate_end out meant a resumed run handed downstream steps
+                // a failed group's output as if it were a clean result - and a
+                // forged aggregate_end could hand them any text in the run dir
+                // with nothing marking it. Live and resumed have to agree.
+                let exposed = if !ok {
                     failed_output(&step, chain.trim_end(), exit, timed_out)
                 } else {
                     chain.trim_end().to_string()
@@ -788,6 +811,15 @@ fn reconcile_session_access(
         let Ok(primary) = leaf::effective(flow, step) else {
             continue;
         };
+        // Any level the step COULD have run at, primary or fallback, counts as
+        // untampered. A reviewer noted that when a fallback declares a higher
+        // level than the primary, a forged log claiming that higher level is
+        // accepted - which is true, and deliberate. The set comes from the flow,
+        // and check_flow_fingerprint has already established the flow is the one
+        // that produced this run: the author declared that this step may run at
+        // that level, so resuming its session there is inside what they asked
+        // for. Narrowing it would need the log to say WHICH profile ran, and the
+        // log is the thing being distrusted. Recorded as B-16.
         let mut possible: Vec<preset::Access> = vec![primary.access];
         for fb in &step.fallback {
             if let Ok(e) = leaf::effective_with(flow, step, Some(fb)) {
@@ -1087,10 +1119,31 @@ fn check_flow_fingerprint(
         .get("flow_fingerprint_algo")
         .and_then(|x| x.as_str())
         .unwrap_or(LEGACY_FINGERPRINT_ALGO);
+    // The older algorithms hashed raw bytes, so an old run and a re-checked-out
+    // flow disagree over nothing but line endings - and those are exactly the
+    // runs the legacy path exists to rescue. Accept the value computed either
+    // way for them. This does not weaken anything: the check asks "is this the
+    // same flow", and a flow that differs only in CRLF vs LF is the same flow,
+    // which is why new runs normalise before hashing in the first place.
+    let normalised = flow_text.replace("\r\n", "\n");
     let expected = match old_algo {
         FINGERPRINT_ALGO => fingerprint(flow_text),
-        RAW_SHA_FINGERPRINT_ALGO => crate::sha256::hex(flow_text.as_bytes()),
-        LEGACY_FINGERPRINT_ALGO => legacy_fingerprint_fnv(flow_text),
+        RAW_SHA_FINGERPRINT_ALGO => {
+            let raw = crate::sha256::hex(flow_text.as_bytes());
+            if old_fp == raw {
+                raw
+            } else {
+                crate::sha256::hex(normalised.as_bytes())
+            }
+        }
+        LEGACY_FINGERPRINT_ALGO => {
+            let raw = legacy_fingerprint_fnv(flow_text);
+            if old_fp == raw {
+                raw
+            } else {
+                legacy_fingerprint_fnv(&normalised)
+            }
+        }
         other => {
             return Err(format!(
                 "{} records an unknown flow_fingerprint_algo '{other}'; the flow cannot be verified as unchanged (use --force-resume to resume anyway)",
@@ -1918,6 +1971,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
                     );
                 }
+                // A skipped member writes no step_end of its own, so THIS log
+                // would not remember it and a second crash in the same fan-out
+                // would run and re-bill it on the third attempt. Record the
+                // carry-over explicitly. It is not a step_end: nothing ran, so
+                // it must not add to the leaf count or the cost.
+                log_restored_members(&mut log, &step.id, visit, &restored);
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
                 for (pos, &ci) in fresh_idx.iter().enumerate() {
                     let c = &children[ci];
@@ -2117,6 +2176,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": preps.len()}),
                     );
                 }
+                // See the parallel branch: without this a second crash in the
+                // same foreach re-runs the items the first resume carried over.
+                log_restored_members(&mut log, &step.id, visit, &restored);
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
                 for (pos, &i) in fresh_idx.iter().enumerate() {
                     let tag = if visit == 1 {
@@ -2995,6 +3057,27 @@ fn dry_run(
 
 fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
     let _ = writeln!(f, "{v}");
+}
+
+/// Remember, in THIS run's log, the fan-out members a resume carried over
+/// instead of executing. Without it the carry-over lives only in memory: the
+/// skipped members write no step_end, so a second crash in the same fan-out
+/// leaves the next resume with no record of them and they run - and bill - a
+/// second time. Sorted so the log is reproducible.
+fn log_restored_members(
+    f: &mut std::fs::File,
+    group: &str,
+    visit: u32,
+    restored: &HashSet<String>,
+) {
+    let mut names: Vec<&String> = restored.iter().collect();
+    names.sort();
+    for name in names {
+        log_event(
+            f,
+            json!({"ts": utc_stamp(), "event": "member_restored", "step": name, "parent": group, "visit": visit}),
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

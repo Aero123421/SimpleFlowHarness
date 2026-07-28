@@ -745,6 +745,164 @@ else
   bad "CRLF: the resume failed (exit $rc15) - see c15.err"
 fi
 
+# ------------------------------------------------------- 16. second round
+# The panel's second pass. Each of these is a case the first version of this
+# file could not tell apart from a pass.
+sec "16. cases the second review round found missing"
+
+# (a) F-2: TWO crashes in the same fan-out. The first resume carries members
+# over without executing them, so they write no step_end - and the carry-over
+# lived only in memory, leaving the third attempt with no record and running
+# them again. Money bug, one level deeper than the original F-2.
+mkdir -p c16 && (
+cd c16 || exit
+cat > flow.yaml <<'YAML'
+name: twice
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: m1
+        cmd: ["sh", "-c", "echo m1 >> ../tally16.txt; echo o1"]
+      - id: m2
+        cmd: ["sh", "-c", "echo m2 >> ../tally16.txt; echo o2"]
+      - id: m3
+        cmd: ["sh", "-c", "echo m3 >> ../tally16.txt; n=$(cat ../n16 2>/dev/null || echo 0); n=$((n+1)); echo $n > ../n16; if [ $n -lt 3 ]; then exit 7; fi; echo o3"]
+  - id: after
+    cmd: ["echo", "twice-done"]
+YAML
+"$SFH" run flow.yaml --runs-dir runs -q >/dev/null 2>&1
+rd="$(ls -d runs/*/ 2>/dev/null | head -1 | sed 's:/*$::')"
+if [ -n "$rd" ]; then
+  "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q >/dev/null 2>&1
+  "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q >/dev/null 2>&1
+fi
+printf '%s %s %s\n' \
+  "$(if [ -f ../tally16.txt ]; then grep -c '^m1$' ../tally16.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally16.txt ]; then grep -c '^m2$' ../tally16.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally16.txt ]; then grep -c '^m3$' ../tally16.txt | head -1; else echo 0; fi)" \
+  > ../c16.verdict
+)
+q1=""; q2=""; q3=""
+[ -f c16.verdict ] && read -r q1 q2 q3 < c16.verdict
+if [ "${q1:-0}" = "1" ] && [ "${q2:-0}" = "1" ] && [ "${q3:-0}" = "3" ]; then
+  ok "F-2: two crashes in a row still only pay for the member that keeps failing"
+else
+  bad "F-2: across two resumes members ran m1=$q1 m2=$q2 m3=$q3, expected 1 1 3"
+fi
+
+# (b) F-6: `status` never emits the run's output file, so "no secret in the
+# output" says nothing about whether the nonce was checked. Judge the refusal.
+# Only the states sfh actually WRITES are checked here; see below for "dead".
+for st in failed stopped done; do
+  out="$("$SFH" status "f_$st" 2>&1)"
+  case "$out" in
+    *"refusing to report"*|*"refusing to treat"*)
+      ok "status: refused a forged '$st' run dir by name" ;;
+    *)
+      bad "status: reported a forged '$st' run dir without refusing it" ;;
+  esac
+done
+
+# "dead" is DERIVED - sfh never writes it - so a status.json claiming it is
+# simply unrecognised, which is its own fail-closed answer (exit 2, "cannot
+# tell"). The state worth testing is the one that really produces `dead`: a run
+# that says it is running while its pid is gone and its heartbeat is stale.
+mkdir -p f_derived_dead
+printf 'TOP-SECRET-derived\n' > f_derived_dead/leak.txt
+printf '{"state":"running","exit_code":0,"pid":999999,"heartbeat_utc":"20250101-000000","steps_done":1,"emit_step":"x","emit_file":"leak.txt","run_dir":"f_derived_dead","flow":"x.yaml","sfh_version":"1.0.0","nonce":"deadbeef"}' \
+  > f_derived_dead/status.json
+out="$("$SFH" status f_derived_dead 2>&1)"
+rc=$?
+case "$out" in
+  *TOP-SECRET*) bad "status: LEAKED the emit file of a run that resolved to dead" ;;
+  *)            ok  "status: emitted nothing for a run that resolved to dead" ;;
+esac
+if [ "$rc" -ne 0 ]
+  then ok  "status: a run resolved to dead is not reported as success"
+  else bad "status: FAIL-OPEN - a run resolved to dead returned 0"; fi
+out="$("$SFH" wait f_derived_dead --timeout 5 2>&1)"
+case "$out" in
+  *TOP-SECRET*) bad "wait: LEAKED the emit file of a run that resolved to dead" ;;
+  *)            ok  "wait: emitted nothing for a run that resolved to dead" ;;
+esac
+
+# (c) F-10: `failed` is the field aggregate_end owes. Missing or mistyped, it
+# must not read back as a success - the earlier tests only dropped the two
+# fields step_end owes.
+mkdir -p c16c && (
+cd c16c || exit
+cat > flow.yaml <<'YAML'
+name: aggfail
+steps:
+  - id: fan
+    parallel:
+      - id: z1
+        cmd: ["echo", "AGGTEXT-1"]
+      - id: z2
+        cmd: ["echo", "AGGTEXT-2"]
+  - id: gate
+    cmd: ["sh", "-c", "if [ -f ../t16c ]; then echo ok; else touch ../t16c; exit 5; fi"]
+  - id: use
+    cmd: ["echo", "{{steps.fan.output}}"]
+YAML
+"$SFH" run flow.yaml --runs-dir runs -q >/dev/null 2>&1
+rd="$(ls -d runs/*/ 2>/dev/null | head -1 | sed 's:/*$::')"
+if [ -n "$rd" ]; then
+  cp "$rd/log.jsonl" ../agg-orig.jsonl
+  sed -e 's/"failed":false,//g' -e 's/,"failed":false//g' \
+      "$rd/log.jsonl" > "$rd/l.new" && mv "$rd/l.new" "$rd/log.jsonl"
+  "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q > ../c16c-missing.out 2>&1
+  cp ../agg-orig.jsonl "$rd/log.jsonl"
+  rm -f ../t16c && touch ../t16c
+  sed -e 's/"failed":false/"failed":"no"/g' \
+      "$rd/log.jsonl" > "$rd/l.new" && mv "$rd/l.new" "$rd/log.jsonl"
+  "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q > ../c16c-mistyped.out 2>&1
+fi
+)
+for case_ in missing mistyped; do
+  f="c16c-$case_.out"
+  if [ ! -f "$f" ]; then
+    bad "F-10: could not set up the aggregate_end '$case_' case"
+  elif grep -q 'did not complete' "$f" 2>/dev/null || ! grep -q 'AGGTEXT-1' "$f" 2>/dev/null; then
+    ok "F-10: an aggregate_end with '$case_' failed is not restored as a success"
+  else
+    bad "F-10: FAIL-OPEN - an aggregate_end with '$case_' failed passed as a clean success"
+  fi
+done
+
+# (d) F-8: vars restored from a resumed meta.json are run-derived. The unit
+# test hands the taint set in by hand, so it would still pass if the engine
+# forgot to populate it - only a real resume proves the wiring.
+mkdir -p c16d && (
+cd c16d || exit
+cat > flow.yaml <<'YAML'
+name: taintvar
+vars:
+  p: "echo"
+steps:
+  - id: gate
+    cmd: ["sh", "-c", "if [ -f ../t16d ]; then echo ok; else touch ../t16d; exit 5; fi"]
+  - id: b
+    tool: codex
+    access: read
+    bin: "{{vars.p}}"
+    prompt: "hi"
+YAML
+"$SFH" run flow.yaml --runs-dir runs -q >/dev/null 2>&1
+rd="$(ls -d runs/*/ 2>/dev/null | head -1 | sed 's:/*$::')"
+if [ -n "$rd" ]; then
+  "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q >/dev/null 2>../c16d-plain.err
+  "$SFH" run flow.yaml --resume "$rd" --runs-dir runs --var p=echo -q >/dev/null 2>../c16d-var.err
+fi
+)
+if [ -f c16d-plain.err ] && grep -qE "run-derived|resumed run|cannot be used|refus" c16d-plain.err
+  then ok  "F-8: a var restored from meta.json is refused in bin: on resume"
+  else bad "F-8: a restored var reached bin: without being treated as run-derived"; fi
+if [ -f c16d-var.err ] && ! grep -qE "run-derived|resumed run" c16d-var.err
+  then ok  "LEGIT: re-supplying the value with --var makes the resume work again"
+  else bad "LEGIT: --var does not clear the taint, so such a flow can never resume"; fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"

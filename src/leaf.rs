@@ -386,7 +386,10 @@ pub fn shell_script_span(argv: &[String]) -> Option<std::ops::Range<usize>> {
             if "encodedcommand".starts_with(bare) && bare.starts_with('e') {
                 return Some(i + 1..(i + 2).min(argv.len()));
             }
-            if "command".starts_with(bare) {
+            // -CommandWithArgs (pwsh 7.4+) and its documented short form -cwa
+            // also take a command string. -cwa is not a prefix of the full
+            // name, so prefix matching alone missed both.
+            if "command".starts_with(bare) || "commandwithargs".starts_with(bare) || bare == "cwa" {
                 return Some(i + 1..argv.len());
             }
         }
