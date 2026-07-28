@@ -451,7 +451,25 @@ fn unquote(v: &str) -> String {
     v.trim().trim_matches('"').trim().to_string()
 }
 
+/// Split a codex `-c`/`--config` value into a (key, unquoted-value) pair, e.g.
+/// `sandbox_mode="danger-full-access"` -> ("sandbox_mode", "danger-full-access").
+fn config_kv(value: &str) -> Option<(String, String)> {
+    let (k, v) = value.split_once('=')?;
+    let k = k.trim().to_string();
+    if k.is_empty() {
+        return None;
+    }
+    Some((k, unquote(v)))
+}
+
 pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Escalation> {
+    // IMPORTANT: a SAFE (narrowing or same-tier) arg must NOT stop the scan. The
+    // old code did `return wider(...)` directly, so the first classifiable arg
+    // ended the whole walk: `["--permission-mode","dontAsk",
+    // "--dangerously-skip-permissions"]` classified `dontAsk` as read-tier,
+    // returned None, and never looked at the full-access flag that followed.
+    // Every branch now only returns when it finds a WIDENING arg and otherwise
+    // falls through to the next element (rev_break #8).
     for (i, a) in args.iter().enumerate() {
         // Tool-independent "approve everything" switches.
         let (flag, eq_value) = match a.split_once('=') {
@@ -471,18 +489,23 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
         };
         match tool {
             "codex" => {
-                // -s/--sandbox <mode>, or a bare -c value element sandbox_mode=<mode>.
+                // -s/--sandbox <mode>, a bare -c value element sandbox_mode=<mode>,
+                // OR the joined forms -c sandbox_mode=<mode> / --config=sandbox_mode=<mode>.
                 let mode = if flag == "-s" || flag == "--sandbox" {
                     value_of(true)
                 } else if flag == "sandbox_mode" {
                     Some(eq_value.clone().unwrap_or_default())
+                } else if flag == "-c" || flag == "--config" {
+                    value_of(true).and_then(|v| {
+                        config_kv(&v).and_then(|(k, val)| (k == "sandbox_mode").then_some(val))
+                    })
                 } else {
                     None
                 };
                 if let Some(m) = mode {
                     let clean = unquote(&m);
                     if let Some(r) = codex_sandbox_rank(&clean) {
-                        return wider(
+                        if let Some(e) = wider(
                             a,
                             format!(
                                 "sandbox mode '{clean}' is the {} tier, above the declared '{}'",
@@ -491,26 +514,38 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             ),
                             r,
                             access,
-                        );
+                        ) {
+                            return Some(e);
+                        }
                     }
                 }
-                // approval_policy=<policy> as a bare -c value: anything except
-                // "never" auto-approves at least some actions.
-                if flag == "approval_policy" {
-                    if let Some(v) = eq_value {
-                        let clean = unquote(&v);
-                        let rank = match clean.as_str() {
-                            "never" => Some(0),
-                            "on-failure" | "on-request" | "unapproved" => Some(2),
-                            _ => None,
-                        };
-                        if let Some(r) = rank {
-                            return wider(
-                                a,
-                                format!("approval_policy '{clean}' auto-approves tool calls"),
-                                r,
-                                access,
-                            );
+                // approval_policy=<policy>: anything except "never" auto-approves
+                // at least some actions. Recognised both as a bare -c value element
+                // and inside the joined -c/--config forms.
+                let approval = if flag == "approval_policy" {
+                    eq_value.clone()
+                } else if flag == "-c" || flag == "--config" {
+                    value_of(true).and_then(|v| {
+                        config_kv(&v).and_then(|(k, val)| (k == "approval_policy").then_some(val))
+                    })
+                } else {
+                    None
+                };
+                if let Some(v) = approval {
+                    let clean = unquote(&v);
+                    let rank = match clean.as_str() {
+                        "never" => Some(0),
+                        "on-failure" | "on-request" | "unapproved" => Some(2),
+                        _ => None,
+                    };
+                    if let Some(r) = rank {
+                        if let Some(e) = wider(
+                            a,
+                            format!("approval_policy '{clean}' auto-approves tool calls"),
+                            r,
+                            access,
+                        ) {
+                            return Some(e);
                         }
                     }
                 }
@@ -520,7 +555,7 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                     if let Some(v) = value_of(true) {
                         let clean = unquote(&v);
                         if let Some(r) = permission_mode_rank(&clean) {
-                            return wider(
+                            if let Some(e) = wider(
                                 a,
                                 format!(
                                     "permission mode '{clean}' is the {} tier, above the declared '{}'",
@@ -529,13 +564,15 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                                 ),
                                 r,
                                 access,
-                            );
+                            ) {
+                                return Some(e);
+                            }
                         }
                     }
                 } else if flag == "--tools" || flag == "--allowedTools" {
                     if let Some(v) = value_of(true) {
                         let r = claude_tool_list_rank(&v);
-                        return wider(
+                        if let Some(e) = wider(
                             a,
                             format!(
                                 "the tool list grants the {} tier, above the declared '{}'",
@@ -544,15 +581,19 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             ),
                             r,
                             access,
-                        );
+                        ) {
+                            return Some(e);
+                        }
                     }
                 } else if flag == "--add-dir" {
-                    return wider(
+                    if let Some(e) = wider(
                         a,
                         "grants access to directories outside the workspace".to_string(),
                         2,
                         access,
-                    );
+                    ) {
+                        return Some(e);
+                    }
                 }
             }
             "opencode" => {
@@ -563,13 +604,15 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                     if let Some(v) = value_of(true) {
                         let clean = unquote(&v);
                         if clean == "build" {
-                            return wider(
+                            if let Some(e) = wider(
                                 a,
                                 "the build agent edits files, above the declared 'read'"
                                     .to_string(),
                                 1,
                                 access,
-                            );
+                            ) {
+                                return Some(e);
+                            }
                         }
                     }
                 }
@@ -579,7 +622,7 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                     if let Some(v) = value_of(true) {
                         let clean = unquote(&v);
                         if let Some(r) = permission_mode_rank(&clean) {
-                            return wider(
+                            if let Some(e) = wider(
                                 a,
                                 format!(
                                     "permission mode '{clean}' is the {} tier, above the declared '{}'",
@@ -588,7 +631,9 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                                 ),
                                 r,
                                 access,
-                            );
+                            ) {
+                                return Some(e);
+                            }
                         }
                     }
                 } else if flag == "--allow" {
@@ -604,7 +649,7 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             "edit" | "write" => 1,
                             _ => 0,
                         };
-                        return wider(
+                        if let Some(e) = wider(
                             a,
                             format!(
                                 "allowing '{v}' grants the {} tier, above the declared '{}'",
@@ -613,7 +658,9 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             ),
                             r,
                             access,
-                        );
+                        ) {
+                            return Some(e);
+                        }
                     }
                 }
             }
@@ -627,7 +674,7 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             _ => None,
                         };
                         if let Some(r) = rank {
-                            return wider(
+                            if let Some(e) = wider(
                                 a,
                                 format!(
                                     "mode '{clean}' is the {} tier, above the declared '{}'",
@@ -636,7 +683,9 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                                 ),
                                 r,
                                 access,
-                            );
+                            ) {
+                                return Some(e);
+                            }
                         }
                     }
                 }
@@ -651,7 +700,7 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                 if flag == "--tools" || flag == "-t" {
                     if let Some(v) = value_of(true) {
                         let r = pi_tool_list_rank(&v);
-                        return wider(
+                        if let Some(e) = wider(
                             a,
                             format!(
                                 "the tool list grants the {} tier, above the declared '{}'",
@@ -660,7 +709,9 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             ),
                             r,
                             access,
-                        );
+                        ) {
+                            return Some(e);
+                        }
                     }
                 }
             }
@@ -1332,6 +1383,22 @@ mod tests {
         (PathBuf::from("/tmp/last.txt"), PathBuf::from("/tmp/p.txt"))
     }
 
+    #[test]
+    fn access_parse_rejects_unknown_values() {
+        // rev_complete S2-4: an unparseable access string (e.g. a log.jsonl an
+        // attacker edited to "access":"bogus") must NOT parse to a usable level.
+        // engine::load_resume maps the Err to None via .ok(), and the resume
+        // guard then fails closed on None - this test pins the first link.
+        assert_eq!(Access::parse(Some("read")).unwrap(), Access::Read);
+        assert_eq!(Access::parse(Some("write")).unwrap(), Access::Write);
+        assert_eq!(Access::parse(Some("full")).unwrap(), Access::Full);
+        assert!(Access::parse(Some("bogus")).is_err());
+        assert!(Access::parse(Some("FULL")).is_err());
+        assert!(Access::parse(Some("")).is_err());
+        // None defaults to write (cmd: steps), never to an escalation.
+        assert_eq!(Access::parse(None).unwrap(), Access::Write);
+    }
+
     fn build_argv(tool: &str, access: Access) -> Vec<String> {
         let (l, p) = paths();
         let bp = BuildPaths {
@@ -1880,6 +1947,56 @@ mod tests {
                 argv
             );
         }
+    }
+
+    #[test]
+    fn escalation_scan_does_not_stop_at_a_safe_arg() {
+        // rev_break #8: a SAFE (narrowing / same-tier) arg used to end the whole
+        // scan, so a widening arg placed AFTER a harmless one slipped through.
+        // dontAsk is the read tier on a read step (safe), but the Bash tool list
+        // that follows it is full access and must still be caught.
+        assert!(
+            find_escalation(
+                "claude",
+                Access::Read,
+                &args(&["--permission-mode", "dontAsk", "--allowedTools", "Bash"])
+            )
+            .is_some(),
+            "a widening arg after a safe one must not be skipped"
+        );
+        // Same shape for codex: a narrowing sandbox first, then a full-access one.
+        assert!(find_escalation(
+            "codex",
+            Access::Read,
+            &args(&["-s", "read-only", "-s", "danger-full-access"])
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn escalation_detects_joined_config_sandbox_mode() {
+        // rev_break #8: --config=sandbox_mode="danger-full-access" is a single
+        // argv element; the old code only recognised sandbox_mode as its own
+        // element (or -s/--sandbox), so the joined form was invisible.
+        assert!(find_escalation(
+            "codex",
+            Access::Read,
+            &args(&["--config=sandbox_mode=\"danger-full-access\""])
+        )
+        .is_some());
+        assert!(find_escalation(
+            "codex",
+            Access::Read,
+            &args(&["-c", "approval_policy=on-failure"])
+        )
+        .is_some());
+        // The joined form still narrows correctly.
+        assert!(find_escalation(
+            "codex",
+            Access::Read,
+            &args(&["--config=sandbox_mode=\"read-only\""])
+        )
+        .is_none());
     }
 
     #[test]

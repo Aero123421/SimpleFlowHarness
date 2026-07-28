@@ -70,6 +70,7 @@ pub struct Prepared {
     pub warmup_key: Option<String>,
     pub env_remove: Vec<String>,
     pub env_set: Vec<(String, String)>,
+    pub run_dir: PathBuf,
     pub out_file: PathBuf,
     pub err_file: PathBuf,
     pub chain_file: PathBuf,
@@ -254,8 +255,86 @@ pub struct PrepCtx<'a> {
     pub sessions: &'a HashMap<String, SessionInfo>,
     /// Steps whose sessions later steps want to resume (continue_from targets).
     pub needed_sessions: &'a HashSet<String>,
+    /// Var keys whose values came from a resumed run dir's meta.json and were
+    /// not overridden by an explicit --var: run-derived UNTRUSTED input, barred
+    /// from executed-privileged template sinks (rev_break #12).
+    pub tainted_vars: &'a HashSet<String>,
     pub quiet: bool,
     pub verbose: bool,
+}
+
+/// Whether a template key may feed an EXECUTED-privileged sink: `bin` (argv[0]),
+/// `cwd` (the workspace base a write/full tool acts in) and argv[0] of a custom
+/// cmd. These are executed with sfh's own OS rights regardless of access: read,
+/// so only values the USER controls may flow into them (rev_break #12):
+/// - `steps.*` is step output - untrusted on a fresh run (an upstream or resumed
+///   result could name an arbitrary binary or move the write base),
+/// - `notes` / `item` / `item_index` are run-derived the same way (notes.md is
+///   appended from step output; foreach items render from it),
+/// - a var is barred only when its value came from the resumed run dir's
+///   meta.json (tainted) and was not re-supplied with --var; a var the user
+///   defined or overrode is their own value and stays allowed.
+///
+/// A step can opt back in with allow_dynamic_exec_paths: true, in which case
+/// the caller does not consult this predicate at all.
+pub fn exec_path_key_check(key: &str, tainted_vars: &HashSet<String>) -> Result<(), String> {
+    if key.starts_with("steps.") {
+        return Err(format!(
+            "refusing to expand '{{{{{key}}}}}': this field is executed by sfh and must not depend on step output (an upstream or resumed result could inject an arbitrary path). Set allow_dynamic_exec_paths: true on this step to accept run-derived values here"
+        ));
+    }
+    if matches!(key, "notes" | "item" | "item_index") {
+        return Err(format!(
+            "refusing to expand '{{{{{key}}}}}': this field is executed by sfh and '{key}' is run-derived data (set allow_dynamic_exec_paths: true on this step to accept it)"
+        ));
+    }
+    if let Some(name) = key.strip_prefix("vars.") {
+        if tainted_vars.contains(name) {
+            return Err(format!(
+                "refusing to expand '{{{{{key}}}}}': this field is executed by sfh and var '{name}' came from the resumed run dir's meta.json (pass --var {name}=... to supply your own value, or set allow_dynamic_exec_paths: true on this step)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn exec_template_check<'a>(
+    tainted_vars: &'a HashSet<String>,
+) -> impl Fn(&str, &str) -> Result<(), String> + 'a {
+    move |key: &str, _: &str| -> Result<(), String> { exec_path_key_check(key, tainted_vars) }
+}
+
+/// True when `argv` is really a shell invocation in argv clothing: argv[0] is a
+/// known shell and the next argument is its "run this string" flag. The string
+/// after that flag is re-parsed by the shell, so it needs the SAME template
+/// treatment as a string-form cmd - the argv branch's ordinary "data is safe"
+/// reasoning does not apply to it (rev_break #13: `cmd: ["sh","-c","...{{x}}..."]`
+/// bypassed the shell-template defence entirely). Returns the index of the
+/// first shell-script argument (everything from there on is shell text).
+pub fn shell_script_start(argv: &[String]) -> Option<usize> {
+    let prog = argv.first()?;
+    let stem = Path::new(prog)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let sh_family = matches!(
+        stem.as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "busybox"
+    );
+    let cmd_exe = stem == "cmd";
+    if !sh_family && !cmd_exe {
+        return None;
+    }
+    for (i, a) in argv.iter().enumerate().skip(1) {
+        let low = a.to_lowercase();
+        if sh_family && (low == "-c" || low == "-lc" || low == "-ec") {
+            return Some(i + 1);
+        }
+        if cmd_exe && (low == "/c" || low == "/k" || low == "/r") {
+            return Some(i + 1);
+        }
+    }
+    None
 }
 
 pub fn make_builtins(
@@ -283,6 +362,28 @@ pub fn make_builtins(
 }
 
 const ARG_PROMPT_MAX: usize = 25_000;
+
+/// Metacharacter check applied to substituted values when a step opts in to
+/// shell templating (unsafe_shell_template), for both the string-form cmd and
+/// an argv form that wraps a shell. A delimiter filter, not a security
+/// boundary - see the callers for why expansion is refused without the opt-in.
+pub fn shell_metachar_check(key: &str, val: &str) -> Result<(), String> {
+    const BAD: &[char] = &['\n', '\r', '&', '|', '<', '>', '^', '%', '`', '$', ';', '"'];
+    if val.contains(BAD) {
+        Err(format!(
+            "substituted value of '{{{{{key}}}}}' contains newlines or shell metacharacters; use an argv-form cmd: [...] or filters (e.g. | head:1)"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The refusal text for template expansion that would land in shell-parsed text.
+pub fn shell_expansion_refused(what: &str, key: &str) -> String {
+    format!(
+        "{what} would expand '{{{{{key}}}}}' into a shell string, and template expansion in a shell-parsed cmd is disabled by default (the substituted value would be re-parsed by the shell). Use an argv form that does not wrap a shell: cmd: [\"program\", \"--flag\", \"{{{{{key}}}}}\"], or set unsafe_shell_template: true on this step to accept shell templating"
+    )
+}
 
 /// Render templates, apply guards, and build the concrete command for one leaf run.
 pub fn prepare_leaf(
@@ -335,13 +436,33 @@ pub fn prepare_leaf(
     let model = opt_rend(&eff.model, &ctx)?;
     let effort = opt_rend(&eff.effort, &ctx)?;
     let agent = opt_rend(&eff.agent, &ctx)?;
-    let bin = opt_rend(&eff.bin, &ctx)?;
+    // `bin` becomes argv[0] and `cwd` is the workspace base a write/full tool
+    // acts in, so both are EXECUTED-privileged: an upstream or resumed step
+    // output flowing into either would let untrusted text point sfh at an
+    // arbitrary binary (bin) or move the write base outside the workspace (cwd),
+    // in both cases running with sfh's own OS rights regardless of access: read.
+    // Refuse run-derived templates in these fields (step output, notes, foreach
+    // items, and vars restored from the resumed run dir); user-controlled
+    // sources still expand (rev_break #9, rev_break #12). The step can opt back
+    // in with allow_dynamic_exec_paths: true.
+    let rend_exec = |label: &str, t: &str| -> Result<String, String> {
+        if step.allow_dynamic_exec_paths.unwrap_or(false) {
+            return template::render(t, &ctx)
+                .map_err(|e| format!("step '{}' {label}: {e}", step.id));
+        }
+        template::render_checked(t, &ctx, &exec_template_check(cx.tainted_vars))
+            .map_err(|e| format!("step '{}' {label}: {e}", step.id))
+    };
+    let bin = match &eff.bin {
+        Some(b) => Some(rend_exec("bin", b)?),
+        None => None,
+    };
     let mut args = Vec::new();
     for a in &eff.args {
         args.push(rend("args", a)?);
     }
     let cwd = match &eff.cwd {
-        Some(c) => Some(PathBuf::from(rend("cwd", c)?)),
+        Some(c) => Some(PathBuf::from(rend_exec("cwd", c)?)),
         None => None,
     };
     let timeout_sec = eff.timeout_sec;
@@ -370,32 +491,51 @@ pub fn prepare_leaf(
             // shell; unsafe_shell_template: true is the explicit opt-in back
             // into shell templating (with the metacharacter check still on).
             let checked = if step.unsafe_shell_template.unwrap_or(false) {
-                template::render_checked(s, &ctx, &|key, val| {
-                    const BAD: &[char] = &[
-                        '\n', '\r', '&', '|', '<', '>', '^', '%', '`', '$', ';', '"',
-                    ];
-                    if val.contains(BAD) {
-                        Err(format!(
-                            "substituted value of '{{{{{key}}}}}' contains newlines or shell metacharacters; use an argv-form cmd: [...] or filters (e.g. | head:1)"
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                })
+                template::render_checked(s, &ctx, &shell_metachar_check)
             } else {
                 template::render_checked(s, &ctx, &|key, _| {
-                    Err(format!(
-                        "string-form cmd would expand '{{{{{key}}}}}' into a shell string, and template expansion in a string cmd is disabled by default (the substituted value would be re-parsed by the shell). Use the argv form, which spawns without a shell: cmd: [\"program\", \"--flag\", \"{{{{{key}}}}}\"], or set unsafe_shell_template: true on this step to accept shell templating"
-                    ))
+                    Err(shell_expansion_refused("string-form cmd", key))
                 })
             }
             .map_err(|e| format!("step '{}' cmd: {e}", step.id))?;
             (execute::Invocation::Shell(checked), None)
         }
         Some(flow::Cmd::Argv(v)) => {
-            let mut nv = Vec::new();
-            for x in v {
-                nv.push(rend("cmd", x)?);
+            if v.is_empty() {
+                return Err(format!("step '{}': cmd array is empty", step.id));
+            }
+            // argv[0] is the program sfh executes: the same executed-privileged
+            // sink as `bin`, so it gets the same run-derived-template refusal
+            // (rev_break #12 - the old code rendered argv[0] like data, so a
+            // crafted run could select an arbitrary program through a resumed
+            // meta.json var or a step output).
+            let mut nv = vec![rend_exec("cmd[0]", &v[0])?];
+            // An argv form that WRAPS a shell (["sh","-c","..."]) re-parses its
+            // script argument in that shell, so the script gets the exact same
+            // treatment as a string-form cmd: expansion refused by default,
+            // metacharacter-checked under unsafe_shell_template. The old code
+            // saw only "the argv branch" here and skipped every shell defence
+            // (rev_break #13).
+            let mut head = nv.clone();
+            head.extend(v.iter().skip(1).cloned());
+            let script_from = shell_script_start(&head);
+            for (i, x) in v.iter().enumerate().skip(1) {
+                let rendered = match script_from {
+                    Some(start) if i >= start => {
+                        if step.unsafe_shell_template.unwrap_or(false) {
+                            template::render_checked(x, &ctx, &shell_metachar_check)
+                        } else {
+                            template::render_checked(x, &ctx, &|key, _| {
+                                Err(shell_expansion_refused(
+                                    "cmd: [\"sh\", \"-c\", ...] shell text",
+                                    key,
+                                ))
+                            })
+                        }
+                    }
+                    _ => rend("cmd", x),
+                };
+                nv.push(rendered.map_err(|e| format!("step '{}' cmd: {e}", step.id))?);
             }
             (execute::Invocation::Argv(nv), None)
         }
@@ -475,16 +615,27 @@ pub fn prepare_leaf(
                     // to drop the field). Warn-and-continue would be fail-open:
                     // deleting one field from an attacker-controlled run dir
                     // would be enough to resume a read session at full. So this
-                    // is fail-closed unless the step explicitly opted in.
+                    // is fail-closed at EVERY tier, read included, unless the
+                    // step explicitly opted in (rev_complete S2-4). "But read is
+                    // the lowest tier, so nothing can escalate into it" is true
+                    // for an HONEST missing field, yet indistinguishable from a
+                    // field an attacker deleted, and a read resume of a session
+                    // whose true level is unknown still re-enters a context sfh
+                    // cannot vouch for - so the opt-in is required either way.
+                    // Legitimate pre-1.0 runs are not punished by this: the
+                    // engine fills their missing levels from the (fingerprint-
+                    // verified) flow before this guard runs (reconcile_session_
+                    // access), so None here means a recording-era run with a
+                    // missing or altered field, not an old run.
                     None => {
                         if step.allow_access_override.unwrap_or(false) {
                             eprintln!(
-                                "sfh: warning: step '{}': the session of '{target}' has no recorded access level (run dir predates access recording, or the log was altered); proceeding because allow_access_override is set",
+                                "sfh: warning: step '{}': the session of '{target}' has no recorded access level (the log was altered, or a pre-1.0 run is being resumed without its flow); proceeding because allow_access_override is set",
                                 step.id
                             );
                         } else {
                             return Err(format!(
-                                "step '{}': {what} '{target}' has no recorded access level (the run dir predates access recording, or the log was altered), so an access escalation cannot be ruled out - refusing to resume (set allow_access_override: true on this step to accept)",
+                                "step '{}': {what} '{target}' has no recorded access level (the log was altered, or a pre-1.0 run is being resumed without its flow), so an access escalation cannot be ruled out - refusing to resume (set allow_access_override: true on this step to accept; if you edited the flow, --force-resume is needed too)",
                                 step.id
                             ));
                         }
@@ -570,7 +721,15 @@ pub fn prepare_leaf(
     };
 
     #[allow(clippy::type_complexity)]
-    let (parse, delivery, preassigned, expect_session, expect_marker, mut env_remove, mut env_set): (
+    let (
+        parse,
+        delivery,
+        preassigned,
+        expect_session,
+        expect_marker,
+        mut env_remove,
+        preset_env_set,
+    ): (
         preset::OutputParse,
         preset::Delivery,
         Option<String>,
@@ -606,9 +765,18 @@ pub fn prepare_leaf(
         }
     };
     env_remove.extend(step.env_remove.iter().cloned());
+    // Flow/profile/default env first, then the preset's own env LAST. execute.rs
+    // applies env_set last-wins, so this ordering makes the preset's access
+    // enforcement (opencode's OPENCODE_CONFIG_CONTENT bash/edit/external-dir
+    // deny) override a same-named flow env that would otherwise re-allow bash and
+    // turn a read/write step into full access. The enforcement must not be
+    // overridable by flow data, which is template-expanded and thus reachable
+    // from run output (rev_break #10).
+    let mut env_set: Vec<(String, String)> = Vec::new();
     for (k, v) in &eff.env {
         env_set.push((k.clone(), rend("env", v)?));
     }
+    env_set.extend(preset_env_set);
 
     let (inv, stdin_payload) = match delivery {
         preset::Delivery::Stdin => {
@@ -661,6 +829,7 @@ pub fn prepare_leaf(
         warmup_key,
         env_remove,
         env_set,
+        run_dir: cx.run_dir.to_path_buf(),
         out_file,
         err_file,
         chain_file,
@@ -718,25 +887,55 @@ pub fn check_session(e: &SessionExpect, parsed: &ParsedOut, chain: &str) -> Opti
             "\nsfh: resume mismatch: expected {what} '{exp}' but the tool reported '{got}' (it silently started a new session - resuming from a different working directory does this)\n"
         ))
     };
-    if let (Some(exp), Some(got)) = (e.expect_session, parsed.session.as_deref()) {
-        if got != exp {
-            return mismatch("session", exp, got);
+    // A resume asks the tool to continue a specific session. Every supported
+    // tool echoes the session id back on success, so a tool that silently starts
+    // a FRESH session (or lands in a different one) reports a DIFFERENT id and is
+    // caught here. A tool that reports NO id at all cannot be verified to have
+    // resumed anything, so that is a failure too: the old (Some, None) fallback
+    // accepted "the tool said nothing" as "it resumed the right session", which
+    // let a CLI that ignored the resume flag pass as success (rev_break #16).
+    // Fresh runs are unaffected: expect_session is only set on resume/fork.
+    if let Some(exp) = e.expect_session {
+        match parsed.session.as_deref() {
+            Some(got) if got == exp => {}
+            Some(got) => return mismatch("session", exp, got),
+            None => {
+                return Some(format!(
+                    "\nsfh: resume unverified: the tool reported no session id, so sfh cannot tell whether it continued '{exp}' or silently started a fresh session\n"
+                ))
+            }
         }
     }
     // pi accepts any --session-id and creates one when it is not found in this
-    // cwd, so the id matching proves nothing; the marker does.
-    if let (Some(exp), Some(got)) = (e.expect_marker, parsed.session_marker.as_deref()) {
-        if got != exp {
-            return mismatch("session marker", exp, got);
+    // cwd, so the id matching proves nothing; the marker does. A missing marker
+    // is as unverifiable as a missing id (rev_break #16).
+    if let Some(exp) = e.expect_marker {
+        match parsed.session_marker.as_deref() {
+            Some(got) if got == exp => {}
+            Some(got) => return mismatch("session marker", exp, got),
+            None => {
+                return Some(format!(
+                    "\nsfh: resume unverified: the tool reported no session marker, so sfh cannot tell whether it found the session with marker '{exp}' or created a new one\n"
+                ))
+            }
         }
     }
     // A fork that came back as the parent means the fork flag was ignored: this
-    // run appended to the session its siblings are also using.
-    if let (Some(parent), Some(got)) = (e.forbid_session, parsed.session.as_deref()) {
-        if got == parent {
-            return Some(format!(
-                "\nsfh: fork failed: the tool reported the PARENT session '{parent}' instead of a new one, so this run appended to the parent instead of branching\n"
-            ));
+    // run appended to the session its siblings are also using. No reported id
+    // means no proof the fork happened, which fails the same way (rev_break #16).
+    if let Some(parent) = e.forbid_session {
+        match parsed.session.as_deref() {
+            Some(got) if got == parent => {
+                return Some(format!(
+                    "\nsfh: fork failed: the tool reported the PARENT session '{parent}' instead of a new one, so this run appended to the parent instead of branching\n"
+                ))
+            }
+            Some(_) => {}
+            None => {
+                return Some(
+                    "\nsfh: fork unverified: the tool reported no session id, so sfh cannot tell whether it branched the parent or appended to it\n".to_string(),
+                )
+            }
         }
     }
     // pi names the parent it branched from - positive proof of a fork.
@@ -761,15 +960,33 @@ pub fn check_session(e: &SessionExpect, parsed: &ParsedOut, chain: &str) -> Opti
     None
 }
 
-pub fn parse_output(parse: &preset::OutputParse, stdout: &str, stderr: &str) -> ParsedOut {
-    match parse {
+/// Parse a tool's output. `run_dir`, when given, is the run dir the artifact
+/// paths must stay inside: the codex --output-last-message file is written by
+/// an external CLI and read back here, and on a resumed run that directory is
+/// untrusted input, so the read is contained and no-follow (a symlink at the
+/// fixed name used to pull external text into the chain output). A containment
+/// violation fails the step instead of reading (rev_break #4). Callers without
+/// a run dir (sfh doctor's own scratch dir, created and cleared by sfh) pass
+/// None and get a plain read.
+pub fn parse_output(
+    parse: &preset::OutputParse,
+    stdout: &str,
+    stderr: &str,
+    run_dir: Option<&Path>,
+) -> Result<ParsedOut, String> {
+    Ok(match parse {
         preset::OutputParse::Stdout => ParsedOut {
             text: stdout.trim().to_string(),
             ..Default::default()
         },
         preset::OutputParse::CodexJsonl(f) => {
             let mut o = parse_codex_jsonl(stdout);
-            let file_text = std::fs::read_to_string(f).unwrap_or_default();
+            let file_text = match run_dir {
+                Some(base) => contain::read_contained_abs(base, f)
+                    .map(|t| t.unwrap_or_default())
+                    .map_err(|e| format!("refusing to read the codex last-message file: {e}"))?,
+                None => std::fs::read_to_string(f).unwrap_or_default(),
+            };
             if !file_text.trim().is_empty() {
                 o.text = file_text.trim().to_string();
             } else if o.text.is_empty() {
@@ -786,7 +1003,7 @@ pub fn parse_output(parse: &preset::OutputParse, stdout: &str, stderr: &str) -> 
         preset::OutputParse::AgyJson => parse_agy_json(stdout),
         preset::OutputParse::PiJsonl => parse_pi_jsonl(stdout),
         preset::OutputParse::CursorJson => parse_cursor_json(stdout),
-    }
+    })
 }
 
 /// cursor-agent --output-format json: one result envelope. A model/API failure
@@ -960,6 +1177,80 @@ fn exec_once(p: Prepared) -> LeafDone {
     }
     let cmd_desc = p.inv.describe();
     let cwd_str = p.cwd.as_ref().map(|c| c.display().to_string());
+    // The run dir is untrusted on a resumed run, and the artifact names are
+    // predictable, so a symlink planted at <tag>.out.txt / .err.txt must fail
+    // the step BEFORE anything writes through it: the stdout tee and (for
+    // codex) an external CLI open these paths, and a link would redirect their
+    // writes outside the run dir (rev_break #3). The codex last-message file
+    // is handed to the CLI as a write target and read back by sfh, so it gets
+    // the same refusal plus a no-follow pre-create: the CLI then overwrites a
+    // regular file sfh just verified, not a link planted in between (rev_break
+    // #4; the residual swap window is bounded by the 0700 run dir).
+    let mut artifact_violation: Option<String> = None;
+    for f in [&p.out_file, &p.err_file] {
+        if f.symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            artifact_violation = Some(format!(
+                "refusing to run: {} is a symlink; run artifacts must be regular files inside the run dir",
+                f.display()
+            ));
+            break;
+        }
+    }
+    if artifact_violation.is_none() {
+        if let preset::OutputParse::CodexJsonl(last) = &p.parse {
+            if last
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                artifact_violation = Some(format!(
+                    "refusing to run: {} is a symlink; an external CLI would write through it out of the run dir",
+                    last.display()
+                ));
+            } else if let Err(e) = contain::create_nofollow(last) {
+                artifact_violation = Some(format!(
+                    "refusing to run: cannot pre-create {} as a regular file: {e}",
+                    last.display()
+                ));
+            }
+        }
+    }
+    if let Some(why) = artifact_violation {
+        // Only write the err file when it is itself safe (the violation may be
+        // exactly "the err file is a symlink").
+        if !p
+            .err_file
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            let _ = contain::write_private(&p.err_file, &why);
+        }
+        if !p.quiet {
+            eprintln!("sfh: [{}] {why}", p.tag);
+        }
+        return LeafDone {
+            tag: p.tag,
+            exit_code: -1,
+            timed_out: false,
+            interrupted: false,
+            dur_ms: 0,
+            attempts: 1,
+            chain_output: String::new(),
+            stderr_clean: why,
+            out_file: p.out_file,
+            session_id: None,
+            session_marker: None,
+            tool: p.tool,
+            cwd: cwd_str,
+            access: p.access,
+            usage: preset::Usage::default(),
+            cmd: cmd_desc,
+        };
+    }
     let outcome = match execute::run_cmd(
         &p.inv,
         p.stdin_payload,
@@ -1002,7 +1293,19 @@ fn exec_once(p: Prepared) -> LeafDone {
     let _ = contain::write_private(&p.out_file, &stdout_clean);
     let _ = contain::write_private(&p.err_file, &stderr_clean);
 
-    let parsed = parse_output(&p.parse, &stdout_clean, &stderr_clean);
+    let parsed = match parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)) {
+        Ok(o) => o,
+        Err(e) => {
+            // A containment violation reading the tool's artifact is a failure
+            // of this step, not empty output (rev_break #4).
+            stderr_clean.push_str(&format!("\nsfh: {e}\n"));
+            let _ = contain::write_private(&p.err_file, &stderr_clean);
+            ParsedOut {
+                failed: true,
+                ..Default::default()
+            }
+        }
+    };
     let mut exit_code = outcome.exit_code;
     // Several tools report success/failure in-band and get the exit code wrong.
     if parsed.failed && exit_code == 0 {
@@ -1902,6 +2205,12 @@ mod tests {
         d
     }
 
+    fn no_tainted_vars() -> &'static HashSet<String> {
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<HashSet<String>> = OnceLock::new();
+        EMPTY.get_or_init(HashSet::new)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn ctx<'a>(
         flow: &'a flow::Flow,
@@ -1922,6 +2231,7 @@ mod tests {
             notes_file: run_dir,
             sessions,
             needed_sessions: needed,
+            tainted_vars: no_tainted_vars(),
             quiet: true,
             verbose: false,
         }
@@ -2071,6 +2381,62 @@ mod tests {
         )
         .expect("allow_access_override accepts an unknown recorded level");
 
+        // rev_complete S2-4: a missing recorded level is fail-CLOSED at EVERY
+        // tier, read included. "read is the lowest tier so nothing can escalate
+        // into it" is true for an honest missing field but indistinguishable
+        // from one an attacker deleted, so the opt-in is required either way.
+        // Legitimate pre-1.0 runs are filled from the flow by the engine
+        // (reconcile_session_access) before this guard runs, so they never hit
+        // this path.
+        let mut read_resume: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: low\n    tool: claude\n    access: read\n    prompt: x\n  - id: again\n    tool: claude\n    access: read\n    continue_from: low\n    prompt: y\n",
+        )
+        .unwrap();
+        let again = read_resume.steps.pop().unwrap();
+        let e = prepare_leaf(
+            &ctx(
+                &read_resume,
+                &vars,
+                &outputs,
+                &step_ids,
+                &dir,
+                &sessions_unknown,
+                &needed,
+            ),
+            &again,
+            1,
+            "again",
+            &[],
+            None,
+        )
+        .err()
+        .expect("an unknown recorded level must fail closed even at read");
+        assert!(e.contains("no recorded access level"), "{e}");
+
+        // ...and allow_access_override is the explicit way back in at read too.
+        let mut read_resume_opt: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: low\n    tool: claude\n    access: read\n    prompt: x\n  - id: again\n    tool: claude\n    access: read\n    allow_access_override: true\n    continue_from: low\n    prompt: y\n",
+        )
+        .unwrap();
+        let again_opt = read_resume_opt.steps.pop().unwrap();
+        prepare_leaf(
+            &ctx(
+                &read_resume_opt,
+                &vars,
+                &outputs,
+                &step_ids,
+                &dir,
+                &sessions_unknown,
+                &needed,
+            ),
+            &again_opt,
+            1,
+            "again",
+            &[],
+            None,
+        )
+        .expect("allow_access_override accepts an unknown level at read");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2219,6 +2585,277 @@ mod tests {
         assert!(e.contains("metacharacters"), "{e}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_script_start_detects_wrapped_shells() {
+        // rev_break #13: the argv form can wrap a shell; the script argument
+        // after the -c / /C flag is re-parsed by that shell.
+        assert_eq!(
+            shell_script_start(&["sh".into(), "-c".into(), "echo hi".into()]),
+            Some(2)
+        );
+        assert_eq!(
+            shell_script_start(&["bash".into(), "-c".into(), "x".into()]),
+            Some(2)
+        );
+        assert_eq!(
+            shell_script_start(&["cmd".into(), "/C".into(), "dir".into()]),
+            Some(2)
+        );
+        // Flags before -c: the script is still the element after -c.
+        assert_eq!(
+            shell_script_start(&["sh".into(), "-l".into(), "-c".into(), "x".into()]),
+            Some(3)
+        );
+        // Not a shell, or no run-string flag: no shell text.
+        assert_eq!(shell_script_start(&["echo".into(), "hi".into()]), None);
+        assert_eq!(shell_script_start(&["sh".into(), "script.sh".into()]), None);
+        assert_eq!(shell_script_start(&[]), None);
+    }
+
+    #[test]
+    fn argv_wrapped_shell_applies_shell_template_rules() {
+        // rev_break #13: cmd: ["sh","-c","...{{x}}..."] is the argv branch, but
+        // its third argument is shell text, so it must hit the same refusal as a
+        // string-form cmd - the old code skipped every shell defence here.
+        let dir = temp_run_dir();
+        let mut vars = BTreeMap::new();
+        vars.insert("u".to_string(), "value".to_string());
+        let outputs = BTreeMap::new();
+        let sessions = HashMap::new();
+        let needed = HashSet::new();
+
+        let f: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"sh\", \"-c\", \"echo {{vars.u}}\"]\n",
+        )
+        .unwrap();
+        let step_ids = f.step_ids();
+        let e = prepare_leaf(
+            &ctx(&f, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &f.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .err()
+        .expect("shell text in an argv-wrapped shell must be refused by default");
+        assert!(e.contains("disabled by default"), "{e}");
+
+        // Non-shell arguments (before the script, or in a non-wrapping argv) are
+        // plain data and expand freely.
+        let g: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"printf\", \"%s\", \"{{vars.u}}\"]\n",
+        )
+        .unwrap();
+        let gids = g.step_ids();
+        let p = prepare_leaf(
+            &ctx(&g, &vars, &outputs, &gids, &dir, &sessions, &needed),
+            &g.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .expect("a non-wrapping argv expands its data arguments");
+        match p.inv {
+            execute::Invocation::Argv(v) => assert_eq!(v.last().map(String::as_str), Some("value")),
+            _ => panic!("argv form must spawn directly"),
+        }
+
+        // The opt-in allows it, with the metacharacter check still live.
+        let h: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    unsafe_shell_template: true\n    cmd: [\"sh\", \"-c\", \"echo {{vars.u}}\"]\n",
+        )
+        .unwrap();
+        let hids = h.step_ids();
+        prepare_leaf(
+            &ctx(&h, &vars, &outputs, &hids, &dir, &sessions, &needed),
+            &h.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .expect("unsafe_shell_template allows a benign argv-wrapped expansion");
+        vars.insert("u".to_string(), "a & b".to_string());
+        let e = prepare_leaf(
+            &ctx(&h, &vars, &outputs, &hids, &dir, &sessions, &needed),
+            &h.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .err()
+        .expect("metacharacters are still rejected under the opt-in");
+        assert!(e.contains("metacharacters"), "{e}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exec_privileged_fields_refuse_run_derived_templates() {
+        // rev_break #12: bin / cwd / argv[0] are executed with sfh's own rights,
+        // so step output (and notes / foreach item) may not flow into them.
+        let dir = temp_run_dir();
+        let vars = BTreeMap::new();
+        let outputs = BTreeMap::new();
+        let sessions = HashMap::new();
+        let needed = HashSet::new();
+
+        // bin from step output is refused (step 'a' exists so the template
+        // resolves; the exec-path check then rejects the run-derived value).
+        let f: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\"]\n  - id: b\n    cmd: [\"echo\"]\n    bin: \"{{steps.a.output}}\"\n",
+        )
+        .unwrap();
+        let step_ids = f.step_ids();
+        let e = prepare_leaf(
+            &ctx(&f, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &f.steps[1],
+            1,
+            "b",
+            &[],
+            None,
+        )
+        .err()
+        .expect("bin from step output must be refused");
+        assert!(e.contains("executed by sfh"), "{e}");
+        assert!(e.contains("allow_dynamic_exec_paths"), "{e}");
+
+        // argv[0] from step output is refused.
+        let g: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\"]\n  - id: b\n    cmd: [\"{{steps.a.output}}\", \"--flag\"]\n",
+        )
+        .unwrap();
+        let gids = g.step_ids();
+        let e = prepare_leaf(
+            &ctx(&g, &vars, &outputs, &gids, &dir, &sessions, &needed),
+            &g.steps[1],
+            1,
+            "b",
+            &[],
+            None,
+        )
+        .err()
+        .expect("argv[0] from step output must be refused");
+        assert!(e.contains("executed by sfh"), "{e}");
+
+        // The escape hatch lets run-derived values through.
+        let h: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\"]\n  - id: b\n    allow_dynamic_exec_paths: true\n    cmd: [\"echo\"]\n    cwd: \"{{steps.a.output}}\"\n",
+        )
+        .unwrap();
+        let hids = h.step_ids();
+        prepare_leaf(
+            &ctx(&h, &vars, &outputs, &hids, &dir, &sessions, &needed),
+            &h.steps[1],
+            1,
+            "b",
+            &[],
+            None,
+        )
+        .expect("allow_dynamic_exec_paths accepts run-derived cwd");
+
+        // A user var (not tainted) is still allowed in cwd without the hatch.
+        let mut vars2 = BTreeMap::new();
+        vars2.insert("base".to_string(), "/work".to_string());
+        let i: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\"]\n    cwd: \"{{vars.base}}\"\n",
+        )
+        .unwrap();
+        let iids = i.step_ids();
+        prepare_leaf(
+            &ctx(&i, &vars2, &outputs, &iids, &dir, &sessions, &needed),
+            &i.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .expect("a user-controlled var is allowed in cwd");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tainted_var_is_refused_in_exec_fields() {
+        // rev_break #12: a var restored from the resumed run dir's meta.json is
+        // untrusted; the same {{vars.x}} a user typed themselves is fine.
+        let dir = temp_run_dir();
+        let mut vars = BTreeMap::new();
+        vars.insert("base".to_string(), "/work".to_string());
+        let mut tainted = HashSet::new();
+        tainted.insert("base".to_string());
+        let outputs = BTreeMap::new();
+        let step_ids: HashSet<String> = ["a".into()].into_iter().collect();
+        let sessions = HashMap::new();
+        let needed = HashSet::new();
+
+        let f: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\"]\n    cwd: \"{{vars.base}}\"\n",
+        )
+        .unwrap();
+        let cx = PrepCtx {
+            flow: &f,
+            vars: &vars,
+            outputs: &outputs,
+            step_ids: &step_ids,
+            run_dir: &dir,
+            flow_dir: &dir,
+            notes_file: &dir,
+            sessions: &sessions,
+            needed_sessions: &needed,
+            tainted_vars: &tainted,
+            quiet: true,
+            verbose: false,
+        };
+        let e = prepare_leaf(&cx, &f.steps[0], 1, "a", &[], None)
+            .err()
+            .expect("a tainted var in cwd must be refused");
+        assert!(e.contains("meta.json"), "{e}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_session_fails_closed_when_the_tool_reports_nothing() {
+        // rev_break #16: a resume/fork the tool does not confirm is a failure,
+        // not a silent success on the preassigned/expected id.
+        let resume = SessionExpect {
+            expect_session: Some("sess-1"),
+            expect_marker: None,
+            forbid_session: None,
+            expect_parent: None,
+            allow_empty: true,
+        };
+        let bad = check_session(&resume, &parsed_with(None, None, None), "answer")
+            .expect("no reported session id on a resume must fail");
+        assert!(bad.contains("resume unverified"), "{bad}");
+
+        let marker = SessionExpect {
+            expect_session: Some("same"),
+            expect_marker: Some("2026-07-27T10:00:00Z"),
+            forbid_session: None,
+            expect_parent: None,
+            allow_empty: true,
+        };
+        let bad = check_session(&marker, &parsed_with(Some("same"), None, None), "answer")
+            .expect("no reported marker on a resume must fail");
+        assert!(bad.contains("session marker"), "{bad}");
+
+        let fork = SessionExpect {
+            expect_session: None,
+            expect_marker: None,
+            forbid_session: Some("parent-1"),
+            expect_parent: None,
+            allow_empty: true,
+        };
+        let bad = check_session(&fork, &parsed_with(None, None, None), "answer")
+            .expect("no reported session id on a fork must fail");
+        assert!(bad.contains("fork unverified"), "{bad}");
     }
 
     #[test]

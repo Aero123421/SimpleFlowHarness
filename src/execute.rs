@@ -212,8 +212,11 @@ fn detached_command(
     env: &[(&str, &str)],
 ) -> Result<Command, String> {
     let mk = |p: &Path| -> Result<std::fs::File, String> {
-        let f =
-            std::fs::File::create(p).map_err(|e| format!("cannot create {}: {e}", p.display()))?;
+        // no-follow: a resumed --detach hands the run dir to the background copy,
+        // and a symlink planted at detached.out.txt / detached.err.txt must not
+        // redirect the child's stdio to a file outside the run dir (rev_break #1).
+        let f = crate::contain::create_nofollow(p)
+            .map_err(|e| format!("cannot create {}: {e}", p.display()))?;
         crate::contain::restrict_file(&f);
         Ok(f)
     };
@@ -500,8 +503,22 @@ fn exe_path_is_ours(exe_path: &str) -> bool {
 /// spaces (R-6), so a hint that prints a run dir or flow path unquoted breaks
 /// the moment the user pastes it back: `sfh run 研究 2026.07/... --resume ...`
 /// falls apart into separate arguments. Safe characters pass through; anything
-/// else is wrapped in double quotes with `"` and `\` escaped, which cmd.exe,
-/// PowerShell and POSIX shells all accept as a single argument.
+/// else is wrapped in double quotes and escaped for the platform's primary
+/// shell.
+///
+/// There is no single quoting that is simultaneously correct for cmd.exe,
+/// PowerShell and POSIX sh - backslash is a literal on Windows but the escape
+/// character on Unix, and `$()` / backtick are inert inside cmd.exe double
+/// quotes but expand under POSIX sh and PowerShell. The hint is therefore
+/// escaped for the shell sfh itself uses on each platform (rev_break #13,
+/// rev_regression R-6):
+/// - Unix (sh -c): escape `\`, `"`, `$` and backtick so a hostile flow value in
+///   a forged status.json cannot smuggle `$(...)` / backtick command execution
+///   into a pasted resume command.
+/// - Windows (cmd /C): escape only `"`. Backslash is left literal (doubling it
+///   would corrupt every Windows path), and `$` / backtick have no special
+///   meaning to cmd.exe inside double quotes, so they carry no injection vector
+///   on the default Windows shell.
 pub fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         return "\"\"".to_string();
@@ -514,7 +531,12 @@ pub fn shell_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        if c == '"' || c == '\\' {
+        #[cfg(not(windows))]
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        #[cfg(windows)]
+        if c == '"' {
             out.push('\\');
         }
         out.push(c);
@@ -535,6 +557,127 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     // EPERM: it exists, it just is not ours to signal.
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The start time of a process, as an opaque u64 that is unique per pid on one
+/// boot (Windows: FILETIME of creation; Linux: clock ticks since boot; macOS:
+/// microseconds since the epoch). Used to bind the stop nonce to the process
+/// that owns a run, so a pid REUSED by an unrelated process after the run died
+/// is told apart from the original: `sfh stop` compares this value against the
+/// one recorded when the run started, and refuses when they differ (rev_break
+/// #8). `None` when the OS cannot answer (process gone, or an unsupported
+/// platform); callers then fall back to the weaker (pid, nonce) binding.
+#[cfg(windows)]
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+}
+
+/// Start time of a process (Linux: field 22 of /proc/<pid>/stat, clock ticks
+/// since boot).
+#[cfg(target_os = "linux")]
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 2 (comm) is parenthesized and may itself contain spaces and
+    // parentheses, so split after the LAST ')'. The fields that follow are
+    // state(3) ppid(4) ... starttime(22): the 20th whitespace-separated token.
+    let rest = stat.rsplit_once(')').map(|(_, r)| r)?;
+    let ticks = rest.split_whitespace().nth(19)?;
+    ticks.parse::<u64>().ok()
+}
+
+/// Start time of a process (macOS: proc_pidinfo(PROC_PIDTBSDINFO) ->
+/// pbi_start_tvsec/usec; there is no /proc).
+#[cfg(target_os = "macos")]
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    // struct proc_bsdinfo from <sys/proc_info.h>; only the fields up to the
+    // start time are needed, but every preceding field must keep its exact
+    // type and width or the offset of pbi_start_tvsec is wrong.
+    #[repr(C)]
+    struct ProcBsdInfo {
+        pbi_flags: u32,
+        pbi_status: u32,
+        pbi_xstatus: u32,
+        pbi_pid: u32,
+        pbi_ppid: u32,
+        pbi_uid: u32,
+        pbi_gid: u32,
+        pbi_ruid: u32,
+        pbi_rgid: u32,
+        pbi_svuid: u32,
+        pbi_svgid: u32,
+        rfu_1: u32,
+        pbi_comm: [u8; 16], // MAXCOMLEN
+        pbi_name: [u8; 32], // 2 * MAXCOMLEN
+        pbi_nfiles: u32,
+        pbi_pgid: u32,
+        pbi_pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    }
+    extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+    if pid == 0 {
+        return None;
+    }
+    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
+    let n = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut ProcBsdInfo as *mut libc::c_void,
+            size,
+        )
+    };
+    if n < size {
+        return None;
+    }
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+/// Other Unix targets: no portable way to read a process start time without
+/// procfs, so refuse; the nonce then binds (pid, token) only, on the same
+/// access-control bound as before start-time recording existed (rev_break #8).
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+pub fn pid_start_time(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Is this pid still running? Pid reuse makes it advisory, so callers pair it
@@ -719,7 +862,14 @@ fn spawn_reader<R: Read + Send + 'static>(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut sink = tee.and_then(|p| {
-            let f = std::fs::File::create(p).ok()?;
+            // no-follow on the final component: the tee target is a predictable
+            // <tag>.out.txt inside a run dir that is untrusted on a resumed run,
+            // and File::create FOLLOWS a symlink - a planted link let the child's
+            // stdout truncate and fill a file outside the run dir before the
+            // cleaned-text rewrite (itself no-follow) even ran. A link at the
+            // tee target now fails the open, so the step's capture falls back to
+            // memory instead of writing outside the run dir (rev_break #3).
+            let f = crate::contain::create_nofollow(&p).ok()?;
             crate::contain::restrict_file(&f);
             Some(f)
         });
@@ -887,6 +1037,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exe_match_is_exact_stem_not_substring() {
+        // rev_complete S1-2: the old substring match would let `sfh stop` kill an
+        // unrelated `sfh-helper` because its name contains "sfh". The match must
+        // be an EXACT file-stem comparison. Test against our own binary so the
+        // positive case is portable, then prove a "<stem>-helper" is rejected.
+        let own = std::env::current_exe().expect("current_exe");
+        let own_str = own.to_str().expect("utf8 exe path");
+        assert!(exe_path_is_ours(own_str), "our own executable must match");
+
+        let stem = own
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(!stem.is_empty());
+        let helper = format!("/some/path/{stem}-helper");
+        assert!(
+            !exe_path_is_ours(&helper),
+            "'{stem}-helper' contains the stem but is a different binary and must NOT match"
+        );
+        let helper_exe = format!(r"C:\tools\{stem}-helper.exe");
+        assert!(!exe_path_is_ours(&helper_exe));
+
+        // Unrelated programs and empty paths never match.
+        assert!(!exe_path_is_ours("/usr/bin/python3"));
+        assert!(!exe_path_is_ours(""));
+    }
+
+    #[test]
     fn detects_transient_failures() {
         assert!(is_transient_failure("HTTP 429 Too Many Requests", ""));
         assert!(is_transient_failure("", "Error: overloaded_error"));
@@ -925,12 +1103,29 @@ mod tests {
         assert_eq!(shell_quote(""), "\"\"");
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn shell_quote_escapes_quote_and_backslash() {
-        // MSVCRT and POSIX-shell rules agree inside double quotes: \" is a
-        // literal quote and \\ a literal backslash, so one spelling works for
-        // cmd.exe, PowerShell and sh alike.
-        assert_eq!(shell_quote(r"C:\AI\Simple Flow"), r#""C:\\AI\\Simple Flow""#);
+    fn shell_quote_escapes_for_posix() {
+        // POSIX sh: \" is a literal quote, \\ a literal backslash, and $ / `
+        // are escaped so a forged flow value cannot inject $(...) or backtick
+        // command execution into a pasted resume command (rev_break #13).
+        assert_eq!(
+            shell_quote(r"C:\AI\Simple Flow"),
+            r#""C:\\AI\\Simple Flow""#
+        );
         assert_eq!(shell_quote(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(shell_quote("$(reboot)"), r#""\$(reboot)""#);
+        assert_eq!(shell_quote("`id`"), r#""\`id\`""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_quote_escapes_for_cmd() {
+        // cmd.exe: backslash is literal (doubling it would corrupt Windows
+        // paths - rev_regression R-6) and $ / backtick are inert inside double
+        // quotes, so only the quote itself needs escaping.
+        assert_eq!(shell_quote(r"C:\AI\Simple Flow"), r#""C:\AI\Simple Flow""#);
+        assert_eq!(shell_quote(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(shell_quote("$(reboot)"), r#""$(reboot)""#);
     }
 }

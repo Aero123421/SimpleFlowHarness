@@ -295,7 +295,9 @@ fn run_probe(built: preset::Built, timeout_sec: u64) -> Result<Detail, String> {
 
     let stdout = leaf::clean_text(&out.stdout);
     let stderr = leaf::clean_text(&out.stderr);
-    let parsed = leaf::parse_output(&built.parse, &stdout, &stderr);
+    // None run dir: doctor's scratch files live in a dir sfh itself created and
+    // cleared (build_probe), not an untrusted resumed run dir, so a plain read.
+    let parsed = leaf::parse_output(&built.parse, &stdout, &stderr, None)?;
     if parsed.failed || (out.exit_code != 0 && parsed.text.is_empty()) {
         let why = leaf::tail_lines(&stderr, 3).join(" | ");
         return Err(format!(

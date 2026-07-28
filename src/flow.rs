@@ -111,11 +111,20 @@ pub struct Step {
     /// String = run through cmd /C (Windows) or sh -c (Unix).
     pub cmd: Option<Cmd>,
     /// Explicit escape hatch: allow template expansion inside a string-form
-    /// cmd. Off by default, because a substituted value is re-parsed by the
-    /// shell and a metacharacter blacklist is not a security boundary (a
-    /// hostile value can be a dangerous OPTION to the target program without
-    /// containing any shell metacharacter at all).
+    /// cmd (and inside the shell text of an argv form that wraps a shell, e.g.
+    /// ["sh","-c","..."]). Off by default, because a substituted value is
+    /// re-parsed by the shell and a metacharacter blacklist is not a security
+    /// boundary (a hostile value can be a dangerous OPTION to the target
+    /// program without containing any shell metacharacter at all).
     pub unsafe_shell_template: Option<bool>,
+    /// Explicit escape hatch: allow run-derived templates (step output, notes,
+    /// foreach items, vars restored from a resumed run dir) in executed-
+    /// privileged fields: bin, cwd and argv[0] of a custom cmd. Off by default,
+    /// because those fields are executed with sfh's own OS rights and untrusted
+    /// values there select an arbitrary binary or working directory
+    /// (rev_break #12). A trusted judge step producing the next step's cwd is
+    /// the legitimate use; setting this accepts the risk for this step.
+    pub allow_dynamic_exec_paths: Option<bool>,
     pub prompt: Option<String>,
     /// For custom `cmd` only: "prompt" pipes the rendered prompt to stdin.
     pub stdin: Option<String>,
@@ -228,7 +237,33 @@ pub fn load(path: &Path) -> Result<Flow, String> {
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     merge_global_profiles(&mut flow);
-    validate(&flow)?;
+    validate(&flow, false)?;
+    Ok(flow)
+}
+
+/// Load a flow for a --resume of an UNCHANGED run created by sfh 0.x, which
+/// predates two rules the current validator enforces:
+/// - `access:` was optional and defaulted to write; the strict validator
+///   rejects a step without it (rev_regression R-2),
+/// - a string-form cmd containing a template was allowed; the strict validator
+///   rejects the expansion unless unsafe_shell_template is set (rev_regression:
+///   an unchanged old flow with `cmd: "echo {{steps.x.output}}"` could not be
+///   resumed at all, and fixing the flow changed its fingerprint, so the
+///   suggested --force-resume was the only way through).
+///
+/// `legacy` downgrades BOTH to warnings that restore the old behaviour. The
+/// engine only uses this variant when the resumed run's meta.json records an
+/// sfh 0.x version (rev_break #14 - the old code used it for ANY resume whose
+/// strict load failed, so a crafted run dir could execute a flow a fresh run
+/// rejects). The flow fingerprint check still runs afterwards, so a flow that
+/// actually CHANGED is refused without --force-resume; this only lets an
+/// unchanged legacy flow back in. A fresh run always goes through `load`.
+pub fn load_lenient(path: &Path) -> Result<Flow, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    merge_global_profiles(&mut flow);
+    validate(&flow, true)?;
     Ok(flow)
 }
 
@@ -448,7 +483,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate(flow: &Flow) -> Result<(), String> {
+fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     if flow.steps.is_empty() {
         return Err("flow has no steps".into());
     }
@@ -578,7 +613,7 @@ fn validate(flow: &Flow) -> Result<(), String> {
         check_ref(s, "fork_from", &s.fork_from)
     };
     for s in &flow.steps {
-        validate_step(flow, s, false)?;
+        validate_step(flow, s, false, legacy)?;
         action("on_error", s, &s.on_error, false)?;
         action("on_max_visits", s, &s.on_max_visits, false)?;
         check_continue_from(s)?;
@@ -593,7 +628,7 @@ fn validate(flow: &Flow) -> Result<(), String> {
             let mut targets_seen: std::collections::HashMap<&String, &String> =
                 std::collections::HashMap::new();
             for c in children {
-                validate_step(flow, c, true)?;
+                validate_step(flow, c, true, legacy)?;
                 action("on_error", c, &c.on_error, true)?;
                 check_continue_from(c)?;
                 for (what, target) in [
@@ -721,7 +756,10 @@ fn resolved_access<'a>(flow: &'a Flow, s: &'a Step) -> Option<&'a str> {
         .or(flow.defaults.access.as_deref())
 }
 
-fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
+fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<(), String> {
+    // Fresh runs (and resumes of 1.x runs) require access: on AI steps; a
+    // legacy-era resume restores the pre-1.0 write default instead (load_lenient).
+    let require_access = !legacy;
     let sid = &s.id;
     if is_child {
         if !s.route.is_empty() {
@@ -759,6 +797,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             || s.access.is_some()
             || s.allow_access_override.is_some()
             || s.unsafe_shell_template.is_some()
+            || s.allow_dynamic_exec_paths.is_some()
             || !s.args.is_empty()
             || s.cwd.is_some()
             || s.timeout_sec.is_some()
@@ -818,10 +857,23 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
     if s.cmd.is_none() {
         // "write" means a different thing per tool, so there is no safe implicit
         // default: an AI step must say which tier it wants (cmd: steps are exempt).
-        let Some(acc) = resolved_access(flow, s) else {
-            return Err(format!(
-                "step '{sid}': access is required for steps that call an AI tool - set access: read, write, or full on the step, its profile, or defaults (cmd: steps are exempt)"
-            ));
+        // The one exception is a --resume of an unchanged legacy run (load_lenient),
+        // where sfh <= 0.9 legitimately defaulted a missing access to write; there
+        // we restore that default with a warning instead of blocking the resume
+        // (rev_regression R-2). require_access is true everywhere else.
+        let acc = match resolved_access(flow, s) {
+            Some(a) => a,
+            None if require_access => {
+                return Err(format!(
+                    "step '{sid}': access is required for steps that call an AI tool - set access: read, write, or full on the step, its profile, or defaults (cmd: steps are exempt)"
+                ));
+            }
+            None => {
+                eprintln!(
+                    "sfh: warning: step '{sid}' has no access: level; defaulting to 'write' (the pre-1.0 default) so this legacy run can be resumed - add access: to the flow to make it explicit"
+                );
+                "write"
+            }
         };
         // headless cursor is binary (deny-all or --force), so "write" would
         // silently mean "full". Refuse it; the step must pick read or full.
@@ -872,17 +924,74 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         if v.is_empty() {
             return Err(format!("step '{sid}': cmd array is empty"));
         }
+        // argv[0] is the program sfh executes: an executed-privileged sink, so
+        // the same run-derived-template refusal the runtime applies is checked
+        // here statically (rev_break #12, rev_regression: validate must reject
+        // what run rejects, instead of failing only after upstream steps ran).
+        // At load time no var is tainted yet (vars come from the flow / --var,
+        // both user-controlled), so an empty set reproduces the static subset.
+        if !s.allow_dynamic_exec_paths.unwrap_or(false) {
+            let no_tainted: HashSet<String> = HashSet::new();
+            crate::template::check_keys(&v[0], |key| {
+                crate::leaf::exec_path_key_check(key, &no_tainted)
+            })
+            .map_err(|e| format!("step '{sid}': cmd[0]: {e}"))?;
+        }
+        // An argv form that wraps a shell (["sh","-c","..."]) re-parses its
+        // script text in that shell, so a template in the script is exactly as
+        // dangerous as one in a string-form cmd and gets the same refusal -
+        // the old code saw only "the argv branch" and skipped every shell
+        // defence (rev_break #13). legacy flows predate the rule (load_lenient).
+        if !legacy && !s.unsafe_shell_template.unwrap_or(false) {
+            if let Some(start) = crate::leaf::shell_script_start(v) {
+                for x in &v[start..] {
+                    if crate::template::contains_template(x) {
+                        return Err(format!(
+                            "step '{sid}': cmd wraps a shell and its shell text contains a template, which is disabled by default for the same reason as a string-form cmd (the value is re-parsed by the shell). Avoid the shell:\n  cmd: [\"program\", \"--flag\", \"{{{{steps.x.output}}}}\"]\nor set unsafe_shell_template: true on this step to accept shell templating"
+                        ));
+                    }
+                }
+            }
+        }
     }
     if let Some(Cmd::Shell(c)) = &s.cmd {
         if c.trim().is_empty() {
             return Err(format!("step '{sid}': cmd string is empty"));
         }
         if !s.unsafe_shell_template.unwrap_or(false) && crate::template::contains_template(c) {
-            return Err(format!(
-                "step '{sid}': string-form cmd contains a template, but template expansion in a string cmd is disabled by default: the substituted value is handed to a shell (cmd /C | sh -c), and a metacharacter blacklist cannot make that safe (a hostile value can be a dangerous option to the target program without any shell metacharacters). Use the array form, which spawns without a shell:\n  cmd: [\"program\", \"--flag\", \"{{{{steps.x.output}}}}\"]\nor set unsafe_shell_template: true on this step to accept shell templating (substituted values are then only checked for shell metacharacters)"
-            ));
+            if legacy {
+                // Pre-1.0 flows legitimately templated string cmds; load_lenient
+                // restores that instead of wedging the resume (rev_regression:
+                // an unchanged old flow could not be resumed at all).
+                eprintln!(
+                    "sfh: warning: step '{sid}': string-form cmd expands a template (allowed for this legacy resume; add unsafe_shell_template: true to make it explicit)"
+                );
+            } else {
+                return Err(format!(
+                    "step '{sid}': string-form cmd contains a template, but template expansion in a string cmd is disabled by default: the substituted value is handed to a shell (cmd /C | sh -c), and a metacharacter blacklist cannot make that safe (a hostile value can be a dangerous option to the target program without any shell metacharacters). Use the array form, which spawns without a shell:\n  cmd: [\"program\", \"--flag\", \"{{{{steps.x.output}}}}\"]\nor set unsafe_shell_template: true on this step to accept shell templating (substituted values are then only checked for shell metacharacters)"
+                ));
+            }
         }
         validate_shell_portability(sid, c)?;
+    }
+    // bin / cwd are executed-privileged (argv[0] and the write base): reject
+    // step-output / run-derived templates statically, mirroring the runtime
+    // check so `sfh validate` fails where `sfh run` would (rev_regression: the
+    // validator used to pass flows that always failed at runtime, after upstream
+    // steps had already run and spent). Merged values (step > profile > defaults)
+    // are checked, matching what the runtime renders.
+    if !s.allow_dynamic_exec_paths.unwrap_or(false) {
+        if let Ok(eff) = crate::leaf::effective(flow, s) {
+            let no_tainted: HashSet<String> = HashSet::new();
+            for (label, val) in [("bin", &eff.bin), ("cwd", &eff.cwd)] {
+                if let Some(t) = val {
+                    crate::template::check_keys(t, |key| {
+                        crate::leaf::exec_path_key_check(key, &no_tainted)
+                    })
+                    .map_err(|e| format!("step '{sid}': {label}: {e}"))?;
+                }
+            }
+        }
     }
     if s.cmd.is_some() && !s.fallback.is_empty() {
         return Err(format!(
@@ -1062,10 +1171,11 @@ fn group_common(s: &Step) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Returns Err(message) so tests can assert on validation text.
+    /// Returns Err(message) so tests can assert on validation text. Fresh-run
+    /// (strict) validation: legacy = false.
     fn parse(y: &str) -> Result<(), String> {
         let f: Flow = yaml::from_str(y).map_err(|e| e.to_string())?;
-        validate(&f)
+        validate(&f, false)
     }
 
     #[test]
@@ -1361,6 +1471,69 @@ mod tests {
             "steps:\n  - id: check\n    cmd: [\"cmd\", \"/C\", \"echo %NAME% ^& more\"]\n"
         )
         .is_ok());
+    }
+
+    // rev_break #13: an argv form that wraps a shell re-parses its script text,
+    // so a template there is rejected like a string-form cmd unless opted in.
+    #[test]
+    fn argv_wrapped_shell_template_is_rejected_unless_opted_in() {
+        let e =
+            parse("steps:\n  - id: a\n    cmd: [\"sh\", \"-c\", \"echo {{steps.x.output}}\"]\n")
+                .unwrap_err();
+        assert!(e.contains("wraps a shell"), "{e}");
+        assert!(e.contains("unsafe_shell_template"), "{e}");
+        // The opt-in allows it.
+        assert!(parse(
+            "steps:\n  - id: a\n    unsafe_shell_template: true\n    cmd: [\"sh\", \"-c\", \"echo {{vars.x}}\"]\n"
+        )
+        .is_ok());
+        // A non-wrapping argv expands freely (the recommended path).
+        assert!(parse(
+            "steps:\n  - id: a\n    cmd: [\"tar\", \"-cf\", \"b.tar\", \"{{steps.x.output}}\"]\n"
+        )
+        .is_ok());
+    }
+
+    // rev_break #12 / rev_regression: bin / cwd / argv[0] are executed-privileged;
+    // the validator rejects step-output templates there exactly where the runtime
+    // does, so `sfh validate` fails up front instead of after upstream steps ran.
+    #[test]
+    fn exec_privileged_fields_reject_step_output_at_validation() {
+        for yaml in [
+            "steps:\n  - id: a\n    cmd: [\"echo\"]\n    bin: \"{{steps.x.output}}\"\n",
+            "steps:\n  - id: a\n    cmd: [\"echo\"]\n    cwd: \"{{steps.x.output}}\"\n",
+            "steps:\n  - id: a\n    cmd: [\"{{steps.x.output}}\"]\n",
+        ] {
+            let e = parse(yaml).unwrap_err();
+            assert!(e.contains("executed by sfh"), "{yaml}: {e}");
+            assert!(e.contains("allow_dynamic_exec_paths"), "{yaml}: {e}");
+        }
+        // The escape hatch, and a plain (non-run-derived) value, both pass.
+        assert!(parse(
+            "steps:\n  - id: a\n    allow_dynamic_exec_paths: true\n    cmd: [\"echo\"]\n    cwd: \"{{steps.x.output}}\"\n"
+        )
+        .is_ok());
+        assert!(parse("steps:\n  - id: a\n    cmd: [\"echo\"]\n    cwd: \"/work\"\n").is_ok());
+    }
+
+    // rev_regression: load_lenient restores the pre-1.0 rules for an unchanged
+    // legacy run - a missing access defaults to write and a string-form cmd may
+    // carry a template - where the strict loader rejects both.
+    #[test]
+    fn lenient_loader_restores_legacy_defaults() {
+        let missing_access = "steps:\n  - id: a\n    tool: claude\n    prompt: x\n";
+        // Strict (fresh run) rejects the missing access.
+        assert!(parse(missing_access).is_err());
+        // Lenient (legacy resume) accepts it with a warning.
+        let f: Flow = yaml::from_str(missing_access).unwrap();
+        assert!(validate(&f, true).is_ok());
+
+        let templated_cmd = "steps:\n  - id: a\n    cmd: \"echo {{steps.x.output}}\"\n";
+        // Strict rejects the string-cmd template.
+        assert!(parse(templated_cmd).is_err());
+        // Lenient accepts it with a warning.
+        let f: Flow = yaml::from_str(templated_cmd).unwrap();
+        assert!(validate(&f, true).is_ok());
     }
 
     #[test]

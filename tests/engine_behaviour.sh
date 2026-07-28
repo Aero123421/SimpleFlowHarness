@@ -44,6 +44,17 @@ have_symlinks() {
 winpid_of() {
   cat "/proc/$1/winpid" 2>/dev/null || echo "$1"
 }
+# FNV-1a 64 over a file's bytes as 16 lowercase hex chars - the flow fingerprint
+# sfh <= 0.9 recorded in meta.json. Bash int64 arithmetic wraps mod 2^64 with
+# the same two's-complement bits the Rust implementation uses.
+fnv1a64() {
+  local h=-3750763034362895579 # 0xcbf29ce484222325
+  local b
+  for b in $(od -An -tu1 -v "$1"); do
+    h=$(( (h ^ b) * 0x100000001b3 ))
+  done
+  printf '%016x' "$h"
+}
 
 # --- built-in AI guide -------------------------------------------------------
 "$SFH" guide > guide.out 2> guide.err
@@ -910,6 +921,35 @@ else
   pass=$((pass + 1))
 fi
 
+# --- S1-1b: sfh wait must not accept an unauthenticated terminal state --------
+# rev_break #7: a forged status.json that claims done/exit 0 but has no matching
+# sfh-nonce file must NOT be reported as success to a caller/CI. The emit path is
+# clean here (no emit_file), so the nonce authentication is what must refuse it.
+mkdir -p s11b-run
+cat > s11b-run/status.json <<JSON
+{
+  "state": "done",
+  "current_step": "x",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 1,
+  "cost_usd": 0.0,
+  "run_dir": "s11b-run",
+  "flow": "x.yaml",
+  "pid": 99999,
+  "sfh_version": "0.9.0",
+  "exit_code": 0,
+  "emit_step": null,
+  "emit_file": null,
+  "error": null,
+  "unfinished_step": null,
+  "nonce": "forged-nonce"
+}
+JSON
+"$SFH" wait s11b-run > s11b.out 2> s11b.err
+check "S1-1b: a forged done status with no matching nonce is not a success" 1 $?
+contains "S1-1b: the refusal names the nonce problem" "nonce" s11b.err
+
 # --- S1-2: sfh stop must not kill unrelated processes -------------------------
 # A forged status.json naming a LIVE unrelated process must not result in a
 # kill. The victim is a process this test spawned, so "is it still alive?" is
@@ -981,6 +1021,49 @@ contains "S1-2: corrupted nonce refusal is reported" "refusing" s12b.err
 # Clean up the still-running detached process
 S12_PID="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$S12_DIR/status.json")"
 kill "$S12_PID" 2>/dev/null || taskkill //PID "$S12_PID" //T //F >/dev/null 2>&1
+
+# With a MATCHING nonce on both sides and a MATCHING pid in the nonce file, the
+# nonce checks all pass and the decision must fall to the executable-name
+# comparison (pid_is_sfh). Without this case the strict stem match would never
+# be exercised: the fixtures above are refused earlier, on the nonce itself.
+sleep 30 &
+S12C_VICTIM=$!
+S12C_WINPID="$(winpid_of "$S12C_VICTIM")"
+mkdir -p s12c-run
+cat > s12c-run/status.json <<JSON
+{
+  "state": "running",
+  "current_step": "x",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 0,
+  "cost_usd": 0.0,
+  "run_dir": "s12c-run",
+  "flow": "x.yaml",
+  "pid": $S12C_WINPID,
+  "sfh_version": "0.9.0",
+  "exit_code": null,
+  "emit_step": null,
+  "emit_file": null,
+  "error": null,
+  "unfinished_step": null,
+  "nonce": "shared-nonce-s12c"
+}
+JSON
+echo "$S12C_WINPID shared-nonce-s12c" > s12c-run/sfh-nonce
+echo '{"ts":"20250101-000000","event":"run_start"}' > s12c-run/log.jsonl
+"$SFH" stop s12c-run > s12c.out 2>s12c.err
+check "S1-2: a matching nonce+pid on a non-sfh process is refused" 1 $?
+contains "S1-2: the refusal is the executable check, not the nonce" "not running the same sfh executable" s12c.err
+if kill -0 "$S12C_VICTIM" 2>/dev/null; then
+  echo "ok   - S1-2: the process that passed every nonce check survived"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-2: a non-sfh process with a matching nonce was killed"
+  fail=$((fail + 1))
+fi
+kill "$S12C_VICTIM" 2>/dev/null
+wait "$S12C_VICTIM" 2>/dev/null
 
 # --- S1-3: flow name must not escape the runs root ----------------------------
 cat > s13.yaml <<'YAML'
@@ -1440,6 +1523,224 @@ mv "$R2_DIR/log.jsonl.tmp" "$R2_DIR/log.jsonl"
 check "R-2: a wrong FNV fingerprint is detected as a flow change" 2 $?
 contains "R-2: the error says different version (not unknown algo)" "different version" r2.err
 
+# The positive half: a run dir whose meta.json carries the CORRECT old FNV
+# fingerprint (and no algo field, exactly like sfh 0.9 wrote) must resume
+# without --force-resume and run the remaining step with restored outputs.
+cat > r2b.yaml <<'YAML'
+name: r2b
+steps:
+  - id: one
+    cmd: ["echo", "first"]
+  - id: two
+    cmd: ["echo", "second:{{steps.one.output | trim}}"]
+YAML
+mkdir -p r2b-run
+R2B_FP="$(fnv1a64 r2b.yaml)"
+R2B_FLOW_ABS="$(cd "$(dirname r2b.yaml)" && pwd)/$(basename r2b.yaml)"
+cat > r2b-run/meta.json <<JSON
+{"sfh_version":"0.9.0","flow":"$R2B_FLOW_ABS","flow_fingerprint":"$R2B_FP","name":"r2b","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > r2b-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo first"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":5,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo first","session":null}
+JSON
+echo "first" > r2b-run/one.chain.txt
+echo "first" > r2b-run/one.out.txt
+"$SFH" run r2b.yaml --resume r2b-run -q > r2b.out 2>r2b.err
+check "R-2: a correct old FNV fingerprint resumes without --force-resume" 0 $?
+contains "R-2: the resumed run saw the restored output of step one" "second:first" r2b.out
+
+# --- resume regression: a crash mid-fan-out is resumable ----------------------
+# A fan-out logs no step_start of its own; if the run dies before aggregate_end
+# (taskkill /F, power loss) the group_start record is the only trace of where it
+# was. A flow whose FIRST step is the fan-out must still have a resume position.
+cat > rfan.yaml <<'YAML'
+name: rfan
+steps:
+  - id: fan
+    parallel:
+      - id: fa
+        cmd: ["echo", "FA-A"]
+      - id: fb
+        cmd: ["echo", "FA-B"]
+  - id: last
+    cmd: ["echo", "fan-done"]
+YAML
+mkdir -p rfan-run
+cat > rfan-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"x","name":"rfan","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > rfan-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}
+{"ts":"20250101-000002","event":"step_end","step":"fa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":4,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"fa.chain.txt","out_file":"fa.out.txt","cmd":"echo FA-A","session":null}
+JSON
+echo "FA-A" > rfan-run/fa.chain.txt
+echo "FA-A" > rfan-run/fa.out.txt
+"$SFH" run rfan.yaml --resume rfan-run --force-resume > rfan.out 2>rfan.err
+check "a crash before aggregate_end resumes instead of 'cannot tell where'" 0 $?
+contains "the unfinished fan-out is reported, not lost" "never recorded an end" rfan.err
+contains "the resumed fan-out ran through to the end" "fan-done" rfan.out
+
+# --- resume regression: fan-out routing matches live (headerless plain) -------
+# Live routing tests conditions against the headerless plain concatenation; the
+# chain file holds the labeled aggregate with "--- id ---" headers. A resume
+# that re-reads the chain would match conditions live never saw and could pick
+# a different branch. The plain_file copy keeps resume on the same text.
+cat > rplain.yaml <<'YAML'
+name: rplain
+steps:
+  - id: fan
+    parallel:
+      - id: pa
+        cmd: ["echo", "AAA"]
+      - id: pb
+        cmd: ["echo", "BBB"]
+    route:
+      - when_contains: "--- pb ---"
+        goto: bad
+  - id: good
+    cmd: ["echo", "took-good"]
+    route:
+      - goto: end
+  - id: bad
+    cmd: ["echo", "took-bad"]
+YAML
+mkdir -p rplain-run
+cat > rplain-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"x","name":"rplain","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > rplain-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}
+{"ts":"20250101-000002","event":"step_end","step":"pa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"pa.chain.txt","out_file":"pa.out.txt","cmd":"echo AAA","session":null}
+{"ts":"20250101-000003","event":"step_end","step":"pb","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"pb.chain.txt","out_file":"pb.out.txt","cmd":"echo BBB","session":null}
+{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"failed":false,"exit":0,"output_hash":"x","chain_file":"fan.chain.txt","out_file":"fan.out.txt","plain_file":"fan.plain.txt"}
+JSON
+printf -- '--- pa ---\nAAA\n\n--- pb ---\nBBB\n' > rplain-run/fan.chain.txt
+cp rplain-run/fan.chain.txt rplain-run/fan.out.txt
+printf 'AAA\n\nBBB\n' > rplain-run/fan.plain.txt
+"$SFH" run rplain.yaml --resume rplain-run --force-resume -q > rplain.out 2>rplain.err
+check "resume re-routes a completed fan-out" 0 $?
+contains "resume routed against the headerless plain text, like live" "took-good" rplain.out
+if grep -qF "took-bad" rplain.out; then
+  echo "FAIL - resume routed against the labeled chain headers"
+  fail=$((fail + 1))
+else
+  echo "ok   - the labeled chain headers did not steer the resumed route"
+  pass=$((pass + 1))
+fi
+
+# --- resume regression: the original --var values come back -------------------
+# Completed steps ran under the original overrides; routing/foreach/prompts
+# after the resume must render with the SAME values, not the flow's defaults.
+cat > rvars.yaml <<'YAML'
+name: rvars
+vars:
+  greeting: default-val
+steps:
+  - id: one
+    cmd: ["echo", "one"]
+  - id: two
+    cmd: ["echo", "greet={{vars.greeting}}"]
+YAML
+for tag in rvars rvars2; do
+  mkdir -p "$tag-run"
+  cat > "$tag-run/meta.json" <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"x","name":"rvars","started_utc":"20250101-000000","os":"linux","vars":{"greeting":"from-meta"},"tools":{},"resumed":false}
+JSON
+  cat > "$tag-run/log.jsonl" <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo one"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo one","session":null}
+JSON
+  echo "one" > "$tag-run/one.chain.txt"
+  echo "one" > "$tag-run/one.out.txt"
+done
+"$SFH" run rvars.yaml --resume rvars-run --force-resume -q > rvars.out 2>rvars.err
+check "resume restores the recorded vars from meta.json" 0 $?
+contains "a resumed prompt renders with the original override, not the default" "greet=from-meta" rvars.out
+# An explicit --var on the resume command overrides the recorded value.
+"$SFH" run rvars.yaml --var greeting=from-cli --resume rvars2-run --force-resume -q > rvars2.out 2>rvars2.err
+check "resume with an explicit --var still works" 0 $?
+contains "an explicit --var beats the recorded value" "greet=from-cli" rvars2.out
+
+# The failure hint must repeat this attempt's --var overrides, quoted so the
+# command works when pasted back (values may carry spaces since R-6).
+cat > rvarhint.yaml <<'YAML'
+name: rvarhint
+steps:
+  - id: bad
+    cmd: ["sh", "-c", "exit 1"]
+YAML
+"$SFH" run rvarhint.yaml --var "greet=hello world" --runs-dir rvarhint-runs -q > /dev/null 2>rvarhint.err
+check "the failing fixture run fails" 1 $?
+contains "the resume hint repeats the --var override" '--var "greet=hello world"' rvarhint.err
+contains "the resume hint names the run dir" "--resume" rvarhint.err
+
+# --- resume regression: an explicit --resume ignores the default runs root ----
+# A read-only checkout may resume a run dir on writable storage; that must not
+# fail because the DEFAULT .sfh/runs cannot be created in the cwd. Here a plain
+# file occupies the .sfh name, so creating the default root is impossible.
+mkdir -p ror-cwd ror-run
+echo "not a directory" > ror-cwd/.sfh
+cat > ror.yaml <<'YAML'
+name: ror
+steps:
+  - id: one
+    cmd: ["echo", "one"]
+  - id: two
+    cmd: ["echo", "ror-done"]
+YAML
+cat > ror-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"x","name":"ror","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > ror-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo one"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo one","session":null}
+JSON
+echo "one" > ror-run/one.chain.txt
+echo "one" > ror-run/one.out.txt
+(
+  cd ror-cwd && "$SFH" run ../ror.yaml --resume ../ror-run --force-resume -q
+) > ror.out 2>ror.err
+check "an explicit --resume does not need the default runs root" 0 $?
+contains "the resumed run executed its remaining step" "ror-done" ror.out
+
+# --- resume regression: compactor leaf count and cost survive resume ----------
+# A live run counts the summarizer as one more leaf run and adds its cost the
+# moment compact starts; a resume that drops both under-reports steps_done and
+# cost, which can push a resumed run past max_total_steps / max_cost_usd that
+# the live run would have honoured.
+mkdir -p rcomp-run
+cat > rcomp.yaml <<'YAML'
+name: rcomp
+steps:
+  - id: one
+    cmd: ["echo", "x"]
+  - id: two
+    cmd: ["echo", "saw={{steps.one.outputs | trim}}"]
+YAML
+cat > rcomp-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"x","name":"rcomp","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > rcomp-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo x"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":11,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo x","session":null}
+{"ts":"20250101-000003","event":"compact_end","step":"one","chars":7,"cost_usd":0.5,"precompact_file":"one.precompact.txt"}
+JSON
+echo "the summary" > rcomp-run/one.chain.txt
+echo "the summary" > rcomp-run/one.out.txt
+echo "the original" > rcomp-run/one.precompact.txt
+"$SFH" run rcomp.yaml --resume rcomp-run --force-resume > rcomp.out 2>rcomp.err
+check "resume after a compaction completes" 0 $?
+contains "the summarizer leaf is counted in steps done" "2 steps already done" rcomp.err
+contains "the summarizer cost is restored" '$0.5000' rcomp.err
+contains "the resumed step saw the pre-compact original" "saw=the original" rcomp.out
+
 # --- R-3: a legacy run (no nonce) can be stopped via process ownership --------
 # The run must look LIVE, or status resolves to "dead" and stop returns before
 # the ownership check is ever reached - so the victim is a real process this
@@ -1517,6 +1818,34 @@ fi
 kill "$R3B_VICTIM" 2>/dev/null
 wait "$R3B_VICTIM" 2>/dev/null
 
+# The positive half: a REAL detached run of this very sfh whose nonce records
+# are removed is exactly the legacy format. The checks above prove a non-sfh
+# process is refused on this path; here the process genuinely is sfh, so stop
+# must succeed on process ownership alone.
+cat > r3c-long.yaml <<'YAML'
+name: r3c-long
+steps:
+  - id: think
+    cmd: ["sh", "-c", "sleep 60"]
+YAML
+R3C_DIR="$("$SFH" run r3c-long.yaml --detach -q 2>/dev/null)"
+sleep 2
+r3c_rc=1
+# The heartbeat rewrites status.json every 3s and puts the nonce field back,
+# so strip both records and stop at once; retry if a heartbeat lands between.
+for _ in 1 2 3; do
+  rm -f "$R3C_DIR/sfh-nonce"
+  grep -v '"nonce":' "$R3C_DIR/status.json" |
+    sed 's/\("unfinished_step": null\),/\1/' > "$R3C_DIR/status.json.tmp"
+  mv "$R3C_DIR/status.json.tmp" "$R3C_DIR/status.json"
+  "$SFH" stop "$R3C_DIR" > r3c.out 2>r3c.err
+  r3c_rc=$?
+  grep -qF "nonce present on only one side" r3c.err || break
+done
+check "R-3: a real nonce-less sfh run is stopped successfully" 0 "$r3c_rc"
+contains "R-3: the legacy warning is printed for a real sfh run" "older sfh" r3c.err
+contains "R-3: the kill of the real sfh run is reported" "killed pid" r3c.err
+
 # --- R-5: narrowing args pass; only widening args are refused -----------------
 cat > r5-narrow.yaml <<'YAML'
 name: r5-narrow
@@ -1592,6 +1921,20 @@ steps:
 YAML
 "$SFH" validate r6-dotdot.yaml > r6-dotdot.out 2>&1
 check "R-6: the reserved name '..' is refused" 2 $?
+
+# A real run under a spaced name: the command hints status prints must quote
+# the run dir, or the suggested command falls apart when pasted back.
+cat > r6live.yaml <<'YAML'
+name: "live 研究"
+steps:
+  - id: a
+    cmd: ["echo", "ok"]
+YAML
+"$SFH" run r6live.yaml --runs-dir r6live-runs -q > /dev/null 2>&1
+check "R-6: a spaced-name run completes" 0 $?
+R6L_DIR="$(dirname "$(find r6live-runs -type f -name 'log.jsonl' -print -quit)")"
+"$SFH" status "$R6L_DIR" > r6l-status.out 2>r6l-status.err
+contains "R-6: the status hint quotes a run dir with spaces" 'sfh wait "' r6l-status.err
 
 # --- R-7: an existing --runs-dir keeps its permissions ------------------------
 case "$(uname 2>/dev/null)" in
@@ -1671,6 +2014,37 @@ else
   echo "ok   - R-4: an immediate stop raises no nonce complaint"
   pass=$((pass + 1))
 fi
+
+# A stale heartbeat with a LIVE pid is the wedged process (or one that just
+# came back from suspend) that most needs stopping. status resolves it to
+# "dead", but stop must not take that as "already done": it has to verify
+# ownership and kill. SIGSTOP freezes the run so no heartbeat can refresh the
+# file; Windows has no equivalent, so the check is skipped there.
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ok   - stale-heartbeat stop of a live pid (skipped: no SIGSTOP on Windows)"
+    pass=$((pass + 1))
+    ;;
+  *)
+    cat > rh-long.yaml <<'YAML'
+name: rh-long
+steps:
+  - id: think
+    cmd: ["sh", "-c", "sleep 60"]
+YAML
+    RH_DIR="$("$SFH" run rh-long.yaml --detach -q 2>/dev/null)"
+    sleep 2
+    RH_PID="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$RH_DIR/status.json")"
+    kill -STOP "$RH_PID"
+    touch -t 202501010000 "$RH_DIR/status.json"
+    "$SFH" stop "$RH_DIR" > rh.out 2>rh.err
+    check "sfh stop works on a stale-heartbeat run whose pid is alive" 0 $?
+    contains "stop says why it is acting on a 'dead' run" "but process" rh.err
+    contains "the wedged run's kill is reported" "killed pid" rh.err
+    kill -CONT "$RH_PID" 2>/dev/null
+    kill -9 "$RH_PID" 2>/dev/null
+    ;;
+esac
 
 # --- S1-4 extended: out_file and precompact_file containment ------------------
 # out_file pointing outside the run dir must fail the resume.

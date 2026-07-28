@@ -1,0 +1,401 @@
+# v1 強化・最終ラウンド。**合格条件を閉じたリストに限定する。**
+#
+# 第2ラウンドが止まらなかった理由:
+#   攻撃面レビュアーに「回避経路を探してください」という**終端条件の無い問い**を
+#   与えていた。サンドボックスを持たず外部CLIを起動するプログラムに対して
+#   「まだ穴はあるか」と聞けば答えは常に yes になる。周回ごとに 13→16 と増え続けた。
+#   一方、閉じたリストで判定していた網羅性レビュアーは 3→4→0 と収束した。
+#
+# したがってこのラウンドでは:
+#   - 判定対象を **F-1〜F-11 の11項目だけ**にする
+#   - 新たに見つけた問題は「追加所見」として記録してよいが、**それを理由に FAIL にしない**
+#   - 実装は2バッチに割る(前回 fix2 が 3600 秒でタイムアウトしたため)
+#   - タイムアウトを 7200 秒に上げる
+#   - 差し戻しの入力は「不足と判定された項目だけ」に絞る(毎回500行を読み直させない)
+#
+#   sfh run examples/v1-harden-r3.yaml --detach
+name: v1-harden-r3
+
+profiles:
+  qwen:
+    tool: opencode
+    model: alibaba-token-plan/qwen3.8-max-preview
+    access: full
+  rev:
+    tool: codex
+    bin: 'C:\Users\nanoc\AppData\Local\OpenAI\Codex\bin\69066b736e1e17a4\codex.exe'
+    model: gpt-5.6-sol
+    effort: high
+    access: read
+
+defaults:
+  timeout_sec: 7200
+  max_visits: 6
+  max_cost_usd: 80.0
+  wall_clock_sec: 64800
+  max_emit_chars: 100000
+  retry: { max: 2, backoff_sec: 30 }
+  tool_max_parallel:
+    codex: 3
+    opencode: 1
+
+steps:
+  - id: prep_verify
+    cmd: ["git", "branch", "--show-current"]
+    route:
+      - when_last_line_contains: "sfh/v1-harden"
+        goto: fixA
+      - goto: fail
+
+  # ============================================================ バッチA: 回帰
+  # 正当な利用者を閉め出している箇所。全部「前は動いていたのに動かなくなった」。
+  - id: fixA
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化・最終ラウンド、バッチA。
+      **セキュリティ修正が正当な利用者を閉め出している箇所**を直します。
+
+      ## F-2【高】parallel / foreach の途中で落ちると完了済みメンバーまで再実行される
+      load_resume は完了済みの子の訪問回数とコストを復元し、親グループを再開位置にします。
+      しかし再開時は parallel / foreach の**全メンバーを再生成**します。
+      結果:
+        - 完了していた子AIがもう一度呼ばれる = **二重課金**
+        - 別セッションが新たに作られる
+        - `max_total_steps` がライブ実行にちょうどの値だと、
+          復元済み件数 + 全メンバー件数で上限を超えて**再開できなくなる**
+      → 完了済みメンバーは再実行せず、記録された出力を使うこと。
+
+      ## F-3【高】旧 run の continue_from / fork_from が write/full で再開できない
+      旧ログには `session.access` が無いので load_resume が `None` を復元し、
+      prepare_leaf が read 以外を拒否します。**元のフローに `access: write` が
+      明示してあった場合も同じ**です。新規ライブ実行では access が記録されるので、
+      ライブ実行と resume で挙動が食い違います。
+      → `None`(=記録が無い旧形式)は「昇格」とは判定しないこと。
+        ただし**記録があって、それより高い access への再開**は従来通り拒否すること。
+        エラー案内も `allow_access_override` だけでなく、フロー編集後は
+        `--force-resume` も要る旨を書くこと。
+
+      ## F-4【中】旧 run 互換ローダーが新しい文字列 cmd: 制限を緩和していない
+      `load_lenient` も通常の検証を呼ぶため、テンプレート入り文字列 cmd の拒否が
+      無条件にかかります。旧版で正当だった `cmd: "echo {{raw}}{{steps.x.output}}{{endraw}}"`
+      を含む未完了 run は、FNV 指紋が一致しても再開できません。
+      案内どおりフローを直すと指紋が変わるので、結局 `--force-resume` が要ります。
+      → 旧 run の再開時は、この制限を**警告に落とす**こと(新規実行では従来通りエラー)。
+
+      ## F-5【中】bin: / cwd: のテンプレートが validate を通るのに実行時に必ず拒否される
+      prepare_leaf が `steps.*` を全面禁止していますが、同じ静的検査が validator に
+      ありません。信頼済みの判定コマンドが作った worktree パスを次段の `cwd:` に使う、
+      という**正当な構成も拒否**されます。上流ステップを実行・課金した後に初めて失敗します。
+      → 同じ検査を `flow::validate` にも置き、実行前に落とすこと。
+        加えて、明示的な escape hatch を用意すること(既存の
+        `allow_access_override` を流用するか、理由を書いて別の方法にすること)。
+
+      ## やってはいけないこと
+      - 範囲外のリファクタをしない。F-2〜F-5 だけ触ること
+      - 既存のテストを消したり緩めたりしない
+      - clippy を黙らせるための #[allow(...)] を足さない
+      - 新しい外部クレートを追加しない
+      - 質問せず、解釈を出力に明記して進めること(無人で回っています)
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+      F-2〜F-5 それぞれに挙動テストを足すこと。
+      **F-2 のテストは「完了済みメンバーが再実行されないこと」を確認すること**
+      (単に再開が成功するだけでは不十分。旧実装でも通ってしまう)。
+
+      前回の検証結果(初回は空):
+      {{steps.checkA.output | tail:120}}
+
+  - id: checkA
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 3600
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: fixB
+      - goto: fixA
+
+  # ============================================================ バッチB: fail-open
+  # 「判定できないときに通してしまう」箇所。
+  - id: fixB
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化・最終ラウンド、バッチB。
+      **判定できないときに拒否ではなく許可している箇所**を直します。
+
+      原則: **run ディレクトリは信頼できない入力。判定に必要な情報が
+      欠けている・偽装されうる場合は、通さない。**
+
+      ## F-1 セッション access が欠落・不正のとき、read への再開も拒否する
+      現在は `None` を read への再開では許しています。網羅性レビュアーの指摘:
+      「欠落・不正 access を表す `None` は、再開先が `read` の場合も
+      明示的 override なしでは拒否する必要がある」。
+      現在の成功を期待しているテストも、拒否を期待するよう直すこと。
+      **ただし F-3(バッチA)との整合に注意**: 旧形式で `session.access` の
+      キー自体が無い run は「旧形式」として別扱いし、値が不正な場合とは区別すること。
+      どう区別したかをコードのコメントに書くこと。
+
+      ## F-6 status / wait の成功判定に fail-open が残っている
+      - `status` は nonce を一切検査せず、偽の `state:"done"` で exit 0 を返す
+      - `wait` は nonce 検査が `done` のときだけ。`failed` / `dead` / `stopped` に
+        `exit_code:0` を書けば成功として 0 を返せる
+      - `done` でも「nonce 両方欠落 + 空の log.jsonl」で旧形式分岐を通れる
+      - **結果の出力が nonce 検査より先に行われている**
+      → 検査を出力より前に移し、全ての終端状態で検査すること。
+        旧形式分岐は log.jsonl が実在し中身があることを要求すること。
+
+      ## F-7 セッション access を未信頼ログの自己申告値で判定している
+      欠落・不正は概ね拒否しますが、**有効な偽の `"access":"full"`** はそのまま
+      採用されます。read で作られたセッションでも、full での continue_from /
+      fork_from が「昇格なし」と判定されます。
+      → run dir 由来の値を単独の根拠にしないこと。実装案(どれでもよい、理由を書くこと):
+        - session の access を nonce と一緒に改竄検知できる形で記録する
+        - あるいは「記録された access は参考値であり、昇格判定は
+          **フロー側の宣言**を根拠にする」と設計を変える
+      **どちらを選んだか、なぜかを必ず書くこと。**
+
+      ## F-8 run 由来値の汚染が特権テンプレートまで届いていない
+      `bin:` / `cwd:` の検査はキー名が `steps.` で始まる場合しか拒否しません。
+      しかし `meta.json` の vars、`notes.md`、foreach の `item` も run 由来です。
+      細工した run dir から任意の実行ファイルや作業ディレクトリを選べます。
+      さらに配列形式 `cmd:` は argv[0] まで通常展開されるので、任意プログラム起動に届きます。
+      → run 由来のキー(`vars.*` は resume 時、`notes`、`item`、`item_index`)も
+        特権フィールドでは拒否すること。argv[0] も同じ扱いにすること。
+
+      ## F-9 argv 形式に包んだシェルが、シェルテンプレート防御を迂回する
+      `cmd: ["sh","-c","...{{raw}}{{untrusted}}{{endraw}}..."]` は argv 分岐なので
+      `unsafe_shell_template` もメタ文字検査も通りません。しかし第3引数は
+      実際にはシェルに再解釈されます。
+      → argv[0] が既知のシェル(sh / bash / cmd / cmd.exe / powershell / pwsh / zsh)
+        の場合は、文字列形式と同じ扱いにすること。
+
+      ## F-10 resume ログの成功フィールドが欠落時に false 扱いになる
+      `exit` は `Some(0)` を要求していますが、`timed_out` / `interrupted` / `failed` は
+      欠落・型不正を `false` にしています。`exit:0` だけの偽 `step_end` が成功として
+      復元され、ステップの再実行を省略してセッション・出力・ルートを採用できます。
+      → 3つとも、欠落・型不正は**成功ではない**と扱うこと。
+
+      ## F-11 セッション再開確認が、報告フィールド欠落時に許可している
+      セッション ID / marker の比較は、期待値と報告値が**両方 Some のときだけ**です。
+      CLI がセッション情報を返さなくても、preassigned / expected ID へフォールバックして
+      「正しいセッションを再開した」と扱えます。
+      → 期待値があるのに報告が無い場合は失敗にすること。
+        **ツールによっては正常でも報告しない場合があるなら、そのツールを明示的に
+        列挙して例外にし、理由を書くこと**(全体を緩めないこと)。
+
+      ## やってはいけないこと
+      - 範囲外のリファクタをしない。F-1、F-6〜F-11 だけ触ること
+      - 既存のテストを消したり緩めたりしない
+      - clippy を黙らせるための #[allow(...)] を足さない
+      - 質問せず、解釈を出力に明記して進めること
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+      F-1、F-6〜F-11 それぞれに挙動テストを足すこと。
+      **テストは「修正前のコードでは落ちる」ものにすること。**
+      正常系だけを通すテストは、修正を検証したことになりません。
+
+      前回の検証結果(初回は空):
+      {{steps.checkB.output | tail:120}}
+
+  - id: checkB
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 3600
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: stage
+      - goto: fixB
+
+  - id: stage
+    cmd: ["git", "add", "-A"]
+    route: [{ goto: review }]
+
+  # ============================================================ レビュー
+  # **閉じたリストだけを判定する。** 新発見は記録するが FAIL の理由にしない。
+  - id: review
+    max_parallel: 3
+    max_visits: 4
+    on_max_visits: goto:unresolved
+    parallel:
+      - id: rev_impl
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) のレビュアーです。
+          自分たちのオープンソースプロジェクトに入れた修正のレビューです。
+
+          ## 環境の制約
+          読み取り専用で動いています。**テストは実行できませんし、する必要もありません。**
+          fmt / clippy / cargo test / 挙動テスト / 全 examples の validate は
+          決定論的ゲートが既に通しています。**コードを読んでください。**
+          差分は `git --no-pager diff main` です。
+
+          ## 判定対象(この11項目**だけ**)
+          F-1  セッション access が欠落・不正のとき read への再開も拒否する
+               (旧形式=キー自体が無い、とは区別すること)
+          F-2  parallel / foreach の resume で完了済みメンバーを再実行しない
+          F-3  旧 run(access 記録なし)の continue_from / fork_from が write/full で再開できる
+          F-4  旧 run の再開時、文字列 cmd: のテンプレート制限が警告に落ちる
+          F-5  bin: / cwd: のテンプレート検査が validate にもある + escape hatch がある
+          F-6  status / wait の全終端状態で nonce を検査し、検査を出力より前に行う
+          F-7  セッション access を未信頼ログの自己申告値だけで判定していない
+          F-8  run 由来値(vars/notes/item)も特権テンプレート(bin/cwd/argv[0])で拒否する
+          F-9  argv[0] が既知のシェルなら、文字列形式と同じ検査を通す
+          F-10 resume ログの timed_out / interrupted / failed が欠落・型不正なら成功としない
+          F-11 セッション再開確認で、期待値があるのに報告が無い場合は失敗にする
+
+          ## 判定の仕方
+          各項目を **完了 / 不足** で判定し、根拠となる file:line を挙げてください。
+          「完了」と判定するには、**その挙動を確認できるコードとテストの両方**を
+          指せること。テストが**修正前のコードでも通る**なら「不足」です。
+
+          ## 重要: 判定範囲の制限
+          上の11項目以外の問題を見つけた場合、「## 追加所見」として末尾に書いてください。
+          **それを理由に FAIL にしないでください。** このラウンドの判定対象は
+          11項目だけです。追加所見は次のラウンドの入力になります。
+
+          ## 出力
+          11項目の判定表 → 不足の詳細 → 追加所見(あれば)。
+          **最後の行に `REVIEW-PASS`(11項目すべて完了)か
+          `REVIEW-FAIL`(不足あり)を単独で書くこと。** 他の語を最後の行に書かないこと。
+
+      - id: rev_tests
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**テスト品質**レビュアーです。
+
+          ## 環境の制約
+          読み取り専用です。テストは実行できませんし、する必要もありません。
+          決定論的ゲートが既に通しています。**テストのソースを読んでください。**
+          差分は `git --no-pager diff main` です。
+
+          ## あなたの仕事
+          F-1〜F-11(下記)に対して足されたテストが、**本当にその修正を検証しているか**
+          だけを判定します。実装の正しさは別のレビュアーが見ます。
+
+          F-1 セッション access 欠落・不正 → read への再開も拒否
+          F-2 parallel / foreach resume で完了済みメンバーを再実行しない
+          F-3 旧 run の continue_from / fork_from が write/full で再開できる
+          F-4 旧 run 再開時の文字列 cmd: 制限が警告に落ちる
+          F-5 bin: / cwd: テンプレート検査が validate にもある
+          F-6 status / wait の全終端状態で nonce 検査、検査が出力より前
+          F-7 セッション access を自己申告値だけで判定していない
+          F-8 run 由来値も特権テンプレートで拒否
+          F-9 argv[0] が既知のシェルなら文字列形式と同じ検査
+          F-10 resume ログの成功フィールド欠落を成功としない
+          F-11 セッション再開確認で報告欠落を失敗にする
+
+          ## 判定基準(これだけ)
+          各項目のテストについて:
+          - **修正前のコードで、そのテストは落ちるか。** 落ちないなら「不足」。
+            例: 「厳密一致にした」修正の回帰テストが、部分一致でも拒否される入力を
+            使っているなら、そのテストは修正を検証していない
+          - 攻撃が**防がれること**を確認しているか、単に正常系が通るだけか
+          - 判定に使う出力先は正しいか(stderr に出るメッセージを stdout で探していないか)
+
+          ## 重要: 判定範囲の制限
+          11項目のテスト品質**だけ**を判定してください。
+          他に気づいたことは「## 追加所見」として末尾に書き、**FAIL の理由にしないこと。**
+
+          ## 出力
+          11項目それぞれについて「テストは修正を検証している / していない」の判定表と理由。
+          **最後の行に `REVIEW-PASS`(全項目のテストが修正を検証している)か
+          `REVIEW-FAIL`(検証できていない項目がある)を単独で書くこと。**
+
+      - id: rev_portable
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**移植性**レビュアーです。
+
+          ## 環境の制約
+          読み取り専用です。テストは実行できません。**コードを読んでください。**
+          差分は `git --no-pager diff main` です。
+
+          ## 絶対条件
+          **Windows / macOS / Linux で完全に同じ挙動**。これは sfh の絶対条件です。
+          片方の OS でしか動かない、あるいは片方でだけ挙動が変わる実装は不合格です。
+
+          ## 判定対象(この観点**だけ**)
+          F-1〜F-11 の修正(下記)が、3 OS で同じ挙動になるか:
+          F-1 セッション access の欠落・不正判定
+          F-2 parallel / foreach resume の完了済みメンバー再利用
+          F-3 旧 run の access 記録なしの扱い
+          F-4 旧 run 再開時の cmd: 制限緩和
+          F-5 bin: / cwd: テンプレート検査
+          F-6 status / wait の nonce 検査
+          F-7 セッション access の信頼元
+          F-8 run 由来値の特権テンプレート拒否
+          F-9 既知シェルの判定(**シェル名の一覧が 3 OS で妥当か**)
+          F-10 resume ログの成功フィールド判定
+          F-11 セッション再開確認
+
+          特に見てほしいもの:
+          - パス比較(大文字小文字、区切り文字、UNC、シンボリックリンク、canonicalize)
+          - プロセス識別(/proc は Linux のみ。macOS と Windows はどうしているか)
+          - パーミッション(Unix のモードビットに依存していないか)
+          - `cfg!(windows)` で**判定結果そのもの**が変わっていないか
+            (移植性の検査は、どの OS でも同じ答えを出すべき)
+          - 行末、文字エンコーディング
+
+          ## 重要: 判定範囲の制限
+          上の観点**だけ**で判定してください。他は「## 追加所見」に書き、
+          **FAIL の理由にしないこと。**
+
+          ## 出力
+          項目ごとに「3 OS で同一 / OS 依存あり」の判定と根拠。
+          **最後の行に `REVIEW-PASS`(全て 3 OS で同一)か
+          `REVIEW-FAIL`(OS 依存がある)を単独で書くこと。**
+
+  - id: verdict
+    cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS$' - || true); echo \"PASSES=$n\""]
+    stdin: prompt
+    prompt: "{{steps.review.outputs}}"
+    on_error: continue
+    route:
+      - when_last_line_is: "PASSES=3"
+        goto: wrap
+      - goto: fixC
+
+  # 差し戻し。**不足と判定された項目だけ**を渡す(全文500行を読み直させない)。
+  - id: fixC
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化・最終ラウンド。**レビュー指摘への対応**。
+
+      codex 3体が F-1〜F-11 の11項目を、実装 / テスト品質 / 移植性 の3観点で
+      独立に判定しました。全員一致の合格が出ていません。
+
+      **「不足」と判定された項目だけを直してください。** 「完了」の項目は触らないこと。
+      「## 追加所見」に書かれているものは**このラウンドの対象外**です。無視してください
+      (v1.1 のバックログに回します)。
+
+      指摘に同意できない場合は、直さずに**理由をコードのコメントに書き**、
+      なぜ現状で正しいのかを説明すること(次のレビューでその説明が読まれます)。
+      質問はしないこと。無人で回っています。
+
+      {{steps.review.outputs | tail:300}}
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+
+  - id: checkC
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 3600
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: stage
+      - goto: fixC
+
+  - id: unresolved
+    cmd: ["sh", "-c", "echo 'UNRESOLVED: the 11-item checklist did not reach unanimous pass'; git --no-pager diff --stat main"]
+    route: [{ goto: end }]
+
+  - id: wrap
+    cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED THE 11-ITEM CHECKLIST'; git --no-pager diff --stat main; echo '--- unit ---'; cargo test 2>&1 | tail -3"]

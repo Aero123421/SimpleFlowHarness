@@ -46,6 +46,39 @@ pub fn render_checked(input: &str, ctx: &Ctx, check: SubstCheck) -> Result<Strin
 
 const RAW_END: &str = "{{endraw}}";
 
+/// Call `check(key)` for every template key that rendering `input` would
+/// substitute (raw blocks skipped, filters stripped). Used to statically
+/// validate executed-privileged fields (bin / cwd / argv[0]) at load time,
+/// when the substituted VALUES are not yet known but the KEYS already reveal
+/// whether step output or other run-derived data would flow in (rev_break #12,
+/// rev_regression: validator must reject what the runtime rejects).
+pub fn check_keys(
+    input: &str,
+    mut check: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        if let Some(body) = after.strip_prefix("raw}}") {
+            match body.find(RAW_END) {
+                Some(end) => {
+                    rest = &body[end + RAW_END.len()..];
+                    continue;
+                }
+                None => return Ok(()), // unclosed raw: a render error, reported elsewhere
+            }
+        }
+        let Some(end) = after.find("}}") else {
+            return Ok(()); // unclosed: a render error, reported elsewhere
+        };
+        let inner = &after[..end];
+        let key = inner.split('|').next().unwrap_or("").trim();
+        check(key)?;
+        rest = &after[end + 2..];
+    }
+    Ok(())
+}
+
 /// True when rendering `input` would substitute at least one value. Raw blocks
 /// ({{raw}}...{{endraw}}) pass their body through untouched and do not count.
 /// Used to fail-closed on template expansion inside string-form cmd:.

@@ -350,7 +350,7 @@ fn cmd_init(rest: &[String]) -> i32 {
             eprintln!("wrote {}", path.display());
             eprintln!(
                 "next: edit it, then `sfh validate {0}` and `sfh run {0}`",
-                path.display()
+                execute::shell_quote(&path.display().to_string())
             );
             0
         }
