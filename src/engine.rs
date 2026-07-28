@@ -862,7 +862,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     },
                     _ => {
                         return Err(format!(
-                            "step '{}' exceeded max_visits ({max_v}) - loop not converging (set on_max_visits: goto:<id> to degrade gracefully)",
+                            "step '{}' exceeded max_visits ({max_v}) - loop not converging (set on_max_visits: goto:<id> to degrade gracefully). Nodes are checked on entry, so the node entered first in a loop reaches its limit first; put the degradation hook on that node",
                             step.id
                         ))
                     }
@@ -1217,6 +1217,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let rt = d.chain_output.clone();
                 (d.chain_output.clone(), rt, !d.ok())
             };
+            let notes_output = chain_output.clone();
 
             // ---- compact ----
             if let Some(comp) = &step.compact {
@@ -1240,9 +1241,20 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
                     );
+                    let cx = mk_cx!(&outputs, &sessions);
+                    let compact_prompt_file = run_dir.join(format!("{gtag}.compact.prompt.txt"));
+                    let builtins =
+                        leaf::make_builtins(&cx, &step.id, visit, &compact_prompt_file, &[]);
+                    let compact_ctx = template::Ctx {
+                        vars: &vars,
+                        outputs: &outputs,
+                        step_ids: &step_ids,
+                        builtins,
+                    };
                     match run_compact(
                         &flow,
                         comp,
+                        &compact_ctx,
                         &chain_output,
                         &run_dir,
                         &gtag,
@@ -1295,7 +1307,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     f,
                     "## {} (visit {visit})\n{}\n",
                     step.id,
-                    chain_output.trim_end()
+                    notes_output.trim_end()
                 );
             }
 
@@ -1608,6 +1620,7 @@ fn head_tail(s: &str, budget: usize) -> String {
 fn run_compact(
     flow: &flow::Flow,
     comp: &flow::Compact,
+    ctx: &template::Ctx,
     original: &str,
     run_dir: &Path,
     tag: &str,
@@ -1637,13 +1650,15 @@ fn run_compact(
     // save money, not to spend it.
     let cap = comp.max_input_chars.unwrap_or(120_000) as usize;
     let body = head_tail(original, cap);
-    let instr = comp.instruction.clone().unwrap_or_else(|| {
-        format!(
+    let instr = match &comp.instruction {
+        Some(instruction) => template::render(instruction, ctx)
+            .map_err(|e| format!("compact.instruction: {e}"))?,
+        None => format!(
             "Summarize the text below in at most {target} characters, in the same language as the text. \
              It will be passed to another AI agent as context, so keep every conclusion, number, file path and open question. \
              Output only the summary."
-        )
-    });
+        ),
+    };
     let prompt = format!("{instr}\n\n---\n{body}");
     let ctag = format!("{tag}.compact");
     let prompt_file = run_dir.join(format!("{ctag}.prompt.txt"));

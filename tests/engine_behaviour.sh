@@ -94,6 +94,39 @@ YAML
 check "on_max_visits degrades instead of failing the flow" 0 $?
 contains "reached the fallback step" "degraded-gracefully" visits.out
 
+# --- compact instruction rendering + pre-compact notes -----------------------
+# `echo` stands in for codex: it exits successfully without calling an AI, while
+# sfh still writes the exact compact prompt and replaces the chain output.
+cat > compact.yaml <<'YAML'
+name: compact
+vars:
+  topic: "rendered-topic"
+steps:
+  - id: source
+    cmd: ["printf", "ORIGINAL-BEFORE-COMPACT-0123456789"]
+    notes: append
+    compact:
+      when_over: 10
+      tool: codex
+      bin: "echo"
+      instruction: "INSTRUCTION={{vars.topic}}"
+  - id: after
+    cmd: ["echo", "compact-finished"]
+YAML
+"$SFH" run compact.yaml --runs-dir compact-runs -q > compact.out 2> compact.err
+check "compact flow runs with a fake summarizer" 0 $?
+COMPACT_PROMPT="$(find compact-runs -type f -name 'source.compact.prompt.txt' -print -quit)"
+COMPACT_NOTES="$(find compact-runs -type f -name 'notes.md' -print -quit)"
+contains "compact.instruction templates are rendered" "INSTRUCTION=rendered-topic" "$COMPACT_PROMPT"
+if grep -qF -e '{{vars.topic}}' "$COMPACT_PROMPT"; then
+  echo "FAIL - compact prompt retained the literal instruction template"
+  fail=$((fail + 1))
+else
+  echo "ok   - compact prompt contains no literal instruction template"
+  pass=$((pass + 1))
+fi
+contains "notes preserve the pre-compact original" "ORIGINAL-BEFORE-COMPACT-0123456789" "$COMPACT_NOTES"
+
 # --- empty output from a cmd step is allowed, shell injection is not ----------
 cat > guard.yaml <<'YAML'
 name: guard
