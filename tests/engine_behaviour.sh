@@ -127,6 +127,56 @@ contains "reached the fallback step" "degraded-gracefully" visits.out
 VISITS_LOG="$(find visits-runs -type f -name 'log.jsonl' -print -quit)"
 contains "max_visits routing records its reason" '"via":"max_visits"' "$VISITS_LOG"
 
+# --- max_visits entry order in a two-node loop -------------------------------
+cat > visits-first-hook.yaml <<'YAML'
+name: visits-first-hook
+steps:
+  - id: first
+    cmd: ["echo", "first"]
+    max_visits: 2
+    on_max_visits: goto:after
+    route:
+      - goto: second
+  - id: second
+    cmd: ["echo", "second"]
+    max_visits: 2
+    route:
+      - goto: first
+  - id: after
+    cmd: ["echo", "degraded-gracefully"]
+YAML
+"$SFH" run visits-first-hook.yaml -q > visits-first-hook.out 2>&1
+check "the first-entered node reaches an equal visit limit first" 0 $?
+contains "the first node's hook reaches the fallback" "degraded-gracefully" visits-first-hook.out
+
+cat > visits-second-hook.yaml <<'YAML'
+name: visits-second-hook
+steps:
+  - id: first
+    cmd: ["echo", "first"]
+    max_visits: 2
+    route:
+      - goto: second
+  - id: second
+    cmd: ["echo", "second"]
+    max_visits: 2
+    on_max_visits: goto:after
+    route:
+      - goto: first
+  - id: after
+    cmd: ["echo", "must-not-reach"]
+YAML
+"$SFH" run visits-second-hook.yaml -q > visits-second-hook.out 2>&1
+check "a hook only on the later-entered node cannot catch the limit" 1 $?
+contains "the error identifies the first-entered node" "step 'first' exceeded max_visits" visits-second-hook.out
+if grep -qF -e "must-not-reach" visits-second-hook.out; then
+  echo "FAIL - the later node's hook incorrectly reached its fallback"
+  fail=$((fail + 1))
+else
+  echo "ok   - the later node's hook did not run"
+  pass=$((pass + 1))
+fi
+
 # --- compact instruction rendering + pre-compact notes -----------------------
 # `echo` stands in for codex: it exits successfully without calling an AI, while
 # sfh still writes the exact compact prompt and replaces the chain output.
@@ -212,6 +262,156 @@ else
   echo "ok   - resume skipped completed steps"
   pass=$((pass + 1))
 fi
+
+# --- failed output provenance banners ----------------------------------------
+cat > failed-output.yaml <<'YAML'
+name: failed-output
+steps:
+  - id: worker
+    cmd: ["sh", "-c", "printf PARTIAL-LEAF; exit 9"]
+    on_error: continue
+  - id: consumer
+    prompt: |
+      CONSUMER-BEGIN
+      {{steps.worker.output}}
+      CONSUMER-END
+    cmd: ["cat", "{{prompt_file}}"]
+YAML
+"$SFH" run failed-output.yaml --runs-dir failed-output-runs -q > failed-output.out 2>&1
+check "a flow may continue after a failed leaf" 0 $?
+FAILED_OUTPUT_DIR="$(dirname "$(find failed-output-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "failed leaf text is marked in the downstream prompt" "step 'worker' did not complete (exit=9, timed_out=false)" "$FAILED_OUTPUT_DIR/consumer.prompt.txt"
+contains "the banner denies result status" "It is not a result." "$FAILED_OUTPUT_DIR/consumer.prompt.txt"
+contains "the raw failed leaf chain is preserved" "PARTIAL-LEAF" "$FAILED_OUTPUT_DIR/worker.chain.txt"
+if grep -qF -e "[sfh:" "$FAILED_OUTPUT_DIR/worker.chain.txt"; then
+  echo "FAIL - a plain leaf's raw chain file contains an sfh banner"
+  fail=$((fail + 1))
+else
+  echo "ok   - a plain leaf's raw chain file remains banner-free"
+  pass=$((pass + 1))
+fi
+
+# A successful flow must not present its final failed leaf's partial text as a
+# successful stdout result merely because on_error routed to end.
+cat > failed-final.yaml <<'YAML'
+name: failed-final
+steps:
+  - id: final
+    cmd: ["sh", "-c", "printf MUST-NOT-EMIT; exit 9"]
+    on_error: goto:end
+YAML
+"$SFH" run failed-final.yaml -q > failed-final.out 2> failed-final.err
+check "on_error may deliberately end a flow after a failed final step" 0 $?
+if [ -s failed-final.out ]; then
+  echo "FAIL - failed final step was emitted as a successful result"
+  sed -n '1,20p' failed-final.out
+  fail=$((fail + 1))
+else
+  echo "ok   - failed final step is not emitted on the success path"
+  pass=$((pass + 1))
+fi
+
+# --- one failed member in an eight-way fan-out -------------------------------
+cat > fan-banner.yaml <<'YAML'
+name: fan-banner
+steps:
+  - id: fan
+    parallel:
+      - { id: c0, cmd: ["echo", "OK-0"] }
+      - { id: c1, cmd: ["echo", "OK-1"] }
+      - { id: c2, cmd: ["echo", "OK-2"] }
+      - id: c3
+        cmd: ["sh", "-c", "printf BROKEN-3; exit 9"]
+        on_error: continue
+      - { id: c4, cmd: ["echo", "OK-4"] }
+      - { id: c5, cmd: ["echo", "OK-5"] }
+      - { id: c6, cmd: ["echo", "OK-6"] }
+      - { id: c7, cmd: ["echo", "OK-7"] }
+  - id: consumer
+    prompt: "{{steps.fan.output}}"
+    cmd: ["cat", "{{prompt_file}}"]
+YAML
+"$SFH" run fan-banner.yaml --runs-dir fan-banner-runs -q > fan-banner.out 2>&1
+check "an eight-way fan-out may continue with one opted-out failure" 0 $?
+FAN_BANNER_DIR="$(dirname "$(find fan-banner-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "the failed member's aggregate header is marked" "--- c3 [sfh: FAILED exit=9, timed_out=false] ---" "$FAN_BANNER_DIR/fan.chain.txt"
+contains "the failed member's text has a provenance banner" "step 'c3' did not complete (exit=9, timed_out=false)" "$FAN_BANNER_DIR/fan.chain.txt"
+if [ "$(grep -cF -e "did not complete" "$FAN_BANNER_DIR/fan.chain.txt")" = "1" ] &&
+   [ "$(grep -cF -e "[sfh: FAILED" "$FAN_BANNER_DIR/fan.chain.txt")" = "1" ]; then
+  echo "ok   - exactly one of eight fan-out members is marked"
+  pass=$((pass + 1))
+else
+  echo "FAIL - fan-out marked the wrong number of members"
+  sed -n '1,60p' "$FAN_BANNER_DIR/fan.chain.txt"
+  fail=$((fail + 1))
+fi
+contains "a successful adjacent member stays unmarked" "--- c2 ---" "$FAN_BANNER_DIR/fan.chain.txt"
+
+# --- live and resumed prompts are byte-identical -----------------------------
+# First run live and retain the exact downstream prompt. Then trim the event log
+# immediately after a successful checkpoint's step_end, simulating power loss
+# before its position event. Resume must re-evaluate routing, not rerun the
+# checkpoint, and must reconstruct the earlier failure banner byte-for-byte.
+cat > prompt-parity.yaml <<'YAML'
+name: prompt-parity
+steps:
+  - id: failed_source
+    cmd: ["sh", "-c", "printf PARITY-PARTIAL; exit 9"]
+    on_error: continue
+  - id: checkpoint
+    cmd: ["echo", "CHECKPOINT"]
+  - id: consumer
+    prompt: |
+      BYTE-BEGIN
+      {{steps.failed_source.output}}
+      BYTE-END
+    cmd: ["cat", "{{prompt_file}}"]
+YAML
+"$SFH" run prompt-parity.yaml --runs-dir prompt-parity-runs -q > prompt-parity-live.out 2>&1
+check "the prompt parity flow runs live" 0 $?
+PROMPT_PARITY_DIR="$(dirname "$(find prompt-parity-runs -type f -name 'log.jsonl' -print -quit)")"
+cp "$PROMPT_PARITY_DIR/consumer.prompt.txt" prompt.live
+awk '{ print } /"event":"step_end"/ && /"step":"checkpoint"/ { exit }' \
+  "$PROMPT_PARITY_DIR/log.jsonl" > "$PROMPT_PARITY_DIR/log.trimmed"
+mv "$PROMPT_PARITY_DIR/log.trimmed" "$PROMPT_PARITY_DIR/log.jsonl"
+"$SFH" run prompt-parity.yaml --resume "$PROMPT_PARITY_DIR" -q > prompt-parity-resume.out 2>&1
+check "resume continues from an unrecorded routing decision" 0 $?
+if cmp -s prompt.live "$PROMPT_PARITY_DIR/consumer.prompt.txt"; then
+  echo "ok   - live and resumed downstream prompts are byte-identical"
+  pass=$((pass + 1))
+else
+  echo "FAIL - live and resumed downstream prompts differ"
+  diff -u prompt.live "$PROMPT_PARITY_DIR/consumer.prompt.txt" | sed -n '1,80p'
+  fail=$((fail + 1))
+fi
+if [ "$(grep -F '"event":"step_end"' "$PROMPT_PARITY_DIR/log.jsonl" | grep -cF '"step":"checkpoint"')" = "1" ]; then
+  echo "ok   - resume re-evaluated routing without rerunning the checkpoint"
+  pass=$((pass + 1))
+else
+  echo "FAIL - resume reran the successful checkpoint"
+  fail=$((fail + 1))
+fi
+contains "the reconstructed routing decision is logged" '"after":"checkpoint"' "$PROMPT_PARITY_DIR/log.jsonl"
+
+# A step_start without its step_end is different: sfh cannot know whether the
+# command had side effects, so it warns and records that the command will rerun.
+cat > unfinished.yaml <<'YAML'
+name: unfinished
+steps:
+  - id: open_pr
+    cmd: ["echo", "RERUN-COMMAND"]
+YAML
+"$SFH" run unfinished.yaml --runs-dir unfinished-runs -q > unfinished-live.out 2>&1
+check "the unfinished-step fixture runs once" 0 $?
+UNFINISHED_DIR="$(dirname "$(find unfinished-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_start"/ && /"step":"open_pr"/ { exit }' \
+  "$UNFINISHED_DIR/log.jsonl" > "$UNFINISHED_DIR/log.trimmed"
+mv "$UNFINISHED_DIR/log.trimmed" "$UNFINISHED_DIR/log.jsonl"
+"$SFH" run unfinished.yaml --resume "$UNFINISHED_DIR" -q > unfinished-resume.out 2> unfinished-resume.err
+check "an unfinished first step can be resumed" 0 $?
+contains "resume warns that the unfinished command will rerun" "resuming will run it again:" unfinished-resume.err
+contains "status records the unfinished step id" '"step": "open_pr"' "$UNFINISHED_DIR/status.json"
+contains "status records the rerun risk" '"will_rerun": true' "$UNFINISHED_DIR/status.json"
 
 # --- timeout kills the step, and a background grandchild cannot hang the flow --
 cat > timeout.yaml <<'YAML'
@@ -461,8 +661,41 @@ contains "the second attempt chain has an a2 artifact" "SECOND-STDOUT" "$RETRY_D
 # --- runs subcommands ---------------------------------------------------------
 "$SFH" runs list > runs.out 2>&1
 check "runs list works" 0 $?
+"$SFH" runs list --runs-dir visits-runs --json > runs-list.json 2>&1
+check "runs list --json works" 0 $?
+contains "runs list reports the maximum visit" '"visit": 2' runs-list.json
+contains "runs list derives consecutive repeated outputs" '"repeat": 1' runs-list.json
+contains "runs list JSON includes the selected cost footer" '"total_cost_usd": 0.0' runs-list.json
+VISITS_DIR="$(dirname "$VISITS_LOG")"
+"$SFH" runs show "$VISITS_DIR" --json > runs-show.json 2>&1
+check "runs show --json works" 0 $?
+contains "runs show reports per-step visits" '"step": "loop"' runs-show.json
+contains "runs show reports per-step repeats" '"repeat": 1' runs-show.json
 "$SFH" runs clean --older-than 3650 --keep 1 --dry-run > clean.out 2>&1
 check "runs clean --dry-run works" 0 $?
+
+# --- a blocking human gate can use a run-local answer file -------------------
+cat > human-gate.yaml <<'YAML'
+name: human-gate
+steps:
+  - id: approve
+    cmd: ["sh", "-c", "cat >&2; while [ ! -s \"$1\" ]; do sleep 1; done; cat \"$1\"", "human-gate", "{{run_dir}}/approval.txt"]
+    stdin: prompt
+    prompt: |
+      release を承認するなら approval.txt に理由を書いてください。
+    timeout_sec: 5
+    on_error: goto:expired
+  - id: accepted
+    cmd: ["echo", "accepted={{steps.approve.output | trim}}"]
+    route: [{goto: end}]
+  - id: expired
+    cmd: ["echo", "approval-expired"]
+YAML
+(while [ ! -d human-gate-run ]; do sleep 0.1; done; printf 'APPROVE-42\n' > human-gate-run/approval.txt) &
+"$SFH" run human-gate.yaml --run-dir human-gate-run -q > human-gate.out 2>&1
+check "a run-local human gate blocks and then continues" 0 $?
+contains "the human answer becomes chain output" "accepted=APPROVE-42" human-gate.out
+contains "stdin prompt records what the human must inspect" "release を承認" human-gate-run/approve.err.txt
 
 echo
 echo "engine behaviour: $pass passed, $fail failed"

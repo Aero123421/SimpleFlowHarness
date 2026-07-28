@@ -57,8 +57,8 @@ DOCTOR OPTIONS:
   without one it probes every preset and just reports which are absent.
 
 RUNS OPTIONS:
-  runs list [--runs-dir d] [-n N]
-  runs show <run-dir>
+  runs list [--runs-dir d] [-n N] [--json]
+  runs show <run-dir> [--json]
   runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]
 
 EXIT CODES:
@@ -359,6 +359,7 @@ fn cmd_runs(rest: &[String]) -> i32 {
     let mut days = 30u64;
     let mut keep = 5usize;
     let mut dry = false;
+    let mut as_json = false;
     let mut target: Option<PathBuf> = None;
     let sub = rest.first().map(String::as_str).unwrap_or("list");
     let mut i = 1;
@@ -382,6 +383,10 @@ fn cmd_runs(rest: &[String]) -> i32 {
                 dry = true;
                 Ok(())
             }
+            "--json" if sub == "list" || sub == "show" => {
+                as_json = true;
+                Ok(())
+            }
             s if s.starts_with('-') => Err(format!("unknown flag '{s}'")),
             s => {
                 target = Some(PathBuf::from(s));
@@ -394,9 +399,9 @@ fn cmd_runs(rest: &[String]) -> i32 {
         i += 1;
     }
     match sub {
-        "list" => runs::list(&runs_dir, limit),
+        "list" => runs::list(&runs_dir, limit, as_json),
         "show" => match target {
-            Some(d) => runs::show(&d),
+            Some(d) => runs::show(&d, as_json),
             None => usage_err("usage: sfh runs show <run-dir>"),
         },
         "clean" => runs::clean(&runs_dir, days, keep, dry),

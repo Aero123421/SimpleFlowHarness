@@ -1,0 +1,226 @@
+# sfh v0.9 を sfh 自身で実装するフロー(v0.8 の続き)。
+#
+# 5項目すべて「2026-07-28 に実際に起きた事故」への対応:
+#   1. Windows で動かない書き方でフローが黙って死んだ(私が踏んだ)
+#   2. 枝の終点を書き忘れて、全部の枝が順に実行された(私が踏んだ)
+#   3. 合言葉のかぶりは今のところ踏んでいないが、機械的に検出できる
+#   4. 「ぴったり一致」が無いので 3 が起きうる
+#   5. 他の AI がこれを使えないと意味がない
+#
+#   sfh run examples/selfhost-v09.yaml --detach
+name: selfhost-v09
+
+vars:
+  branch: "sfh/v0.9-portable-guards"
+
+profiles:
+  dev:
+    tool: codex
+    bin: 'C:\Users\nanoc\AppData\Local\OpenAI\Codex\bin\69066b736e1e17a4\codex.exe'
+    model: gpt-5.6-sol
+    effort: high
+    access: full
+
+defaults:
+  timeout_sec: 3600
+  max_visits: 4
+  max_cost_usd: 40.0
+  wall_clock_sec: 21600
+  max_emit_chars: 20000
+
+steps:
+  - id: prep
+    cmd: ["git", "switch", "-c", "{{vars.branch}}"]
+    on_error: continue
+
+  # ---------------------------------------------------------------- batch E
+  - id: e_impl
+    use: dev
+    prompt: |
+      あなたは sfh (D:\AI\SimpleFlowHarness) のメンテナです。
+      **指示された範囲だけ**を実装してください。
+
+      ## sfh の思想(これに反する変更はしない)
+      **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
+      「この書き方は cmd.exe では動かない」は配管の事実なので断定してよい。
+      「この出力は良い/悪い」は絶対に判断しない。
+
+      ## 絶対条件: Windows / macOS / Linux で完全に同じ挙動
+      これは要件ではなく制約です。片方の OS でしか動かない書き方は、
+      **どの OS で書かれていてもエラー**にします。Linux で書いて通ったフローが
+      Mac の同僚のところで死ぬ、を防ぐのが目的だからです。
+
+      ## E-1. 片 OS 専用のシェル構文を validate で止める
+      文字列形式の `cmd:` は Windows では `cmd /C`、Unix では `sh -c` に渡ります。
+      **同じ YAML が OS によって別の言語として解釈される**という罠が設計に埋まっています。
+      2026-07-28 に私自身がこれを踏み、フローが黙って死にました
+      (`; echo "EXIT=$?"` が cmd.exe では区切りにならず、`&&` の短絡で
+       ステップ自体が非ゼロ終了し、on_error: fail に食われた)。
+
+      src/flow.rs の validate に検査を足す。**全 OS で同じ判定にすること**
+      (cfg! でプラットフォーム分岐させない。移植性の検査なので結果が OS で変わってはいけない)。
+
+      sh 専用と判定する構文:
+        `$?`  `$(`  `${`  バッククォート  `;`(区切りとしての使用)
+      cmd 専用と判定する構文:
+        `%NAME%` 形式の変数参照  `^` によるエスケープ
+      両方で動くので許可するもの:
+        `&&`  `||`  `>`  `<`  `2>&1`  単純なパイプ `|`
+
+      エラー文には**直し方**を必ず書くこと。例:
+
+        step 'check': `;` は cmd.exe では区切り文字にならないので、この行は
+        Windows で違う意味になります。配列形式にしてください:
+          cmd: ["sh", "-c", "..."]
+        あるいは、シェル自体を使わない書き方(推奨):
+          cmd: ["cargo", "test"]
+          on_error: goto:fix
+
+      **注意**: 誤検出は害なので、`;` の判定は慎重に。
+      引用符の中の `;` は区切りではありません。最低限、単純な引用符の対応は見ること。
+      判断に迷うケースは**通す**(見逃しは事故だが、誤検出は正しいフローを止めるので、より悪い)。
+
+      ## E-2. 枝のダダ漏れを validate で警告する
+      2026-07-28 に私が踏んだ 2 つ目の事故:
+
+        - id: met
+          cmd: [...]          # ← 終点を書き忘れ
+        - id: unmet
+          cmd: [...]
+        - id: unclear
+          cmd: [...]
+
+      3 つの分岐先を縦に並べたが、`met` に `route: [{goto: end}]` を書かなかったので、
+      met → unmet → unclear と**全部順に実行された**。
+      **エラーは一切出ず、正常終了し、最後の枝の出力が答えとして表示された。**
+
+      検出方法: あるステップが複数の `route:` の goto 先になっており、
+      かつそれらの分岐先が**ファイル上で連続して並んでいて**、
+      先の分岐先が `route:` も `on_error: goto:` も持たない場合に警告する。
+      これは警告であってエラーではない(意図的に素通りさせる設計もありうる)。
+
+      ## E-3. 合言葉のかぶりを validate で止める
+      同じステップの `route:` に `when_last_line_contains: "ACHIEVED"` と
+      `when_last_line_contains: "NOT-ACHIEVED"` が並んでいると、
+      **未達の出力が達成側にマッチします**(NOT-ACHIEVED は ACHIEVED を含むため)。
+      しかも先に書いた方が勝つので、順序次第で黙って壊れます。
+
+      同一ステップ内で、ある合言葉が別の合言葉の部分文字列になっていたらエラー。
+      直し方(E-4 の `when_last_line_is` を使う、または重ならない語を選ぶ)を提示すること。
+
+      ## E-4. `when_last_line_is:` を足す(ぴったり一致)
+      最終行が**その文字列と完全に一致**する場合だけマッチする述語。
+      比較の前に両端の空白を落とすこと(既存の last_line が trim している)。
+      これがあれば E-3 の問題は原理的に起きません。
+      `when_contains` / `when_matches` / `when_last_line_contains` /
+      `when_last_line_matches` と同じ場所に、同じ作法で足すこと。
+      schema/flow.schema.json と --dry-run の表示も更新すること。
+
+      ## やってはいけないこと
+      - cfg!(windows) でプラットフォームごとに判定を変えない(E-1 の意味が消える)
+      - 新しい YAML キーは `when_last_line_is` だけ。他は足さない
+      - 既存のテストを消したり緩めたりしない
+      - clippy を黙らせるための #[allow(...)] を足さない
+      - 仕様に矛盾を見つけたら**質問せず**、矛盾の内容と採った解釈を出力に明記して進めること
+        (このフローは無人で回っており、質問は誰にも届きません)
+
+      ## 完了条件
+      fmt / clippy -D warnings / cargo test / cargo build --release /
+      tests/engine_behaviour.sh が全部通ること。
+      E-1〜E-4 それぞれに AI を呼ばない挙動テストを足すこと。
+      特に E-1 は**誤検出しないこと**のテストも書くこと
+      (`&&` だけの行、引用符に囲まれた `;` などが通ること)。
+
+      前回の検証結果(初回は空):
+      {{steps.e_check.output | tail:120}}
+
+  - id: e_check
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 1800
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: f_impl
+      - goto: e_impl
+
+  # ---------------------------------------------------------------- batch F
+  - id: f_impl
+    use: dev
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) v0.9 の 2 バッチ目。
+
+      ## F-1. `sfh guide` を足す
+      **読者は人間ではなく AI です。** sfh は単一バイナリで配られるので、
+      codex app や claude code がフローを書こうとするとき、README は手元にありません。
+      `sfh guide` と打てば正しい書き方が出てくる、という形が一番確実です。
+
+      ### 分量の制約(厳守)
+      **1 画面程度に収めること。80 行以内。**
+      「こういうことができる」+ 短い例、だけ。マニュアルを書かないでください。
+      詳しい説明は README と外部の SKILL が担当します。
+      各項目は**例を見れば分かる**ように書き、説明文は 1〜2 行に留めること。
+
+      ### 内容(これだけ。増やさない)
+      1. 最小のフロー(ステップ 2 つ)
+      2. **決定論的なゲート**(最重要・最初に置く)
+
+           - id: build
+             cmd: ["cargo", "test"]     # プログラムを直接起動。シェルを使わない
+             on_error: goto:fix         # 落ちたらここへ
+           - id: ship
+             route: [{ goto: end }]     # ← 枝の終点を必ず書く
+           - id: fix
+             prompt: "{{raw}}{{steps.build.stderr_file}}{{endraw}} を読んで直せ"
+             route: [{ goto: build }]
+
+         **これが 3 OS で完全に同じ挙動になる唯一の書き方**であることを 1 行で書く。
+      3. AI に合否を言わせる形(ゴール判定)。`when_last_line_is` を使い、
+         達成 / 未達 / **判定不能** の 3 分岐にすること。
+      4. 差し戻しループの上限と降格(`max_visits` + `on_max_visits`)。
+         **ループで先に入場するノードが先に上限へ達する**という規則を 1 行で。
+      5. 並列(`parallel:`)と件数ぶんの枝分かれ(`foreach:`)を 1 例ずつ
+      6. 人間に聞くステップ(`cmd:` が答えを待つ。timeout_sec が期限)
+      7. 投げっぱなし: `--detach` → `sfh status` → `sfh wait` / `sfh stop`
+      8. 末尾に 1 行: 詳細は README、困ったら `sfh validate` と `sfh --dry-run`
+
+      ### 書き方の制約
+      - 例は**すべて 3 OS で動くもの**にすること。`sh -c` を主役にしない
+        (Windows では Git Bash が入っている保証がないため)。
+        `sh -c` は「複数コマンドを繋ぎたいときだけ」と 1 行で触れる程度に留める。
+      - 出力は日本語ではなく**英語**で書くこと(README 本文は日本語だが、
+        guide は AI が読む前提で、英語の方が全ツールで安定するため)
+      - `sfh guide` はどこからでも実行でき、引数を取らない
+
+      ## F-2. README の「イディオム集」を書き直す
+      v0.8 のバッチ D が `EXIT=$?` を推奨として書いているはずです。
+      **stderr_file が入った今、それは時代遅れです。** 主役を差し替えること:
+      - 主: `cmd: [...]` + `on_error: goto:` + `{{raw}}{{steps.X.stderr_file}}{{endraw}}`(シェル無し・3OS 同一)
+      - 従: `sh -c` は複数コマンドを繋ぐときだけ。Windows では Git Bash が要ることを明記
+      - `EXIT=$?` の芸は「stderr_file が無かった時代の回避策」として 1 行だけ歴史に残す
+
+      ## F-3. バージョンを 0.9.0 に上げ、README のテスト本数を実数に合わせる
+
+      ## やってはいけないこと
+      - guide を長くしない。80 行以内は厳守
+      - guide に載せる例が実際に動くことを**自分で実行して確かめる**こと。
+        動かない例を載せるくらいなら、その項目を削ること
+
+      ## 完了条件
+      fmt / clippy -D warnings / cargo test / cargo build --release /
+      tests/engine_behaviour.sh。
+      `sfh guide` の出力が 80 行以内であることをテストで固定すること。
+
+      前回の検証結果(初回は空):
+      {{steps.f_check.output | tail:120}}
+
+  - id: f_check
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 1800
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: wrap
+      - goto: f_impl
+
+  - id: wrap
+    cmd: ["sh", "-c", "git --no-pager diff --stat main...HEAD 2>&1; echo '--- guide ---'; ./target/release/sfh guide 2>&1 | head -20; echo '--- guide lines ---'; ./target/release/sfh guide 2>&1 | wc -l"]

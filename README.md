@@ -116,8 +116,8 @@ doctor options:
   未インストールのものは SKIP と報告するだけ。
 
 runs options:
-  runs list [--runs-dir d] [-n N]                       状態・ステップ数・コスト付き一覧
-  runs show <run-dir>                                   ステップ別の所要時間・出力量・コスト
+  runs list [--runs-dir d] [-n N] [--json]              終了・訪問・反復・コスト付き一覧
+  runs show <run-dir> [--json]                          ステップ別の終了・訪問・反復・コスト
   runs clean [--older-than 30d] [--keep 5] [--dry-run]  古いrun dirを削除
 
 exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー
@@ -226,6 +226,13 @@ steps:
 
 集約は `{{steps.verify.outputs}}`。件数上限100。
 
+失敗した leaf の途中出力を `on_error: continue` で後段へ渡す場合、sfh は
+`exit` / `timed_out` を含む `[sfh: ... did not complete ...]` バナーを
+`{{steps.ID.output}}` / `.outputs` の先頭へ付ける。これは成果物の評価ではなく、
+sfh が起動したプロセスが完了しなかったという配管上の事実である。parallel /
+foreach の集約では失敗した要素のヘッダと本文だけが標識され、成功した要素は
+そのまま残る。バナーもレンダリング後の文字列なので `max_prompt_chars` に算入される。
+
 ### セッション再開: `continue_from:`(コンテキスト最強の節約)
 
 ```yaml
@@ -282,13 +289,15 @@ steps:
 
 fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び出し前にexit 1**で落ちます。加えてsfhは、子が**親のセッションIDを返してきたら失敗扱い**にします(forkフラグが無視されて親に追記された状態)。piはさらに`parentSession`で親を明示するので、それも照合します。
 
+循環の中では `fork_from` の意味が変わる。`continue_from` で差し戻すと、却下された試行とレビューを同じセッションへ周回ごとに積み上げ、会話だけを試行前へ戻すことはできない。`fork_from` なら各周回が同じ親セッションから新しい子を作るため、**毎回「試行前の会話状態」からやり直せる**。ワークツリーまで巻き戻す機能ではないが、差し戻しループの実装セッションにはこちらが合う。具体例は後述のイディオム集に示す。
+
 ### コンテキスト管理
 
 | 機構 | 書き方 | 効果 |
 |---|---|---|
 | フィルタ | `{{steps.x.output \| head:30}}` `\| tail:20` `\| truncate:4000` `\| lines:10-40` `\| trim` | 巨大出力を機械的に切る(タダ) |
 | プロンプト予算 | `max_prompt_chars`(defaults/step) | 事故で巨大プロンプトに課金する前に失敗 |
-| 共有ノート | `notes: append` → `{{notes}}` | 要点だけをrun_dir/notes.mdに蓄積して全文連鎖をやめる |
+| 共有ノート | `notes: append` → `{{notes \| tail:120}}` | chain output全文をnotes.mdへ追記する。参照側で直近N行に制限する |
 | 自動要約 | `compact: {when_over: N, use: <profile>}` | 閾値超過時のみ安いモデルで圧縮。`{{steps.x.output}}`は要約後、`.outputs`は原文のまま |
 | セッション再開 | `continue_from:` | 再注入そのものを不要にする |
 | stdout上限 | `max_emit_chars` | 呼び出し元のコンテキストを機械的に守る |
@@ -304,7 +313,8 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 全プリセットを機械可読モード(`--output-format json` 等)で起動しているので、**各ステップのトークン数と(報告される場合は)USDコストが自動で記録**される。
 
 - 進捗表示に `$0.0661` のように出る / `log.jsonl` の各 `step_end` に `input_tokens` `output_tokens` `cost_usd`
-- `sfh runs list` / `sfh runs show <dir>` で後から集計を確認
+- `sfh runs list --json` / `sfh runs show <dir> --json` で後から機械集計できる。`visit` は最大訪問番号、`repeat` は同じステップで同一 `output_hash` が連続した時の初回を除く最大反復回数
+- `runs list` の末尾(`--json` では `total_cost_usd`)は、`-n` 適用後に選ばれたrun群の報告済みコスト合計
 - `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)
 - コスト報告があるのは claude / grok / opencode。codex と agy はトークン数のみ
 
@@ -316,6 +326,12 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 ```
 
 `log.jsonl` から完了済みステップの出力・訪問回数・セッションID・累計コストを復元し、失敗したステップから再開する。フローファイルが変更されていると指紋(fingerprint)不一致で拒否する(`--force-resume`で強行)。
+
+成功した `step_end` の直後、次の `position` を記録する前に sfh が停止していた場合は、
+そのステップを再実行せず、保存済み chain 出力に対して route 規則だけを再評価し、
+決定を `position` イベントとして追記する。一方、`step_start` はあるが対応する
+`step_end` が無いコマンドは完了したか判定できないため再実行する。resume 前に
+コマンドライン付きで警告し、同じ情報を `status.json.unfinished_step` にも残す。
 
 - **リトライ**: `retry: {max: 2, backoff_sec: 5}` — 既定では 429 / 5xx / 接続断など**一過性と判定できる失敗のみ**再試行(指数バックオフ)。`retry_on: any` で何でも、`never` で無効
 - **フォールバック**: `fallback: [profile_a, profile_b]` — リトライ後も落ちたら別プロファイル(別プロバイダ・別モデルでも可)で再挑戦
@@ -415,7 +431,13 @@ codex-local:
   bin: 'C:\Users\you\AppData\Local\OpenAI\Codex\bin\<hash>\codex.exe'
 ```
 
-## カスタムコマンド(プリセット以外)
+## sfh が判断する境界
+
+> **sfh は自分の配管については判断する。仕事については絶対に判断しない。**
+
+「能力を足さず、順番と分岐だけ」という説明はもう正確ではない。`compact:` はsfhが選んだモデルと指示で下流の文脈を書き換え、`retry_on: transient` は既知の一過性エラー表現を照合して再試行を決める。どちらも配管を維持するための判断である。一方、成果物が正しいか、レビューに合格したか、作業が停滞したかはsfhには決めさせない。その判定はユーザーが `cmd:` と `route:` で明示し、sfhは終了コード・出力・訪問・コストという観測事実だけを記録する。
+
+## カスタムコマンド(エスケープハッチ)
 
 ```yaml
   - id: anything
@@ -426,6 +448,205 @@ codex-local:
 
 文字列形式の `cmd:` では、テンプレート置換値(AI出力など)に改行やシェルメタ文字(`& | < > ^ % $` 等)が含まれると**実行前にエラー**にする(シェルインジェクション防止)。その場合は配列形式か `| head:1` 等のフィルタを使うこと。
 
+## イディオム集
+
+以下はsfhに仕事の判定能力を足さず、ユーザー所有の判定器を配管へ組み込むための形である。
+
+### fail-closed ゲート
+
+通過条件だけを肯定的に書き、最後の述語なしルールを差し戻し側にする。判定不能な出力を通さない。
+
+```yaml
+defaults:
+  max_visits: 3
+steps:
+  - id: implement
+    tool: claude
+    on_max_visits: goto:manual_review
+    prompt: |
+      修正してください。前回の指摘:
+      {{steps.review.output | tail:40}}
+  - id: review
+    tool: claude
+    prompt: |
+      {{steps.implement.output}}
+      合格なら最終行を VERDICT: OK にしてください。
+    route:
+      - when_last_line_contains: "VERDICT: OK"
+        goto: accepted
+      - goto: implement                 # 読めない出力も差し戻す
+  - id: accepted
+    cmd: ["echo", "accepted"]
+    route: [{goto: end}]
+  - id: manual_review
+    cmd: ["echo", "visit limit reached"]
+```
+
+`max_visits` は実行後ではなく**ステップ入場時**に検査する。`implement → review → implement` で両者の上限が同じなら、毎周先に入る `implement` が先に上限を超えるため、`on_max_visits` もそこへ置く。
+
+### 終了コードでルーティングする決定論的検証器
+
+POSIXシェル:
+
+```yaml
+  - id: test
+    cmd: ["sh", "-c", "cargo test 2>&1; echo \"EXIT=$?\""]
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: accepted
+      - goto: fix
+  - id: accepted
+    cmd: ["echo", "tests passed"]
+    route: [{goto: end}]
+  - id: fix
+    cmd: ["echo", "tests failed"]
+```
+
+Windowsのcmd.exe:
+
+```yaml
+  - id: test
+    cmd: ["cmd", "/D", "/S", "/C", "cargo test 2>&1 & call echo EXIT=%^errorlevel%"]
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: accepted
+      - goto: fix
+  - id: accepted
+    cmd: ["echo", "tests passed"]
+    route: [{goto: end}]
+  - id: fix
+    cmd: ["echo", "tests failed"]
+```
+
+末尾の `echo` 自体が成功するので、このステップのプロセス終了は0になり、テスト結果を通常の `route:` だけで扱える。cmd.exeでは行全体の解析時に `%errorlevel%` が先に展開されるため、素の `echo %errorlevel%` では直前コマンドの値にならない。`call echo %^errorlevel%` で二段目の展開を使う。
+
+### 改竄トリップワイヤ
+
+追跡済みファイルはGitのindexを基準に、宣言したパスだけを比較する。
+
+```yaml
+  - id: tests_tripwire
+    cmd: ["git", "diff", "--quiet", "--exit-code", "--", "tests"]
+    allow_empty: true
+    on_error: goto:tampered
+```
+
+未追跡ファイルも拒否するPOSIX版:
+
+```yaml
+  - id: untracked_tests_tripwire
+    cmd: ["sh", "-c", "test -z \"$(git ls-files --others --exclude-standard -- tests)\""]
+    allow_empty: true
+    on_error: goto:tampered
+```
+
+これは宣言パスだけの内容比較で、Gitのindexキャッシュが効き、そのまま `--dry-run` に現れてコピペできる。sfh固有の `protect:` キーにはしない。暗黙機能は `--dry-run` のコマンドとして印字できず、表示結果をコピーしたフローからトリップワイヤだけが消え、完全性の約束が壊れるためである。なお最初の形式はworking tree対indexなので、基準をHEADにしたい場合は `diff` の直後に `HEAD` を足す。
+
+### 人間ゲート
+
+sfhは子プロセスのstdinを端末へ直結しない。次はrun固有の回答ファイルを待つ、実際にブロックするPOSIX版である。
+
+```yaml
+  - id: package
+    cmd: ["echo", "release-candidate.zip"]
+  - id: approve
+    cmd: ["sh", "-c", "cat >&2; while [ ! -s \"$1\" ]; do sleep 1; done; cat \"$1\"", "human-gate", "{{run_dir}}/approval.txt"]
+    stdin: prompt
+    prompt: |
+      release を承認するなら approval.txt に判断理由を書いてください。
+      対象: {{steps.package.output}}
+    timeout_sec: 3600
+    on_error: goto:approval_expired
+    route: [{goto: approved}]
+  - id: approved
+    cmd: ["echo", "approved: {{steps.approve.output | trim}}"]
+    route: [{goto: end}]
+  - id: approval_expired
+    cmd: ["echo", "approval expired"]
+```
+
+表示内容は `stdin: prompt` でコマンドへ渡り、`<run-dir>/approve.err.txt` に残る。人間は確認後に `<run-dir>/approval.txt` を作る。期限は `timeout_sec`、期限切れの方針は `on_error`、回答ファイルの内容は `approve` のchain outputとして後段へ渡る。GUI・チケット・チャット承認を使う場合も、同じstdin/stdout契約のコマンドへ差し替えればよい。
+
+### ケース行列
+
+ケースごとに独立したrun dirを固定し、失敗ケースがあっても全件を回す。
+
+```yaml
+vars:
+  cases: |
+    parser-empty
+    parser-large
+    parser-invalid
+steps:
+  - id: matrix
+    foreach:
+      from: "{{vars.cases}}"
+      split: lines
+    max_parallel: 3
+    cmd: ["sfh", "run", "case.yaml", "--var", "case={{item}}", "--run-dir", "evruns/{{item}}", "-q"]
+    on_error: continue
+```
+
+`case.yaml` 内の外部採点器が返す終了コードをground truthにする。sfhはその意味を推測せず記録するだけで、集計は次の一行で得られる。
+
+```bash
+sfh runs list --runs-dir evruns --json
+```
+
+専用の `sfh eval` は要らない。必要な分類はユーザーの採点器と `jq` で計算する。
+
+### ユーザーが所有する停滞検知
+
+```yaml
+  - id: artifact_delta
+    cmd: ["git", "diff", "--stat", "--", "."]
+    allow_empty: true
+```
+
+どの差分を進捗と呼ぶかは、後段のユーザー所有コマンドで決める。sfhが `output_hash` の反復だけを見て自動停止してはいけない。chain outputはエージェントの最終メッセージであって成果物ではなく、同じ「完了しました」が続いてもワークツリーは進んでいる場合があるからである。
+
+### 差し戻しループ内の `fork_from`
+
+```yaml
+  - id: baseline
+    tool: claude
+    prompt: "要件と現状を読み、修正前の前提を整理して"
+  - id: attempt
+    tool: claude
+    fork_from: baseline
+    max_visits: 3
+    on_max_visits: goto:manual_review
+    prompt: |
+      修正を1案実施してください。前回の却下理由:
+      {{steps.review.output | tail:40}}
+  - id: review
+    tool: claude
+    prompt: "{{steps.attempt.output}}\n最終行は VERDICT: OK または VERDICT: REVISE"
+    route:
+      - when_last_line_contains: "VERDICT: OK"
+        goto: accepted
+      - goto: attempt
+  - id: accepted
+    cmd: ["echo", "accepted"]
+    route: [{goto: end}]
+  - id: manual_review
+    cmd: ["echo", "visit limit reached"]
+```
+
+`continue_from: attempt` で周回すると却下済み試行が1セッションへ蓄積し続ける。`fork_from: baseline` なら各visitが同じ修正前の会話から独立分岐する。対応ツールはclaude / opencode / grok / pi。ファイル変更は共有ワークツリーに残るので、毎周ファイルまで戻したい場合はユーザー所有の `cmd:` を別途置く。
+
+### 増え続けるnotesを末尾だけ読む
+
+```yaml
+  - id: next
+    tool: claude
+    prompt: |
+      直近の作業記録だけを踏まえて次へ進んでください:
+      {{notes | tail:120}}
+```
+
+`notes: append` は要点ではなく各ステップのchain output**全体**を `notes.md` へ追記し、ファイル自体には上限がない。裸の `{{notes}}` を毎回再注入すると、下流の `max_prompt_chars` に達したステップで初めて一発失敗する。その時点までの上流呼び出しは課金済みである。`tail:N` は末尾N行だけを機械的に渡す無料の歯止めで、必要なら `compact:` と併用する。
+
 ## 実行成果物(run ディレクトリ)
 
 ```
@@ -434,6 +655,7 @@ codex-local:
   log.jsonl        ステップ毎のexit/所要時間/トークン/コスト/セッションID/コマンドライン
   status.json      3秒ごとに更新される生存信号(state/current_step/cost_usd/pid)
                    終了時に exit_code / emit_step / emit_file / error が入る
+                   resume時の再実行リスクは unfinished_step に入る
   detached.*.txt   --detach 実行のstdout/stderr(sfh wait はここを返す)
   notes.md         notes: append の蓄積
   <id>.prompt.txt  レンダリング済みプロンプト
@@ -443,6 +665,12 @@ codex-local:
   <id>.precompact.txt  compact前の原文
   <id>.v2.*        差し戻し2周目 / <id>.i0.* foreachのitem 0 / <id>.compact.* 自動要約
 ```
+
+平 leaf の `<id>.chain.txt` は失敗時もバナー無しの生テキストで、resume は
+`step_end` の `exit` / `timed_out` からメモリ上のバナーを再構成する。そのため
+resume を重ねても二重バナーにならない。parallel / foreach は集約済みの一つの
+文字列を `.out.txt` / `.chain.txt` / テンプレート値へ共通して書くため、集約ファイル
+自体がバナー付きであり、バナー無しの集約コピーは存在しない。
 
 `sfh runs list` で一覧、`sfh runs show <dir>` でステップ別の明細、`sfh runs clean --older-than 30d --keep 5` で掃除。
 
@@ -476,8 +704,8 @@ codex-local:
 ## 開発
 
 ```bash
-cargo test                              # 62本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト43本
+cargo test                              # 65本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト106本
 ```
 
 CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。
