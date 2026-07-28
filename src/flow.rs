@@ -990,8 +990,18 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
     // steps had already run and spent). Merged values (step > profile > defaults)
     // are checked, matching what the runtime renders.
     if !s.allow_dynamic_exec_paths.unwrap_or(false) {
-        if let Ok(eff) = crate::leaf::effective(flow, s) {
-            let no_tainted: HashSet<String> = HashSet::new();
+        let no_tainted: HashSet<String> = HashSet::new();
+        // Every profile this step can run under, not just its primary. A
+        // fallback's bin/cwd is executed exactly like the primary's, and the
+        // run-time precheck already enumerates all of them - so a flow with
+        // `bin: "{{steps.a.output}}"` on a FALLBACK passed `sfh validate` and
+        // then died at `sfh run`, after the upstream steps had been paid for.
+        // That is the precise failure F-5 exists to prevent.
+        let mut effs = vec![crate::leaf::effective(flow, s)];
+        for fb in &s.fallback {
+            effs.push(crate::leaf::effective_with(flow, s, Some(fb)));
+        }
+        for eff in effs.into_iter().flatten() {
             for (label, val) in [("bin", &eff.bin), ("cwd", &eff.cwd)] {
                 if let Some(t) = val {
                     crate::template::check_keys(t, |key| {

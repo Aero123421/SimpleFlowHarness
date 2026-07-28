@@ -903,6 +903,135 @@ if [ -f c16d-var.err ] && ! grep -qE "run-derived|resumed run" c16d-var.err
   then ok  "LEGIT: re-supplying the value with --var makes the resume work again"
   else bad "LEGIT: --var does not clear the taint, so such a flow can never resume"; fi
 
+# -------------------------------------------------------- 17. third round
+sec "17. cases the third review round found missing"
+
+# (a) F-5: a fallback profile's bin/cwd is executed exactly like the primary's.
+# The validator only looked at the primary, so such a flow passed `sfh
+# validate` and died at `sfh run` - after the upstream steps had been paid
+# for, which is the exact failure F-5 exists to prevent.
+cat > f17a.yaml <<'YAML'
+name: fb-bin
+profiles:
+  slow: { tool: codex, access: read, bin: "{{steps.a.output}}" }
+steps:
+  - id: a
+    cmd: ["echo", "/bin/sh"]
+  - id: b
+    tool: codex
+    access: read
+    bin: "codex"
+    fallback: ["slow"]
+    prompt: "hi"
+YAML
+if "$SFH" validate f17a.yaml >/dev/null 2>&1
+  then bad "validate accepted a step-derived bin: on a FALLBACK profile"
+  else ok  "validate rejected a step-derived bin: on a fallback profile"; fi
+
+cat > f17b.yaml <<'YAML'
+name: fb-cwd
+profiles:
+  slow: { tool: codex, access: read, cwd: "{{steps.a.output}}" }
+steps:
+  - id: a
+    cmd: ["echo", "/tmp"]
+  - id: b
+    tool: codex
+    access: read
+    fallback: ["slow"]
+    prompt: "hi"
+YAML
+if "$SFH" validate f17b.yaml >/dev/null 2>&1
+  then bad "validate accepted a step-derived cwd: on a FALLBACK profile"
+  else ok  "validate rejected a step-derived cwd: on a fallback profile"; fi
+
+# Control: the same fallback with a literal bin must still validate, and the
+# escape hatch must still open the door.
+cat > f17c.yaml <<'YAML'
+name: fb-ok
+profiles:
+  slow: { tool: codex, access: read, bin: "codex" }
+steps:
+  - id: b
+    tool: codex
+    access: read
+    fallback: ["slow"]
+    prompt: "hi"
+YAML
+if "$SFH" validate f17c.yaml >/dev/null 2>&1
+  then ok  "control: a fallback with a literal bin still validates"
+  else bad "control: the fallback check now rejects literal bins too"; fi
+
+cat > f17d.yaml <<'YAML'
+name: fb-hatch
+profiles:
+  slow: { tool: codex, access: read, bin: "{{steps.a.output}}" }
+steps:
+  - id: a
+    cmd: ["echo", "/bin/sh"]
+  - id: b
+    tool: codex
+    access: read
+    allow_dynamic_exec_paths: true
+    fallback: ["slow"]
+    prompt: "hi"
+YAML
+if "$SFH" validate f17d.yaml >/dev/null 2>&1
+  then ok  "LEGIT: allow_dynamic_exec_paths still opens the door for fallbacks"
+  else bad "LEGIT: the escape hatch does not cover fallback profiles"; fi
+
+# (b) F-2: a HARD kill leaves no aggregate_end, so the resume continues the
+# SAME visit - and a mirror onto visit+1 would then be picked up by a
+# deliberate route-back later in that same resumed process. Two crash shapes,
+# opposite corrections.
+mkdir -p c17 && (
+cd c17 || exit
+cat > flow.yaml <<'YAML'
+name: hardkill
+steps:
+  - id: fan
+    max_parallel: 2
+    max_visits: 4
+    parallel:
+      - id: h1
+        cmd: ["sh", "-c", "echo h1 >> ../tally17.txt; echo o1"]
+      - id: h2
+        cmd: ["sh", "-c", "echo h2 >> ../tally17.txt; echo o2"]
+  - id: gate
+    max_visits: 4
+    cmd: ["sh", "-c", "if [ ! -f ../g17 ]; then touch ../g17; echo again; else echo done; fi"]
+    route:
+      - when_last_line_is: "again"
+        goto: fan
+      - goto: end
+YAML
+# Build the interrupted run by hand: group_start with NO aggregate_end, and one
+# member finished. That is what a kill -9 mid-group leaves behind.
+mkdir -p run
+printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":"hardkill","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' > run/meta.json
+{
+  printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
+  printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}\n'
+  printf '{"ts":"20250101-000002","event":"step_end","step":"h1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"h1.chain.txt","out_file":"h1.out.txt","cmd":"echo o1","session":null}\n'
+} > run/log.jsonl
+echo "o1" > run/h1.chain.txt
+echo "o1" > run/h1.out.txt
+"$SFH" run flow.yaml --resume run --force-resume -q > ../c17.out 2> ../c17.err
+printf '%s %s\n' \
+  "$(if [ -f ../tally17.txt ]; then grep -c '^h1$' ../tally17.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally17.txt ]; then grep -c '^h2$' ../tally17.txt | head -1; else echo 0; fi)" \
+  > ../c17.verdict
+)
+p1=""; p2=""
+[ -f c17.verdict ] && read -r p1 p2 < c17.verdict
+# h1 finished before the kill, so the continued visit 1 must NOT re-run it;
+# the route-back then runs BOTH members again. h1 = 1 (loop only), h2 = 2.
+if [ "${p1:-0}" = "1" ] && [ "${p2:-0}" = "2" ]; then
+  ok "F-2: after a kill with no aggregate_end, the continued visit skips and the route-back does not"
+else
+  bad "F-2: hard-kill resume then route-back ran h1=$p1 h2=$p2, expected 1 2"
+fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"

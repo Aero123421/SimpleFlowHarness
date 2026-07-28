@@ -730,6 +730,9 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             _ => {}
         }
     }
+    // Which (step, visit) pairs opened without ever closing. Needed below and
+    // `unfinished` is consumed on the next line.
+    let still_open: HashSet<(String, u32)> = unfinished.keys().cloned().collect();
     st.unfinished_step = unfinished.into_values().next_back();
     if st.pending_route.is_none() && !st.completed {
         if let Some(u) = &st.unfinished_step {
@@ -759,6 +762,13 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
     // explicitly asking for another lap. st.start names the one group whose
     // interrupted work this resume is continuing; any group it reaches after
     // that, it reaches on purpose.
+    // And ONLY when that visit actually ended. A group killed hard enough to
+    // leave no aggregate_end is still open, so the resume continues the SAME
+    // visit and the original key already covers it - mirroring anyway planted
+    // a set at visit + 1 that a deliberate route-back later in the same
+    // resumed process would pick up, skipping members the flow had just asked
+    // to run again. Two different crashes, opposite corrections; the presence
+    // of the aggregate_end is what tells them apart.
     if let Some(resume_at) = st.start.clone() {
         let last = st
             .completed_members
@@ -767,14 +777,16 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             .map(|(_, visit)| *visit)
             .max();
         if let Some(visit) = last {
-            if let Some(set) = st
-                .completed_members
-                .get(&(resume_at.clone(), visit))
-                .cloned()
-            {
-                st.completed_members
-                    .entry((resume_at, visit + 1))
-                    .or_insert(set);
+            if !still_open.contains(&(resume_at.clone(), visit)) {
+                if let Some(set) = st
+                    .completed_members
+                    .get(&(resume_at.clone(), visit))
+                    .cloned()
+                {
+                    st.completed_members
+                        .entry((resume_at, visit + 1))
+                        .or_insert(set);
+                }
             }
         }
     }
