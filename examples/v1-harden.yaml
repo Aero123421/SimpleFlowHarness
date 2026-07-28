@@ -1,0 +1,459 @@
+# v1.0.0 に向けたセキュリティ強化。実装は qwen、レビューは codex 3体。
+#
+# 設計:
+#   - 各バッチは cargo(決定論)で合否判定。LLM の自己申告は使わない
+#   - レビューは 3体並列。合否は grep が数える(AI に「全員合格」を判定させない)
+#   - ゲートは全て fail-closed(合格だけを明示的に通す)
+#   - on_max_visits はループで先に入場するノードに置く
+#
+#   sfh run examples/v1-harden.yaml --detach
+name: v1-harden
+
+vars:
+  branch: "sfh/v1-harden"
+
+profiles:
+  qwen:
+    tool: opencode
+    model: alibaba-token-plan/qwen3.8-max-preview
+    access: full
+  rev:
+    tool: codex
+    bin: 'C:\Users\nanoc\AppData\Local\OpenAI\Codex\bin\69066b736e1e17a4\codex.exe'
+    model: gpt-5.6-sol
+    effort: high
+    access: read
+
+defaults:
+  timeout_sec: 3600
+  max_visits: 5
+  max_cost_usd: 60.0
+  wall_clock_sec: 43200
+  max_emit_chars: 100000
+  tool_max_parallel:
+    codex: 3
+    opencode: 1
+
+steps:
+  - id: prep
+    cmd: ["git", "switch", "-c", "{{vars.branch}}"]
+    on_error: goto:prep_existing
+    route: [{ goto: prep_verify }]
+  - id: prep_existing
+    cmd: ["git", "switch", "{{vars.branch}}"]
+    route: [{ goto: prep_verify }]
+  - id: prep_verify
+    cmd: ["git", "branch", "--show-current"]
+    route:
+      - when_last_line_contains: "{{vars.branch}}"
+        goto: s1_impl
+      - goto: fail
+
+  # ============================================================ S1
+  # run ディレクトリの信頼境界。実証済みの脆弱性3件 + パス封じ込め。
+  - id: s1_impl
+    use: qwen
+    prompt: |
+      あなたは sfh (D:\AI\SimpleFlowHarness, v0.9.0, Rust) のメンテナです。
+      セキュリティ監査で**実際に再現された脆弱性**を修正します。
+
+      ## 最重要の考え方
+      **run ディレクトリはコードではなくデータであり、信頼できない入力です。**
+      `sfh wait <dir>` / `sfh stop <dir>` / `sfh run --resume <dir>` は、
+      他人が用意したディレクトリを渡されうる。親AIエージェントが Web や Issue から
+      拾ったパスを渡す状況を想定してください。
+      「悪意ある YAML を実行した」は脅威ではありません(cmd: で何でもできるので)。
+      **脅威は run ディレクトリの中身を信じてしまうことです。**
+
+      ## S1-1【実証済み】`sfh wait` が任意のファイルを stdout に出す
+      再現手順(実際に成功した):
+        1. 攻撃者が status.json に "emit_file": "<被害者の秘密ファイル>" を書く
+        2. 被害者(または親AI)が `sfh wait <そのdir>` を実行
+        3. 秘密の中身が stdout に出る
+      src/watch.rs の emit_file はパス制限なく read_to_string されています。
+      **`sfh wait` の stdout を読むのは親AIエージェント**なので、秘密が
+      そのままAIの文脈に入り、Web ツールを持つAIなら外部送信されます。
+
+      修正: status.json / log.jsonl 由来のパスは、**canonicalize した上で
+      run ディレクトリ配下であることを確認**してから読むこと。
+      配下でなければエラーにし、何が拒否されたかを表示すること。
+
+      ## S1-2【実証済み】`sfh stop` が無関係なプロセスを殺す
+      再現手順(実際に成功した。無害な timeout.exe を殺せた):
+        1. 攻撃者が status.json に "pid": <被害者のIDEのPID> を書く
+        2. `sfh stop <そのdir>` で taskkill /T /F される
+      src/watch.rs は status.json の pid を追加確認なしで kill に渡しています。
+
+      修正: **pid だけを根拠に kill しないこと。** 最低限、その run が本当に
+      sfh のものだと確認する仕組みを入れる。実装案(どれでもよい、理由を書くこと):
+        - run 作成時に 128bit 以上のランダムな nonce を生成して run dir と
+          status.json の両方に記録し、stop 時に照合する
+        - kill 対象プロセスの実行ファイル名が sfh 自身であることを確認する
+        - 上記の組み合わせ
+      照合できない場合は kill せず、理由を表示して終了すること。
+
+      ## S1-3【実証済み】フロー name でディレクトリを脱出できる
+      `name: x/../../ESCAPED-HERE` を書くと、runs ルートの外に着地します
+      (実際に `.sfh/runs/` ではなく `.sfh/` 直下に作られた)。`--dry-run` だけで起きます。
+      step id と profile 名は [A-Za-z0-9_-] に制限されているのに name は無検証です。
+
+      修正: name も同じ安全な文字集合に制限する。加えて、run dir を作った後に
+      **canonicalize して runs ルート配下であることを確認**すること。
+
+      ## S1-4 `--resume` が任意のパスを読む
+      src/engine.rs の load_resume は log.jsonl の chain_file / out_file /
+      precompact_file を `run_dir.join(p)` しています。
+      **Rust の PathBuf::join は、引数が絶対パスだと元のパスを丸ごと置き換えます。**
+      `../..` も拒否していません。攻撃者が用意した run dir を --resume すると、
+      任意ファイルの中身が「過去ステップの出力」として復元され、後段AIのプロンプトに入ります。
+
+      修正: S1-1 と同じ封じ込めを適用すること。共通のヘルパー関数を1つ作り、
+      run dir 由来のパスは全てそれを通すようにするのが望ましい。
+
+      ## やってはいけないこと
+      - 新しい YAML キーを足さない
+      - 既存のテストを消したり緩めたりしない
+      - clippy を黙らせるための #[allow(...)] を足さない
+      - 範囲外のリファクタをしない
+      - 仕様に矛盾を見つけたら**質問せず**、解釈を出力に明記して進めること
+        (このフローは無人で回っており、質問は誰にも届きません)
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh が全部通ること。**自分で実行して確認すること。**
+      S1-1〜S1-4 それぞれに、攻撃を再現して**防がれること**を確認する
+      挙動テストを tests/engine_behaviour.sh に足すこと。
+
+      前回の検証結果(初回は空):
+      {{steps.s1_check.output | tail:120}}
+
+  - id: s1_check
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 2400
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: s2_impl
+      - goto: s1_impl
+
+  # ============================================================ S2
+  # 権限契約。access: が主張通りでない箇所と、その回避経路。
+  - id: s2_impl
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化、2バッチ目。**権限契約**です。
+
+      ## 原則
+      **サンドボックスの無い環境でシェルを自動承認したら、それは full と同じ。**
+      これは sfh 自身が pi のコードに書いている原則です(src/preset.rs の pi_tools)。
+      同じ原則を全ツールに一貫して適用します。
+
+      ## S2-1 access: の宣言と実装が食い違っている
+      監査で指摘された箇所を、**実際にコードを読んで確認してから**直すこと:
+
+      - **opencode の write が実質 full**: read は edit/bash を deny 注入しているのに、
+        write は external_directory: deny だけで build agent を --auto で起動する。
+        bash が自動承認されるなら `python -c "..."` 等で workspace 外を書ける。
+        → write で bash を deny するか、それが不可能なら write を拒否して
+          「opencode は read と full の二段階」と明示すること。どちらを選んだか理由を書くこと。
+
+      - **pi の write が extension を無効化していない**: read では
+        「project-local extension は full process rights で動く」を理由に
+        --no-extensions / --no-skills / --no-prompt-templates を付けているのに、
+        write では付けていない。攻撃者がリポジトリに extension を置けば、
+        Bash を allowlist から外した意味が消える。
+        → write でも同じフラグを付けること。
+
+      - **cursor の write が full と同一**: 両方 --force を渡している。
+        → cursor は read と full の二段階にし、`access: write` を
+          validate エラーにすること。既定値が write なので、cursor を使う
+          ステップは access を明示しないと通らなくなる。これは意図した挙動です。
+
+      ## S2-2 access: の既定値をやめる
+      現在 access の既定は write です。上記の通りツールによって write の意味が
+      揃わないので、**AI を呼ぶステップでは access を必須にする**こと
+      (cmd: ステップは対象外)。validate で欠落をエラーにし、
+      「read / write / full のどれかを明示してください」と案内すること。
+
+      ## S2-3 ESCALATION_FLAGS がすり抜ける
+      現在は7つの文字列を各 argv 要素に対して単純 contains しているだけです。
+      抜けている例(監査より): pi の `--approve` `--tools` `-t`、
+      opencode の `--agent`、claude の `--tools` `--allowedTools` `--permission-mode`、
+      grok の `--allow` `--permission-mode`、agy の `--mode`、
+      codex の `-s` `--sandbox` `-c sandbox_mode=...`。
+      **README 自身が pi の write に Bash を足す方法として `-t` を案内しているのに
+      検知していません。** しかも検知しても警告を出して実行します。
+
+      修正:
+      - ツールごとに「権限に関係するフラグ」の一覧を持つこと
+      - `access` が full でないステップの `args:` にそれらが現れたら、
+        **警告ではなく validate エラー**にすること(fail-closed)
+      - 逃げ道として `allow_access_override: true` を新設してよい。
+        明示的に書いた人だけが越えられるようにする
+      - テンプレート展開**後**にも同じ検査を通すこと(args にテンプレートが使えるため)
+
+      ## S2-4 セッション再開で権限が上がる
+      SessionInfo は tool/id/cwd/marker しか記録しておらず、元の access を保存していません。
+      read で汚染された(悪意ある Web ページを読んだ)セッションを、
+      次のステップが `continue_from:` で full として再開できます。
+      これは「低権限で取り込んだ未信頼状態を高権限へ持ち上げる」典型的な経路です。
+
+      修正: SessionInfo に元の access を記録し、**より高い access での
+      continue_from / fork_from を既定で拒否**すること
+      (read → write/full、write → full を禁止)。
+      `allow_access_override: true` があるステップだけ許可してよい。
+
+      ## やってはいけないこと
+      - S2-2 と S2-3 以外の新しい YAML キーを足さない
+      - 既存のテストを消したり緩めたりしない
+      - 範囲外のリファクタをしない
+      - 質問せず、解釈を明記して進めること
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh。
+      **既存の examples/*.yaml が全て validate を通ること**(access 必須化で
+      壊れるものがあれば examples 側を直すこと)。
+      S2-1〜S2-4 それぞれに挙動テストを足すこと。
+      README の権限に関する記述を、実装に合わせて正確に書き直すこと。
+
+      前回の検証結果(初回は空):
+      {{steps.s2_check.output | tail:120}}
+
+  - id: s2_check
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 2400
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: s3_impl
+      - goto: s2_impl
+
+  # ============================================================ S3
+  # 残りの堅牢化。
+  - id: s3_impl
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化、3バッチ目。残りを片付けます。
+
+      ## S3-1 文字列 cmd: のメタ文字チェックは安全境界にならない
+      現在 `\n \r & | < > ^ % ` $ ; "` を拒否していますが、これは**区切り文字の
+      一部を止めるだけ**です。監査が示した実例:
+
+          cmd: "tar -cf backup.tar {{raw}}{{steps.lister.output}}{{endraw}}"
+
+      上流の AI 出力が `--checkpoint=1 --checkpoint-action=exec='sh payload.sh' harmless.txt`
+      を返すと、**現在の禁止文字を1つも含まないのに任意コマンドが実行されます。**
+      対象プログラムの危険なオプションは素通りします。
+
+      修正: **文字列形式 `cmd:` の中でのテンプレート展開を既定で禁止**すること。
+      必要な人には `unsafe_shell_template: true` を明示させる。
+      配列形式では従来通り展開してよい(シェルを介さないため、
+      ただし「引数として渡る」ことは変わらないので README の
+      「設計上安全」という断定は正確な表現に直すこと)。
+      エラー文で配列形式への移行を案内すること。
+
+      ## S3-2 未使用プロファイルの bin が実行される
+      provenance 収集が「そのツールに一致する最初のプロファイル」を探して
+      `--version` を実行しています(src/engine.rs)。doctor も同じ方式です。
+      その結果、一度も `use:` されていないプロファイルの bin が起動します:
+
+          profiles:
+            aaa-unused: { tool: codex, bin: /tmp/malware }
+          steps:
+            - id: real
+              tool: codex          # aaa-unused は使っていない
+
+      修正: **実際に解決された (tool, bin) の組だけ**を集めて version probe すること。
+      使われていないプロファイルの bin は絶対に実行しないこと。doctor も同様に直すこと。
+
+      ## S3-3 run 成果物のパーミッションと .gitignore
+      - run dir は create_dir_all されるだけで、Unix の 0700 / ファイル 0600 を
+        強制していません。umask 022 なら 0755/0644 になります。
+        → Unix では run ルートと run dir を 0700、書き出すファイルを 0600 にすること。
+          Windows では現在のユーザーのみの DACL にできればなお良いが、
+          難しければ実施しないでよい(その場合は理由を書くこと)。
+      - `.gitignore` は「既に存在すれば何もしない」ため、悪意あるリポジトリが
+        空の `.gitignore` を先に置けば、prompt・出力・セッションIDが
+        `git add -A` でコミットされます。README の「コミットされることはない」は嘘になります。
+        → 既存ファイルの中身を検証し、`*` を含まなければ追記するか警告すること。
+          README の断定表現も実装に合わせて直すこと。
+
+      ## S3-4 fingerprint を暗号学的ハッシュにする
+      flow の変更検知に FNV-1a 64bit を使っており、コード自身が
+      "not a security hash" と書いています。それを `--resume` 拒否の根拠にしています。
+      衝突する別 YAML を用意されると、変更されたフローが同一と判定されます。
+      → SHA-256 に変更すること。**外部クレートを足さないこと**(依存を増やさない方針)。
+      Rust だけで SHA-256 を実装するか、それが過剰なら
+      「run artifact の形式は v1 で固定されるので今変える」という判断のもと、
+      最小の実装を自分で書くこと。実装したらテストで既知のテストベクタを検証すること。
+      meta.json に fingerprint のアルゴリズム名も記録すること。
+
+      ## やってはいけないこと
+      - S3-1 の `unsafe_shell_template` 以外の新しい YAML キーを足さない
+      - **新しい外部クレートを追加しない**(単一バイナリ・依存最小が方針)
+      - 既存のテストを消したり緩めたりしない
+      - 質問せず、解釈を明記して進めること
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+      S3-1〜S3-4 それぞれに挙動テストを足すこと。
+      SHA-256 は既知のテストベクタ(空文字列 / "abc")で単体テストすること。
+
+      前回の検証結果(初回は空):
+      {{steps.s3_check.output | tail:120}}
+
+  - id: s3_check
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 2400
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: review
+      - goto: s3_impl
+
+  # ============================================================ レビュー
+  # codex 3体を並列で。角度を変えて、独立に判定させる。
+  - id: review
+    max_parallel: 3
+    max_visits: 4
+    on_max_visits: goto:unresolved
+    parallel:
+      - id: rev_break
+        use: rev
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**攻撃側**レビュアーです。
+          直前に入ったセキュリティ修正を、**破ろうとしてください**。
+
+          修正されたはずの項目:
+          S1: run dir 由来のパス封じ込め(wait の emit_file / resume の chain_file 等)、
+              stop の PID 検証、flow name のディレクトリ脱出
+          S2: access の実装一致(opencode/pi/cursor)、access 必須化、
+              ESCALATION_FLAGS の fail-closed 化、セッション再開での権限昇格禁止
+          S3: 文字列 cmd: でのテンプレート展開禁止、未使用プロファイルの bin 実行、
+              run dir のパーミッションと .gitignore、SHA-256 fingerprint
+
+          # やること
+          `git --no-pager diff main...HEAD` で変更を読み、**回避経路を探してください**。
+          可能なら実際に再現を試すこと(読み取り専用の権限なので、
+          攻撃の構築は `--dry-run` や validate の挙動で確認すること)。
+
+          特に確認すること:
+          - パス封じ込めは symlink / UNC / 8.3形式 / 大文字小文字 / `..` の
+            エンコード違いを通すか
+          - canonicalize は対象が存在しない場合どうなるか
+          - PID 検証は本当に偽装できないか
+          - access 検査はテンプレート展開後にも効いているか
+          - fail-closed になっているか(判定不能なときに通していないか)
+
+          # 出力
+          発見した回避経路を、再現手順つきで列挙してください。
+          **最後の行に `REVIEW-PASS`(破れなかった)か `REVIEW-FAIL`(破れた)を
+          単独で書くこと。** それ以外の語を最後の行に書かないこと。
+
+      - id: rev_regression
+        use: rev
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**回帰**レビュアーです。
+          直前に入ったセキュリティ修正が、**既存の機能を壊していないか**を見ます。
+
+          sfh は Windows / macOS / Linux の**完全同一挙動が絶対条件**です。
+
+          # やること
+          `git --no-pager diff main...HEAD` を読み、以下を確認してください:
+          - 3OS で挙動が割れる箇所を新たに作っていないか
+            (パス正規化、canonicalize、パーミッション、シンボリックリンク、
+             大文字小文字、UNC パス、行末)
+          - `--resume` がライブ実行と食い違わないか
+          - `--detach` / status / wait / stop の連携が壊れていないか
+          - parallel / foreach / continue_from / fork_from との相互作用
+          - 既存の examples が全て動くか
+          - エラーメッセージが「次に何をすればよいか」を伝えているか
+          - 正しいフローを誤って拒否していないか(誤検出は害です)
+
+          # 出力
+          壊れている箇所を、再現手順つきで列挙してください。
+          **最後の行に `REVIEW-PASS`(回帰なし)か `REVIEW-FAIL`(回帰あり)を
+          単独で書くこと。** それ以外の語を最後の行に書かないこと。
+
+      - id: rev_complete
+        use: rev
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**網羅性**レビュアーです。
+          指示された修正が**本当に全部入ったか**、黙って飛ばされたものがないかを見ます。
+
+          # 対象の一覧(この全てが入っているはず)
+          S1-1 wait の emit_file による任意ファイル読み出し
+          S1-2 stop の任意 PID kill
+          S1-3 flow name によるディレクトリ脱出
+          S1-4 resume の chain_file / out_file / precompact_file のパス封じ込め
+          S2-1 opencode write の bash、pi write の extension、cursor write == full
+          S2-2 access の既定値廃止(AI ステップでは必須)
+          S2-3 ESCALATION_FLAGS のツール別化と fail-closed 化
+          S2-4 セッション再開での access 昇格禁止
+          S3-1 文字列 cmd: でのテンプレート展開禁止
+          S3-2 未使用プロファイルの bin を実行しない
+          S3-3 run dir のパーミッションと .gitignore の検証
+          S3-4 SHA-256 fingerprint(外部クレート追加なし)
+
+          # やること
+          `git --no-pager diff main...HEAD` とコードを読み、各項目について
+          **入っている / 入っていない / 部分的** を判定してください。
+          「入っている」と判定するには、**実際にその挙動を確認できるコードまたは
+          テスト**を指せること。コミットメッセージや README の記述は根拠になりません。
+
+          テストについても確認すること: 各項目に挙動テストが付いているか。
+          テストが「攻撃が防がれること」を実際に確認しているか、
+          単に正常系を通しているだけではないか。
+
+          # 出力
+          項目ごとの判定を表で示し、不足を列挙してください。
+          **最後の行に `REVIEW-PASS`(全項目が実装されテストされている)か
+          `REVIEW-FAIL`(不足あり)を単独で書くこと。** それ以外の語を最後の行に書かないこと。
+
+  # 合否は AI ではなく grep が数える。3体全員が PASS のときだけ先へ進む。
+  - id: verdict
+    cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS$' - || true); echo \"PASSES=$n\""]
+    stdin: prompt
+    prompt: "{{steps.review.outputs}}"
+    on_error: continue
+    route:
+      - when_last_line_is: "PASSES=3"
+        goto: wrap
+      - goto: s_fix
+
+  - id: s_fix
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化。**レビューでの指摘に対応**します。
+
+      codex 3体が独立にレビューし、全員一致の合格が出ませんでした。
+      以下が3体分の指摘です。**指摘された箇所を全て直してください。**
+
+      指摘に同意できない場合は、直さずに**理由をコードのコメントまたは
+      README に書き**、なぜ現状で正しいのかを説明すること(次のレビューで
+      その説明が読まれます)。質問はしないこと。無人で回っています。
+
+      {{steps.review.outputs | tail:400}}
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+
+  - id: s_recheck
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 2400
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: review
+      - goto: s_fix
+
+  # レビューが収束しなかったとき。成功を装わず、未解決のまま報告する。
+  - id: unresolved
+    cmd: ["sh", "-c", "echo 'UNRESOLVED: reviewers did not reach unanimous pass within max_visits'; git --no-pager diff --stat main...HEAD"]
+    route: [{ goto: end }]
+
+  - id: wrap
+    cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED'; git --no-pager diff --stat main...HEAD 2>&1; echo '--- tests ---'; cargo test 2>&1 | tail -3; bash tests/engine_behaviour.sh 2>&1 | tail -2"]
