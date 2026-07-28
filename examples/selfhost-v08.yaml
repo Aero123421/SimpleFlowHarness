@@ -71,9 +71,25 @@ steps:
       「全部捨てずに現状のレポートを要約して返す」が**機能していない**。
 
       修正: `on_max_visits: goto:summarize` を **execute** に付ける。
-      review 側の max_visits は実装側より1小さくし、なぜそうするのかを
-      日本語コメントで説明する(入場順の規則を書く)。
+      **上限は両者を同じ値にすること**(= review_execute の明示的な max_visits: 3 は
+      defaults と同じなので消してよい)。
+
+      前回この指示に「review 側を1つ小さくしろ」と書いたのは**私の誤りでした**。
+      入場時判定なので上限が小さい方が先に落ちる。review を小さくすると
+      フックを持たない review が先に落ちてフロー全体が失敗する。
+      あなたがそれを指摘して実装を止めたのは正しい判断です。
+      同じ上限なら、毎周先に入場する execute が先に落ち、そのフックが効く:
+      exec v1, rev v1, exec v2, rev v2, exec v3, rev v3, exec v4 → 4>3 で execute が落ちる。
+
+      なぜそうなるかを日本語コメントで research.yaml に書くこと(入場順の規則)。
       同じ問題が examples/ の他のフローにもないか確認して直すこと。
+
+      ### A-2b. A-2 に AI を呼ばない挙動テストを付ける
+      A-2 は「テストが緑」では検証できない。tests/engine_behaviour.sh に足すこと:
+      2ノードのループ(両方 cmd:、上限は同じ、フックは**先に入場する方**だけに付ける)を作り、
+      **フックを持つ側が先に落ちて降格先へ飛ぶ**ことを確認する。
+      ついでに逆(フックを持たない側が先に落ちるとフローが失敗する)も確認すると、
+      入場順の規則が回帰で壊れたときに検知できる。
 
       ### A-3. src/engine.rs:826 付近の max_visits エラーメッセージに入場順の規則を1文足す
       利用者がこのエラーに当たったとき手元にあるのはこの文字列なので、
@@ -108,6 +124,10 @@ steps:
       - 「進捗が無い」を sfh が自動判定する仕組みを作らない
       - リファクタリングのついでをしない。指示された範囲だけ触る
       - 既存のテストを消したり緩めたりしない
+      - **clippy を黙らせるために #[allow(...)] を足さない。** 引数が多すぎると
+        言われたら構造体にまとめるなど、指摘に沿って直すこと
+      - 仕様に矛盾を見つけたら**質問せずに、矛盾の内容と採った解釈を出力に明記して
+        実装を進めること**。このフローは無人で回っているので、質問は誰にも届かない
 
       ## 完了条件
       `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test &&
@@ -118,7 +138,12 @@ steps:
       {{steps.a_check.output | tail:120}}
 
   - id: a_check
-    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
+    # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
+    # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
+    # 検証器が落ちること自体は「フローの失敗」ではなく「差し戻しの入力」。
+    on_error: continue
     timeout_sec: 1800
     route:
       # 合格だけを明示的に通す。それ以外(落ちた・読めない)は全部差し戻し。
@@ -205,7 +230,12 @@ steps:
       {{steps.b_check.output | tail:120}}
 
   - id: b_check
-    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
+    # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
+    # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
+    # 検証器が落ちること自体は「フローの失敗」ではなく「差し戻しの入力」。
+    on_error: continue
     timeout_sec: 1800
     route:
       - when_last_line_contains: "EXIT=0"
@@ -295,7 +325,12 @@ steps:
       {{steps.c_check.output | tail:120}}
 
   - id: c_check
-    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
+    # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
+    # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
+    # 検証器が落ちること自体は「フローの失敗」ではなく「差し戻しの入力」。
+    on_error: continue
     timeout_sec: 1800
     route:
       - when_last_line_contains: "EXIT=0"
@@ -391,7 +426,12 @@ steps:
       {{steps.d_check.output | tail:120}}
 
   - id: d_check
-    cmd: "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""
+    # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
+    # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
+    # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
+    # 検証器が落ちること自体は「フローの失敗」ではなく「差し戻しの入力」。
+    on_error: continue
     timeout_sec: 1800
     route:
       - when_last_line_contains: "EXIT=0"

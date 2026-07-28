@@ -242,14 +242,40 @@ fn effort_vocab_warning(tool: &str, e: &str) -> Option<String> {
 // Run state that survives a crash: everything needed by --resume.
 // ---------------------------------------------------------------------------
 
+fn failed_output(step: &str, text: &str, exit: i32, timed_out: bool) -> String {
+    format!(
+        "[sfh: step '{step}' did not complete (exit={exit}, timed_out={timed_out}).\n \
+         The text below is whatever it produced before failing. It is not a result.]\n{text}"
+    )
+}
+
+#[derive(Clone)]
+struct PendingRoute {
+    step: String,
+    visit: u32,
+    route_text: String,
+}
+
+#[derive(Clone)]
+struct UnfinishedStep {
+    step: String,
+    started: String,
+    cmd: String,
+}
+
 #[derive(Default)]
 struct ResumeState {
     outputs: BTreeMap<String, template::StepOutput>,
     visits: HashMap<String, u32>,
     sessions: HashMap<String, leaf::SessionInfo>,
+    chain_files: HashMap<String, PathBuf>,
     total: u32,
     cost_usd: f64,
     start: Option<String>,
+    pending_route: Option<PendingRoute>,
+    unfinished_step: Option<UnfinishedStep>,
+    last_executed: Option<String>,
+    last_success: Option<String>,
     completed: bool,
 }
 
@@ -258,6 +284,7 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
         .map_err(|e| format!("cannot read {}/log.jsonl: {e}", run_dir.display()))?;
     let mut st = ResumeState::default();
     let mut last_step: Option<String> = None;
+    let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
     for line in log.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -273,14 +300,39 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             // is already right. `outputs` has to be walked back to what was
             // summarized, or a resumed run sees strictly less than a live one.
             "compact_end" | "compact_failed" => {
-                if let (Some(e), Some(p)) = (
-                    st.outputs.get_mut(&step),
-                    v.get("precompact_file").and_then(|x| x.as_str()),
-                ) {
-                    if let Ok(t) = std::fs::read_to_string(run_dir.join(p)) {
-                        e.outputs = t.trim_end().to_string();
+                let precompact = v
+                    .get("precompact_file")
+                    .and_then(|x| x.as_str())
+                    .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok());
+                if let (Some(e), Some(p)) = (st.outputs.get_mut(&step), precompact.as_ref()) {
+                    e.outputs = p.trim_end().to_string();
+                }
+                if let (Some(pending), Some(p)) = (st.pending_route.as_mut(), precompact) {
+                    if pending.step == step {
+                        // Live routing uses the pre-compact text, even though
+                        // the chain file now contains the summary/head+tail.
+                        pending.route_text = p.trim_end().to_string();
                     }
                 }
+            }
+            "step_start" => {
+                let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                unfinished.insert(
+                    (step.clone(), visit),
+                    UnfinishedStep {
+                        step,
+                        started: v
+                            .get("ts")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        cmd: v
+                            .get("cmd")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("unknown command")
+                            .to_string(),
+                    },
+                );
             }
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
@@ -290,45 +342,83 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     st.cost_usd += c;
                 }
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
-                let is_child = v.get("parent").is_some();
+                let is_child = v.get("parent").is_some_and(|p| !p.is_null());
+                if ev == "step_end" {
+                    unfinished.remove(&(step.clone(), visit));
+                }
                 if !is_child {
                     let e = st.visits.entry(step.clone()).or_insert(0);
                     *e = (*e).max(visit);
                     last_step = Some(step.clone());
+                    st.last_executed = Some(step.clone());
                 }
                 let ok = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) == 0
                     && !v
                         .get("timed_out")
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false)
+                    && !v
+                        .get("interrupted")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false)
                     && !v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false);
-                if ok {
-                    let rd = |k: &str| -> Option<String> {
-                        v.get(k)
-                            .and_then(|x| x.as_str())
-                            .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
-                    };
-                    let chain = rd("chain_file").unwrap_or_default();
-                    // `outputs` is the pre-compact TEXT, never the raw tool
-                    // output: out_file holds a claude JSON envelope or a codex
-                    // event stream, and restoring that would inject machine
-                    // noise into a resumed prompt. Uncompacted steps have no
-                    // separate original, so chain is the original. A compacted
-                    // step patches this from its compact_end event below.
-                    let outs = chain.clone();
-                    let file = v
-                        .get("out_file")
+                let rd = |k: &str| -> Option<String> {
+                    v.get(k)
                         .and_then(|x| x.as_str())
-                        .map(|p| run_dir.join(p).display().to_string())
-                        .unwrap_or_default();
-                    st.outputs.insert(
-                        step.clone(),
-                        template::StepOutput {
-                            output: chain.trim_end().to_string(),
-                            outputs: outs.trim_end().to_string(),
-                            output_file: file,
-                        },
-                    );
+                        .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
+                };
+                let chain = rd("chain_file").unwrap_or_default();
+                let exit = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+                let timed_out = v
+                    .get("timed_out")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                let exposed = if ev == "step_end" && !ok {
+                    failed_output(&step, chain.trim_end(), exit, timed_out)
+                } else {
+                    chain.trim_end().to_string()
+                };
+                // `outputs` is the pre-compact TEXT, never the raw tool
+                // output: out_file holds a claude JSON envelope or a codex
+                // event stream, and restoring that would inject machine
+                // noise into a resumed prompt. Uncompacted steps have no
+                // separate original, so chain is the original. A compacted
+                // step patches this from its compact_end event below.
+                let file = v
+                    .get("out_file")
+                    .and_then(|x| x.as_str())
+                    .map(|p| run_dir.join(p).display().to_string())
+                    .unwrap_or_default();
+                let stderr_file = v
+                    .get("out_file")
+                    .and_then(|x| x.as_str())
+                    .map(|p| stderr_file_for(&run_dir.join(p)).display().to_string())
+                    .filter(|p| Path::new(p).exists())
+                    .unwrap_or_default();
+                st.outputs.insert(
+                    step.clone(),
+                    template::StepOutput {
+                        output: exposed.clone(),
+                        outputs: exposed,
+                        output_file: file,
+                        exit,
+                        stderr_file,
+                    },
+                );
+                if !is_child {
+                    if let Some(p) = v.get("chain_file").and_then(|x| x.as_str()) {
+                        st.chain_files.insert(step.clone(), run_dir.join(p));
+                    }
+                    if ok {
+                        st.last_success = Some(step.clone());
+                    }
+                    st.pending_route = (ev == "step_end" && ok).then(|| PendingRoute {
+                        step: step.clone(),
+                        visit,
+                        route_text: chain.trim_end().to_string(),
+                    });
+                }
+                if ok {
                     if let Some(s) = v.get("session") {
                         if let (Some(t), Some(id)) = (
                             s.get("tool").and_then(|x| x.as_str()),
@@ -351,6 +441,7 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 }
             }
             "position" => {
+                st.pending_route = None;
                 let next = v.get("next").and_then(|x| x.as_str()).unwrap_or("");
                 if next == "end" || next == "fail" {
                     st.completed = true;
@@ -364,9 +455,14 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             _ => {}
         }
     }
-    if st.start.is_none() && !st.completed {
-        // The last step never produced a routing decision: re-run it.
-        st.start = last_step;
+    st.unfinished_step = unfinished.into_values().next_back();
+    if st.pending_route.is_none() && !st.completed {
+        if let Some(u) = &st.unfinished_step {
+            st.start = Some(u.step.clone());
+        } else if st.start.is_none() {
+            // A failed step ended without recording its on_error decision.
+            st.start = last_step;
+        }
     }
     Ok(st)
 }
@@ -464,6 +560,7 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, St
                 emit_step: None,
                 emit_file: None,
                 error: None,
+                unfinished_step: None,
             },
         );
     }
@@ -520,9 +617,18 @@ struct Status {
     emit_step: Option<String>,
     emit_file: Option<String>,
     error: Option<String>,
+    unfinished_step: Option<UnfinishedStep>,
 }
 
 fn write_status(path: &Path, s: &Status) {
+    let unfinished_step = s.unfinished_step.as_ref().map(|u| {
+        json!({
+            "step": u.step,
+            "started_utc": u.started,
+            "cmd": u.cmd,
+            "will_rerun": true,
+        })
+    });
     let v = json!({
         "state": s.state,
         "current_step": s.step,
@@ -538,6 +644,7 @@ fn write_status(path: &Path, s: &Status) {
         "emit_step": s.emit_step,
         "emit_file": s.emit_file,
         "error": s.error,
+        "unfinished_step": unfinished_step,
     });
     let text = serde_json::to_string_pretty(&v).unwrap_or_default();
     // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
@@ -627,11 +734,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 dir.display()
             ));
         }
-        if resumed.start.is_none() {
+        if resumed.start.is_none() && resumed.pending_route.is_none() {
             return Err(format!(
                 "{}: cannot tell where to resume from",
                 dir.display()
             ));
+        }
+        if let Some(u) = &resumed.unfinished_step {
+            eprintln!(
+                "sfh: step '{}' started {} and never recorded an end.\n     resuming will run it again: {}",
+                u.step, u.started, u.cmd
+            );
         }
         run_dir = dir;
         is_resume = true;
@@ -722,7 +835,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let status_path = run_dir.join("status.json");
     let status = Arc::new(Mutex::new(Status {
         state: "running",
-        step: resumed.start.clone().unwrap_or_default(),
+        step: resumed
+            .pending_route
+            .as_ref()
+            .map(|p| p.step.clone())
+            .or_else(|| resumed.start.clone())
+            .unwrap_or_default(),
         started: started.clone(),
         steps_done: resumed.total,
         cost_usd: resumed.cost_usd,
@@ -733,6 +851,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         emit_step: None,
         emit_file: None,
         error: None,
+        unfinished_step: resumed.unfinished_step.clone(),
     }));
     {
         let s = Arc::clone(&status);
@@ -761,11 +880,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut sessions = resumed.sessions;
     let mut total: u32 = resumed.total;
     let mut cost_usd: f64 = resumed.cost_usd;
-    let mut last_executed: Option<String> = None;
-    let mut last_success: Option<String> = None;
+    let mut last_executed = resumed.last_executed;
+    let mut last_success = resumed.last_success;
+    let pending_route = resumed.pending_route;
     // step id -> the chain file its LAST visit wrote. A re-visited step writes
     // <id>.v2.chain.txt, so nothing may assume <id>.chain.txt.
-    let mut chain_files: HashMap<String, PathBuf> = HashMap::new();
+    let mut chain_files = resumed.chain_files;
     let mut cur = match &resumed.start {
         Some(id) => *index_of
             .get(id)
@@ -773,12 +893,21 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         None => 0,
     };
     if is_resume && !opts.quiet {
-        eprintln!(
-            "sfh: resuming {} at step '{}' ({} steps already done, ${cost_usd:.4} spent)",
-            run_dir.display(),
-            resumed.start.clone().unwrap_or_default(),
-            total
-        );
+        if let Some(p) = &pending_route {
+            eprintln!(
+                "sfh: resuming {} by re-evaluating routing after step '{}' ({} steps already done, ${cost_usd:.4} spent)",
+                run_dir.display(),
+                p.step,
+                total
+            );
+        } else {
+            eprintln!(
+                "sfh: resuming {} at step '{}' ({} steps already done, ${cost_usd:.4} spent)",
+                run_dir.display(),
+                resumed.start.clone().unwrap_or_default(),
+                total
+            );
+        }
     }
     let max_total = flow.defaults.max_total_steps.unwrap_or(100);
     let n_steps = flow.steps.len();
@@ -795,6 +924,71 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .map(|s| Instant::now() + Duration::from_secs(s));
 
     let result: Result<(), String> = (|| {
+        if let Some(pending) = pending_route {
+            let completed_idx = *index_of.get(&pending.step).ok_or_else(|| {
+                format!(
+                    "resume: completed step '{}' no longer exists in the flow",
+                    pending.step
+                )
+            })?;
+            let step = &flow.steps[completed_idx];
+            let gtag = if pending.visit == 1 {
+                step.id.clone()
+            } else {
+                format!("{}.v{}", step.id, pending.visit)
+            };
+            let pf = run_dir.join(format!("{gtag}.prompt.txt"));
+            let prep_ctx = leaf::PrepCtx {
+                flow: &flow,
+                vars: &vars,
+                outputs: &outputs,
+                step_ids: &step_ids,
+                run_dir: &run_dir,
+                flow_dir: &flow_dir,
+                notes_file: &notes_file,
+                sessions: &sessions,
+                needed_sessions: &needed_sessions,
+                quiet: opts.quiet,
+                verbose: opts.verbose,
+            };
+            let builtins = leaf::make_builtins(&prep_ctx, &step.id, pending.visit, &pf, &[]);
+            let ctx = template::Ctx {
+                vars: &vars,
+                outputs: &outputs,
+                step_ids: &step_ids,
+                builtins,
+            };
+            let target = evaluate_route(step, &pending.route_text, &ctx)?;
+            match target.as_ref().map(|(target, via)| (target.as_str(), *via)) {
+                None => {
+                    log_position(
+                        &mut log,
+                        &step.id,
+                        next_label(completed_idx + 1, &flow),
+                        PositionVia::Fallthrough,
+                    );
+                    cur = completed_idx + 1;
+                    if cur >= n_steps {
+                        return Ok(());
+                    }
+                }
+                Some(("end", via)) => {
+                    log_position(&mut log, &step.id, "end".into(), via);
+                    return Ok(());
+                }
+                Some(("fail", via)) => {
+                    log_position(&mut log, &step.id, "fail".into(), via);
+                    return Err(format!("step '{}' routed to fail", step.id));
+                }
+                Some((id, via)) => {
+                    if !opts.quiet {
+                        eprintln!("sfh: [{}] -> goto {id}", step.id);
+                    }
+                    log_position(&mut log, &step.id, id.to_string(), via);
+                    cur = index_of[id];
+                }
+            }
+        }
         loop {
             if execute::interrupted() {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
@@ -838,7 +1032,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 );
                 match action {
                     "continue" => {
-                        log_position(&mut log, &step.id, next_label(cur + 1, &flow));
+                        log_position(
+                            &mut log,
+                            &step.id,
+                            next_label(cur + 1, &flow),
+                            PositionVia::MaxVisits,
+                        );
                         cur += 1;
                         if cur >= n_steps {
                             return Ok(());
@@ -847,22 +1046,37 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     }
                     a if a.starts_with("goto:") => match &a[5..] {
                         "end" => {
-                            log_position(&mut log, &step.id, "end".into());
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "end".into(),
+                                PositionVia::MaxVisits,
+                            );
                             return Ok(());
                         }
                         "fail" => {
-                            log_position(&mut log, &step.id, "fail".into());
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "fail".into(),
+                                PositionVia::MaxVisits,
+                            );
                             return Err(format!("step '{}' exhausted max_visits ({max_v})", step.id));
                         }
                         id => {
-                            log_position(&mut log, &step.id, id.to_string());
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                id.to_string(),
+                                PositionVia::MaxVisits,
+                            );
                             cur = index_of[id];
                             continue;
                         }
                     },
                     _ => {
                         return Err(format!(
-                            "step '{}' exceeded max_visits ({max_v}) - loop not converging (set on_max_visits: goto:<id> to degrade gracefully)",
+                            "step '{}' exceeded max_visits ({max_v}) - loop not converging (set on_max_visits: goto:<id> to degrade gracefully). Nodes are checked on entry, so the node entered first in a loop reaches its limit first; put the degradation hook on that node",
                             step.id
                         ))
                     }
@@ -906,6 +1120,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             if execute::interrupted() {
                                 break;
                             }
+                            cost_usd += $done.usage.cost_usd.unwrap_or(0.0);
+                            log_step_end(
+                                &mut log,
+                                &$label,
+                                Some(&step.id),
+                                visit,
+                                &$done,
+                            );
                             if !opts.quiet {
                                 eprintln!("sfh: [{}] falling back to profile '{fb}'", $label);
                             }
@@ -984,6 +1206,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let mut plain = String::new();
                 let mut hard_fail = false;
                 for (c, d) in children.iter().zip(dones.iter()) {
+                    let exposed = if d.ok() {
+                        d.chain_output.clone()
+                    } else {
+                        failed_output(&c.id, &d.chain_output, d.exit_code, d.timed_out)
+                    };
                     if !d.ok() {
                         eprintln!(
                             "sfh: [{}] failed (exit={}, timed_out={})",
@@ -1000,9 +1227,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     outputs.insert(
                         c.id.clone(),
                         template::StepOutput {
-                            output: d.chain_output.clone(),
-                            outputs: d.chain_output.clone(),
+                            output: exposed.clone(),
+                            outputs: exposed.clone(),
                             output_file: d.out_file.display().to_string(),
+                            exit: d.exit_code,
+                            stderr_file: stderr_file_for(&d.out_file).display().to_string(),
                         },
                     );
                     if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
@@ -1017,17 +1246,26 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         );
                     }
                     log_step_end(&mut log, &c.id, Some(&step.id), visit, d);
+                    let failed_header = if d.ok() {
+                        String::new()
+                    } else {
+                        format!(
+                            " [sfh: FAILED exit={}, timed_out={}]",
+                            d.exit_code, d.timed_out
+                        )
+                    };
                     agg.push_str(&format!(
-                        "--- {} ---\n{}\n\n",
+                        "--- {}{} ---\n{}\n\n",
                         c.id,
-                        d.chain_output.trim_end()
+                        failed_header,
+                        exposed.trim_end()
                     ));
                     plain.push_str(&format!("{}\n\n", d.chain_output.trim_end()));
                 }
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
-                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
                 (agg, plain, hard_fail)
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
@@ -1111,6 +1349,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let mut plain = String::new();
                 let mut any_fail = false;
                 for (i, d) in dones.iter().enumerate() {
+                    let label = format!("{}[{i}]", step.id);
+                    let exposed = if d.ok() {
+                        d.chain_output.clone()
+                    } else {
+                        failed_output(&label, &d.chain_output, d.exit_code, d.timed_out)
+                    };
                     if !d.ok() {
                         any_fail = true;
                         eprintln!(
@@ -1122,18 +1366,21 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         }
                     }
                     cost_usd += d.usage.cost_usd.unwrap_or(0.0);
-                    log_step_end(
-                        &mut log,
-                        &format!("{}[{i}]", step.id),
-                        Some(&step.id),
-                        visit,
-                        d,
-                    );
+                    log_step_end(&mut log, &label, Some(&step.id), visit, d);
+                    let failed_header = if d.ok() {
+                        String::new()
+                    } else {
+                        format!(
+                            " [sfh: FAILED exit={}, timed_out={}]",
+                            d.exit_code, d.timed_out
+                        )
+                    };
                     agg.push_str(&format!(
-                        "--- {}[{i}] item: {} ---\n{}\n\n",
+                        "--- {}[{i}]{} item: {} ---\n{}\n\n",
                         step.id,
+                        failed_header,
                         one_line(items.get(i).map(String::as_str).unwrap_or(""), 80),
-                        d.chain_output.trim_end()
+                        exposed.trim_end()
                     ));
                     plain.push_str(&format!("{}\n\n", d.chain_output.trim_end()));
                 }
@@ -1141,8 +1388,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let hard_fail = any_fail && step.on_error.as_deref() != Some("continue");
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
-                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail);
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
                 (agg, plain, hard_fail)
             } else {
                 if total + 1 > max_total {
@@ -1164,6 +1411,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         if execute::interrupted() {
                             break;
                         }
+                        cost_usd += done.usage.cost_usd.unwrap_or(0.0);
+                        log_step_end(&mut log, &step.id, None, visit, &done);
                         if !opts.quiet {
                             eprintln!("sfh: [{}] falling back to profile '{fb}'", step.id);
                         }
@@ -1206,17 +1455,25 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     );
                 }
                 log_step_end(&mut log, &step.id, None, visit, d);
+                let exposed = if d.ok() {
+                    d.chain_output.clone()
+                } else {
+                    failed_output(&step.id, &d.chain_output, d.exit_code, d.timed_out)
+                };
                 outputs.insert(
                     step.id.clone(),
                     template::StepOutput {
-                        output: d.chain_output.clone(),
-                        outputs: d.chain_output.clone(),
+                        output: exposed.clone(),
+                        outputs: exposed,
                         output_file: d.out_file.display().to_string(),
+                        exit: d.exit_code,
+                        stderr_file: stderr_file_for(&d.out_file).display().to_string(),
                     },
                 );
                 let rt = d.chain_output.clone();
                 (d.chain_output.clone(), rt, !d.ok())
             };
+            let notes_output = chain_output.clone();
 
             // ---- compact ----
             if let Some(comp) = &step.compact {
@@ -1240,15 +1497,26 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
                     );
-                    match run_compact(
-                        &flow,
-                        comp,
-                        &chain_output,
-                        &run_dir,
-                        &gtag,
-                        opts.quiet,
-                        opts.verbose,
-                    ) {
+                    let cx = mk_cx!(&outputs, &sessions);
+                    let compact_prompt_file = run_dir.join(format!("{gtag}.compact.prompt.txt"));
+                    let builtins =
+                        leaf::make_builtins(&cx, &step.id, visit, &compact_prompt_file, &[]);
+                    let compact_ctx = template::Ctx {
+                        vars: &vars,
+                        outputs: &outputs,
+                        step_ids: &step_ids,
+                        builtins,
+                    };
+                    let compact_run = CompactRun {
+                        flow: &flow,
+                        ctx: &compact_ctx,
+                        original: &chain_output,
+                        run_dir: &run_dir,
+                        tag: &gtag,
+                        quiet: opts.quiet,
+                        verbose: opts.verbose,
+                    };
+                    match run_compact(comp, compact_run) {
                         Ok((sum, usage)) => {
                             cost_usd += usage.cost_usd.unwrap_or(0.0);
                             log_event(
@@ -1295,7 +1563,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     f,
                     "## {} (visit {visit})\n{}\n",
                     step.id,
-                    chain_output.trim_end()
+                    notes_output.trim_end()
                 );
             }
 
@@ -1315,11 +1583,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     "continue" => {}
                     oe if oe.starts_with("goto:") => match &oe[5..] {
                         "end" => {
-                            log_position(&mut log, &step.id, "end".into());
+                            log_position(&mut log, &step.id, "end".into(), PositionVia::OnError);
                             return Ok(());
                         }
                         "fail" => {
-                            log_position(&mut log, &step.id, "fail".into());
+                            log_position(&mut log, &step.id, "fail".into(), PositionVia::OnError);
                             return Err(format!(
                                 "step '{}' failed and on_error routed to fail",
                                 step.id
@@ -1327,7 +1595,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         }
                         id => match index_of.get(id) {
                             Some(i) => {
-                                log_position(&mut log, &step.id, id.to_string());
+                                log_position(
+                                    &mut log,
+                                    &step.id,
+                                    id.to_string(),
+                                    PositionVia::OnError,
+                                );
                                 cur = *i;
                                 continue;
                             }
@@ -1350,8 +1623,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
 
             // ---- routing ----
-            let mut target: Option<String> = None;
-            {
+            let target = {
                 let pf = run_dir.join(format!("{gtag}.prompt.txt"));
                 let cx = mk_cx!(&outputs, &sessions);
                 let builtins = leaf::make_builtins(&cx, &step.id, visit, &pf, &[]);
@@ -1361,59 +1633,34 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     step_ids: &step_ids,
                     builtins,
                 };
-                let last = leaf::last_line(&route_text).to_string();
-                for r in &step.route {
-                    let mut ok = true;
-                    let mut check =
-                        |needle: &Option<String>, hay: &str, is_rx: bool| -> Result<(), String> {
-                            if !ok {
-                                return Ok(());
-                            }
-                            let Some(t) = needle else { return Ok(()) };
-                            let t = template::render(t, &ctx)?;
-                            let hit = if is_rx {
-                                regex::Regex::new(&t)
-                                    .map_err(|e| format!("step '{}' route regex: {e}", step.id))?
-                                    .is_match(hay)
-                            } else {
-                                hay.contains(&t)
-                            };
-                            if !hit {
-                                ok = false;
-                            }
-                            Ok(())
-                        };
-                    check(&r.when_contains, &route_text, false)?;
-                    check(&r.when_matches, &route_text, true)?;
-                    check(&r.when_last_line_contains, &last, false)?;
-                    check(&r.when_last_line_matches, &last, true)?;
-                    if ok {
-                        target = Some(r.goto.clone());
-                        break;
-                    }
-                }
-            }
-            match target.as_deref() {
+                evaluate_route(step, &route_text, &ctx)?
+            };
+            match target.as_ref().map(|(target, via)| (target.as_str(), *via)) {
                 None => {
-                    log_position(&mut log, &step.id, next_label(cur + 1, &flow));
+                    log_position(
+                        &mut log,
+                        &step.id,
+                        next_label(cur + 1, &flow),
+                        PositionVia::Fallthrough,
+                    );
                     cur += 1;
                     if cur >= n_steps {
                         return Ok(());
                     }
                 }
-                Some("end") => {
-                    log_position(&mut log, &step.id, "end".into());
+                Some(("end", via)) => {
+                    log_position(&mut log, &step.id, "end".into(), via);
                     return Ok(());
                 }
-                Some("fail") => {
-                    log_position(&mut log, &step.id, "fail".into());
+                Some(("fail", via)) => {
+                    log_position(&mut log, &step.id, "fail".into(), via);
                     return Err(format!("step '{}' routed to fail", step.id));
                 }
-                Some(id) => {
+                Some((id, via)) => {
                     if !opts.quiet {
                         eprintln!("sfh: [{}] -> goto {id}", step.id);
                     }
-                    log_position(&mut log, &step.id, id.to_string());
+                    log_position(&mut log, &step.id, id.to_string(), via);
                     cur = index_of[id];
                 }
             }
@@ -1456,20 +1703,24 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
             );
-            let Some(emit_id) = opts.emit.clone().or(last_executed) else {
+            let emit_id = opts.emit.clone().or(last_success);
+            let emit_id =
+                emit_id.filter(|id| outputs.get(id).is_some_and(|output| output.exit == 0));
+            if let Some(id) = &emit_id {
+                let out = outputs
+                    .get(id)
+                    .map(|s| s.output.clone())
+                    .unwrap_or_default();
+                // Emit first: `sfh wait` treats a terminal status.json as "the
+                // output is ready", so the status must not go terminal before it.
+                print_emit(&out, max_emit, chain_files.get(id));
+            } else if last_executed.is_none() {
                 // Rare, but leaving status.json on "running" would make this
                 // look like a run that got killed rather than one that ended.
                 finish("failed", cost_usd, 1, None, Some("no step was executed"));
                 return Err("no step was executed".into());
-            };
-            let out = outputs
-                .get(&emit_id)
-                .map(|s| s.output.clone())
-                .unwrap_or_default();
-            // Emit first: `sfh wait` treats a terminal status.json as "the
-            // output is ready", so the status must not go terminal before it.
-            print_emit(&out, max_emit, chain_files.get(&emit_id));
-            finish("done", cost_usd, 0, Some(&emit_id), None);
+            }
+            finish("done", cost_usd, 0, emit_id.as_deref(), None);
             if !opts.quiet {
                 eprintln!(
                     "sfh: done. {} leaf runs, ${cost_usd:.4} reported. run dir: {}",
@@ -1579,6 +1830,7 @@ fn write_aggregate(
     agg: &str,
     outputs: &mut BTreeMap<String, template::StepOutput>,
     step_id: &str,
+    failed: bool,
 ) {
     let gfile = run_dir.join(format!("{gtag}.out.txt"));
     let _ = std::fs::write(&gfile, agg);
@@ -1589,6 +1841,8 @@ fn write_aggregate(
             output: agg.to_string(),
             outputs: agg.to_string(),
             output_file: gfile.display().to_string(),
+            exit: if failed { 1 } else { 0 },
+            stderr_file: String::new(),
         },
     );
 }
@@ -1605,15 +1859,29 @@ fn head_tail(s: &str, budget: usize) -> String {
     format!("{head}\n...[sfh: truncated middle]...\n{tail}")
 }
 
-fn run_compact(
-    flow: &flow::Flow,
-    comp: &flow::Compact,
-    original: &str,
-    run_dir: &Path,
-    tag: &str,
+struct CompactRun<'a, 'ctx> {
+    flow: &'a flow::Flow,
+    ctx: &'a template::Ctx<'ctx>,
+    original: &'a str,
+    run_dir: &'a Path,
+    tag: &'a str,
     quiet: bool,
     verbose: bool,
+}
+
+fn run_compact(
+    comp: &flow::Compact,
+    run: CompactRun<'_, '_>,
 ) -> Result<(String, preset::Usage), String> {
+    let CompactRun {
+        flow,
+        ctx,
+        original,
+        run_dir,
+        tag,
+        quiet,
+        verbose,
+    } = run;
     let prof = comp.use_.as_ref().and_then(|u| flow.profiles.get(u));
     let tool = comp
         .tool
@@ -1637,13 +1905,15 @@ fn run_compact(
     // save money, not to spend it.
     let cap = comp.max_input_chars.unwrap_or(120_000) as usize;
     let body = head_tail(original, cap);
-    let instr = comp.instruction.clone().unwrap_or_else(|| {
-        format!(
+    let instr = match &comp.instruction {
+        Some(instruction) => template::render(instruction, ctx)
+            .map_err(|e| format!("compact.instruction: {e}"))?,
+        None => format!(
             "Summarize the text below in at most {target} characters, in the same language as the text. \
              It will be passed to another AI agent as context, so keep every conclusion, number, file path and open question. \
              Output only the summary."
-        )
-    });
+        ),
+    };
     let prompt = format!("{instr}\n\n---\n{body}");
     let ctag = format!("{tag}.compact");
     let prompt_file = run_dir.join(format!("{ctag}.prompt.txt"));
@@ -1888,10 +2158,80 @@ fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
     let _ = writeln!(f, "{v}");
 }
 
-fn log_position(f: &mut std::fs::File, after: &str, next: String) {
+#[derive(Clone, Copy)]
+enum PositionVia {
+    Rule,
+    CatchAll,
+    Fallthrough,
+    OnError,
+    MaxVisits,
+}
+
+impl PositionVia {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::CatchAll => "catch_all",
+            Self::Fallthrough => "fallthrough",
+            Self::OnError => "on_error",
+            Self::MaxVisits => "max_visits",
+        }
+    }
+}
+
+fn evaluate_route(
+    step: &flow::Step,
+    route_text: &str,
+    ctx: &template::Ctx<'_>,
+) -> Result<Option<(String, PositionVia)>, String> {
+    let last = leaf::last_line(route_text).to_string();
+    for r in &step.route {
+        let mut matched = true;
+        let mut check = |needle: &Option<String>, hay: &str, is_rx: bool| -> Result<(), String> {
+            if !matched {
+                return Ok(());
+            }
+            let Some(t) = needle else { return Ok(()) };
+            let t = template::render(t, ctx)?;
+            let hit = if is_rx {
+                regex::Regex::new(&t)
+                    .map_err(|e| format!("step '{}' route regex: {e}", step.id))?
+                    .is_match(hay)
+            } else {
+                hay.contains(&t)
+            };
+            if !hit {
+                matched = false;
+            }
+            Ok(())
+        };
+        check(&r.when_contains, route_text, false)?;
+        check(&r.when_matches, route_text, true)?;
+        check(&r.when_last_line_contains, &last, false)?;
+        check(&r.when_last_line_matches, &last, true)?;
+        if matched {
+            let via = if r.when_contains.is_none()
+                && r.when_matches.is_none()
+                && r.when_last_line_contains.is_none()
+                && r.when_last_line_matches.is_none()
+            {
+                PositionVia::CatchAll
+            } else {
+                PositionVia::Rule
+            };
+            return Ok(Some((r.goto.clone(), via)));
+        }
+    }
+    Ok(None)
+}
+
+fn log_position(f: &mut std::fs::File, after: &str, next: String, via: PositionVia) {
     log_event(
         f,
-        json!({"ts": utc_stamp(), "event": "position", "after": after, "next": next}),
+        json!({
+            "ts": utc_stamp(), "event": "position", "after": after,
+            "next": next, "via": via.as_str(),
+        }),
     );
 }
 
@@ -1915,6 +2255,7 @@ fn log_step_end(
             "visit": visit, "exit": d.exit_code, "timed_out": d.timed_out,
             "interrupted": d.interrupted, "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
             "output_chars": d.chain_output.chars().count(),
+            "output_hash": fingerprint(&d.chain_output),
             "input_tokens": d.usage.input_tokens, "output_tokens": d.usage.output_tokens,
             "cost_usd": d.usage.cost_usd, "tool": d.tool,
             "chain_file": file_name(&d.out_file).map(|n| n.replace(".out.txt", ".chain.txt")),
@@ -1924,12 +2265,20 @@ fn log_step_end(
     );
 }
 
-fn log_aggregate_end(f: &mut std::fs::File, step: &str, visit: u32, gtag: &str, failed: bool) {
+fn log_aggregate_end(
+    f: &mut std::fs::File,
+    step: &str,
+    visit: u32,
+    gtag: &str,
+    failed: bool,
+    plain: &str,
+) {
     log_event(
         f,
         json!({
             "ts": utc_stamp(), "event": "aggregate_end", "step": step, "visit": visit,
             "failed": failed, "exit": if failed { 1 } else { 0 },
+            "output_hash": fingerprint(plain),
             "chain_file": format!("{gtag}.chain.txt"), "out_file": format!("{gtag}.out.txt"),
         }),
     );
@@ -1937,6 +2286,16 @@ fn log_aggregate_end(f: &mut std::fs::File, step: &str, visit: u32, gtag: &str, 
 
 fn file_name(p: &Path) -> Option<String> {
     p.file_name().map(|n| n.to_string_lossy().into_owned())
+}
+
+fn stderr_file_for(out_file: &Path) -> PathBuf {
+    let name = out_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".out.txt"))
+        .map(|n| format!("{n}.err.txt"))
+        .unwrap_or_else(|| "stderr.err.txt".to_string());
+    out_file.with_file_name(name)
 }
 
 fn abs(p: &Path) -> PathBuf {
@@ -2008,6 +2367,16 @@ mod tests {
         assert!(cut.ends_with("VERDICT: OK"), "{cut}");
         assert!(cut.contains("truncated middle"));
         assert_eq!(head_tail("short", 100), "short");
+    }
+
+    #[test]
+    fn failed_output_records_process_facts_without_changing_the_text() {
+        assert_eq!(
+            failed_output("verify[1]", "partial text", 9, false),
+            "[sfh: step 'verify[1]' did not complete (exit=9, timed_out=false).\n \
+             The text below is whatever it produced before failing. It is not a result.]\n\
+             partial text"
+        );
     }
 
     #[test]

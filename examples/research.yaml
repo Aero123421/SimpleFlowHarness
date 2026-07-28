@@ -62,16 +62,19 @@ steps:
 
       最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
     route:
-      # 最終行だけを見るので、本文中で REVISE に言及しても誤爆しない
-      - when_last_line_contains: "VERDICT: REVISE"
-        goto: plan
-      - goto: execute
+      # 最終行の合格だけを通し、読めない判定は差し戻す
+      - when_last_line_contains: "VERDICT: OK"
+        goto: execute
+      - goto: plan
 
   # 3) 実行者: 計画に従って調査を実行し、レポートを書く。
   #    巨大レポートは compact で自動要約してから下流に流す(原文は {{steps.execute.outputs}})。
   - id: execute
     use: worker
     access: full
+    # 上限は入場時に判定される。同じ上限の execute → review_execute ループでは
+    # 毎周先に入場する execute が先に上限へ達するため、降格フックもここに置く。
+    on_max_visits: goto:summarize
     notes: append
     compact:
       when_over: 30000
@@ -101,13 +104,10 @@ steps:
       {{steps.execute.output}}
 
       最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
-    max_visits: 3
-    # 3回差し戻しても収束しなければ、全部捨てずに現状のレポートを要約して返す
-    on_max_visits: goto:summarize
     route:
-      - when_last_line_contains: "VERDICT: REVISE"
-        goto: execute
-      - goto: summarize
+      - when_last_line_contains: "VERDICT: OK"
+        goto: summarize
+      - goto: execute
 
   # 5) 要約: 呼び出し元エージェントに返す短いサマリだけを stdout へ
   - id: summarize

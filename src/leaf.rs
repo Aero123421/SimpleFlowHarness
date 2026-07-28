@@ -836,7 +836,21 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
     let cfg = prep.retry;
     let mut attempt = 0u32;
     loop {
-        let mut done = exec_once(prep.clone());
+        let mut attempt_prep = prep.clone();
+        if attempt > 0 {
+            let number = attempt + 1;
+            attempt_prep.tag = format!("{}.a{number}", prep.tag);
+            attempt_prep.out_file = prep
+                .out_file
+                .with_file_name(format!("{}.a{number}.out.txt", prep.tag));
+            attempt_prep.err_file = prep
+                .err_file
+                .with_file_name(format!("{}.a{number}.err.txt", prep.tag));
+            attempt_prep.chain_file = prep
+                .chain_file
+                .with_file_name(format!("{}.a{number}.chain.txt", prep.tag));
+        }
+        let mut done = exec_once(attempt_prep);
         done.attempts = attempt + 1;
         if done.ok() || done.interrupted || attempt >= cfg.max {
             return done;
