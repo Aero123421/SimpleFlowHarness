@@ -11,6 +11,7 @@ mod watch;
 use std::path::PathBuf;
 
 const EXAMPLE: &str = include_str!("../examples/research.yaml");
+const GUIDE: &str = include_str!("guide.txt");
 
 const HELP: &str = "\
 sfh - SimpleFlowHarness: chain AI CLI agents into staged flows
@@ -23,6 +24,7 @@ USAGE:
   sfh doctor [flow.yaml]                 Check the presets still match the installed CLIs
   sfh validate <flow.yaml> [--var k=v]   Parse and static-check a flow file
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
+  sfh guide                              Show the compact AI-oriented flow guide
   sfh runs list|show|clean [...]         Browse or prune past runs
 
 RUN OPTIONS:
@@ -85,6 +87,7 @@ fn main() {
         Some("doctor") => cmd_doctor(&args[1..]),
         Some("validate") => cmd_validate(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
+        Some("guide") => cmd_guide(&args[1..]),
         Some("runs") => cmd_runs(&args[1..]),
         Some("-V") | Some("--version") | Some("version") => {
             println!("sfh {}", env!("CARGO_PKG_VERSION"));
@@ -353,6 +356,14 @@ fn cmd_init(rest: &[String]) -> i32 {
     }
 }
 
+fn cmd_guide(rest: &[String]) -> i32 {
+    if !rest.is_empty() {
+        return usage_err("usage: sfh guide");
+    }
+    print!("{GUIDE}");
+    0
+}
+
 fn cmd_runs(rest: &[String]) -> i32 {
     let mut runs_dir = PathBuf::from(".sfh").join("runs");
     let mut limit = 20usize;
@@ -408,5 +419,65 @@ fn cmd_runs(rest: &[String]) -> i32 {
         other => usage_err(&format!(
             "unknown runs subcommand '{other}' (list/show/clean)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GUIDE;
+
+    #[test]
+    fn guide_fits_one_screen() {
+        assert!(
+            GUIDE.lines().count() <= 80,
+            "guide is {} lines; maximum is 80",
+            GUIDE.lines().count()
+        );
+    }
+
+    #[test]
+    fn every_guide_yaml_example_validates_and_dry_runs() {
+        for (index, tail) in GUIDE.split("```yaml").skip(1).enumerate() {
+            let yaml = tail
+                .split("```")
+                .next()
+                .expect("guide YAML fence must be closed")
+                .trim();
+            let path =
+                std::env::temp_dir().join(format!("sfh-guide-{}-{index}.yaml", std::process::id()));
+            std::fs::write(&path, yaml).expect("write guide example");
+            let validate_result = crate::engine::validate(&path, &[]);
+            let runs_dir =
+                std::env::temp_dir().join(format!("sfh-guide-{}-{index}-runs", std::process::id()));
+            let run_result = crate::engine::run(crate::engine::RunOpts {
+                flow_path: path.clone(),
+                vars: Vec::new(),
+                emit: None,
+                runs_dir: Some(runs_dir.clone()),
+                dry_run: true,
+                verbose: false,
+                quiet: true,
+                resume: None,
+                resume_latest: false,
+                force_resume: false,
+                no_partial_emit: false,
+                detach: false,
+                run_dir: None,
+            });
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir_all(&runs_dir);
+            assert_eq!(
+                validate_result,
+                0,
+                "guide YAML example {} is invalid",
+                index + 1
+            );
+            assert_eq!(
+                run_result,
+                0,
+                "guide YAML example {} does not dry-run",
+                index + 1
+            );
+        }
     }
 }

@@ -83,6 +83,7 @@ sfh stop [run-dir]                     実行を中止(子AIごと殺す)
 sfh doctor [flow.yaml]                 プリセットが実CLIとまだ噛み合っているか検査
 sfh validate <flow.yaml> [--var k=v]   実行せずに検査
 sfh init [file] [--force]              例のフローファイルを生成
+sfh guide                              AI向けの短いフロー記法ガイド
 sfh runs list|show|clean [...]         過去の実行を一覧/詳細/掃除
 
 run options:
@@ -486,39 +487,24 @@ steps:
 
 ### 終了コードでルーティングする決定論的検証器
 
-POSIXシェル:
+検証器は配列形式の `cmd:` で直接起動し、失敗時だけ `on_error:` で修正役へ送る。修正役は保存済みstderrを `{{steps.test.stderr_file}}` から読むため、シェルを挟まずWindows / macOS / Linuxで同じになる。
 
 ```yaml
   - id: test
-    cmd: ["sh", "-c", "cargo test 2>&1; echo \"EXIT=$?\""]
-    route:
-      - when_last_line_contains: "EXIT=0"
-        goto: accepted
-      - goto: fix
+    cmd: ["cargo", "test"]
+    on_error: goto:fix
   - id: accepted
-    cmd: ["echo", "tests passed"]
+    cmd: ["cargo", "--version"]
     route: [{goto: end}]
   - id: fix
-    cmd: ["echo", "tests failed"]
+    tool: claude
+    prompt: "{{steps.test.stderr_file}} を読んでテストを直してください"
+    route: [{goto: test}]
 ```
 
-Windowsのcmd.exe:
+`sh -c` は複数コマンドをどうしても連結するときだけ使い、Windowsでは別途Git Bashが必要になる。
 
-```yaml
-  - id: test
-    cmd: ["cmd", "/D", "/S", "/C", "cargo test 2>&1 & call echo EXIT=%^errorlevel%"]
-    route:
-      - when_last_line_contains: "EXIT=0"
-        goto: accepted
-      - goto: fix
-  - id: accepted
-    cmd: ["echo", "tests passed"]
-    route: [{goto: end}]
-  - id: fix
-    cmd: ["echo", "tests failed"]
-```
-
-末尾の `echo` 自体が成功するので、このステップのプロセス終了は0になり、テスト結果を通常の `route:` だけで扱える。cmd.exeでは行全体の解析時に `%errorlevel%` が先に展開されるため、素の `echo %errorlevel%` では直前コマンドの値にならない。`call echo %^errorlevel%` で二段目の展開を使う。
+`EXIT=$?` を最終行へ出す手法は、`stderr_file` が無かった時代の回避策としてのみ残る。
 
 ### 改竄トリップワイヤ
 
@@ -704,8 +690,8 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 ## 開発
 
 ```bash
-cargo test                              # 65本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト106本
+cargo test                              # 72本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト125本
 ```
 
 CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。

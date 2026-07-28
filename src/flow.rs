@@ -193,6 +193,8 @@ pub struct Route {
     /// Same as when_contains but only the LAST non-empty line is searched -
     /// the deterministic way to read a "VERDICT: OK" trailer.
     pub when_last_line_contains: Option<String>,
+    /// Exact match against the trimmed last non-empty line.
+    pub when_last_line_is: Option<String>,
     pub when_last_line_matches: Option<String>,
     /// Step id, or "end" (finish flow, success) or "fail" (finish flow, failure).
     pub goto: String,
@@ -527,8 +529,72 @@ fn validate(flow: &Flow) -> Result<(), String> {
                 }
             }
         }
+        for left in 0..s.route.len() {
+            let Some(a) = &s.route[left].when_last_line_contains else {
+                continue;
+            };
+            for right in left + 1..s.route.len() {
+                let Some(b) = &s.route[right].when_last_line_contains else {
+                    continue;
+                };
+                if !a.contains(b) && !b.contains(a) {
+                    continue;
+                }
+                return Err(format!(
+                    "step '{}' route[{left}] and route[{right}]: when_last_line_contains phrases {a:?} and {b:?} overlap (one is a substring of the other), so rule order can silently select the wrong branch. Use when_last_line_is for exact verdicts, or choose non-overlapping phrases",
+                    s.id
+                ));
+            }
+        }
+    }
+    for warning in branch_fallthrough_warnings(flow) {
+        eprintln!("sfh: warning: {warning}");
     }
     Ok(())
+}
+
+fn branch_fallthrough_warnings(flow: &Flow) -> Vec<String> {
+    let indices: std::collections::HashMap<&str, usize> = flow
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| (step.id.as_str(), index))
+        .collect();
+    let mut warnings = Vec::new();
+
+    for source in &flow.steps {
+        let mut targets: Vec<usize> = source
+            .route
+            .iter()
+            .filter_map(|route| indices.get(route.goto.as_str()).copied())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.len() < 2
+            || !targets
+                .windows(2)
+                .all(|pair| pair[1] == pair[0].saturating_add(1))
+        {
+            continue;
+        }
+
+        for pair in targets.windows(2) {
+            let branch = &flow.steps[pair[0]];
+            let next = &flow.steps[pair[1]];
+            let has_error_goto = branch
+                .on_error
+                .as_deref()
+                .is_some_and(|action| action.starts_with("goto:"));
+            if branch.route.is_empty() && !has_error_goto {
+                warnings.push(format!(
+                    "step '{}' is a consecutive branch destination of step '{}' but has neither route: nor on_error: goto:, so successful execution falls through to step '{}'. Add an explicit route (for example route: [{{goto: end}}]) if this branch should terminate",
+                    branch.id, source.id, next.id
+                ));
+            }
+        }
+    }
+
+    warnings
 }
 
 fn check_retry_on(ctx: &str, v: &str) -> Result<(), String> {
@@ -650,6 +716,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         if c.trim().is_empty() {
             return Err(format!("step '{sid}': cmd string is empty"));
         }
+        validate_shell_portability(sid, c)?;
     }
     if s.cmd.is_some() && !s.fallback.is_empty() {
         return Err(format!(
@@ -723,6 +790,91 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
         }
     }
     group_common(s)
+}
+
+fn validate_shell_portability(step_id: &str, command: &str) -> Result<(), String> {
+    let Some((syntax, shell, reason)) = shell_portability_issue(command) else {
+        return Ok(());
+    };
+    let explicit = if shell == "sh" {
+        r#"cmd: ["sh", "-c", "..."]"#
+    } else {
+        r#"cmd: ["cmd", "/C", "..."]"#
+    };
+    Err(format!(
+        "step '{step_id}': `{syntax}` {reason}, so this string-form cmd has different meanings on Windows and Unix. Pin the shell with array form:\n  {explicit}\nOr avoid a shell (recommended):\n  cmd: [\"cargo\", \"test\"]"
+    ))
+}
+
+fn shell_portability_issue(command: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let bytes = command.as_bytes();
+    let mut quote = None;
+    let mut semicolon = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if quote != Some(Quote::Double) => {
+                quote = if quote == Some(Quote::Single) {
+                    None
+                } else {
+                    Some(Quote::Single)
+                };
+            }
+            b'"' if quote != Some(Quote::Single) => {
+                quote = if quote == Some(Quote::Double) {
+                    None
+                } else {
+                    Some(Quote::Double)
+                };
+            }
+            b'$' if quote != Some(Quote::Single) && index + 1 < bytes.len() => {
+                let issue = match bytes[index + 1] {
+                    b'?' => Some(("$?", "sh", "is sh-only exit-status syntax")),
+                    b'(' => Some(("$(", "sh", "starts sh-only command substitution")),
+                    b'{' => Some(("${", "sh", "starts sh-only parameter expansion")),
+                    _ => None,
+                };
+                if issue.is_some() {
+                    return issue;
+                }
+            }
+            b'`' if quote != Some(Quote::Single) => {
+                return Some(("`", "sh", "starts sh-only command substitution"));
+            }
+            b';' if quote.is_none() => semicolon = true,
+            b'^' if quote != Some(Quote::Double) => {
+                return Some(("^", "cmd", "is cmd.exe escape syntax"));
+            }
+            b'%' => {
+                let rest = &bytes[index + 1..];
+                if let Some(end) = rest.iter().position(|byte| *byte == b'%') {
+                    let name = &rest[..end];
+                    if !name.is_empty()
+                        && (name[0].is_ascii_alphabetic() || name[0] == b'_')
+                        && name[1..]
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        return Some(("%NAME%", "cmd", "is cmd.exe-only variable syntax"));
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    if semicolon && quote.is_none() {
+        Some((";", "sh", "is a command separator in sh but not in cmd.exe"))
+    } else {
+        None
+    }
 }
 
 fn group_common(s: &Step) -> Result<(), String> {
@@ -825,5 +977,72 @@ mod tests {
                 .unwrap_err()
                 .contains("retry_on")
         );
+    }
+
+    #[test]
+    fn rejects_platform_specific_string_shell_syntax() {
+        for (command, marker) in [
+            ("echo $?", "$?"),
+            ("echo $(date)", "$("),
+            ("echo ${NAME}", "${"),
+            ("echo `date`", "`"),
+            ("echo first; echo second", ";"),
+            ("echo %NAME%", "%NAME%"),
+            ("echo one^&two", "^"),
+        ] {
+            let yaml = format!("steps:\n  - id: check\n    cmd: {command:?}\n");
+            let error = parse(&yaml).unwrap_err();
+            assert!(error.contains(marker), "{command:?}: {error}");
+            assert!(error.contains("array form"), "{command:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn accepts_portable_operators_and_quoted_semicolons() {
+        for command in [
+            "echo one && echo two || echo three",
+            "echo one | echo two > output.txt 2>&1",
+            "echo \"a;b\" && echo 'c;d'",
+            "echo \"a^b\"",
+            "echo '$? `${NAME}'",
+            "echo \"unterminated; ambiguous",
+        ] {
+            let yaml = format!("steps:\n  - id: check\n    cmd: {command:?}\n");
+            assert!(parse(&yaml).is_ok(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn argv_form_may_explicitly_select_a_shell() {
+        assert!(parse(
+            "steps:\n  - id: check\n    cmd: [\"sh\", \"-c\", \"echo $?; echo ${NAME}\"]\n"
+        )
+        .is_ok());
+        assert!(parse(
+            "steps:\n  - id: check\n    cmd: [\"cmd\", \"/C\", \"echo %NAME% ^& more\"]\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_overlapping_last_line_contains_phrases() {
+        let error = parse(
+            "steps:\n  - id: choose\n    cmd: echo verdict\n    route:\n      - when_last_line_contains: ACHIEVED\n        goto: end\n      - when_last_line_contains: NOT-ACHIEVED\n        goto: fail\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("substring"), "{error}");
+        assert!(error.contains("when_last_line_is"), "{error}");
+    }
+
+    #[test]
+    fn identifies_unterminated_consecutive_branches() {
+        let flow: Flow = yaml::from_str(
+            "steps:\n  - id: choose\n    cmd: echo verdict\n    route:\n      - {when_last_line_is: MET, goto: met}\n      - {when_last_line_is: UNMET, goto: unmet}\n      - {when_last_line_is: UNCLEAR, goto: unclear}\n  - id: met\n    cmd: echo met\n  - id: unmet\n    cmd: echo unmet\n    route: [{goto: end}]\n  - id: unclear\n    cmd: echo unclear\n",
+        )
+        .unwrap();
+        let warnings = branch_fallthrough_warnings(&flow);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("step 'met'"), "{warnings:?}");
+        assert!(warnings[0].contains("step 'unmet'"), "{warnings:?}");
     }
 }

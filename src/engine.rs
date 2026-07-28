@@ -163,6 +163,7 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
                 &r.when_contains,
                 &r.when_matches,
                 &r.when_last_line_contains,
+                &r.when_last_line_is,
                 &r.when_last_line_matches,
             ]
             .into_iter()
@@ -2139,6 +2140,9 @@ fn dry_run(
             if let Some(c) = &r.when_last_line_contains {
                 cond.push(format!("last line contains {c:?}"));
             }
+            if let Some(c) = &r.when_last_line_is {
+                cond.push(format!("last line is {c:?}"));
+            }
             if let Some(c) = &r.when_last_line_matches {
                 cond.push(format!("last line matches {c:?}"));
             }
@@ -2210,9 +2214,17 @@ fn evaluate_route(
         check(&r.when_last_line_contains, &last, false)?;
         check(&r.when_last_line_matches, &last, true)?;
         if matched {
+            if let Some(t) = &r.when_last_line_is {
+                if last != template::render(t, ctx)? {
+                    matched = false;
+                }
+            }
+        }
+        if matched {
             let via = if r.when_contains.is_none()
                 && r.when_matches.is_none()
                 && r.when_last_line_contains.is_none()
+                && r.when_last_line_is.is_none()
                 && r.when_last_line_matches.is_none()
             {
                 PositionVia::CatchAll
