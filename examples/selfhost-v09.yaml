@@ -29,9 +29,24 @@ defaults:
   max_emit_chars: 20000
 
 steps:
+  # ブランチを作る。既にあれば切り替える。どちらでもなければフローを止める。
+  # シェルを使わずに書いてあるので Windows/macOS/Linux で同じ挙動になる。
   - id: prep
     cmd: ["git", "switch", "-c", "{{vars.branch}}"]
-    on_error: continue
+    on_error: goto:prep_existing
+    route: [{ goto: prep_verify }]
+
+  - id: prep_existing
+    cmd: ["git", "switch", "{{vars.branch}}"]
+    route: [{ goto: prep_verify }]
+
+  # main の上で codex を走らせる事故を防ぐ確認。合格だけを通す(fail-closed)。
+  - id: prep_verify
+    cmd: ["git", "branch", "--show-current"]
+    route:
+      - when_last_line_contains: "{{vars.branch}}"
+        goto: e_impl
+      - goto: fail
 
   # ---------------------------------------------------------------- batch E
   - id: e_impl
