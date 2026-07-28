@@ -1092,6 +1092,62 @@ else
   bad "F-2: after a successful lap plus route-back, members ran k1=$v1 k2=$v2, expected 1 1 (the new lap was skipped)"
 fi
 
+# -------------------------------------------------------- 19. fifth round
+sec "19. cases the fifth review round found missing"
+
+# The last F-2 shape: the fan-out FAILS, on_error: continue lets the flow keep
+# going, and a route sends it deliberately back into the same group - then the
+# process dies before the new lap starts. "Last lap failed" is true here, but
+# the flow explicitly asked for another lap, so nothing may be carried over.
+# This is the case that "failed aggregate + resume-at" could not see.
+mkdir -p c19 && (
+cd c19 || exit
+cat > flow.yaml <<'YAML'
+name: failloop
+steps:
+  - id: fan
+    max_parallel: 2
+    max_visits: 4
+    on_error: continue
+    parallel:
+      - id: w1
+        cmd: ["sh", "-c", "echo w1 >> ../tally19.txt; echo o1"]
+      - id: w2
+        cmd: ["sh", "-c", "echo w2 >> ../tally19.txt; exit 7"]
+    route: [{goto: done19}]
+  - id: done19
+    cmd: ["echo", "loop-over"]
+YAML
+mkdir -p run
+printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":"failloop","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' > run/meta.json
+# w1 succeeded, w2 failed, the group closed as failed - and then a position
+# event routed straight back INTO fan. The process died there.
+{
+  printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
+  printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}\n'
+  printf '{"ts":"20250101-000002","event":"step_end","step":"w1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"w1.chain.txt","out_file":"w1.out.txt","cmd":"echo o1","session":null}\n'
+  printf '{"ts":"20250101-000003","event":"step_end","step":"w2","parent":"fan","visit":1,"exit":7,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":0,"output_hash":"x","chain_file":"w2.chain.txt","out_file":"w2.out.txt","cmd":"exit 7","session":null}\n'
+  printf '{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"exit":1,"failed":true,"out_file":"fan.out.txt","plain_file":"fan.plain.txt","output_hash":"x"}\n'
+  printf '{"ts":"20250101-000005","event":"position","after":"fan","next":"fan","via":"rule"}\n'
+} > run/log.jsonl
+for n in w1 w2 fan; do echo "o-$n" > "run/$n.chain.txt"; echo "o-$n" > "run/$n.out.txt"; done
+echo "o-fan" > run/fan.plain.txt
+"$SFH" run flow.yaml --resume run --force-resume -q > ../c19.out 2> ../c19.err
+printf '%s %s\n' \
+  "$(if [ -f ../tally19.txt ]; then grep -c '^w1$' ../tally19.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally19.txt ]; then grep -c '^w2$' ../tally19.txt | head -1; else echo 0; fi)" \
+  > ../c19.verdict
+)
+w1c=""; w2c=""
+[ -f c19.verdict ] && read -r w1c w2c < c19.verdict
+# The route asked for a fresh lap: BOTH members run, including the one that
+# succeeded last time.
+if [ "${w1c:-0}" -ge 1 ] 2>/dev/null && [ "${w2c:-0}" -ge 1 ] 2>/dev/null; then
+  ok "F-2: an explicit route back into a FAILED fan-out still runs every member"
+else
+  bad "F-2: after a failed lap plus an explicit route-back, members ran w1=$w1c w2=$w2c, expected both to run"
+fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"

@@ -367,8 +367,19 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
     let mut st = ResumeState::default();
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
-    // group id -> (visit of its most recent aggregate_end, whether it failed).
-    let mut last_aggregate: HashMap<String, (u32, bool)> = HashMap::new();
+    // Groups whose finished members a resume should carry into the next visit,
+    // and the visit to carry them FROM. Populated when a fan-out's lap ends in
+    // failure, and removed the moment the log shows the run did something else
+    // with that group afterwards - routed back into it, or opened a new lap.
+    //
+    // Read from the log in order rather than reconstructed at the end. Four
+    // attempts at inferring this from the finished state (highest visit with
+    // members, whether a visit was left open, whether the last lap failed) each
+    // leaked a different case, because "the run stopped here" and "the flow
+    // deliberately came back here" look identical once the log is a set of
+    // facts. In sequence they do not: one is a failed aggregate_end with
+    // nothing after it, the other has a position or a group_start after it.
+    let mut carry_from: HashMap<String, u32> = HashMap::new();
     for line in log.lines() {
         // A malformed line is skipped, not a hard error: the log is append-only
         // and the last line is routinely torn when sfh is killed mid-write, so
@@ -448,6 +459,9 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             // like an unfinished leaf; aggregate_end clears it.
             "group_start" | "foreach_start" => {
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                // A new lap opened, so whatever the previous one left behind is
+                // not something to carry into it.
+                carry_from.remove(&step);
                 let (kind, members) = if ev == "group_start" {
                     ("parallel", "children")
                 } else {
@@ -546,7 +560,11 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 // times in three review rounds. The question is simply "did the
                 // last aggregate_end for this group say failed", so record that.
                 if ev == "aggregate_end" && !is_child {
-                    last_aggregate.insert(step.clone(), (visit, failed_raw != Some(false)));
+                    if failed_raw == Some(false) {
+                        carry_from.remove(&step);
+                    } else {
+                        carry_from.insert(step.clone(), visit);
+                    }
                 }
                 let ok = exit_raw == Some(0)
                     && absent_or_false("timed_out", timed_out_raw)
@@ -735,6 +753,10 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     st.start = None;
                 } else {
                     st.completed = false;
+                    // Routing INTO a fan-out is the flow asking for a fresh lap
+                    // of it, however the previous lap ended. The run did not
+                    // simply stop at a failure, so there is nothing to carry.
+                    carry_from.remove(next);
                     st.start = Some(next.to_string());
                 }
             }
@@ -774,17 +796,15 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
     //     and its carried members are in the log as member_restored, so the
     //     third attempt carries from visit 2, not visit 1.
     if let Some(resume_at) = st.start.clone() {
-        if let Some(&(visit, failed)) = last_aggregate.get(&resume_at) {
-            if failed {
-                if let Some(set) = st
-                    .completed_members
-                    .get(&(resume_at.clone(), visit))
-                    .cloned()
-                {
-                    st.completed_members
-                        .entry((resume_at, visit + 1))
-                        .or_insert(set);
-                }
+        if let Some(&visit) = carry_from.get(&resume_at) {
+            if let Some(set) = st
+                .completed_members
+                .get(&(resume_at.clone(), visit))
+                .cloned()
+            {
+                st.completed_members
+                    .entry((resume_at, visit + 1))
+                    .or_insert(set);
             }
         }
     }
