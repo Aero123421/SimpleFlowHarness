@@ -271,6 +271,11 @@ struct PendingRoute {
     step: String,
     visit: u32,
     route_text: String,
+    /// True when route_text came from a fan-out's headerless plain output.
+    /// Compaction rewrites the chain file but never changes what live routing
+    /// matched against, so a plain-sourced route must NOT be patched from the
+    /// precompact file the way a leaf's chain-sourced route is.
+    from_plain: bool,
 }
 
 #[derive(Clone)]
@@ -317,6 +322,17 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             // is already right. `outputs` has to be walked back to what was
             // summarized, or a resumed run sees strictly less than a live one.
             "compact_end" | "compact_failed" => {
+                // A live run counts the summarizer as one more leaf run and
+                // adds its cost the moment compact starts; a resume that drops
+                // both under-reports steps_done and cost, which can push a
+                // resumed run past max_total_steps / max_cost_usd that the
+                // live run would have honoured.
+                st.total += 1;
+                if ev == "compact_end" {
+                    if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
+                        st.cost_usd += c;
+                    }
+                }
                 // A path that escapes the run dir fails the resume outright;
                 // only a genuinely absent file reads as None (S1-4).
                 let precompact = match v.get("precompact_file").and_then(|x| x.as_str()) {
@@ -327,9 +343,11 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     e.outputs = p.trim_end().to_string();
                 }
                 if let (Some(pending), Some(p)) = (st.pending_route.as_mut(), precompact) {
-                    if pending.step == step {
+                    if pending.step == step && !pending.from_plain {
                         // Live routing uses the pre-compact text, even though
                         // the chain file now contains the summary/head+tail.
+                        // A fan-out's route text is its headerless plain
+                        // output, which compaction never touches.
                         pending.route_text = p.trim_end().to_string();
                     }
                 }
@@ -353,6 +371,35 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     },
                 );
             }
+            // A fan-out logs NO step_start (its members do), so without these
+            // events a crash mid-fan-out - before aggregate_end - leaves no
+            // record of where the run was. A flow whose FIRST step is a fan-out
+            // then has nothing to resume from at all. Track the group exactly
+            // like an unfinished leaf; aggregate_end clears it.
+            "group_start" | "foreach_start" => {
+                let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                let (kind, members) = if ev == "group_start" {
+                    ("parallel", "children")
+                } else {
+                    ("foreach", "items")
+                };
+                let n = v
+                    .get(members)
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                unfinished.insert(
+                    (step.clone(), visit),
+                    UnfinishedStep {
+                        started: v
+                            .get("ts")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        cmd: format!("{kind} fan-out ({n} members)"),
+                        step,
+                    },
+                );
+            }
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
                     st.total += 1;
@@ -362,9 +409,11 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 }
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
                 let is_child = v.get("parent").is_some_and(|p| !p.is_null());
-                if ev == "step_end" {
-                    unfinished.remove(&(step.clone(), visit));
-                }
+                // step_end clears an unfinished leaf; aggregate_end clears the
+                // fan-out group opened by group_start/foreach_start. A child's
+                // step_end is keyed by the CHILD id, so it cannot clear its
+                // parent group's entry.
+                unfinished.remove(&(step.clone(), visit));
                 if !is_child {
                     let e = st.visits.entry(step.clone()).or_insert(0);
                     *e = (*e).max(visit);
@@ -388,6 +437,15 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 let chain = match v.get("chain_file").and_then(|x| x.as_str()) {
                     Some(p) => contain::read_contained_opt(run_dir, p)?.unwrap_or_default(),
                     None => String::new(),
+                };
+                // Fan-out steps route against the headerless plain
+                // concatenation, NOT the labeled aggregate the chain file
+                // holds: live routing matches `plain`, so a resume that
+                // re-reads the chain would test conditions against "--- id ---"
+                // headers and could pick a different branch.
+                let plain = match v.get("plain_file").and_then(|x| x.as_str()) {
+                    Some(p) => contain::read_contained_opt(run_dir, p)?,
+                    None => None,
                 };
                 let exit = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
                 let timed_out = v
@@ -440,11 +498,27 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     if ok {
                         st.last_success = Some(step.clone());
                     }
-                    st.pending_route = (ev == "step_end" && ok).then(|| PendingRoute {
-                        step: step.clone(),
-                        visit,
-                        route_text: chain.trim_end().to_string(),
-                    });
+                    st.pending_route = if ev == "step_end" && ok {
+                        Some(PendingRoute {
+                            step: step.clone(),
+                            visit,
+                            route_text: chain.trim_end().to_string(),
+                            from_plain: false,
+                        })
+                    } else if ev == "aggregate_end" && ok {
+                        // Runs written before plain_file existed have no
+                        // headerless copy: leave the route unset (as before)
+                        // so the fan-out re-runs rather than routing on
+                        // headered text live never matched against.
+                        plain.map(|p| PendingRoute {
+                            step: step.clone(),
+                            visit,
+                            route_text: p.trim_end().to_string(),
+                            from_plain: true,
+                        })
+                    } else {
+                        None
+                    };
                 }
                 if ok {
                     if let Some(s) = v.get("session") {
@@ -611,7 +685,7 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
         eprintln!(
             "sfh: detached (pid {}). poll with: sfh status {}",
             d.pid,
-            run_dir.display()
+            execute::shell_quote(&run_dir.display().to_string())
         );
     }
     // stdout gets the run dir and nothing else, so a caller can capture it.
@@ -814,10 +888,6 @@ fn write_status(path: &Path, s: &Status) {
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let flow = flow::load(&opts.flow_path)?;
     let mut vars = flow.vars_string_map()?;
-    for (k, v) in &opts.vars {
-        vars.insert(k.clone(), v.clone());
-    }
-    precheck(&flow, &vars)?;
     let step_ids = flow.step_ids();
     if let Some(e) = &opts.emit {
         if !step_ids.contains(e) {
@@ -832,11 +902,47 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .runs_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
-    protect_runs_root(&runs_root)?;
     // Same rule `sfh validate` enforces through flow::validate: only characters
     // that would affect the run dir PATH are forbidden (R-6).
     let name = flow.name.clone().unwrap_or_else(|| "flow".into());
     flow::validate_name(&name)?;
+
+    // Resolve the resume target BEFORE the precheck and before anything
+    // touches the runs root. A resumed run must see the variable values its
+    // original attempt recorded in meta.json - without them, completed steps
+    // ran under the old overrides while routing/foreach/prompts after the
+    // resume render with defaults, a mixed execution. And an explicit
+    // --resume of a dir elsewhere must not fail because the DEFAULT runs
+    // root cannot be created here: a read-only checkout resuming a run dir
+    // on writable storage is a legitimate use, and protecting a runs root
+    // the resumed run will never write to is unrelated to its safety.
+    let resume_dir: Option<PathBuf> = if opts.dry_run {
+        None
+    } else {
+        resume_target(opts, &runs_root)?.map(|d| abs(&d))
+    };
+    if let Some(dir) = &resume_dir {
+        let meta: serde_json::Value = std::fs::read_to_string(dir.join("meta.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(json!({}));
+        if !opts.force_resume {
+            check_flow_fingerprint(&meta, &flow_text, dir, &opts.flow_path)?;
+        }
+        // Recorded vars override the flow's defaults; an explicit --var on
+        // THIS command overrides both (applied after this block).
+        if let Some(obj) = meta.get("vars").and_then(|x| x.as_object()) {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    vars.insert(k.clone(), s.to_string());
+                }
+            }
+        }
+    }
+    for (k, v) in &opts.vars {
+        vars.insert(k.clone(), v.clone());
+    }
+    precheck(&flow, &vars)?;
 
     // Which steps must produce resumable sessions (continue_from targets).
     let mut needed_sessions: HashSet<String> = HashSet::new();
@@ -861,19 +967,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let run_dir: PathBuf;
     let mut is_resume = false;
     if opts.dry_run {
+        protect_runs_root(&runs_root)?;
         let base = format!("{}-{}-dryrun", utc_stamp(), name);
         run_dir = abs(&runs_root.join(base));
         contain::mkdir_private(&run_dir)
             .map_err(|e| format!("cannot create run dir {}: {e}", run_dir.display()))?;
-    } else if let Some(dir) = resume_target(opts, &runs_root)? {
-        let dir = abs(&dir);
-        let meta: serde_json::Value = std::fs::read_to_string(dir.join("meta.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or(json!({}));
-        if !opts.force_resume {
-            check_flow_fingerprint(&meta, &flow_text, &dir, &opts.flow_path)?;
-        }
+    } else if let Some(dir) = resume_dir {
+        // The resumed dir was protected when it was first created; nothing
+        // here writes to the runs root, so its state is not this run's
+        // concern (and the root may be absent or read-only by design).
         resumed = load_resume(&dir)?;
         if resumed.completed {
             return Err(format!(
@@ -903,6 +1005,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = d;
     } else {
+        protect_runs_root(&runs_root)?;
         let base = format!("{}-{}", utc_stamp(), name);
         let mut d = runs_root.join(&base);
         let mut n = 1;
@@ -1449,8 +1552,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 }
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
+                // The headerless routing text, kept separately: the chain file
+                // holds the labeled aggregate, and a resume must route against
+                // exactly what this live run routed against (see load_resume).
+                let plain_name = format!("{gtag}.plain.txt");
+                let _ = contain::write_private(&run_dir.join(&plain_name), &plain);
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain, &plain_name);
                 (agg, plain, hard_fail)
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
@@ -1573,8 +1681,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let hard_fail = any_fail && step.on_error.as_deref() != Some("continue");
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
+                let plain_name = format!("{gtag}.plain.txt");
+                let _ = contain::write_private(&run_dir.join(&plain_name), &plain);
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
+                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain, &plain_name);
                 (agg, plain, hard_fail)
             } else {
                 if total + 1 > max_total {
@@ -1948,10 +2058,21 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
             finish("failed", cost_usd, 1, pick.as_deref(), Some(&msg));
             eprintln!("sfh: run dir: {}", run_dir.display());
+            // Paths are quoted (flow names may carry spaces since R-6, and so
+            // may the runs dir) and this attempt's --var overrides are
+            // repeated, so the printed command works when pasted back even on
+            // a resume that predates meta.json var restoration.
+            let mut var_args = String::new();
+            for (k, v) in &opts.vars {
+                var_args.push_str(&format!(
+                    " --var {}",
+                    execute::shell_quote(&format!("{k}={v}"))
+                ));
+            }
             eprintln!(
-                "sfh: resume with: sfh run {} --resume {}",
-                opts.flow_path.display(),
-                run_dir.display()
+                "sfh: resume with: sfh run {}{var_args} --resume {}",
+                execute::shell_quote(&opts.flow_path.display().to_string()),
+                execute::shell_quote(&run_dir.display().to_string())
             );
             Ok(1)
         }
@@ -2470,6 +2591,7 @@ fn log_aggregate_end(
     gtag: &str,
     failed: bool,
     plain: &str,
+    plain_file: &str,
 ) {
     log_event(
         f,
@@ -2478,6 +2600,7 @@ fn log_aggregate_end(
             "failed": failed, "exit": if failed { 1 } else { 0 },
             "output_hash": fingerprint(plain),
             "chain_file": format!("{gtag}.chain.txt"), "out_file": format!("{gtag}.out.txt"),
+            "plain_file": plain_file,
         }),
     );
 }

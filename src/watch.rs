@@ -167,6 +167,16 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
     })
 }
 
+/// The flow path for a command hint: a placeholder when unknown, otherwise
+/// quoted so a name with spaces (allowed since R-6) pastes back as one arg.
+fn flow_arg(flow: &str) -> String {
+    if flow.is_empty() {
+        "<flow.yaml>".to_string()
+    } else {
+        execute::shell_quote(flow)
+    }
+}
+
 /// Resolve an explicit run dir, or the newest run under `root`.
 pub fn resolve(target: Option<&Path>, root: &Path) -> Result<PathBuf, String> {
     match target {
@@ -236,15 +246,14 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
             "sfh: still running (pid {}); `sfh wait` blocks until it finishes",
             snap.pid
         ),
-        "done" => eprintln!("sfh: result: sfh wait {}", snap.dir.display()),
+        "done" => eprintln!(
+            "sfh: result: sfh wait {}",
+            execute::shell_quote(&snap.dir.display().to_string())
+        ),
         "stopped" | "dead" => eprintln!(
             "sfh: this run was killed before it finished. resume with: sfh run {} --resume {}",
-            if snap.flow.is_empty() {
-                "<flow.yaml>"
-            } else {
-                &snap.flow
-            },
-            snap.dir.display()
+            flow_arg(&snap.flow),
+            execute::shell_quote(&snap.dir.display().to_string())
         ),
         _ => {}
     }
@@ -268,13 +277,28 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
             return 2;
         }
     };
-    if snap.terminal() {
+    // A stale heartbeat resolves the state to "dead", but when the pid is
+    // still alive that is exactly the wedged process - or one that just came
+    // back from suspend - that most needs stopping. "Already dead" would leave
+    // nothing but a manual kill. A genuinely gone pid stays terminal. The
+    // ownership verification below still runs, so a reused pid is not killed
+    // on this path either.
+    let alive = execute::pid_alive(snap.pid);
+    if snap.terminal() && !(snap.state == "dead" && alive) {
         eprintln!(
             "sfh: nothing to stop - this run is already '{}'. run dir: {}",
             snap.state,
             dir.display()
         );
         return 0;
+    }
+    if snap.state == "dead" && alive {
+        eprintln!(
+            "sfh: {} reads as dead ({}) but process {} is still alive; verifying ownership before stopping it",
+            dir.display(),
+            snap.reason.as_deref().unwrap_or("no heartbeat"),
+            snap.pid
+        );
     }
     if !verify_run_ownership(&dir, &snap) {
         return 1;
@@ -283,7 +307,7 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
         eprintln!(
             "sfh: could not kill process {} (already gone?); check: sfh status {}",
             snap.pid,
-            dir.display()
+            execute::shell_quote(&dir.display().to_string())
         );
         return 1;
     }

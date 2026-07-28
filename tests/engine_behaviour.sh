@@ -30,6 +30,20 @@ contains() { # contains <name> <needle> <file>
     fail=$((fail + 1))
   fi
 }
+# Real (native) symlink support. msys' default ln -s writes a copy or a marker
+# file a native Windows binary does not follow, which would test nothing; force
+# native-or-fail so the symlink attacks are only run where they can exist.
+have_symlinks() {
+  rm -f "$WORK/.sym-probe"
+  MSYS=winsymlinks:nativestrict ln -s /nonexistent-sfh-target "$WORK/.sym-probe" 2>/dev/null || return 1
+  [ -L "$WORK/.sym-probe" ]
+}
+# The Windows pid of a background job. msys' bash reports its OWN internal pid
+# in $!, which a native Windows binary (sfh) cannot see; the real one is in
+# /proc/<pid>/winpid. On real Unix the pid is already the OS pid.
+winpid_of() {
+  cat "/proc/$1/winpid" 2>/dev/null || echo "$1"
+}
 
 # --- built-in AI guide -------------------------------------------------------
 "$SFH" guide > guide.out 2> guide.err
@@ -846,12 +860,14 @@ fi
 contains "S1-1: the refusal is reported" "refused to emit" s11.err
 
 # S1-1 symlink: a symlink at the fixed name detached.out.txt pointing outside
-# the run dir must be refused the same way.
-mkdir -p s11-sym-run
-echo "TOP-SECRET-S11-SYM" > s11-sym-secret.txt
-ln -sf "$(pwd)/s11-sym-secret.txt" s11-sym-run/detached.out.txt 2>/dev/null \
-  || cp s11-sym-secret.txt s11-sym-run/detached.out.txt
-cat > s11-sym-run/status.json <<JSON
+# the run dir must be refused the same way. Needs real symlinks: where the
+# filesystem cannot create them (Windows without developer mode) an attacker
+# cannot plant them either, so the check is skipped there.
+if have_symlinks; then
+  mkdir -p s11-sym-run
+  echo "TOP-SECRET-S11-SYM" > s11-sym-secret.txt
+  MSYS=winsymlinks:nativestrict ln -sf "$(pwd)/s11-sym-secret.txt" s11-sym-run/detached.out.txt
+  cat > s11-sym-run/status.json <<JSON
 {
   "state": "done",
   "current_step": "x",
@@ -871,29 +887,39 @@ cat > s11-sym-run/status.json <<JSON
   "nonce": "deadbeef"
 }
 JSON
-"$SFH" wait s11-sym-run > s11-sym.out 2>s11-sym.err
-s11s_rc=$?
-if grep -qF "TOP-SECRET-S11-SYM" s11-sym.out; then
-  echo "FAIL - S1-1: sfh wait followed an outward symlink in detached.out.txt"
-  fail=$((fail + 1))
+  "$SFH" wait s11-sym-run > s11-sym.out 2>s11-sym.err
+  s11s_rc=$?
+  if grep -qF "TOP-SECRET-S11-SYM" s11-sym.out; then
+    echo "FAIL - S1-1: sfh wait followed an outward symlink in detached.out.txt"
+    fail=$((fail + 1))
+  else
+    echo "ok   - S1-1: sfh wait refuses an outward symlink at detached.out.txt"
+    pass=$((pass + 1))
+  fi
+  if [ "$s11s_rc" -ne 0 ]; then
+    echo "ok   - S1-1: symlink violation exits non-zero"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - S1-1: symlink violation exited 0"
+    fail=$((fail + 1))
+  fi
 else
-  echo "ok   - S1-1: sfh wait refuses an outward symlink at detached.out.txt"
+  echo "ok   - S1-1: outward symlink at detached.out.txt (skipped: no native symlink support)"
   pass=$((pass + 1))
-fi
-if [ "$s11s_rc" -ne 0 ]; then
-  echo "ok   - S1-1: symlink violation exits non-zero"
+  echo "ok   - S1-1: symlink violation exit code (skipped: no native symlink support)"
   pass=$((pass + 1))
-else
-  echo "FAIL - S1-1: symlink violation exited 0"
-  fail=$((fail + 1))
 fi
 
 # --- S1-2: sfh stop must not kill unrelated processes -------------------------
-# A fake run dir (no sfh-nonce file) must not result in a kill. Depending on
-# whether the OS reports the fake pid as alive, sfh either refuses (nonce
-# mismatch) or reports the run as already dead - both are safe.
+# A forged status.json naming a LIVE unrelated process must not result in a
+# kill. The victim is a process this test spawned, so "is it still alive?" is
+# answered the same way on every OS (kill -0), unlike pid 1, which Windows
+# cannot signal and would report dead no matter what sfh did.
+sleep 30 &
+S12_VICTIM=$!
+S12_WINPID="$(winpid_of "$S12_VICTIM")"
 mkdir -p s12-run
-cat > s12-run/status.json <<'JSON'
+cat > s12-run/status.json <<JSON
 {
   "state": "running",
   "current_step": "x",
@@ -903,7 +929,7 @@ cat > s12-run/status.json <<'JSON'
   "cost_usd": 0.0,
   "run_dir": "s12-run",
   "flow": "x.yaml",
-  "pid": 1,
+  "pid": $S12_WINPID,
   "sfh_version": "0.9.0",
   "exit_code": null,
   "emit_step": null,
@@ -921,14 +947,16 @@ else
   echo "ok   - S1-2: sfh stop does not kill from a fake run dir"
   pass=$((pass + 1))
 fi
-# PID 1 (init/launchd/System) must still be alive after the attempt.
-if kill -0 1 2>/dev/null; then
-  echo "ok   - S1-2: pid 1 is still alive after the stop attempt"
+# The unrelated process named in the forged status must still be alive.
+if kill -0 "$S12_VICTIM" 2>/dev/null; then
+  echo "ok   - S1-2: the unrelated process survived the stop attempt"
   pass=$((pass + 1))
 else
-  echo "FAIL - S1-2: pid 1 is gone (sfh killed an unrelated process)"
+  echo "FAIL - S1-2: the unrelated process is gone (sfh killed it)"
   fail=$((fail + 1))
 fi
+kill "$S12_VICTIM" 2>/dev/null
+wait "$S12_VICTIM" 2>/dev/null
 
 # A real detached run with a corrupted nonce must be refused outright.
 cat > s12-long.yaml <<'YAML'
@@ -1413,8 +1441,16 @@ check "R-2: a wrong FNV fingerprint is detected as a flow change" 2 $?
 contains "R-2: the error says different version (not unknown algo)" "different version" r2.err
 
 # --- R-3: a legacy run (no nonce) can be stopped via process ownership --------
+# The run must look LIVE, or status resolves to "dead" and stop returns before
+# the ownership check is ever reached - so the victim is a real process this
+# test spawned (a pid like 99999 is dead on arrival on Windows and proves
+# nothing). The victim is not an sfh process, so the legacy path must warn
+# about the older sfh, then refuse on process ownership.
+sleep 30 &
+R3_VICTIM=$!
+R3_WINPID="$(winpid_of "$R3_VICTIM")"
 mkdir -p r3-run
-cat > r3-run/status.json <<'JSON'
+cat > r3-run/status.json <<JSON
 {
   "state": "running",
   "current_step": "x",
@@ -1424,7 +1460,7 @@ cat > r3-run/status.json <<'JSON'
   "cost_usd": 0.0,
   "run_dir": "r3-run",
   "flow": "x.yaml",
-  "pid": 99999,
+  "pid": $R3_WINPID,
   "sfh_version": "0.8.0",
   "exit_code": null,
   "emit_step": null,
@@ -1437,9 +1473,6 @@ JSON
 echo '{"ts":"20250101-000000","event":"run_start"}' > r3-run/log.jsonl
 "$SFH" stop r3-run > r3.out 2>r3.err
 r3_rc=$?
-# pid 99999 is not sfh (or not alive), so the stop should refuse on process
-# ownership - but it must NOT refuse on "nonce missing". The legacy path is
-# taken (warning about older sfh), then the pid check fails.
 if grep -qF "nonce mismatch" r3.err; then
   echo "FAIL - R-3: a legacy run was refused for missing nonce"
   fail=$((fail + 1))
@@ -1448,18 +1481,41 @@ else
   pass=$((pass + 1))
 fi
 contains "R-3: the legacy warning is printed" "older sfh" r3.err
+if [ "$r3_rc" -ne 0 ]; then
+  echo "ok   - R-3: a legacy run naming a non-sfh process is not stopped"
+  pass=$((pass + 1))
+else
+  echo "FAIL - R-3: sfh stopped a non-sfh process"
+  fail=$((fail + 1))
+fi
+if kill -0 "$R3_VICTIM" 2>/dev/null; then
+  echo "ok   - R-3: the legacy run's process survived"
+  pass=$((pass + 1))
+else
+  echo "FAIL - R-3: the legacy run's process was killed"
+  fail=$((fail + 1))
+fi
+kill "$R3_VICTIM" 2>/dev/null
+wait "$R3_VICTIM" 2>/dev/null
 
-# A legacy run dir WITHOUT log.jsonl is a bare status.json - must be refused.
+# A legacy run dir WITHOUT log.jsonl is a bare status.json - must be refused
+# as unrecognisable even when it names a live process.
+sleep 30 &
+R3B_VICTIM=$!
+R3B_WINPID="$(winpid_of "$R3B_VICTIM")"
 mkdir -p r3-bare
-cp r3-run/status.json r3-bare/status.json
+sed "s/\"pid\": $R3_WINPID/\"pid\": $R3B_WINPID/" r3-run/status.json > r3-bare/status.json
 "$SFH" stop r3-bare > r3-bare.out 2>r3-bare.err
-if [ $? -ne 0 ] && grep -qF "not recognisable" r3-bare.err; then
+r3b_rc=$?
+if [ "$r3b_rc" -ne 0 ] && grep -qF "not recognisable" r3-bare.err; then
   echo "ok   - R-3: a bare status.json (no log, no nonce) is refused"
   pass=$((pass + 1))
 else
   echo "FAIL - R-3: a bare status.json was not refused"
   fail=$((fail + 1))
 fi
+kill "$R3B_VICTIM" 2>/dev/null
+wait "$R3B_VICTIM" 2>/dev/null
 
 # --- R-5: narrowing args pass; only widening args are refused -----------------
 cat > r5-narrow.yaml <<'YAML'
@@ -1562,6 +1618,60 @@ YAML
     ;;
 esac
 
+# --- R-1: sfh stop verifies process ownership on THIS OS ----------------------
+# macOS has no /proc, so the ownership question is answered per-OS (proc_pidpath
+# on macOS, /proc/<pid>/exe on Linux, QueryFullProcessImageNameW on Windows).
+# A successful stop of a real detached run proves the check works on the OS the
+# suite runs on: it can only succeed when pid_is_sfh recognised our own binary.
+cat > r1-long.yaml <<'YAML'
+name: r1-long
+steps:
+  - id: think
+    cmd: ["sh", "-c", "sleep 60"]
+YAML
+R1_DIR="$("$SFH" run r1-long.yaml --detach -q 2>/dev/null)"
+sleep 2
+"$SFH" stop "$R1_DIR" > r1.out 2>r1.err
+check "R-1: sfh stop succeeds on this OS (ownership verified)" 0 $?
+contains "R-1: the kill is reported" "killed pid" r1.err
+"$SFH" status "$R1_DIR" > r1-status.out 2>&1
+contains "R-1: the run is recorded as stopped" "stopped" r1-status.out
+
+# --- R-4: one nonce per attempt; status.json and sfh-nonce never disagree -----
+# The parent mints the nonce and the detached child inherits it (SFH_NONCE), so
+# no observer can ever see the two files disagree. Sample them hard right after
+# the detach, then require a stop landing at once not to be refused.
+R4_DIR="$("$SFH" run r1-long.yaml --detach -q 2>/dev/null)"
+r4_bad=0
+for _ in $(seq 1 150); do
+  [ -f "$R4_DIR/sfh-nonce" ] && [ -f "$R4_DIR/status.json" ] || continue
+  n_file="$(awk '{print $NF}' "$R4_DIR/sfh-nonce" 2>/dev/null)"
+  p_file="$(awk '{print $1}' "$R4_DIR/sfh-nonce" 2>/dev/null)"
+  n_status="$(sed -n 's/.*"nonce": *"\([0-9a-f]*\)".*/\1/p' "$R4_DIR/status.json" 2>/dev/null)"
+  p_status="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$R4_DIR/status.json" 2>/dev/null)"
+  [ -z "$n_status" ] && continue
+  if [ "$n_file" != "$n_status" ] || [ "$p_file" != "$p_status" ]; then
+    r4_bad=1
+  fi
+done
+if [ "$r4_bad" -eq 0 ]; then
+  echo "ok   - R-4: status.json and sfh-nonce never disagree after detach"
+  pass=$((pass + 1))
+else
+  echo "FAIL - R-4: status.json and sfh-nonce disagreed (nonce race)"
+  fail=$((fail + 1))
+fi
+R4B_DIR="$("$SFH" run r1-long.yaml --detach -q 2>/dev/null)"
+"$SFH" stop "$R4B_DIR" > r4b.out 2>r4b.err
+check "R-4: sfh stop right after detach is not refused" 0 $?
+if grep -qF "nonce" r4b.err; then
+  echo "FAIL - R-4: an immediate stop complained about the nonce"
+  fail=$((fail + 1))
+else
+  echo "ok   - R-4: an immediate stop raises no nonce complaint"
+  pass=$((pass + 1))
+fi
+
 # --- S1-4 extended: out_file and precompact_file containment ------------------
 # out_file pointing outside the run dir must fail the resume.
 mkdir -p s14b-run
@@ -1626,20 +1736,21 @@ else
   fail=$((fail + 1))
 fi
 
-# A symlink inside the run dir pointing outside must also be caught.
-mkdir -p s14d-run
-echo "TOP-SECRET-S14D" > s14d-secret.txt
-cat > s14d-run/meta.json <<'JSON'
+# A symlink inside the run dir pointing outside must also be caught. Needs
+# real symlinks (see S1-1): a copy would be a legitimate run-dir file.
+if have_symlinks; then
+  mkdir -p s14d-run
+  echo "TOP-SECRET-S14D" > s14d-secret.txt
+  cat > s14d-run/meta.json <<'JSON'
 {"sfh_version":"0.9.0","flow":"","flow_fingerprint":"abc","name":"s14d","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
 JSON
-ln -sf "$(pwd)/s14d-secret.txt" s14d-run/one.chain.txt 2>/dev/null \
-  || echo "TOP-SECRET-S14D" > s14d-run/one.chain.txt
-cat > s14d-run/log.jsonl <<'JSON'
+  MSYS=winsymlinks:nativestrict ln -sf "$(pwd)/s14d-secret.txt" s14d-run/one.chain.txt
+  cat > s14d-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
 {"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo hi","session":null}
 JSON
-cat > s14d.yaml <<'YAML'
+  cat > s14d.yaml <<'YAML'
 name: s14d
 steps:
   - id: one
@@ -1647,14 +1758,18 @@ steps:
   - id: two
     cmd: ["echo", "leaked={{steps.one.output}}"]
 YAML
-"$SFH" run s14d.yaml --resume s14d-run --force-resume -q > s14d.out 2>s14d.err
-s14d_rc=$?
-if [ "$s14d_rc" -ne 0 ] && ! grep -qF "TOP-SECRET-S14D" s14d.out; then
-  echo "ok   - S1-4: a symlink chain_file pointing outside fails the resume"
-  pass=$((pass + 1))
+  "$SFH" run s14d.yaml --resume s14d-run --force-resume -q > s14d.out 2>s14d.err
+  s14d_rc=$?
+  if [ "$s14d_rc" -ne 0 ] && ! grep -qF "TOP-SECRET-S14D" s14d.out; then
+    echo "ok   - S1-4: a symlink chain_file pointing outside fails the resume"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - S1-4: a symlink chain_file was not refused"
+    fail=$((fail + 1))
+  fi
 else
-  echo "FAIL - S1-4: a symlink chain_file was not refused"
-  fail=$((fail + 1))
+  echo "ok   - S1-4: symlink chain_file (skipped: no native symlink support)"
+  pass=$((pass + 1))
 fi
 
 # --- S2-4 extended: missing recorded access is fail-closed --------------------

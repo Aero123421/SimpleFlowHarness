@@ -496,6 +496,33 @@ fn exe_path_is_ours(exe_path: &str) -> bool {
     }
 }
 
+/// Quote one argument for a copy-pasteable command hint. Flow names may carry
+/// spaces (R-6), so a hint that prints a run dir or flow path unquoted breaks
+/// the moment the user pastes it back: `sfh run 研究 2026.07/... --resume ...`
+/// falls apart into separate arguments. Safe characters pass through; anything
+/// else is wrapped in double quotes with `"` and `\` escaped, which cmd.exe,
+/// PowerShell and POSIX shells all accept as a single argument.
+pub fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "\"\"".to_string();
+    }
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | ','))
+    {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// Is this pid still running? Pid reuse makes it advisory, so callers pair it
 /// with a heartbeat freshness check before declaring a run dead.
 #[cfg(unix)]
@@ -822,7 +849,7 @@ fn kill_tree(child: &mut Child) {
 
 /// Classify a failure as transient (worth retrying) from the tool's own output.
 pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
-    const NEEDLES: [&str; 18] = [
+    const NEEDLES: [&str; 22] = [
         "429",
         "rate limit",
         "rate_limit",
@@ -841,6 +868,15 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
         "fetch failed",
         "network error",
         "reconnecting",
+        // Serving-side aborts. Observed live: opencode reported
+        // "An error occurred in model serving ... [Inference engine abort.
+        // Finish reason: [STOP_ENGINE_ERROR].]" seventeen minutes into a step,
+        // mid-edit. Nothing about the request was wrong, and the next attempt
+        // succeeded - exactly what retry_on: transient exists for.
+        "stop_engine_error",
+        "inference engine abort",
+        "error in model serving",
+        "error occurred in model serving",
     ];
     let hay = format!("{stderr}\n{stdout}").to_lowercase();
     NEEDLES.iter().any(|n| hay.contains(n))
@@ -855,6 +891,11 @@ mod tests {
         assert!(is_transient_failure("HTTP 429 Too Many Requests", ""));
         assert!(is_transient_failure("", "Error: overloaded_error"));
         assert!(is_transient_failure("ERROR: Reconnecting... 3/5", ""));
+        // Verbatim from a live opencode run that died 17 minutes into a step.
+        assert!(is_transient_failure(
+            "",
+            r#"{"type":"error","error":{"name":"UnknownError","data":{"message":"\"An error occurred in model serving, error message is: [Inference engine abort. Finish reason: [STOP_ENGINE_ERROR].]\""}}}"#
+        ));
         assert!(!is_transient_failure("SyntaxError: unexpected token", ""));
         assert!(!is_transient_failure("", "the model refused"));
     }
@@ -864,5 +905,32 @@ mod tests {
         let a = Invocation::Argv(vec!["tool".into(), "--flag".into(), "two words".into()]);
         assert_eq!(a.describe(), "tool --flag \"two words\"");
         assert_eq!(Invocation::Shell("echo hi".into()).describe(), "$ echo hi");
+    }
+
+    #[test]
+    fn shell_quote_leaves_safe_paths_alone() {
+        assert_eq!(shell_quote("flow.yaml"), "flow.yaml");
+        assert_eq!(shell_quote(".sfh/runs/x-1"), ".sfh/runs/x-1");
+        assert_eq!(shell_quote("C:/AI/sfh/.sfh/runs"), "C:/AI/sfh/.sfh/runs");
+        assert_eq!(shell_quote("--var=k=v"), "--var=k=v");
+    }
+
+    #[test]
+    fn shell_quote_wraps_spaces_and_unicode() {
+        assert_eq!(shell_quote("space runs/x 1"), "\"space runs/x 1\"");
+        assert_eq!(
+            shell_quote(".sfh/runs/20260101-研究 2026.07"),
+            "\".sfh/runs/20260101-研究 2026.07\""
+        );
+        assert_eq!(shell_quote(""), "\"\"");
+    }
+
+    #[test]
+    fn shell_quote_escapes_quote_and_backslash() {
+        // MSVCRT and POSIX-shell rules agree inside double quotes: \" is a
+        // literal quote and \\ a literal backslash, so one spelling works for
+        // cmd.exe, PowerShell and sh alike.
+        assert_eq!(shell_quote(r"C:\AI\Simple Flow"), r#""C:\\AI\\Simple Flow""#);
+        assert_eq!(shell_quote(r#"say "hi""#), r#""say \"hi\"""#);
     }
 }

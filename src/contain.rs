@@ -58,7 +58,29 @@ pub fn contained_opt(base: &Path, candidate: &str) -> Result<Option<PathBuf>, St
             canon_base.display()
         ));
     }
-    Ok(Some(canon))
+    Ok(Some(deverbatim(canon)))
+}
+
+/// Windows `canonicalize` returns verbatim paths (`\\?\C:\...`, `\\?\UNC\...`)
+/// that the containment check needs but downstream consumers (template fields
+/// rendered into argv, cmd.exe, msys tools) cannot parse. The decision is made
+/// on the verbatim form; hand back the ordinary spelling of the same resolved
+/// path so a resumed run's stderr_file/output_file stays usable.
+#[cfg(windows)]
+fn deverbatim(p: PathBuf) -> PathBuf {
+    let Some(s) = p.to_str() else { return p };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => p,
+    }
+}
+
+#[cfg(not(windows))]
+fn deverbatim(p: PathBuf) -> PathBuf {
+    p
 }
 
 /// Read a file that must be contained within `base`; a missing file reads as
@@ -293,5 +315,35 @@ mod tests {
         assert!(validate_relative("/etc/passwd").is_err());
         assert!(validate_relative("../secret").is_err());
         assert!(validate_relative("a/../../b").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deverbatim_restores_parseable_paths() {
+        assert_eq!(
+            deverbatim(PathBuf::from(r"\\?\C:\x\y.txt")),
+            PathBuf::from(r"C:\x\y.txt")
+        );
+        assert_eq!(
+            deverbatim(PathBuf::from(r"\\?\UNC\server\share\f")),
+            PathBuf::from(r"\\server\share\f")
+        );
+        assert_eq!(
+            deverbatim(PathBuf::from(r"C:\plain\path")),
+            PathBuf::from(r"C:\plain\path")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn contained_opt_returns_a_non_verbatim_path() {
+        let base = std::env::temp_dir().join(format!("sfh-contain-{}", random_nonce()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("f.txt"), b"x").unwrap();
+        let got = contained_opt(&base, "f.txt").unwrap().unwrap();
+        let s = got.to_str().unwrap_or_default();
+        assert!(!s.starts_with(r"\\?\"), "{s}");
+        assert!(got.ends_with("f.txt"), "{s}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
