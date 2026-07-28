@@ -438,5 +438,7 @@ steps:
         goto: wrap
       - goto: d_impl
 
+  # 配列形式。文字列形式で `;` を使ったせいで、この行は実際に Windows で
+  # `fatal: ambiguous argument ';'` を出した。v0.9 の validate はこれを弾く。
   - id: wrap
-    cmd: "git --no-pager diff --stat main...HEAD 2>&1; git --no-pager status --short 2>&1; echo '--- tests ---'; cargo test 2>&1 | tail -3"
+    cmd: ["sh", "-c", "git --no-pager diff --stat main...HEAD 2>&1; git --no-pager status --short 2>&1; echo '--- tests ---'; cargo test 2>&1 | tail -3"]
