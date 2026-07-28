@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_yaml_ng as yaml;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 #[derive(Deserialize)]
@@ -95,8 +95,13 @@ pub struct Step {
     /// opencode: --variant, grok: --reasoning-effort, agy: --effort,
     /// pi: --thinking.
     pub effort: Option<String>,
-    /// read | write | full (default: write)
+    /// read | write | full. Mandatory for AI steps (step, profile or defaults);
+    /// there is no implicit default.
     pub access: Option<String>,
+    /// Explicit escape hatch: allow args: that would override the declared
+    /// access level, and continue_from/fork_from at a higher access than the
+    /// original session. Both are refused by default (fail-closed).
+    pub allow_access_override: Option<bool>,
     /// Agent name (opencode/claude/grok/agy --agent).
     pub agent: Option<String>,
     /// Extra raw args appended to the preset command line.
@@ -105,6 +110,12 @@ pub struct Step {
     /// Custom command instead of a preset. Array = spawned directly (no shell),
     /// String = run through cmd /C (Windows) or sh -c (Unix).
     pub cmd: Option<Cmd>,
+    /// Explicit escape hatch: allow template expansion inside a string-form
+    /// cmd. Off by default, because a substituted value is re-parsed by the
+    /// shell and a metacharacter blacklist is not a security boundary (a
+    /// hostile value can be a dangerous OPTION to the target program without
+    /// containing any shell metacharacter at all).
+    pub unsafe_shell_template: Option<bool>,
     pub prompt: Option<String>,
     /// For custom `cmd` only: "prompt" pipes the rendered prompt to stdin.
     pub stdin: Option<String>,
@@ -201,6 +212,16 @@ pub struct Route {
 }
 
 pub const TOOLS: [&str; 7] = ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"];
+
+/// One concrete way a flow can launch a preset tool, as collected by
+/// `Flow::resolved_tools`. Ordered so a BTreeSet dedupes and sorts it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ResolvedTool {
+    pub tool: String,
+    pub bin: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
 
 pub fn load(path: &Path) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
@@ -306,26 +327,69 @@ impl Flow {
             .or_else(|| self.defaults.tool.clone())
     }
 
-    /// Every preset tool this flow could invoke (for version stamping).
-    pub fn tools_used(&self) -> HashSet<String> {
-        let mut out = HashSet::new();
-        for s in &self.steps {
-            out.extend(self.step_tool(s));
-            for f in &s.fallback {
-                out.extend(self.profiles.get(f).and_then(|p| p.tool.clone()));
-            }
-            if let Some(children) = &s.parallel {
-                for c in children {
-                    out.extend(self.step_tool(c));
+    /// Every (tool, bin, model, effort) tuple this flow can actually launch,
+    /// resolved exactly the way the engine resolves a step (step > profile
+    /// (use:) > defaults), plus fallback profiles and compact summarizers.
+    /// Profiles no step references never appear here, so their bins are never
+    /// version-probed and never launched: a `profiles:` entry is configuration
+    /// data, not an instruction to run anything.
+    pub fn resolved_tools(&self) -> BTreeSet<ResolvedTool> {
+        let mut out = BTreeSet::new();
+        let mut note = |s: &Step| {
+            // A step with cmd: launches only its command; tool/fallback
+            // resolution applies to preset steps. A compact: summarizer is a
+            // real preset launch even on a cmd: step, so it is collected
+            // either way.
+            if s.cmd.is_none() {
+                if let Ok(e) = crate::leaf::effective(self, s) {
+                    if let Some(tool) = e.tool {
+                        out.insert(ResolvedTool {
+                            tool,
+                            bin: e.bin,
+                            model: e.model,
+                            effort: e.effort,
+                        });
+                    }
+                }
+                for fb in &s.fallback {
+                    if let Ok(e) = crate::leaf::effective_with(self, s, Some(fb)) {
+                        if let Some(tool) = e.tool {
+                            out.insert(ResolvedTool {
+                                tool,
+                                bin: e.bin,
+                                model: e.model,
+                                effort: e.effort,
+                            });
+                        }
+                    }
                 }
             }
             if let Some(c) = &s.compact {
-                out.extend(c.tool.clone().or_else(|| {
-                    c.use_
-                        .as_ref()
-                        .and_then(|u| self.profiles.get(u))
-                        .and_then(|p| p.tool.clone())
-                }));
+                // Same merge run_compact does: compact fields win over its
+                // profile; step/defaults are not consulted for the summarizer.
+                let prof = c.use_.as_ref().and_then(|u| self.profiles.get(u));
+                if let Some(tool) = c.tool.clone().or_else(|| prof.and_then(|p| p.tool.clone())) {
+                    out.insert(ResolvedTool {
+                        bin: c.bin.clone().or_else(|| prof.and_then(|p| p.bin.clone())),
+                        model: c
+                            .model
+                            .clone()
+                            .or_else(|| prof.and_then(|p| p.model.clone())),
+                        effort: c
+                            .effort
+                            .clone()
+                            .or_else(|| prof.and_then(|p| p.effort.clone())),
+                        tool,
+                    });
+                }
+            }
+        };
+        for s in &self.steps {
+            note(s);
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    note(c);
+                }
             }
         }
         out
@@ -605,6 +669,19 @@ fn check_retry_on(ctx: &str, v: &str) -> Result<(), String> {
     }
 }
 
+/// access after merging step > profile (use:) > defaults, as declared in YAML.
+fn resolved_access<'a>(flow: &'a Flow, s: &'a Step) -> Option<&'a str> {
+    s.access
+        .as_deref()
+        .or_else(|| {
+            s.use_
+                .as_ref()
+                .and_then(|u| flow.profiles.get(u))
+                .and_then(|p| p.access.as_deref())
+        })
+        .or(flow.defaults.access.as_deref())
+}
+
 fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
     let sid = &s.id;
     if is_child {
@@ -641,6 +718,8 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             || s.bin.is_some()
             || s.effort.is_some()
             || s.access.is_some()
+            || s.allow_access_override.is_some()
+            || s.unsafe_shell_template.is_some()
             || !s.args.is_empty()
             || s.cwd.is_some()
             || s.timeout_sec.is_some()
@@ -697,6 +776,46 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
             ));
         }
     }
+    if s.cmd.is_none() {
+        // "write" means a different thing per tool, so there is no safe implicit
+        // default: an AI step must say which tier it wants (cmd: steps are exempt).
+        let Some(acc) = resolved_access(flow, s) else {
+            return Err(format!(
+                "step '{sid}': access is required for steps that call an AI tool - set access: read, write, or full on the step, its profile, or defaults (cmd: steps are exempt)"
+            ));
+        };
+        // headless cursor is binary (deny-all or --force), so "write" would
+        // silently mean "full". Refuse it; the step must pick read or full.
+        if flow.step_tool(s).as_deref() == Some("cursor") && acc == "write" {
+            return Err(format!(
+                "step '{sid}': cursor headless has only two permission tiers (read = deny-all, full = approve-all); access: write is not supported - pick read or full"
+            ));
+        }
+        // Args that override the declared access are a validation error unless
+        // the step explicitly opts in. Args containing templates are re-checked
+        // after rendering, both in the precheck and right before each spawn.
+        // Fallback-profile args are covered by the same runtime check.
+        if acc != "full" && !s.allow_access_override.unwrap_or(false) {
+            if let Some(t) = flow.step_tool(s) {
+                let prof_args = s
+                    .use_
+                    .as_ref()
+                    .and_then(|u| flow.profiles.get(u))
+                    .map(|p| p.args.as_slice())
+                    .unwrap_or(&[]);
+                for a in prof_args.iter().chain(s.args.iter()) {
+                    if a.contains("{{") {
+                        continue;
+                    }
+                    if crate::preset::is_escalation_arg(&t, a) {
+                        return Err(format!(
+                            "step '{sid}': args: contains '{a}', which overrides the declared access level; use access: full, or set allow_access_override: true on this step to accept it"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     if let Some(st) = &s.stdin {
         if !["prompt", "none"].contains(&st.as_str()) {
             return Err(format!("step '{sid}': stdin must be 'prompt' or 'none'"));
@@ -715,6 +834,11 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
     if let Some(Cmd::Shell(c)) = &s.cmd {
         if c.trim().is_empty() {
             return Err(format!("step '{sid}': cmd string is empty"));
+        }
+        if !s.unsafe_shell_template.unwrap_or(false) && crate::template::contains_template(c) {
+            return Err(format!(
+                "step '{sid}': string-form cmd contains a template, but template expansion in a string cmd is disabled by default: the substituted value is handed to a shell (cmd /C | sh -c), and a metacharacter blacklist cannot make that safe (a hostile value can be a dangerous option to the target program without any shell metacharacters). Use the array form, which spawns without a shell:\n  cmd: [\"program\", \"--flag\", \"{{{{steps.x.output}}}}\"]\nor set unsafe_shell_template: true on this step to accept shell templating (substituted values are then only checked for shell metacharacters)"
+            ));
         }
         validate_shell_portability(sid, c)?;
     }
@@ -916,10 +1040,10 @@ mod tests {
 
     #[test]
     fn rejects_continue_from_foreach_and_self() {
-        let e = parse("name: t\nsteps:\n  - id: a\n    foreach: {from: x}\n    cmd: echo hi\n  - id: b\n    tool: claude\n    continue_from: a\n    prompt: x\n").unwrap_err();
+        let e = parse("name: t\nsteps:\n  - id: a\n    foreach: {from: x}\n    cmd: echo hi\n  - id: b\n    tool: claude\n    access: read\n    continue_from: a\n    prompt: x\n").unwrap_err();
         assert!(e.contains("foreach step"), "{e}");
         let e = parse(
-            "name: t\nsteps:\n  - id: b\n    tool: claude\n    continue_from: b\n    prompt: x\n",
+            "name: t\nsteps:\n  - id: b\n    tool: claude\n    access: read\n    continue_from: b\n    prompt: x\n",
         )
         .unwrap_err();
         assert!(e.contains("itself"), "{e}");
@@ -927,7 +1051,7 @@ mod tests {
 
     #[test]
     fn rejects_sibling_and_duplicate_resume_targets() {
-        let y = "name: t\nsteps:\n  - id: seed\n    tool: claude\n    prompt: x\n  - id: g\n    parallel:\n      - id: c1\n        tool: claude\n        continue_from: seed\n        prompt: x\n      - id: c2\n        tool: claude\n        continue_from: seed\n        prompt: x\n";
+        let y = "name: t\nsteps:\n  - id: seed\n    tool: claude\n    access: read\n    prompt: x\n  - id: g\n    parallel:\n      - id: c1\n        tool: claude\n        access: read\n        continue_from: seed\n        prompt: x\n      - id: c2\n        tool: claude\n        access: read\n        continue_from: seed\n        prompt: x\n";
         let e = parse(y).unwrap_err();
         assert!(e.contains("two concurrent resumes"), "{e}");
     }
@@ -940,15 +1064,15 @@ mod tests {
 
     #[test]
     fn fork_from_is_rejected_for_tools_without_a_headless_fork() {
-        let e = parse("name: t\nsteps:\n  - id: a\n    tool: codex\n    prompt: x\n  - id: b\n    tool: codex\n    fork_from: a\n    prompt: y\n").unwrap_err();
+        let e = parse("name: t\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n  - id: b\n    tool: codex\n    access: read\n    fork_from: a\n    prompt: y\n").unwrap_err();
         assert!(e.contains("cannot fork a session headlessly"), "{e}");
         // claude can fork
-        assert!(parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    prompt: x\n  - id: b\n    tool: claude\n    fork_from: a\n    prompt: y\n").is_ok());
+        assert!(parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    access: read\n    prompt: x\n  - id: b\n    tool: claude\n    access: read\n    fork_from: a\n    prompt: y\n").is_ok());
     }
 
     #[test]
     fn siblings_may_fork_one_parent_but_may_not_resume_it() {
-        let fork = "name: t\nsteps:\n  - id: seed\n    tool: claude\n    prompt: x\n  - id: g\n    parallel:\n      - id: c1\n        tool: claude\n        fork_from: seed\n        prompt: x\n      - id: c2\n        tool: claude\n        fork_from: seed\n        prompt: y\n";
+        let fork = "name: t\nsteps:\n  - id: seed\n    tool: claude\n    access: read\n    prompt: x\n  - id: g\n    parallel:\n      - id: c1\n        tool: claude\n        access: read\n        fork_from: seed\n        prompt: x\n      - id: c2\n        tool: claude\n        access: read\n        fork_from: seed\n        prompt: y\n";
         assert!(
             parse(fork).is_ok(),
             "forking one parent from two siblings is the point"
@@ -961,8 +1085,120 @@ mod tests {
 
     #[test]
     fn fork_from_and_continue_from_are_mutually_exclusive() {
-        let e = parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    prompt: x\n  - id: b\n    tool: claude\n    continue_from: a\n    fork_from: a\n    prompt: y\n").unwrap_err();
+        let e = parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    access: read\n    prompt: x\n  - id: b\n    tool: claude\n    access: read\n    continue_from: a\n    fork_from: a\n    prompt: y\n").unwrap_err();
         assert!(e.contains("mutually exclusive"), "{e}");
+    }
+
+    // "write" means something different per tool, so an AI step must declare
+    // its tier; only cmd: steps may omit it.
+    #[test]
+    fn ai_steps_must_declare_an_access_level() {
+        let e = parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    prompt: x\n").unwrap_err();
+        assert!(e.contains("access is required"), "{e}");
+        assert!(e.contains("read, write, or full"), "{e}");
+        // step-level, profile-level and defaults-level all satisfy it
+        assert!(parse(
+            "name: t\nsteps:\n  - id: a\n    tool: claude\n    access: read\n    prompt: x\n"
+        )
+        .is_ok());
+        assert!(parse(
+            "name: t\nprofiles:\n  p: {tool: claude, access: read}\nsteps:\n  - id: a\n    use: p\n    prompt: x\n"
+        )
+        .is_ok());
+        assert!(parse(
+            "name: t\ndefaults:\n  access: full\nsteps:\n  - id: a\n    tool: claude\n    prompt: x\n"
+        )
+        .is_ok());
+        // parallel children are AI steps too
+        let e = parse(
+            "name: t\nsteps:\n  - id: g\n    parallel:\n      - id: c\n        tool: claude\n        prompt: x\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("access is required"), "{e}");
+        // cmd: steps are exempt
+        assert!(parse("name: t\nsteps:\n  - id: a\n    cmd: echo hi\n").is_ok());
+    }
+
+    #[test]
+    fn cursor_write_is_a_validation_error() {
+        let e = parse(
+            "name: t\nsteps:\n  - id: a\n    tool: cursor\n    access: write\n    prompt: x\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("two permission tiers"), "{e}");
+        // defaults-supplied write is just as wrong
+        let e = parse(
+            "name: t\ndefaults:\n  access: write\nsteps:\n  - id: a\n    tool: cursor\n    prompt: x\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("two permission tiers"), "{e}");
+        for acc in ["read", "full"] {
+            assert!(
+                parse(&format!(
+                    "name: t\nsteps:\n  - id: a\n    tool: cursor\n    access: {acc}\n    prompt: x\n"
+                ))
+                .is_ok(),
+                "{acc}"
+            );
+        }
+    }
+
+    // Args that change the tool's permission set used to be a warning; they are
+    // now a validation error unless the step opts in or declares full.
+    #[test]
+    fn permission_flags_in_args_are_rejected_unless_full_or_overridden() {
+        let cases = [
+            (
+                "pi",
+                "write",
+                "[\"-t\", \"read,bash,edit,write,grep,find,ls\"]",
+            ),
+            ("pi", "read", "[\"--approve\"]"),
+            ("claude", "read", "[\"--allowedTools\", \"Bash\"]"),
+            (
+                "claude",
+                "write",
+                "[\"--permission-mode\", \"bypassPermissions\"]",
+            ),
+            ("opencode", "read", "[\"--agent\", \"build\"]"),
+            ("grok", "write", "[\"--allow\", \"Bash(ls)\"]"),
+            ("agy", "read", "[\"--mode\", \"accept-edits\"]"),
+            ("codex", "write", "[\"-s\", \"danger-full-access\"]"),
+            (
+                "codex",
+                "read",
+                "[\"-c\", \"sandbox_mode=\\\"workspace-write\\\"\"]",
+            ),
+            ("codex", "write", "[\"--force\"]"),
+        ];
+        for (tool, acc, args) in cases {
+            let yaml = format!(
+                "name: t\nsteps:\n  - id: a\n    tool: {tool}\n    access: {acc}\n    args: {args}\n    prompt: x\n"
+            );
+            let e = parse(&yaml).unwrap_err();
+            assert!(
+                e.contains("overrides the declared access level"),
+                "{tool}: {e}"
+            );
+            assert!(e.contains("allow_access_override"), "{tool}: {e}");
+            // the escape hatch: an explicit opt-in
+            let opted = yaml.replace("    args:", "    allow_access_override: true\n    args:");
+            assert!(parse(&opted).is_ok(), "{tool} with override");
+            // full means full: the same args are fine
+            let full = yaml.replace(&format!("access: {acc}"), "access: full");
+            assert!(parse(&full).is_ok(), "{tool} at full");
+        }
+        // profile args are merged into the step and checked the same way
+        let e = parse(
+            "name: t\nprofiles:\n  p: {tool: pi, access: write, args: [\"-t\", \"read,bash\"]}\nsteps:\n  - id: a\n    use: p\n    prompt: x\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("overrides the declared access level"), "{e}");
+        // templated args cannot be judged at load time; the runtime check owns them
+        assert!(parse(
+            "name: t\nvars: {f: \"--force\"}\nsteps:\n  - id: a\n    tool: claude\n    access: read\n    args: [\"{{vars.f}}\"]\n    prompt: x\n"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1013,6 +1249,40 @@ mod tests {
     }
 
     #[test]
+    fn string_cmd_template_expansion_is_rejected_unless_opted_in() {
+        let e = parse("steps:\n  - id: a\n    cmd: \"tar -cf backup.tar {{steps.x.output}}\"\n")
+            .unwrap_err();
+        assert!(e.contains("disabled by default"), "{e}");
+        assert!(e.contains("cmd: ["), "{e}");
+        assert!(e.contains("unsafe_shell_template"), "{e}");
+        // vars and builtins count as expansion too
+        assert!(parse("steps:\n  - id: a\n    cmd: \"echo v{{visit}}\"\n").is_err());
+        // the explicit opt-in
+        assert!(parse(
+            "steps:\n  - id: a\n    unsafe_shell_template: true\n    cmd: \"echo {{vars.x}}\"\n"
+        )
+        .is_ok());
+        // raw blocks are not expansions
+        assert!(parse(
+            "steps:\n  - id: a\n    cmd: \"echo {{raw}}{{steps.x.output}}{{endraw}}\"\n"
+        )
+        .is_ok());
+        // no template at all: fine either way
+        assert!(parse("steps:\n  - id: a\n    cmd: \"echo plain\"\n").is_ok());
+        // the array form is the recommended path and always allowed
+        assert!(parse(
+            "steps:\n  - id: a\n    cmd: [\"tar\", \"-cf\", \"backup.tar\", \"{{steps.x.output}}\"]\n"
+        )
+        .is_ok());
+        // not a group setting
+        let e = parse(
+            "steps:\n  - id: g\n    unsafe_shell_template: true\n    parallel:\n      - id: c\n        cmd: [\"echo\", \"hi\"]\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("carries only"), "{e}");
+    }
+
+    #[test]
     fn argv_form_may_explicitly_select_a_shell() {
         assert!(parse(
             "steps:\n  - id: check\n    cmd: [\"sh\", \"-c\", \"echo $?; echo ${NAME}\"]\n"
@@ -1032,6 +1302,47 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("substring"), "{error}");
         assert!(error.contains("when_last_line_is"), "{error}");
+    }
+
+    #[test]
+    fn resolved_tools_only_sees_profiles_the_flow_actually_uses() {
+        let f: Flow = yaml::from_str(
+            "profiles:\n  aaa-unused: {tool: codex, bin: /tmp/malware}\n  used: {tool: claude, bin: /opt/claude, model: m1, effort: high}\n  fb: {tool: grok, bin: /opt/grok}\nsteps:\n  - id: a\n    use: used\n    fallback: [fb]\n    prompt: x\n  - id: b\n    tool: codex\n    access: read\n    prompt: y\n  - id: c\n    cmd: [\"echo\", \"hi\"]\n  - id: d\n    cmd: [\"echo\", \"text\"]\n    compact: {when_over: 5, tool: opencode, bin: /opt/oc}\n",
+        )
+        .unwrap();
+        let r = f.resolved_tools();
+        // Nothing may surface the unused profile's bin: it is data, not an
+        // instruction to run anything.
+        assert!(
+            !r.iter().any(|rt| rt.bin.as_deref() == Some("/tmp/malware")),
+            "{r:?}"
+        );
+        assert!(r.contains(&ResolvedTool {
+            tool: "claude".to_string(),
+            bin: Some("/opt/claude".into()),
+            model: Some("m1".into()),
+            effort: Some("high".into()),
+        }));
+        assert!(r.contains(&ResolvedTool {
+            tool: "grok".to_string(),
+            bin: Some("/opt/grok".into()),
+            model: None,
+            effort: None,
+        }));
+        assert!(r.contains(&ResolvedTool {
+            tool: "codex".to_string(),
+            bin: None,
+            model: None,
+            effort: None,
+        }));
+        // A compact summarizer is a real launch even on a cmd: step.
+        assert!(r.contains(&ResolvedTool {
+            tool: "opencode".to_string(),
+            bin: Some("/opt/oc".into()),
+            model: None,
+            effort: None,
+        }));
+        assert_eq!(r.len(), 4, "{r:?}");
     }
 
     #[test]

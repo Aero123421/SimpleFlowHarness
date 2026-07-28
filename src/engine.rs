@@ -1,6 +1,6 @@
-use crate::{execute, flow, leaf, preset, template};
+use crate::{contain, execute, flow, leaf, preset, template};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -197,7 +197,23 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
                     }
                 }
                 for a in &eff.args {
-                    chk(body_ctx, "args", a)?;
+                    let rendered = template::render(a, body_ctx)
+                        .map_err(|e| format!("step '{}' args: {e}", s.id))?;
+                    // args may render into permission flags (vars are known
+                    // now; step outputs render empty here and are re-checked
+                    // right before each spawn). Fail-closed like validation.
+                    if eff.access != preset::Access::Full
+                        && !s.allow_access_override.unwrap_or(false)
+                    {
+                        if let Some(t) = &eff.tool {
+                            if preset::is_escalation_arg(t, &rendered) {
+                                return Err(format!(
+                                    "step '{}': args: contains '{rendered}', which overrides the declared access level; use access: full, or set allow_access_override: true on this step to accept it",
+                                    s.id
+                                ));
+                            }
+                        }
+                    }
                 }
                 for v in eff.env.values() {
                     chk(body_ctx, "env", v)?;
@@ -304,7 +320,7 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 let precompact = v
                     .get("precompact_file")
                     .and_then(|x| x.as_str())
-                    .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok());
+                    .and_then(|p| contain::read_contained(run_dir, p).ok());
                 if let (Some(e), Some(p)) = (st.outputs.get_mut(&step), precompact.as_ref()) {
                     e.outputs = p.trim_end().to_string();
                 }
@@ -366,7 +382,7 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 let rd = |k: &str| -> Option<String> {
                     v.get(k)
                         .and_then(|x| x.as_str())
-                        .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
+                        .and_then(|p| contain::read_contained(run_dir, p).ok())
                 };
                 let chain = rd("chain_file").unwrap_or_default();
                 let exit = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
@@ -388,11 +404,13 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 let file = v
                     .get("out_file")
                     .and_then(|x| x.as_str())
+                    .filter(|p| contain::validate_relative(p).is_ok())
                     .map(|p| run_dir.join(p).display().to_string())
                     .unwrap_or_default();
                 let stderr_file = v
                     .get("out_file")
                     .and_then(|x| x.as_str())
+                    .filter(|p| contain::validate_relative(p).is_ok())
                     .map(|p| stderr_file_for(&run_dir.join(p)).display().to_string())
                     .filter(|p| Path::new(p).exists())
                     .unwrap_or_default();
@@ -408,7 +426,9 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 );
                 if !is_child {
                     if let Some(p) = v.get("chain_file").and_then(|x| x.as_str()) {
-                        st.chain_files.insert(step.clone(), run_dir.join(p));
+                        if contain::validate_relative(p).is_ok() {
+                            st.chain_files.insert(step.clone(), run_dir.join(p));
+                        }
                     }
                     if ok {
                         st.last_success = Some(step.clone());
@@ -435,6 +455,12 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                                         .get("marker")
                                         .and_then(|x| x.as_str())
                                         .map(String::from),
+                                    // Absent in logs written before access was
+                                    // recorded: the resume guard warns on None.
+                                    access: s
+                                        .get("access")
+                                        .and_then(|x| x.as_str())
+                                        .and_then(|a| preset::Access::parse(Some(a)).ok()),
                                 },
                             );
                         }
@@ -562,6 +588,10 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, St
                 emit_file: None,
                 error: None,
                 unfinished_step: None,
+                nonce: std::fs::read_to_string(run_dir.join("sfh-nonce"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
             },
         );
     }
@@ -579,27 +609,58 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, St
 
 /// Drop a self-ignoring .gitignore into the runs root, the way cargo does for
 /// target/. Run dirs hold rendered prompts, model output and session ids in
-/// plaintext inside the user's own repo; one `git add -A` should not be able to
-/// publish them. Never overwrites an existing file.
+/// plaintext inside the user's own repo; one `git add -A` should not be able
+/// to publish them. A hostile repo can pre-place an EMPTY .gitignore to make
+/// the old "skip if exists" behaviour leave everything tracked, so an existing
+/// file is verified: unless an effective `*` pattern is present, sfh appends
+/// one and says so.
 fn protect_runs_root(root: &Path) {
-    let f = root.join(".gitignore");
-    if f.exists() {
+    if contain::mkdir_private(root).is_err() {
         return;
     }
-    if std::fs::create_dir_all(root).is_ok() {
-        let _ = std::fs::write(&f, "# Created by sfh. Run artifacts are not source.\n*\n");
+    let f = root.join(".gitignore");
+    const BODY: &str = "# Created by sfh. Run artifacts are not source.\n*\n";
+    match std::fs::read_to_string(&f) {
+        Err(_) => {
+            let _ = contain::write_private(&f, BODY);
+        }
+        Ok(text) => {
+            if gitignore_ignores_everything(&text) {
+                return;
+            }
+            eprintln!(
+                "sfh: warning: {} does not ignore everything; appending '*' so run artifacts cannot be committed",
+                f.display()
+            );
+            let _ = contain::write_private(
+                &f,
+                format!("{text}\n# Added by sfh: run artifacts are not source.\n*\n"),
+            );
+        }
     }
 }
 
-/// Cheap change-detection fingerprint (FNV-1a); not a security hash.
-fn fingerprint(s: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+/// True when the gitignore has an effective pattern that ignores every entry:
+/// a non-comment line that is exactly `*` (or `/*`). A `*` inside a comment or
+/// a pattern like `*.log` does NOT count - git would still track the rest.
+fn gitignore_ignores_everything(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#') && (t == "*" || t == "/*")
+    })
 }
+
+/// Change-detection fingerprint of the flow file, recorded in meta.json and
+/// used to refuse `--resume` of a run whose flow has changed. SHA-256 because
+/// this is a security boundary: with FNV-1a a crafted flow could collide with
+/// another and slip a changed flow past the resume guard.
+fn fingerprint(s: &str) -> String {
+    crate::sha256::hex(s.as_bytes())
+}
+
+/// Recorded next to the fingerprint in meta.json so an old run dir can be told
+/// from a new one without guessing which algorithm wrote it.
+const FINGERPRINT_ALGO: &str = "sha256";
 
 struct Status {
     state: &'static str,
@@ -619,6 +680,9 @@ struct Status {
     emit_file: Option<String>,
     error: Option<String>,
     unfinished_step: Option<UnfinishedStep>,
+    /// Random token proving this status.json was written by the sfh that owns
+    /// the run dir. `sfh stop` refuses to kill without a matching nonce file.
+    nonce: String,
 }
 
 fn write_status(path: &Path, s: &Status) {
@@ -646,6 +710,7 @@ fn write_status(path: &Path, s: &Status) {
         "emit_file": s.emit_file,
         "error": s.error,
         "unfinished_step": unfinished_step,
+        "nonce": s.nonce,
     });
     let text = serde_json::to_string_pretty(&v).unwrap_or_default();
     // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
@@ -653,11 +718,11 @@ fn write_status(path: &Path, s: &Status) {
     // is atomic on both platforms, so a reader sees the old or the new file and
     // never a torn one.
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+    if contain::write_private(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
         return;
     }
     let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::write(path, &text);
+    let _ = contain::write_private(path, &text);
 }
 
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
@@ -683,6 +748,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
     protect_runs_root(&runs_root);
     let name = flow.name.clone().unwrap_or_else(|| "flow".into());
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
+        || name.is_empty()
+    {
+        return Err(format!(
+            "flow name '{name}' must be non-empty and use only [A-Za-z0-9_-]"
+        ));
+    }
 
     // Which steps must produce resumable sessions (continue_from targets).
     let mut needed_sessions: HashSet<String> = HashSet::new();
@@ -709,7 +783,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     if opts.dry_run {
         let base = format!("{}-{}-dryrun", utc_stamp(), name);
         run_dir = abs(&runs_root.join(base));
-        std::fs::create_dir_all(&run_dir)
+        contain::mkdir_private(&run_dir)
             .map_err(|e| format!("cannot create run dir {}: {e}", run_dir.display()))?;
     } else if let Some(dir) = resume_target(opts, &runs_root)? {
         let dir = abs(&dir);
@@ -753,7 +827,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // The detaching parent already picked (and created) this directory so
         // it could print the path before the background copy came up.
         let d = abs(d);
-        std::fs::create_dir_all(&d)
+        contain::mkdir_private(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = d;
     } else {
@@ -764,10 +838,21 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             n += 1;
             d = runs_root.join(format!("{base}-{n}"));
         }
-        std::fs::create_dir_all(&d)
+        contain::mkdir_private(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = abs(&d);
     }
+    // Defense-in-depth: even though `name` is charset-validated, confirm the
+    // resolved run dir is actually under the runs root (guards symlink tricks).
+    if !is_resume && opts.run_dir.is_none() && !contain::is_under(&runs_root, &run_dir) {
+        return Err(format!(
+            "run dir {} escapes the runs root {}",
+            run_dir.display(),
+            runs_root.display()
+        ));
+    }
+    let nonce = contain::random_nonce();
+    let _ = contain::write_private(&run_dir.join("sfh-nonce"), &nonce);
     let notes_file = run_dir.join("notes.md");
 
     if opts.dry_run {
@@ -788,26 +873,31 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         return detach_run(opts, &run_dir, is_resume);
     }
 
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(run_dir.join("log.jsonl"))
+    let mut log = contain::append_private(&run_dir.join("log.jsonl"))
         .map_err(|e| format!("cannot open log: {e}"))?;
 
-    // Provenance: which sfh, which tool builds. Cheap, no AI calls.
+    // Provenance: which sfh, which tool builds. Cheap, no AI calls. Probe only
+    // the (tool, bin) pairs the flow actually resolves to: an unused profile's
+    // bin is data, and data must never be executed.
     let mut tool_versions = serde_json::Map::new();
     if !is_resume {
-        for t in flow.tools_used() {
-            let bin = flow
-                .profiles
-                .values()
-                .find(|p| p.tool.as_deref() == Some(t.as_str()) && p.bin.is_some())
-                .and_then(|p| p.bin.clone())
-                .unwrap_or_else(|| t.clone());
-            if let Some(v) = execute::probe_version(&bin) {
-                tool_versions.insert(t.clone(), json!({"bin": bin, "version": v}));
+        let mut by_tool: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+        for rt in flow.resolved_tools() {
+            by_tool.entry(rt.tool).or_default().insert(rt.bin);
+        }
+        for (tool, bins) in by_tool {
+            let entries: Vec<serde_json::Value> = bins
+                .into_iter()
+                .map(|bin| {
+                    let program = bin.unwrap_or_else(|| preset::default_program(&tool));
+                    let version = execute::probe_version(&program);
+                    json!({"bin": program, "version": version})
+                })
+                .collect();
+            if entries.len() == 1 {
+                tool_versions.insert(tool, entries.into_iter().next().unwrap());
             } else {
-                tool_versions.insert(t.clone(), json!({"bin": bin, "version": null}));
+                tool_versions.insert(tool, json!(entries));
             }
         }
     }
@@ -816,6 +906,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "sfh_version": VERSION,
         "flow": abs(&opts.flow_path).display().to_string(),
         "flow_fingerprint": flow_fp,
+        "flow_fingerprint_algo": FINGERPRINT_ALGO,
         "name": name,
         "started_utc": started,
         "os": std::env::consts::OS,
@@ -823,8 +914,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "tools": tool_versions,
         "resumed": is_resume,
     });
-    let _ = std::fs::write(
-        run_dir.join("meta.json"),
+    let _ = contain::write_private(
+        &run_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
     );
     log_event(
@@ -853,6 +944,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         emit_file: None,
         error: None,
         unfinished_step: resumed.unfinished_step.clone(),
+        nonce: nonce.clone(),
     }));
     {
         let s = Arc::clone(&status);
@@ -1243,6 +1335,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 id: sid.clone(),
                                 cwd: d.cwd.clone(),
                                 marker: d.session_marker.clone(),
+                                access: d.access,
                             },
                         );
                     }
@@ -1452,6 +1545,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             id: sid.clone(),
                             cwd: d.cwd.clone(),
                             marker: d.session_marker.clone(),
+                            access: d.access,
                         },
                     );
                 }
@@ -1493,7 +1587,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // documented as the pre-compact original - including after
                     // a --resume, which can only read files.
                     let pre_name = format!("{gtag}.precompact.txt");
-                    let _ = std::fs::write(run_dir.join(&pre_name), &chain_output);
+                    let _ = contain::write_private(&run_dir.join(&pre_name), &chain_output);
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
@@ -1544,8 +1638,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             }
                         }
                     }
-                    let _ =
-                        std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), &chain_output);
+                    let _ = contain::write_private(
+                        &run_dir.join(format!("{gtag}.chain.txt")),
+                        &chain_output,
+                    );
                 }
             }
 
@@ -1555,10 +1651,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
             // ---- notes ----
             if step.notes.as_deref() == Some("append") && !errored {
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&notes_file)
+                let mut f = contain::append_private(&notes_file)
                     .map_err(|e| format!("cannot open notes: {e}"))?;
                 let _ = writeln!(
                     f,
@@ -1693,8 +1786,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             json!(if result.is_ok() { "ok" } else { "failed" }),
         );
     }
-    let _ = std::fs::write(
-        run_dir.join("meta.json"),
+    let _ = contain::write_private(
+        &run_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta_final).unwrap_or_default(),
     );
 
@@ -1834,8 +1927,8 @@ fn write_aggregate(
     failed: bool,
 ) {
     let gfile = run_dir.join(format!("{gtag}.out.txt"));
-    let _ = std::fs::write(&gfile, agg);
-    let _ = std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), agg);
+    let _ = contain::write_private(&gfile, agg);
+    let _ = contain::write_private(&run_dir.join(format!("{gtag}.chain.txt")), agg);
     outputs.insert(
         step_id.to_string(),
         template::StepOutput {
@@ -1918,7 +2011,7 @@ fn run_compact(
     let prompt = format!("{instr}\n\n---\n{body}");
     let ctag = format!("{tag}.compact");
     let prompt_file = run_dir.join(format!("{ctag}.prompt.txt"));
-    std::fs::write(&prompt_file, &prompt).map_err(|e| e.to_string())?;
+    contain::write_private(&prompt_file, &prompt).map_err(|e| e.to_string())?;
     let last = run_dir.join(format!("{ctag}.last.txt"));
     let paths = preset::BuildPaths {
         last_msg: &last,
@@ -1964,6 +2057,7 @@ fn run_compact(
         err_file: run_dir.join(format!("{ctag}.err.txt")),
         chain_file: run_dir.join(format!("{ctag}.chain.txt")),
         tool: Some(tool),
+        access: Some(preset::Access::Read),
         allow_empty: false,
         retry: leaf::RetryCfg::default(),
         quiet,
@@ -2053,16 +2147,16 @@ fn dry_run(
     let step_ids = flow.step_ids();
     let outputs: BTreeMap<String, template::StepOutput> = BTreeMap::new();
     let mut sessions: HashMap<String, leaf::SessionInfo> = HashMap::new();
-    // Fake sessions so continue_from steps can render their resume command.
+    // Fake sessions so continue_from/fork_from steps can render their resume
+    // command. The target's own access comes along, so a dry run already shows
+    // the escalation guard refusing a higher-access resume.
     for s in &flow.steps {
-        let targets: Vec<&String> = std::iter::once(&s.continue_from)
-            .chain(
-                s.parallel
-                    .iter()
-                    .flat_map(|cs| cs.iter().map(|c| &c.continue_from)),
-            )
-            .flatten()
-            .collect();
+        let mut targets: Vec<&String> = Vec::new();
+        for st in std::iter::once(s).chain(s.parallel.iter().flat_map(|cs| cs.iter())) {
+            for t in [&st.continue_from, &st.fork_from].into_iter().flatten() {
+                targets.push(t);
+            }
+        }
         for t in targets {
             if let Some(target_step) = flow.find_step(t) {
                 if let Ok(eff) = leaf::effective(flow, target_step) {
@@ -2074,6 +2168,7 @@ fn dry_run(
                                 id: "<session-id>".into(),
                                 cwd: None,
                                 marker: None,
+                                access: Some(eff.access),
                             },
                         );
                     }
@@ -2256,7 +2351,7 @@ fn log_step_end(
 ) {
     let session = match (&d.tool, &d.session_id) {
         (Some(t), Some(id)) => {
-            json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker})
+            json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker, "access": d.access.map(|a| a.as_str())})
         }
         _ => serde_json::Value::Null,
     };
@@ -2395,7 +2490,12 @@ mod tests {
     fn fingerprint_detects_flow_edits() {
         assert_eq!(fingerprint("a"), fingerprint("a"));
         assert_ne!(fingerprint("a"), fingerprint("b"));
-        assert_eq!(fingerprint("").len(), 16);
+        assert_eq!(fingerprint("").len(), 64);
+        // The resume guard trusts this value; pin it to the known SHA-256 of "".
+        assert_eq!(
+            fingerprint(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

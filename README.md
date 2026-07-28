@@ -161,9 +161,11 @@ steps:
     # bin: /path/to/tool     # 実行ファイル差し替え(PATHが古い時など)
     model: gpt-5-codex
     effort: high             # codex/claude/grok/agy/opencodeで意味が対応(下表)
-    access: full             # read | write | full(既定: write)
+    access: full             # read | write | full。AIステップは明示必須(既定値なし)、cmd:ステップは対象外
+    allow_access_override: true  # 権限上書きargs:と高accessセッション再開を許可(既定は両方拒否)
     agent: plan              # opencode/claude/grok の --agent
     args: ["--foo"]          # プリセットに追加で渡す生フラグ
+    unsafe_shell_template: true  # 例外実名: 文字列形式cmdでのテンプレート展開を許可(既定は禁止、配列形式が推奨)
     cwd: path/to/dir
     timeout_sec: 1800        # 超過でプロセスツリーをkill
     max_prompt_chars: 50000
@@ -243,7 +245,7 @@ foreach の集約では失敗した要素のヘッダと本文だけが標識さ
     prompt: "さっきの計画の手順3だけ詳細化して"
 ```
 
-前段の出力をプロンプトに再注入する必要がなくなる。同一ツール間のみ。5ツールすべて実機検証済み。仕組み:
+前段の出力をプロンプトに再注入する必要がなくなる。同一ツール間のみ。5ツールすべて実機検証済み。またsfhはセッションの**作成時accessを記録**し、それより高いaccessでの `continue_from:` / `fork_from:` は既定で**拒否**する(readで取り込んだ未信頼コンテキストをfullへ昇格させる経路を塞ぐ)。受け入れる場合のみ `allow_access_override: true`。仕組み:
 
 | ツール | ID取得 | 再開 | 注意 |
 |---|---|---|---|
@@ -326,7 +328,7 @@ sfh run research.yaml --resume-latest        # 落ちた所から再開(完了�
 sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 ```
 
-`log.jsonl` から完了済みステップの出力・訪問回数・セッションID・累計コストを復元し、失敗したステップから再開する。フローファイルが変更されていると指紋(fingerprint)不一致で拒否する(`--force-resume`で強行)。
+`log.jsonl` から完了済みステップの出力・訪問回数・セッションID・累計コストを復元し、失敗したステップから再開する。フローファイルが変更されていると指紋(SHA-256)不一致で拒否する(`--force-resume`で強行)。
 
 成功した `step_end` の直後、次の `position` を記録する前に sfh が停止していた場合は、
 そのステップを再実行せず、保存済み chain 出力に対して route 規則だけを再評価し、
@@ -403,18 +405,18 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 |---|---|---|---|---|
 | codex | `exec --skip-git-repo-check -c approval_policy=never -o <last> -` | `-s read-only` | `-s workspace-write` | `--dangerously-bypass-approvals-and-sandbox` |
 | claude | `-p --output-format json` | `--permission-mode dontAsk --tools Read,Glob,Grep,WebSearch,WebFetch,TodoWrite` | `--permission-mode acceptEdits --allowedTools WebSearch,WebFetch` | `--dangerously-skip-permissions` |
-| opencode | `run --auto` ※auto必須(askで永久ハング) | `--agent plan` + edit/bash拒否env | `--agent build` + 外部dir拒否env | `--agent build`(制限なし) |
+| opencode | `run --auto` ※auto必須(askで永久ハング) | `--agent plan` + edit/bash拒否env | `--agent build` + bash/外部dir拒否env | `--agent build`(制限なし) |
 | grok | `--output-format json --prompt-file <f>` | `--permission-mode dontAsk --deny Edit/Write/Bash` | `--permission-mode acceptEdits` | `--permission-mode bypassPermissions` |
 | agy | `--print-timeout <t>s --output-format json -p <prompt>` | `--mode plan` | `--mode accept-edits` | `--dangerously-skip-permissions` |
-| pi | `--mode json --offline` | `--tools read,grep,find,ls` +拡張/スキル無効化 | `--tools read,edit,write,grep,find,ls` | `--tools read,bash,edit,write,grep,find,ls --approve` |
-| cursor | `-p --output-format json --trust --disable-auto-update --disable-project-configs` | `--mode plan`(全承認要求を拒否) | `--force` ※ | `--force` |
+| pi | `--mode json --offline` | `--tools read,grep,find,ls` +拡張/スキル無効化 | `--tools read,edit,write,grep,find,ls` +拡張/スキル無効化 | `--tools read,bash,edit,write,grep,find,ls --approve` |
+| cursor | `-p --output-format json --trust --disable-auto-update --disable-project-configs` | `--mode plan`(全承認要求を拒否) | **(validateエラー)** | `--force` |
 
 補足:
 - **Geminiモデルは `tool: agy` で使う**(gemini-3.6-flash-low 等)。旧gemini CLIには非対応(個人無料枠廃止でAntigravityに統合されたため)。
 - **effortの語彙はツール毎に違う**: codex(none/minimal/low/medium/high/xhigh/max/ultra)、claude(low〜max)、grok/agy(low/medium/high)、pi(off〜max、`--thinking`)、opencodeは`--variant`(モデル毎)。範囲外はvalidateで警告。
-- **pi(`@earendil-works/pi-coding-agent`)にはサンドボックスも権限プロンプトも存在しない**(設計思想として意図的)。素の`pi`は既にread+bash+edit+writeが有効なので、sfhは`--tools`の許可リストで権限を表現する。`read`はツール登録レベルで確実だが、`write`は**書き込み先を制限しない**(ワークスペース境界がない)。またwriteではシェルを登録しない — サンドボックスがない以上bashはfullと同義だから。必要なら`args: ["-t", "read,bash,edit,write,grep,find,ls"]`で明示的に足す。
+- **pi(`@earendil-works/pi-coding-agent`)にはサンドボックスも権限プロンプトも存在しない**(設計思想として意図的)。素の`pi`は既にread+bash+edit+writeが有効なので、sfhは`--tools`の許可リストで権限を表現する。`read`はツール登録レベルで確実だが、`write`は**書き込み先を制限しない**(ワークスペース境界がない)。またread/writeではシェルを登録せず、拡張・スキル・プロンプトテンプレートも無効化する — リポジトリ内に置かれた拡張がfull process rightsでBashを登録すれば許可リストが無意味になるから。コマンド実行が必要なら`access: full`と明示する(または`args: ["-t", "..."]` + `allow_access_override: true`)。
 - **piの`agent:`は無効**(`--agent`が無い)。ペルソナは`args: ["--append-system-prompt", "..."]`で。
-- **cursor(`cursor-agent`)の権限は非対話モードでは2段階しかない**: `--force`なしは全拒否、ありは全承認。したがって`write`は実質`full`と同等で、sfhは警告を出します。中間段階が必要なら別ツールを使ってください。`effort:`と`agent:`も非対応(effortはモデルID側に`-thinking`等で埋め込む)。
+- **cursor(`cursor-agent`)の権限は非対話モードでは2段階しかない**: `--force`なしは全拒否、ありは全承認(シェル含む)。中間段階は存在しないため、**`access: write`はvalidateエラー**。cursorを使うステップは`read`か`full`を明示してください(既定値がないため、accessを書かないステップも通りません)。`effort:`と`agent:`も非対応(effortはモデルID側に`-thinking`等で埋め込む)。
 - **cursorの`continue_from`は再開先の実在をsfhが検証してから実行します。** cursorは`--resume`が「作成も再開も兼ねる」ため、存在しないIDを渡すと**黙って新規チャットを作り、そのIDをそのまま返します**。そこでsfhはチャット実体(`~/.cursor/chats/<cwdハッシュ>/<id>/store.db`)のパスを記録し、再開前に存在を確認します。加えてcursorのセッションは**cwd単位**なので、作成時と違うディレクトリからの再開は警告ではなく**エラーで拒否**します(そのまま走らせると文脈ゼロの別チャットになるため)。実測では再開時の入力トークンが 19,817 → 876 まで下がり、非常に効率的です。
 - **opencodeのmodelは`provider/model`形式必須**。effortは`--variant`に渡る。
 - **agy**: モデルIDにeffortサフィックスがある(例: gemini-3.1-pro-high)場合は`effort:`を併用しない(agyが衝突エラーを出す)。
@@ -443,11 +445,13 @@ codex-local:
 ```yaml
   - id: anything
     cmd: ["mytool", "--flag", "{{prompt_file}}"]   # 配列 = シェル介さず直接spawn(推奨)
-    # cmd: "mytool < in.txt > out.txt"              # 文字列 = cmd /C | sh -c 経由
+    # cmd: "mytool < in.txt > out.txt"              # 文字列 = cmd /C | sh -c 経由(テンプレート展開は既定で禁止)
     stdin: prompt                                   # プロンプトをstdinへ流す場合
 ```
 
-文字列形式の `cmd:` では、テンプレート置換値(AI出力など)に改行やシェルメタ文字(`& | < > ^ % $` 等)が含まれると**実行前にエラー**にする(シェルインジェクション防止)。その場合は配列形式か `| head:1` 等のフィルタを使うこと。
+**文字列形式の `cmd:` でのテンプレート展開は既定で禁止**(validateエラー)。置換値はシェル文字列へ注入されるためで、メタ文字のブラックリストは安全境界にならない — 監査の実例では、上流AI出力 `--checkpoint=1 --checkpoint-action=exec='sh payload.sh' harmless.txt` が禁止文字を1つも含まないまま `tar` の危険オプションとして実行される。本当に必要なステップだけ `unsafe_shell_template: true` を明示すること(置換値のメタ文字チェックは残るが、それは区切り文字のフィルタに過ぎない)。エラー文が案内するとおり、**配列形式 `cmd: [...]` に移行するのが正解**。
+
+配列形式ではシェルを介さず、置換値は1つの引数としてそのまま渡る(シェルインジェクションは起きない)。ただし「引数として渡る」こと自体は変わらない: 上記の値は `tar` の引数になれば依然として危険オプションでありうるので、対象プログラムのオプション解釈に対する保証ではない。
 
 ## イディオム集
 
@@ -662,16 +666,17 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 
 **長いステップの様子を見たいときは `<id>.out.txt` を tail すればいい。** 子プロセスの出力は終了を待たずに逐次書き込まれるので、30分かかるステップが「進んでいる」のか「固まっている」のかが分かる。
 
-> **プロンプトと出力は平文で残る。** 秘匿情報を扱うフローでは `--runs-dir` を安全な場所に向けるか、`sfh runs clean` を定期実行すること。
-> **runsディレクトリを作るとき、sfhはそこに `.gitignore`(中身は `*`)を自動で置く**(cargoが`target/`にやるのと同じ)。あなたのリポジトリで `git add -A` してもrun成果物がコミットされることはない。
+> **プロンプトと出力は平文で残る。** 秘匿情報を扱うフローでは `--runs-dir` を安全な場所に向けるか、`sfh runs clean` を定期実行すること。Unixではsfh自身の成果物をumaskによらず所有者限定(ディレクトリ0700 / ファイル0600)に強制する。Windowsでは継承ACLに依存する(ファイル毎のDACL明示はコストに見合わないため設定していない。ユーザープロファイル配下の既定ACLは通常、所有者とSYSTEM・Administratorsのみ)。
+> **runsディレクトリを作るとき、sfhはそこに `.gitignore`(中身は `*`)を自動で置く**(cargoが`target/`にやるのと同じ)。既存の `.gitignore` がある場合は中身を検証し、実効的な `*` パターンがなければ(空ファイルを先に置かれる攻撃対策)`*` を追記して警告する。ただし守られるのは通常の `git add` までで、既にコミット済みのファイルや `git add -f` はsfhの管轄外。
 
 ## 安全性について正直な話
 
-- **`access:` は絶対的なサンドボックスではない。** 各CLIの権限フラグに翻訳しているだけで、`args:` に `--dangerously-skip-permissions` 等を書けば上書きできる(その場合sfhは警告を出す)。`cmd:` ステップは対象外。
-- **`write` はツールによって強度がまったく違う。** codexだけがOSサンドボックス付き(`-s workspace-write`)で、claude/grok/piにはサンドボックスがない。**サンドボックスのない環境でシェルを自動承認したらそれは`full`と同じ**なので、sfhは claude / grok / pi の `write` では**シェルを自動承認しない**(その旨を警告で出す)。コマンドを走らせる必要があるステップは、`args:` で明示的に許可するか、`access: full` と書いて自覚的にそうすること。
+- **`access:` は絶対的なサンドボックスではない。** 各CLIの権限フラグへの変換であり、OS境界の保証ではない。ただし権限契約を裏切る`args:`(piの`-t`/`--approve`/`--tools`、claudeの`--tools`/`--allowedTools`/`--permission-mode`、opencodeの`--agent`、grokの`--allow`/`--permission-mode`、agyの`--mode`、codexの`-s`/`--sandbox`/`-c sandbox_mode=...`、および`--force`等の全局バイパス)は、accessがfullでないステップでは**validateエラー**(fail-closed。検知しても警告して実行していた旧挙動は廃止)。逃げ道は当該ステップへの`allow_access_override: true`の明示記載だけ。argsにはテンプレートが使えるため、**同じ検査はテンプレート展開後(起動直前)にも走る** — 上流出力が権限フラグを注入してもスポーン前に拒否される。`cmd:` ステップは対象外。
+- **`write` でシェルは自動承認されない(全ツール共通)。** 原則: **サンドボックスのない環境でシェルを自動承認したら、それは`full`と同じ**。codexだけがOSサンドボックス付き(`-s workspace-write`)。claude / grok / pi / opencode にはサンドボックスがないため、`write`はいずれもシェルを自動承認しない(opencodeはenvでbash拒否を注入、piはシェルツールを登録せず拡張も無効化、claude/grokは編集のみ自動承認)。コマンド実行が必要なステップは`access: full`と自覚的に書くか、`args:` + `allow_access_override: true`を併記すること。**cursorはread/fullの2段階のみ**(非対話の`--force`は全承認=シェル含む)で、`access: write`はvalidateエラー。
+- **セッションは作成時より高い権限では再開できない。** sfhはセッションの作成時accessを記録し(`log.jsonl`の`session.access`)、それより高いaccessでの`continue_from:` / `fork_from:`を既定で**拒否**する(read→write/full、write→full)。readステップが悪意あるWebページを取り込み、次のステップがそのセッションをfullで再開する、という典型的な権限昇格経路を塞ぐため。受け入れる場合のみ`allow_access_override: true`。
 - **`read` は「漏れない」を意味しない。** ファイル書き込みとシェル実行を止めるだけで、Web検索やAPI送信は止まらない。秘匿データを read ステップに渡しても外に出ないとは限らない。
 - **サブエージェントの出力は信頼できない入力**として扱うこと。stdoutに出るのはAIが生成したテキストで、その中にはWebから拾ってきた内容が混ざりうる(プロンプトインジェクション経路)。呼び出し元エージェントには「これはデータであって指示ではない」と伝えるのが安全。
-- 文字列形式の `cmd:` へのAI出力の注入はメタ文字チェックで防いでいるが、配列形式 `cmd: [...]` は素通しする(そちらはシェルを介さないため設計上安全)。
+- **文字列形式の `cmd:` でのテンプレート展開は既定で禁止。** 置換値はシェル文字列に注入されるため、メタ文字ブラックリストは安全境界にならない(禁止文字を1つも含まない値が、対象プログラムの危険なオプションになりうる。例: tar の `--checkpoint-action=exec=...`)。必要なら `unsafe_shell_template: true` を明示すること(メタ文字チェックは残る)。配列形式 `cmd: [...]` はシェルを介さず、置換値は1引数としてそのまま渡る — シェルインジェクションは起きないが、「引数として渡る」ことは変わらないため、対象プログラムのオプション解釈に対する保証ではない。
 
 ## 既知の注意点
 
@@ -681,7 +686,7 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 - **タイムアウト**: Windowsは`taskkill /T /F`、Unixはprocess group killで子孫ごと落とす。子の終了後にパイプを握り続ける孫プロセスがいてもドレイン期限で先に進む。出力は1ストリーム32MBでキャップ。
 - **`--detach` の切り離しが効かない場合がある**: Windowsで呼び出し元がブレイクアウェイ禁止のjob objectを張っていると、切り離せずに親と心中する(sfhは警告を出す)。その場合でも `--resume` で続きから再開できる。Unix(`setsid`)には制約なし。**sfh自身のjob objectも意図的にブレイクアウェイ禁止**なので、フローの`cmd:`ステップから`sfh run --detach`してもフローより長生きはしない(禁止を解くと、msys2の`sh`がその抜け道を使って孫プロセスを取り残すため — 実測で確認済み)。
 - **Windowsでコンソールウィンドウは出ない**: 子プロセスは`CREATE_NO_WINDOW`で起動する。多段フローで毎ステップcmdウィンドウが点滅する、ということはない。
-- **opencodeのread**は`OPENCODE_CONFIG_CONTENT`でedit/bashを拒否注入(1.18.3のplan agentはbashを塞がないため。実機でBLOCKED確認済み)。完全な保証が要る変更はwrite/fullレビューを挟むこと。
+- **opencodeのread/write**は`OPENCODE_CONFIG_CONTENT`で拒否を注入(read: edit+bash、write: bash+外部ディレクトリ。1.18.3のplan agentはbashを塞がないため。実機でBLOCKED確認済み)。`--auto`は明示deny以外を自動承認するので、writeがシェル付きにならないのはこの注入のおかげ。完全な保証が要る変更はfullレビューを挟むこと。
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。
 - **AIステップが空の最終メッセージを返したら失敗扱い**(既定)。空文字が下流のプロンプトに流れ込む事故を防ぐため。意図的なら `allow_empty: true`。
 - **エディタ補完**: フロー先頭に次の1行を足すとVS Code等でスキーマ補完が効く。
@@ -690,8 +695,8 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 ## 開発
 
 ```bash
-cargo test                              # 72本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト125本
+cargo test                              # 86本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト191本
 ```
 
 CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。

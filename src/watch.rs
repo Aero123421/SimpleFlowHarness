@@ -7,6 +7,7 @@
 //! recently. Either one alone is unreliable - pids get reused, and a wedged
 //! process keeps its pid.
 
+use crate::contain;
 use crate::execute;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub flow: String,
     pub started: String,
+    pub nonce: Option<String>,
 }
 
 impl Snapshot {
@@ -161,6 +163,7 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
         error: opt("error"),
         flow: s("flow"),
         started: s("started_utc"),
+        nonce: opt("nonce"),
     })
 }
 
@@ -273,6 +276,9 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
         );
         return 0;
     }
+    if !verify_run_ownership(&dir, &snap) {
+        return 1;
+    }
     if !execute::kill_pid_tree(snap.pid) {
         eprintln!(
             "sfh: could not kill process {} (already gone?); check: sfh status {}",
@@ -291,7 +297,10 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
                 m.insert("state".into(), serde_json::json!("stopped"));
                 m.insert("exit_code".into(), serde_json::json!(1));
                 m.insert("error".into(), serde_json::json!("cancelled by sfh stop"));
-                let _ = std::fs::write(&sp, serde_json::to_string_pretty(&v).unwrap_or_default());
+                let _ = contain::write_private(
+                    &sp,
+                    serde_json::to_string_pretty(&v).unwrap_or_default(),
+                );
             }
         }
     }
@@ -304,6 +313,35 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
         dir.display()
     );
     0
+}
+
+/// Verify that a run directory genuinely belongs to sfh before killing its pid.
+/// Checks: (1) the nonce in status.json matches the nonce file in the run dir,
+/// (2) the target process is actually sfh. Either check failing is fatal.
+fn verify_run_ownership(dir: &Path, snap: &Snapshot) -> bool {
+    let nonce_file = dir.join("sfh-nonce");
+    let file_nonce = std::fs::read_to_string(&nonce_file)
+        .ok()
+        .map(|s| s.trim().to_string());
+    match (&file_nonce, &snap.nonce) {
+        (Some(f), Some(s)) if !f.is_empty() && f == s => {}
+        _ => {
+            eprintln!(
+                "sfh: refusing to stop {}: nonce mismatch or missing \
+                 (run dir was not created by this version of sfh, or status.json was tampered with)",
+                dir.display()
+            );
+            return false;
+        }
+    }
+    if !execute::pid_is_sfh(snap.pid) {
+        eprintln!(
+            "sfh: refusing to kill pid {}: it does not appear to be an sfh process",
+            snap.pid
+        );
+        return false;
+    }
+    true
 }
 
 /// Print what a foreground run would have printed to stdout.
@@ -320,7 +358,16 @@ fn print_result(snap: &Snapshot) {
         }
     }
     if let Some(f) = &snap.emit_file {
-        if let Ok(t) = std::fs::read_to_string(f) {
+        let fp = Path::new(f);
+        if !contain::is_under(&snap.dir, fp) {
+            eprintln!(
+                "sfh: refused to emit '{}': not under run dir {}",
+                f,
+                snap.dir.display()
+            );
+            return;
+        }
+        if let Ok(t) = std::fs::read_to_string(fp) {
             println!("{}", t.trim_end());
         }
     }

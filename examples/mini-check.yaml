@@ -56,4 +56,4 @@ steps:
       「pi ok」とだけ出力してください。
 
   - id: done
-    cmd: "echo all-presets-ok [{{steps.c_opencode.output | head:1}}] [{{steps.d_grok.output | head:1}}] [{{steps.e_agy.output | head:1}}] [{{steps.f_pi.output | head:1}}]"
+    cmd: ["echo", "all-presets-ok [{{steps.c_opencode.output | head:1}}] [{{steps.d_grok.output | head:1}}] [{{steps.e_agy.output | head:1}}] [{{steps.f_pi.output | head:1}}]"]

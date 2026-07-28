@@ -1,4 +1,4 @@
-use crate::{execute, flow, preset, template};
+use crate::{contain, execute, flow, preset, template};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -15,6 +15,10 @@ pub struct SessionInfo {
     /// pi accepts any --session-id and silently CREATES a session when the id
     /// is not found in this cwd, so the id alone cannot prove a real resume.
     pub marker: Option<String>,
+    /// Access level the session was created under. A later step may not resume
+    /// or fork it at a HIGHER level (untrusted context ingested at read must
+    /// not be promoted to write/full). None = run dir predates the recording.
+    pub access: Option<preset::Access>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -70,6 +74,9 @@ pub struct Prepared {
     pub err_file: PathBuf,
     pub chain_file: PathBuf,
     pub tool: Option<String>,
+    /// Declared access of this run (preset steps only); recorded with the
+    /// session so later steps cannot resume it at a higher level.
+    pub access: Option<preset::Access>,
     pub allow_empty: bool,
     pub retry: RetryCfg,
     pub quiet: bool,
@@ -90,6 +97,8 @@ pub struct LeafDone {
     pub session_marker: Option<String>,
     pub tool: Option<String>,
     pub cwd: Option<String>,
+    /// Declared access this run executed under (preset steps only).
+    pub access: Option<preset::Access>,
     pub usage: preset::Usage,
     pub cmd: String,
 }
@@ -318,7 +327,7 @@ pub fn prepare_leaf(
                 step.id
             ));
         }
-        std::fs::write(&prompt_file, p)
+        contain::write_private(&prompt_file, p)
             .map_err(|e| format!("cannot write {}: {e}", prompt_file.display()))?;
     }
 
@@ -352,20 +361,34 @@ pub fn prepare_leaf(
     let mut warmup_key: Option<String> = None;
     let (inv, tool_used) = match &step.cmd {
         Some(flow::Cmd::Shell(s)) => {
-            // Substituted values land in a cmd /C | sh -c string; reject anything
-            // the shell would re-parse. Escape hatch: argv-form cmd: [...].
-            let checked = template::render_checked(s, &ctx, &|key, val| {
-                const BAD: &[char] = &[
-                    '\n', '\r', '&', '|', '<', '>', '^', '%', '`', '$', ';', '"',
-                ];
-                if val.contains(BAD) {
+            // Substituted values land in a cmd /C | sh -c string. By default
+            // ANY expansion is refused: the metacharacter blacklist below is a
+            // delimiter filter, not a security boundary - a hostile value can
+            // be a dangerous option to the target program (tar
+            // --checkpoint-action=exec=...) without containing a single banned
+            // character. The safe path is the argv form, which never touches a
+            // shell; unsafe_shell_template: true is the explicit opt-in back
+            // into shell templating (with the metacharacter check still on).
+            let checked = if step.unsafe_shell_template.unwrap_or(false) {
+                template::render_checked(s, &ctx, &|key, val| {
+                    const BAD: &[char] = &[
+                        '\n', '\r', '&', '|', '<', '>', '^', '%', '`', '$', ';', '"',
+                    ];
+                    if val.contains(BAD) {
+                        Err(format!(
+                            "substituted value of '{{{{{key}}}}}' contains newlines or shell metacharacters; use an argv-form cmd: [...] or filters (e.g. | head:1)"
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            } else {
+                template::render_checked(s, &ctx, &|key, _| {
                     Err(format!(
-                        "substituted value of '{{{{{key}}}}}' contains newlines or shell metacharacters; use an argv-form cmd: [...] or filters (e.g. | head:1)"
+                        "string-form cmd would expand '{{{{{key}}}}}' into a shell string, and template expansion in a string cmd is disabled by default (the substituted value would be re-parsed by the shell). Use the argv form, which spawns without a shell: cmd: [\"program\", \"--flag\", \"{{{{{key}}}}}\"], or set unsafe_shell_template: true on this step to accept shell templating"
                     ))
-                } else {
-                    Ok(())
-                }
-            })
+                })
+            }
             .map_err(|e| format!("step '{}' cmd: {e}", step.id))?;
             (execute::Invocation::Shell(checked), None)
         }
@@ -391,12 +414,18 @@ pub fn prepare_leaf(
                     }
                 }
             }
-            for a in &args {
-                if preset::ESCALATION_FLAGS.iter().any(|f| a.contains(f)) {
-                    eprintln!(
-                        "sfh: warning: step '{}': args: contains '{a}', which overrides the declared access level",
+            // Same check validation runs on the literal args, repeated here on
+            // the RENDERED args: args may contain templates, so an upstream
+            // output can inject a permission flag that no load-time check saw.
+            // Fail-closed: refuse instead of warn, unless the step opted in.
+            if !matches!(eff.access, preset::Access::Full)
+                && !step.allow_access_override.unwrap_or(false)
+            {
+                if let Some(bad) = args.iter().find(|a| preset::is_escalation_arg(&tool, a)) {
+                    return Err(format!(
+                        "step '{}': args: contains '{bad}', which overrides the declared access level; use access: full, or set allow_access_override: true on this step to accept it",
                         step.id
-                    );
+                    ));
                 }
             }
             let inp = preset::PresetInput {
@@ -427,6 +456,30 @@ pub fn prepare_leaf(
                         "step '{}': {what} '{target}' used tool '{}', this step resolves to '{tool}'",
                         step.id, info.tool
                     ));
+                }
+                // A session ingested at low access may hold untrusted content
+                // (e.g. a web page read during a read step); resuming it at a
+                // higher tier promotes that content into a privileged agent.
+                // Refuse the escalation unless the step explicitly opts in.
+                match info.access {
+                    Some(prev)
+                        if eff.access.rank() > prev.rank()
+                            && !step.allow_access_override.unwrap_or(false) =>
+                    {
+                        return Err(format!(
+                            "step '{}': {what} '{target}' ran with access {}, but this step declares {} - refusing to resume a session at a higher access level than it was created (set allow_access_override: true on this step to accept)",
+                            step.id,
+                            prev.as_str(),
+                            eff.access.as_str()
+                        ));
+                    }
+                    None => {
+                        eprintln!(
+                            "sfh: warning: step '{}': the session of '{target}' has no recorded access level (run dir predates access recording); access escalation cannot be verified",
+                            step.id
+                        );
+                    }
+                    _ => {}
                 }
                 let new_cwd = cwd.as_ref().map(|c| c.display().to_string());
                 let cwd_scoped = if is_fork {
@@ -601,6 +654,7 @@ pub fn prepare_leaf(
         out_file,
         err_file,
         chain_file,
+        access: tool_used.as_ref().map(|_| eff.access),
         tool: tool_used,
         // Custom commands may legitimately print nothing; agent steps may not.
         allow_empty: step.allow_empty.unwrap_or(!is_preset),
@@ -909,7 +963,7 @@ fn exec_once(p: Prepared) -> LeafDone {
     ) {
         Ok(o) => o,
         Err(e) => {
-            let _ = std::fs::write(&p.err_file, &e);
+            let _ = contain::write_private(&p.err_file, &e);
             if !p.quiet {
                 eprintln!("sfh: [{}] spawn failed: {e}", p.tag);
             }
@@ -927,6 +981,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 session_marker: None,
                 tool: p.tool,
                 cwd: cwd_str,
+                access: p.access,
                 usage: preset::Usage::default(),
                 cmd: cmd_desc,
             };
@@ -934,8 +989,8 @@ fn exec_once(p: Prepared) -> LeafDone {
     };
     let stdout_clean = clean_text(&outcome.stdout);
     let mut stderr_clean = clean_text(&outcome.stderr);
-    let _ = std::fs::write(&p.out_file, &stdout_clean);
-    let _ = std::fs::write(&p.err_file, &stderr_clean);
+    let _ = contain::write_private(&p.out_file, &stdout_clean);
+    let _ = contain::write_private(&p.err_file, &stderr_clean);
 
     let parsed = parse_output(&p.parse, &stdout_clean, &stderr_clean);
     let mut exit_code = outcome.exit_code;
@@ -982,10 +1037,10 @@ fn exec_once(p: Prepared) -> LeafDone {
                 session_id = None;
             }
             stderr_clean.push_str(&why);
-            let _ = std::fs::write(&p.err_file, &stderr_clean);
+            let _ = contain::write_private(&p.err_file, &stderr_clean);
         }
     }
-    let _ = std::fs::write(&p.chain_file, &chain_output);
+    let _ = contain::write_private(&p.chain_file, &chain_output);
 
     if !p.quiet {
         let cost = parsed
@@ -1017,6 +1072,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         session_marker,
         tool: p.tool,
         cwd: cwd_str,
+        access: p.access,
         usage: parsed.usage,
         cmd: cmd_desc,
     }
@@ -1435,6 +1491,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         session_marker: None,
         tool: None,
         cwd: None,
+        access: None,
         usage: preset::Usage::default(),
         cmd: String::new(),
     }
@@ -1827,6 +1884,302 @@ mod tests {
             "answer"
         )
         .is_none());
+    }
+
+    fn temp_run_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sfh-leaf-test-{}", gen_uuid()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ctx<'a>(
+        flow: &'a flow::Flow,
+        vars: &'a BTreeMap<String, String>,
+        outputs: &'a BTreeMap<String, template::StepOutput>,
+        step_ids: &'a HashSet<String>,
+        run_dir: &'a Path,
+        sessions: &'a HashMap<String, SessionInfo>,
+        needed: &'a HashSet<String>,
+    ) -> PrepCtx<'a> {
+        PrepCtx {
+            flow,
+            vars,
+            outputs,
+            step_ids,
+            run_dir,
+            flow_dir: run_dir,
+            notes_file: run_dir,
+            sessions,
+            needed_sessions: needed,
+            quiet: true,
+            verbose: false,
+        }
+    }
+
+    // A session ingested at low access may carry untrusted content; resuming it
+    // at a higher tier is the classic promotion path and must fail closed.
+    #[test]
+    fn resume_cannot_escalate_the_sessions_access_level() {
+        let flow: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: low\n    tool: claude\n    access: read\n    prompt: x\n  - id: high\n    tool: claude\n    access: full\n    continue_from: low\n    prompt: y\n",
+        )
+        .unwrap();
+        let dir = temp_run_dir();
+        let vars = BTreeMap::new();
+        let outputs = BTreeMap::new();
+        let step_ids = flow.step_ids();
+        let needed: HashSet<String> = ["low".into()].into_iter().collect();
+        let with_access = |a: Option<preset::Access>| {
+            let mut sessions = HashMap::new();
+            sessions.insert(
+                "low".to_string(),
+                SessionInfo {
+                    tool: "claude".into(),
+                    id: "sess-1".into(),
+                    cwd: None,
+                    marker: None,
+                    access: a,
+                },
+            );
+            sessions
+        };
+        let high = &flow.steps[1];
+
+        let sessions = with_access(Some(preset::Access::Read));
+        let e = prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            high,
+            1,
+            "high",
+            &[],
+            None,
+        )
+        .err()
+        .expect("read -> full resume must be refused");
+        assert!(e.contains("higher access level"), "{e}");
+        assert!(e.contains("read") && e.contains("full"), "{e}");
+
+        // the explicit opt-in is the only way through
+        let mut opted: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: low\n    tool: claude\n    access: read\n    prompt: x\n  - id: high\n    tool: claude\n    access: full\n    allow_access_override: true\n    continue_from: low\n    prompt: y\n",
+        )
+        .unwrap();
+        let high_o = opted.steps.pop().unwrap();
+        prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &high_o,
+            1,
+            "high",
+            &[],
+            None,
+        )
+        .expect("allow_access_override permits the escalation");
+
+        // same tier and downgrades are fine
+        let mut same: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: low\n    tool: claude\n    access: read\n    prompt: x\n  - id: high\n    tool: claude\n    access: read\n    continue_from: low\n    prompt: y\n",
+        )
+        .unwrap();
+        let high_s = same.steps.pop().unwrap();
+        prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &high_s,
+            1,
+            "high",
+            &[],
+            None,
+        )
+        .expect("resuming at the same access level is allowed");
+
+        // write -> full is an escalation too
+        let sessions_w = with_access(Some(preset::Access::Write));
+        assert!(prepare_leaf(
+            &ctx(
+                &flow,
+                &vars,
+                &outputs,
+                &step_ids,
+                &dir,
+                &sessions_w,
+                &needed
+            ),
+            high,
+            1,
+            "high",
+            &[],
+            None,
+        )
+        .is_err());
+
+        // old run dirs without a recorded level warn but are not blocked
+        let sessions_unknown = with_access(None);
+        prepare_leaf(
+            &ctx(
+                &flow,
+                &vars,
+                &outputs,
+                &step_ids,
+                &dir,
+                &sessions_unknown,
+                &needed,
+            ),
+            high,
+            1,
+            "high",
+            &[],
+            None,
+        )
+        .expect("unknown recorded access cannot be compared");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // args may contain templates, so the escalation check must run again on the
+    // RENDERED args: an upstream output can inject a permission flag that no
+    // load-time check ever saw.
+    #[test]
+    fn rendered_args_are_checked_for_permission_flags() {
+        let flow: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    tool: claude\n    access: read\n    args: [\"{{vars.flag}}\"]\n    prompt: x\n",
+        )
+        .unwrap();
+        let dir = temp_run_dir();
+        let mut vars = BTreeMap::new();
+        vars.insert("flag".to_string(), "--force".to_string());
+        let outputs = BTreeMap::new();
+        let step_ids = flow.step_ids();
+        let sessions = HashMap::new();
+        let needed = HashSet::new();
+        let e = prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &flow.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .err()
+        .expect("a rendered --force arg must be refused at read access");
+        assert!(e.contains("overrides the declared access level"), "{e}");
+        assert!(e.contains("--force"), "{e}");
+
+        // a benign value passes the same path
+        vars.insert("flag".to_string(), "--verbose".to_string());
+        prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &flow.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .expect("a non-permission flag must pass");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The metacharacter blacklist stops shell DELIMITERS, not hostile VALUES:
+    // the audit's `--checkpoint-action=exec='sh payload.sh'` contains no banned
+    // character at all, yet runs arbitrary code through tar. So expansion in a
+    // string cmd is refused outright unless the step opts in.
+    #[test]
+    fn string_cmd_template_expansion_is_disabled_by_default() {
+        let flow: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: \"tar -cf backup.tar {{vars.files}}\"\n",
+        )
+        .unwrap();
+        let dir = temp_run_dir();
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "files".to_string(),
+            "--checkpoint=1 --checkpoint-action=exec='sh payload.sh' harmless.txt".to_string(),
+        );
+        let outputs = BTreeMap::new();
+        let step_ids = flow.step_ids();
+        let sessions = HashMap::new();
+        let needed = HashSet::new();
+        let e = prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &flow.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .err()
+        .expect("expansion in a string cmd must be refused by default");
+        assert!(e.contains("disabled by default"), "{e}");
+        assert!(e.contains("cmd: ["), "{e}");
+
+        // The same value through the argv form is data, not shell syntax.
+        let argv: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    cmd: [\"printf\", \"%s\\n\", \"{{vars.files}}\"]\n",
+        )
+        .unwrap();
+        let p = prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &argv.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .expect("the argv form may carry any value as one argument");
+        match p.inv {
+            execute::Invocation::Argv(v) => {
+                assert_eq!(
+                    v.last().map(String::as_str),
+                    Some("--checkpoint=1 --checkpoint-action=exec='sh payload.sh' harmless.txt")
+                );
+            }
+            _ => panic!("argv form must spawn directly"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsafe_shell_template_opts_back_into_shell_templating() {
+        let dir = temp_run_dir();
+        let mut vars = BTreeMap::new();
+        vars.insert("f".to_string(), "harmless.txt".to_string());
+        let outputs = BTreeMap::new();
+        let sessions = HashMap::new();
+        let needed = HashSet::new();
+
+        // Opted in, benign value: expands as before.
+        let ok: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: a\n    unsafe_shell_template: true\n    cmd: \"echo {{vars.f}}\"\n",
+        )
+        .unwrap();
+        let step_ids = ok.step_ids();
+        let p = prepare_leaf(
+            &ctx(&ok, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &ok.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .expect("opt-in allows a benign expansion");
+        assert!(matches!(p.inv, execute::Invocation::Shell(_)));
+
+        // Opted in, metacharacters: the delimiter check still fires.
+        vars.insert("f".to_string(), "x & echo pwned".to_string());
+        let e = prepare_leaf(
+            &ctx(&ok, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &ok.steps[0],
+            1,
+            "a",
+            &[],
+            None,
+        )
+        .err()
+        .expect("metacharacters are still rejected under the opt-in");
+        assert!(e.contains("metacharacters"), "{e}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

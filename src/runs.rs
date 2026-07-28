@@ -304,7 +304,15 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
     );
     if let Some(t) = m.get("tools").and_then(Value::as_object) {
         for (k, v) in t {
-            println!("tool    : {k} = {} ({})", get(v, "version"), get(v, "bin"));
+            // A tool with several distinct bins records an array of entries.
+            match v.as_array() {
+                Some(entries) => {
+                    for e in entries {
+                        println!("tool    : {k} = {} ({})", get(e, "version"), get(e, "bin"));
+                    }
+                }
+                None => println!("tool    : {k} = {} ({})", get(v, "version"), get(v, "bin")),
+            }
         }
     }
     println!();

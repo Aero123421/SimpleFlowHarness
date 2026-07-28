@@ -32,8 +32,7 @@
     },
     "access": {
       "enum": ["read", "write", "full"],
-      "default": "write",
-      "description": "read = no writes, write = workspace edits, full = auto-approve everything."
+      "description": "read = no writes, write = workspace edits (never an auto-approved shell), full = auto-approve everything. Mandatory for AI steps (on the step, its profile, or defaults); there is no implicit default. cursor supports only read and full."
     },
     "action": {
       "type": "string",
@@ -145,13 +144,23 @@
         "model": { "type": "string" },
         "effort": { "type": "string" },
         "access": { "$ref": "#/definitions/access" },
+        "allow_access_override": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit escape hatch: accept args: that override the declared access level, and continue_from/fork_from at a higher access than the original session. Both are refused by default (fail-closed)."
+        },
         "agent": { "type": "string" },
         "args": { "type": "array", "items": { "type": "string" } },
         "cmd": {
           "oneOf": [
-            { "type": "string", "description": "Run via cmd /C | sh -c. Substituted values may not contain shell metacharacters." },
-            { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Spawned directly (recommended)." }
+            { "type": "string", "description": "Run via cmd /C | sh -c. Template expansion is disabled by default (refused at validation); set unsafe_shell_template: true to allow it, in which case substituted values may not contain shell metacharacters." },
+            { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Spawned directly, no shell (recommended). Templates expand per argument; a substituted value stays one argument, but is still an argument to the target program." }
           ]
+        },
+        "unsafe_shell_template": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit escape hatch: allow template expansion inside a string-form cmd. Off by default because a substituted value is re-parsed by the shell and a metacharacter blacklist is not a security boundary. Prefer the array form."
         },
         "prompt": { "type": "string" },
         "stdin": { "enum": ["prompt", "none"], "description": "cmd: steps only." },

@@ -29,7 +29,7 @@
 
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Access {
     Read,
     Write,
@@ -37,12 +37,33 @@ pub enum Access {
 }
 
 impl Access {
+    /// `None` still parses to Write so cmd: steps (which never use it) need no
+    /// special case; validation makes access mandatory for AI steps, so a
+    /// preset step can only reach here with an explicitly declared level.
     pub fn parse(s: Option<&str>) -> Result<Access, String> {
         match s.unwrap_or("write") {
             "read" => Ok(Access::Read),
             "write" => Ok(Access::Write),
             "full" => Ok(Access::Full),
             other => Err(format!("access must be read/write/full, got '{other}'")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::Write => "write",
+            Access::Full => "full",
+        }
+    }
+
+    /// Privilege ordering, used to refuse escalating a resumed session
+    /// (read < write < full).
+    pub fn rank(self) -> u8 {
+        match self {
+            Access::Read => 0,
+            Access::Write => 1,
+            Access::Full => 2,
         }
     }
 }
@@ -176,6 +197,16 @@ pub fn supports_fork(tool: &str) -> bool {
     matches!(tool, "claude" | "opencode" | "grok" | "pi")
 }
 
+/// The executable a preset launches when no `bin:` overrides it. Every preset
+/// runs the tool's own name except cursor, whose CLI is `cursor-agent` -
+/// probing plain `cursor` would start the Electron editor.
+pub fn default_program(tool: &str) -> String {
+    match tool {
+        "cursor" => "cursor-agent".to_string(),
+        t => t.to_string(),
+    }
+}
+
 /// Forking pays off because the child's prompt prefix is byte-identical to the
 /// parent's, so the provider's prompt cache can hit - but N children racing the
 /// first cache write all miss it. Measured on claude: one warm-up child first
@@ -215,8 +246,9 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
     a.push(pi_tools(inp.access).to_string());
     match inp.access {
         // Project-local extensions/skills are TypeScript that runs with full
-        // process rights regardless of the tool allowlist, so a read step must
-        // refuse to load them for the allowlist to mean anything.
+        // process rights regardless of the tool allowlist, so anything below full
+        // must refuse to load them for the allowlist to mean anything: an
+        // extension in the repo could register Bash and undo the write tier.
         Access::Read => push(
             a,
             &[
@@ -227,9 +259,17 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
             ],
         ),
         Access::Write => {
-            push(a, &["--no-approve"]);
+            push(
+                a,
+                &[
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--no-approve",
+                ],
+            );
             warnings.push(
-                "pi write registers no shell tool (pi has no sandbox, so bash would equal full access); add args: [\"-t\", \"read,bash,edit,write,grep,find,ls\"] if the step must run commands"
+                "pi write registers no shell tool (pi has no sandbox, so bash would equal full access); use access: full if the step must run commands (or args: [\"-t\", \"...\"] together with allow_access_override: true)"
                     .into(),
             );
         }
@@ -269,7 +309,7 @@ fn claude_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<Stri
                 ],
             );
             warnings.push(
-                "claude write auto-approves edits only; shell commands are not auto-approved (add args: [\"--allowedTools\", \"Bash,WebSearch,WebFetch\"] if the step must run commands)".into(),
+                "claude write auto-approves edits only; shell commands are not auto-approved (use access: full if the step must run commands, or args: [\"--allowedTools\", \"Bash,...\"] together with allow_access_override: true)".into(),
             );
         }
         Access::Full => push(a, &["--dangerously-skip-permissions"]),
@@ -309,7 +349,7 @@ fn grok_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String
         Access::Write => {
             push(a, &["--permission-mode", "acceptEdits"]);
             warnings.push(
-                "grok write auto-approves edits only; shell commands are not auto-approved (add args: [\"--allow\", \"Bash(...)\"] if the step must run commands)".into(),
+                "grok write auto-approves edits only; shell commands are not auto-approved (use access: full if the step must run commands, or args: [\"--allow\", \"Bash(...)\"] together with allow_access_override: true)".into(),
             );
         }
         Access::Full => push(a, &["--permission-mode", "bypassPermissions"]),
@@ -339,8 +379,10 @@ const CLAUDE_READ_TOOLS: &str = "Read,Glob,Grep,WebSearch,WebFetch,TodoWrite";
 /// need commands say so with `args:`, or use `access: full` and mean it.
 const CLAUDE_WRITE_ALLOWED: &str = "WebSearch,WebFetch";
 
-/// Flags a user could put in `args:` that silently escalate past `access:`.
-pub const ESCALATION_FLAGS: [&str; 7] = [
+/// Flags a user could put in `args:` that escalate past `access:` regardless of
+/// the tool. Flag-shaped entries match a whole argv element or its `--flag=...`
+/// form; bare values (permission-mode names) match as substrings.
+pub const GLOBAL_ESCALATION_FLAGS: [&str; 7] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
     "bypassPermissions",
@@ -349,6 +391,47 @@ pub const ESCALATION_FLAGS: [&str; 7] = [
     "--yolo",
     "--force",
 ];
+
+/// Per-tool `args:` that change what the tool is allowed to do. The preset
+/// itself emits several of these (pi --tools, claude --permission-mode, ...);
+/// the check applies to USER args only, never to the argv sfh builds.
+/// Entries ending in '=' match a value namespace (codex -c sandbox_mode=...).
+pub fn escalation_flags(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "codex" => &["-s", "--sandbox", "sandbox_mode=", "approval_policy="],
+        "claude" => &[
+            "--tools",
+            "--allowedTools",
+            "--permission-mode",
+            "--add-dir",
+        ],
+        "opencode" => &["--agent"],
+        "grok" => &["--allow", "--permission-mode"],
+        "agy" => &["--mode"],
+        "pi" => &["--approve", "--tools", "-t"],
+        _ => &[],
+    }
+}
+
+fn escalation_pattern_matches(pattern: &str, arg: &str) -> bool {
+    if pattern.ends_with('=') {
+        arg.starts_with(pattern)
+    } else if pattern.starts_with('-') {
+        arg == pattern || arg.starts_with(&format!("{pattern}="))
+    } else {
+        arg.contains(pattern)
+    }
+}
+
+/// True when one user-supplied arg would override the declared access level.
+/// A step that is not `full` may carry such an arg only with an explicit
+/// allow_access_override: true (enforced by the caller, fail-closed).
+pub fn is_escalation_arg(tool: &str, arg: &str) -> bool {
+    GLOBAL_ESCALATION_FLAGS
+        .iter()
+        .chain(escalation_flags(tool).iter())
+        .any(|p| escalation_pattern_matches(p, arg))
+}
 
 fn push(a: &mut Vec<String>, items: &[&str]) {
     a.extend(items.iter().map(|s| s.to_string()));
@@ -394,11 +477,16 @@ fn opencode_env(agent_name: &str, access: Access) -> Vec<(String, String)> {
                 "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"edit\":\"deny\",\"bash\":\"deny\"}}}}}}}}"
             ),
         )],
-        // Best-effort workspace boundary: --auto would otherwise auto-approve
-        // out-of-tree access.
+        // --auto auto-approves whatever is not explicitly denied, so write denies
+        // two things: bash (opencode has no OS sandbox - an auto-approved shell
+        // would make write == full, the same rule pi/claude/grok follow) and
+        // out-of-tree writes. Agent-scoped so a user-selected agent cannot
+        // inherit looser defaults.
         Access::Write => vec![(
             "OPENCODE_CONFIG_CONTENT".to_string(),
-            "{\"permission\":{\"external_directory\":\"deny\"}}".to_string(),
+            format!(
+                "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"bash\":\"deny\"}}}}}},\"permission\":{{\"external_directory\":\"deny\"}}}}"
+            ),
         )],
         Access::Full => Vec::new(),
     }
@@ -576,14 +664,16 @@ pub fn build(
             }
             match inp.access {
                 // Headless has exactly two tiers: without --force every gated
-                // operation is denied outright; with it, everything is approved.
+                // operation is denied outright; with it, everything is approved
+                // (shell included). A "write" tier cannot exist, so asking for
+                // one is an error instead of a silent full (validation rejects
+                // it too; this is the fail-closed backstop).
                 Access::Read => push(&mut a, &["--mode", "plan"]),
                 Access::Write => {
-                    push(&mut a, &["--force"]);
-                    warnings.push(
-                        "cursor headless has no middle permission tier: 'write' is as permissive as 'full' (--force approves shell commands too)"
+                    return Err(
+                        "cursor headless has only two permission tiers: read (deny-all) and full (--force, approve-all); access: write is not supported - pick read or full"
                             .into(),
-                    );
+                    )
                 }
                 Access::Full => push(&mut a, &["--force"]),
             }
@@ -803,7 +893,13 @@ pub fn build_resume(
             }
             match inp.access {
                 Access::Read => push(&mut a, &["--mode", "plan"]),
-                Access::Write | Access::Full => push(&mut a, &["--force"]),
+                Access::Write => {
+                    return Err(
+                        "cursor headless has only two permission tiers: read (deny-all) and full (--force, approve-all); access: write is not supported - pick read or full"
+                            .into(),
+                    )
+                }
+                Access::Full => push(&mut a, &["--force"]),
             }
             push(&mut a, &["--resume"]);
             a.push(session_id.to_string());
@@ -1065,6 +1161,17 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--agent" && w[1] == "build"));
         assert!(write.env_set[0].1.contains("external_directory"));
+        // --auto approves whatever is not denied, and opencode has no sandbox:
+        // an auto-approved shell would make write == full.
+        assert!(
+            write.env_set[0].1.contains("\"bash\":\"deny\""),
+            "opencode write must deny bash: {}",
+            write.env_set[0].1
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&write.env_set[0].1).is_ok(),
+            "config env must be valid JSON"
+        );
 
         let full = build(
             "opencode",
@@ -1158,14 +1265,18 @@ mod tests {
             Delivery::Stdin
         );
 
-        for acc in [Access::Write, Access::Full] {
-            assert!(build_argv("cursor", acc).iter().any(|x| x == "--force"));
-        }
-        let w = build("cursor", inp(Access::Write, &[]), &bp, None).unwrap();
-        assert!(w
-            .warnings
+        // cursor headless has no middle tier: full means --force, and write is
+        // refused outright instead of silently meaning full.
+        assert!(build_argv("cursor", Access::Full)
             .iter()
-            .any(|x| x.contains("no middle permission tier")));
+            .any(|x| x == "--force"));
+        for argv in [
+            build("cursor", inp(Access::Write, &[]), &bp, None),
+            build_resume("cursor", "chat-1", inp(Access::Write, &[]), &bp),
+        ] {
+            let e = argv.err().expect("cursor write must be rejected");
+            assert!(e.contains("two permission tiers"), "{e}");
+        }
     }
 
     #[test]
@@ -1322,6 +1433,16 @@ mod tests {
             !write.iter().any(|x| x.contains("bash")),
             "write must not register a shell"
         );
+        // Extensions run with full process rights and could register Bash,
+        // which would undo the allowlist - write must not load them either.
+        for f in [
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-approve",
+        ] {
+            assert!(write.iter().any(|x| x == f), "{f} missing from pi write");
+        }
 
         let full = build_argv("pi", Access::Full);
         assert!(full
@@ -1372,6 +1493,76 @@ mod tests {
         for t in ["claude", "opencode", "grok", "agy", "pi"] {
             let b = build_resume(t, "sid", inp(Access::Read, &[]), &bp).unwrap();
             assert_eq!(b.expect_session.as_deref(), Some("sid"), "{t}");
+        }
+    }
+
+    #[test]
+    fn access_levels_have_a_strict_ordering() {
+        assert!(Access::Read.rank() < Access::Write.rank());
+        assert!(Access::Write.rank() < Access::Full.rank());
+        for a in [Access::Read, Access::Write, Access::Full] {
+            assert_eq!(Access::parse(Some(a.as_str())).unwrap(), a);
+        }
+    }
+
+    // The audit found seven strings checked by naive contains: pi's -t (which
+    // the README itself suggested for adding Bash), claude's --allowedTools,
+    // codex's -c sandbox_mode=... and friends all slipped through. Each tool's
+    // permission levers must be caught, and harmless lookalikes must not be.
+    #[test]
+    fn escalation_detection_covers_each_tools_permission_levers() {
+        for (tool, arg) in [
+            ("pi", "--approve"),
+            ("pi", "--tools"),
+            ("pi", "-t"),
+            ("opencode", "--agent"),
+            ("opencode", "--agent=build"),
+            ("claude", "--tools"),
+            ("claude", "--allowedTools"),
+            ("claude", "--permission-mode"),
+            ("claude", "--permission-mode=bypassPermissions"),
+            ("grok", "--allow"),
+            ("grok", "--permission-mode"),
+            ("agy", "--mode"),
+            ("codex", "-s"),
+            ("codex", "--sandbox"),
+            ("codex", "sandbox_mode=\"danger-full-access\""),
+            ("codex", "approval_policy=\"on-failure\""),
+            // tool-independent bypasses
+            ("claude", "--force"),
+            ("codex", "--yolo"),
+            ("grok", "bypassPermissions"),
+            ("agy", "--dangerously-skip-permissions"),
+        ] {
+            assert!(
+                is_escalation_arg(tool, arg),
+                "{tool}: {arg} slipped through"
+            );
+        }
+        for (tool, arg) in [
+            ("codex", "--model"),
+            ("codex", "-m"),
+            ("codex", "model_reasoning_effort=\"high\""),
+            ("claude", "--effort"),
+            ("claude", "--output-format"),
+            ("opencode", "--variant"),
+            ("grok", "--reasoning-effort"),
+            ("grok", "--deny"),
+            ("agy", "--model"),
+            ("agy", "--agent"),
+            ("pi", "--thinking"),
+            ("pi", "--no-approve"),
+            ("pi", "--no-extensions"),
+            ("pi", "--session-id"),
+            ("cursor", "--mode"),
+            ("cursor", "--trust"),
+            ("codex", "--force-of-nature"),
+            ("agy", "--modest"),
+        ] {
+            assert!(
+                !is_escalation_arg(tool, arg),
+                "{tool}: {arg} is a false positive"
+            );
         }
     }
 }

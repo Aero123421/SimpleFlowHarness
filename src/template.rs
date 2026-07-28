@@ -46,6 +46,30 @@ pub fn render_checked(input: &str, ctx: &Ctx, check: SubstCheck) -> Result<Strin
 
 const RAW_END: &str = "{{endraw}}";
 
+/// True when rendering `input` would substitute at least one value. Raw blocks
+/// ({{raw}}...{{endraw}}) pass their body through untouched and do not count.
+/// Used to fail-closed on template expansion inside string-form cmd:.
+pub fn contains_template(input: &str) -> bool {
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        if let Some(body) = after.strip_prefix("raw}}") {
+            match body.find(RAW_END) {
+                // Skip the raw body; what follows may still contain templates.
+                Some(end) => {
+                    rest = &body[end + RAW_END.len()..];
+                    continue;
+                }
+                // Unclosed raw is a render error anyway; treat as a template
+                // so validation rejects it early instead of at spawn time.
+                None => return true,
+            }
+        }
+        return true;
+    }
+    false
+}
+
 fn render_impl(input: &str, ctx: &Ctx, check: Option<SubstCheck>) -> Result<String, String> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -330,6 +354,23 @@ mod tests {
         assert!(render_with("{{vars.topic", BTreeMap::new())
             .unwrap_err()
             .contains("unclosed"));
+    }
+
+    #[test]
+    fn contains_template_sees_substitutions_but_not_raw_blocks() {
+        assert!(contains_template("echo {{vars.x}}"));
+        assert!(contains_template("{{steps.a.output}}"));
+        assert!(contains_template(
+            "plain {{raw}}literal{{endraw}} then {{vars.x}}"
+        ));
+        assert!(!contains_template("echo plain"));
+        assert!(!contains_template(
+            "echo {{raw}}{{steps.a.output}}{{endraw}}"
+        ));
+        assert!(!contains_template(""));
+        // An unclosed raw block is a render error; count it as a template so
+        // validation rejects it up front.
+        assert!(contains_template("echo {{raw}}never closed"));
     }
 
     #[test]

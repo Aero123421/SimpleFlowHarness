@@ -64,19 +64,15 @@ pub fn run(flow_path: Option<&Path>, timeout_sec: u64, work: &Path) -> i32 {
                     return 2;
                 }
             };
-            let mut used: Vec<String> = f.tools_used().into_iter().collect();
-            used.sort();
-            for t in used {
-                // Same resolution the engine uses when recording provenance.
-                let prof = f
-                    .profiles
-                    .values()
-                    .find(|p| p.tool.as_deref() == Some(t.as_str()));
+            // Exactly the (tool, bin, model, effort) tuples the flow resolves
+            // to - same resolution the engine uses. Unused profiles are never
+            // probed, so a profile's bin is never launched just by existing.
+            for rt in f.resolved_tools() {
                 targets.push(Target {
-                    bin: prof.and_then(|p| p.bin.clone()),
-                    model: prof.and_then(|p| p.model.clone()),
-                    effort: prof.and_then(|p| p.effort.clone()),
-                    tool: t,
+                    tool: rt.tool,
+                    bin: rt.bin,
+                    model: rt.model,
+                    effort: rt.effort,
                 });
             }
             if targets.is_empty() {
@@ -99,7 +95,7 @@ pub fn run(flow_path: Option<&Path>, timeout_sec: u64, work: &Path) -> i32 {
         }
     }
 
-    if let Err(e) = std::fs::create_dir_all(work) {
+    if let Err(e) = crate::contain::mkdir_private(work) {
         eprintln!("sfh: cannot create {}: {e}", work.display());
         return 2;
     }
@@ -248,7 +244,8 @@ fn build_probe(
 ) -> Result<(String, preset::Built), String> {
     let last = work.join(format!("{tool}.last.txt"));
     let pfile = work.join(format!("{tool}.prompt.txt"));
-    std::fs::write(&pfile, PROBE).map_err(|e| format!("cannot write probe prompt: {e}"))?;
+    crate::contain::write_private(&pfile, PROBE)
+        .map_err(|e| format!("cannot write probe prompt: {e}"))?;
     let _ = std::fs::remove_file(&last);
 
     let built = preset::build(

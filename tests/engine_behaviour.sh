@@ -76,10 +76,10 @@ contains "child output is addressable" "done:AAA" basic.out
 BASIC_LOG="$(find basic-runs -type f -name 'log.jsonl' -print -quit)"
 contains "a matched route records via=rule" '"via":"rule"' "$BASIC_LOG"
 contains "an unmatched route records via=fallthrough" '"via":"fallthrough"' "$BASIC_LOG"
-contains "step_end records an output hash" '"output_hash":"fa2bfc19a0708642"' "$BASIC_LOG"
+contains "step_end records an output hash" '"output_hash":"cb1ad2119d8fafb69566510ee712661f9f14b83385006ef92aec47f523a38358"' "$BASIC_LOG"
 if grep -F '"event":"aggregate_end"' "$BASIC_LOG" |
   grep -F '"step":"fan"' |
-  grep -qF '"output_hash":"06b7ba3ef1903648"'; then
+  grep -qF '"output_hash":"68d478004ba12d2dbe1ee1766b705d68c1b7fd5d1c31132412c0fba38407f8e8"'; then
   echo "ok   - aggregate hash is computed from the unlabeled plain output"
   pass=$((pass + 1))
 else
@@ -311,12 +311,17 @@ fi
 contains "notes preserve the pre-compact original" "ORIGINAL-BEFORE-COMPACT-0123456789" "$COMPACT_NOTES"
 
 # --- empty output from a cmd step is allowed, shell injection is not ----------
+# With unsafe_shell_template the step opts back into shell templating; sfh then
+# applies the metacharacter check, which still catches shell DELIMITERS. (That
+# check is not a security boundary - see the S3-1 tests below - but under the
+# opt-in it remains the agreed behaviour.)
 cat > guard.yaml <<'YAML'
 name: guard
 vars:
   evil: "hello & echo pwned"
 steps:
   - id: t
+    unsafe_shell_template: true
     cmd: "echo {{vars.evil}}"
 YAML
 "$SFH" run guard.yaml -q > guard.out 2> guard.err
@@ -602,8 +607,8 @@ fi
 cat > fb.yaml <<'YAML'
 name: fb
 profiles:
-  broken: { tool: codex, bin: "false" }
-  works:  { tool: codex, bin: "echo" }
+  broken: { tool: codex, bin: "false", access: read }
+  works:  { tool: codex, bin: "echo", access: read }
 steps:
   - id: plain
     use: broken
@@ -796,6 +801,528 @@ YAML
 check "a run-local human gate blocks and then continues" 0 $?
 contains "the human answer becomes chain output" "accepted=APPROVE-42" human-gate.out
 contains "stdin prompt records what the human must inspect" "release を承認" human-gate-run/approve.err.txt
+
+echo
+echo "engine behaviour: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]
+
+# --- S1-1: sfh wait must not emit files outside the run dir -------------------
+# Attacker crafts a status.json whose emit_file points at a secret outside the
+# run dir. `sfh wait` reads the status and must refuse to print that file.
+mkdir -p s11-run
+echo "TOP-SECRET-S11" > s11-secret.txt
+cat > s11-run/status.json <<JSON
+{
+  "state": "done",
+  "current_step": "x",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 1,
+  "cost_usd": 0.0,
+  "run_dir": "s11-run",
+  "flow": "x.yaml",
+  "pid": 99999,
+  "sfh_version": "0.9.0",
+  "exit_code": 0,
+  "emit_step": "x",
+  "emit_file": "../s11-secret.txt",
+  "error": null,
+  "unfinished_step": null,
+  "nonce": "deadbeef"
+}
+JSON
+"$SFH" wait s11-run > s11.out 2>s11.err
+if grep -qF "TOP-SECRET-S11" s11.out; then
+  echo "FAIL - S1-1: sfh wait emitted a file outside the run dir"
+  fail=$((fail + 1))
+else
+  echo "ok   - S1-1: sfh wait refuses to emit files outside the run dir"
+  pass=$((pass + 1))
+fi
+contains "S1-1: the refusal is reported" "refused to emit" s11.err
+
+# --- S1-2: sfh stop must not kill unrelated processes -------------------------
+# A fake run dir (no sfh-nonce file) must not result in a kill. Depending on
+# whether the OS reports the fake pid as alive, sfh either refuses (nonce
+# mismatch) or reports the run as already dead - both are safe.
+mkdir -p s12-run
+cat > s12-run/status.json <<'JSON'
+{
+  "state": "running",
+  "current_step": "x",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 0,
+  "cost_usd": 0.0,
+  "run_dir": "s12-run",
+  "flow": "x.yaml",
+  "pid": 1,
+  "sfh_version": "0.9.0",
+  "exit_code": null,
+  "emit_step": null,
+  "emit_file": null,
+  "error": null,
+  "unfinished_step": null,
+  "nonce": "fake-nonce"
+}
+JSON
+"$SFH" stop s12-run > s12.out 2>s12.err
+if grep -qF "killed pid" s12.out; then
+  echo "FAIL - S1-2: sfh stop killed a process from a fake run dir"
+  fail=$((fail + 1))
+else
+  echo "ok   - S1-2: sfh stop does not kill from a fake run dir"
+  pass=$((pass + 1))
+fi
+
+# A real detached run with a corrupted nonce must be refused outright.
+cat > s12-long.yaml <<'YAML'
+name: s12-long
+steps:
+  - id: think
+    cmd: ["sh", "-c", "sleep 60"]
+YAML
+S12_DIR="$("$SFH" run s12-long.yaml --detach -q 2>/dev/null)"
+sleep 1
+echo "corrupted" > "$S12_DIR/sfh-nonce"
+"$SFH" stop "$S12_DIR" > s12b.out 2>s12b.err
+rc2=$?
+if [ "$rc2" -ne 0 ]; then
+  echo "ok   - S1-2: sfh stop refuses a run with a corrupted nonce"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-2: sfh stop accepted a corrupted nonce"
+  fail=$((fail + 1))
+fi
+contains "S1-2: corrupted nonce refusal is reported" "refusing" s12b.err
+# Clean up the still-running detached process
+S12_PID="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$S12_DIR/status.json")"
+kill "$S12_PID" 2>/dev/null || taskkill //PID "$S12_PID" //T //F >/dev/null 2>&1
+
+# --- S1-3: flow name must not escape the runs root ----------------------------
+cat > s13.yaml <<'YAML'
+name: x/../../ESCAPED-S13
+steps:
+  - id: a
+    cmd: ["echo", "hi"]
+YAML
+"$SFH" run s13.yaml --dry-run --runs-dir s13-runs > s13.out 2>s13.err
+check "S1-3: a traversal flow name is rejected" 2 $?
+contains "S1-3: the error names the charset rule" "[A-Za-z0-9_-]" s13.err
+if [ -d "s13-runs/../ESCAPED-S13" ] || [ -d "ESCAPED-S13" ]; then
+  echo "FAIL - S1-3: a directory was created outside the runs root"
+  fail=$((fail + 1))
+else
+  echo "ok   - S1-3: no directory escaped the runs root"
+  pass=$((pass + 1))
+fi
+
+# --- S1-4: --resume must not read files outside the run dir -------------------
+# Attacker crafts a log.jsonl whose chain_file is an absolute path to a secret.
+# Resume must refuse to restore that file's content.
+mkdir -p s14-run
+echo "TOP-SECRET-S14" > s14-secret.txt
+cat > s14-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"abc","name":"s14","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+SECRET_ABS="$(cd "$(dirname s14-secret.txt)" && pwd)/$(basename s14-secret.txt)"
+cat > s14-run/log.jsonl <<JSON
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"$SECRET_ABS","out_file":"$SECRET_ABS","cmd":"echo hi","session":null}
+JSON
+cat > s14.yaml <<'YAML'
+name: s14
+steps:
+  - id: one
+    cmd: ["echo", "hi"]
+  - id: two
+    cmd: ["echo", "leaked={{steps.one.output}}"]
+YAML
+"$SFH" run s14.yaml --resume s14-run --force-resume -q > s14.out 2>s14.err
+if grep -qF "TOP-SECRET-S14" s14.out; then
+  echo "FAIL - S1-4: resume restored content from outside the run dir"
+  fail=$((fail + 1))
+else
+  echo "ok   - S1-4: resume does not read files outside the run dir"
+  pass=$((pass + 1))
+fi
+
+# --- S2-1: cursor has two tiers; write is refused, not silently full ----------
+cat > s21.yaml <<'YAML'
+name: s21
+steps:
+  - id: a
+    tool: cursor
+    access: write
+    prompt: "x"
+YAML
+"$SFH" validate s21.yaml > s21.out 2>&1
+check "S2-1: cursor access: write is a validation error" 2 $?
+contains "S2-1: the error names the two real tiers" "two permission tiers" s21.out
+cat > s21-ok.yaml <<'YAML'
+name: s21-ok
+steps:
+  - id: a
+    tool: cursor
+    access: read
+    prompt: "x"
+  - id: b
+    tool: cursor
+    access: full
+    prompt: "y"
+YAML
+"$SFH" validate s21-ok.yaml > s21-ok.out 2>&1
+check "S2-1: cursor read and full validate" 0 $?
+
+# --- S2-2: AI steps must declare access; cmd: steps are exempt ----------------
+cat > s22.yaml <<'YAML'
+name: s22
+steps:
+  - id: a
+    tool: codex
+    prompt: "x"
+YAML
+"$SFH" validate s22.yaml > s22.out 2>&1
+check "S2-2: an AI step without access is rejected" 2 $?
+contains "S2-2: the error asks for an explicit level" "read, write, or full" s22.out
+cat > s22-ok.yaml <<'YAML'
+name: s22-ok
+profiles:
+  p: { tool: codex, access: read }
+defaults:
+  access: full
+steps:
+  - id: a
+    tool: codex
+    access: read
+    prompt: "x"
+  - id: b
+    use: p
+    prompt: "y"
+  - id: c
+    tool: claude
+    prompt: "z"
+  - id: d
+    cmd: ["echo", "cmd steps are exempt"]
+YAML
+"$SFH" validate s22-ok.yaml > s22-ok.out 2>&1
+check "S2-2: step, profile and defaults access all satisfy; cmd exempt" 0 $?
+
+# --- S2-3: permission flags in args: fail closed ------------------------------
+# Used to be a warning, and the check missed most levers - including pi's -t,
+# which the README itself documented as the way to add Bash to a write step.
+s23_case() { # s23_case <name> <tool> <access> <args-json>
+  cat > "s23-$1.yaml" <<YAML
+name: s23
+steps:
+  - id: a
+    tool: $2
+    access: $3
+    args: $4
+    prompt: "x"
+YAML
+  "$SFH" validate "s23-$1.yaml" > "s23-$1.out" 2>&1
+  check "S2-3: $2 permission flag in args is a validation error" 2 $?
+  contains "S2-3: $2 error names the escape hatch" "allow_access_override" "s23-$1.out"
+}
+s23_case pi-t pi write '["-t", "read,bash,edit,write,grep,find,ls"]'
+s23_case codex-s codex write '["-s", "danger-full-access"]'
+s23_case codex-cfg codex read '["-c", "sandbox_mode=\"danger-full-access\""]'
+s23_case claude-tools claude read '["--allowedTools", "Bash"]'
+s23_case opencode-agent opencode read '["--agent", "build"]'
+s23_case grok-allow grok write '["--allow", "Bash(ls)"]'
+s23_case agy-mode agy read '["--mode", "accept-edits"]'
+cat > s23-override.yaml <<'YAML'
+name: s23-override
+steps:
+  - id: a
+    tool: pi
+    access: write
+    allow_access_override: true
+    args: ["-t", "read,bash,edit,write,grep,find,ls"]
+    prompt: "x"
+YAML
+"$SFH" validate s23-override.yaml > s23-override.out 2>&1
+check "S2-3: allow_access_override is the explicit opt-in" 0 $?
+cat > s23-full.yaml <<'YAML'
+name: s23-full
+steps:
+  - id: a
+    tool: pi
+    access: full
+    args: ["--approve"]
+    prompt: "x"
+YAML
+"$SFH" validate s23-full.yaml > s23-full.out 2>&1
+check "S2-3: full may carry permission flags" 0 $?
+# args accept templates, so the check must run again AFTER rendering: an
+# upstream output can inject a flag no load-time check ever saw. `src` really
+# runs; `inj` must die before any spawn.
+cat > s23-runtime.yaml <<'YAML'
+name: s23-runtime
+steps:
+  - id: src
+    cmd: ["echo", "--force"]
+  - id: inj
+    tool: claude
+    access: read
+    args: ["{{steps.src.output | trim}}"]
+    prompt: "x"
+YAML
+"$SFH" run s23-runtime.yaml -q > s23-runtime.out 2> s23-runtime.err
+check "S2-3: a flag injected by an upstream output is refused before spawn" 1 $?
+contains "S2-3: the runtime error names the escape hatch" "allow_access_override" s23-runtime.err
+
+# --- S2-4: a session cannot be resumed at a higher access level ---------------
+# bin: "echo" stands in for claude: it exits 0 without calling an AI, and sfh
+# pre-assigns the session id itself, so a session gets recorded - with the
+# access level it was created under.
+cat > s24.yaml <<'YAML'
+name: s24
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: high
+    tool: claude
+    bin: "echo"
+    access: full
+    continue_from: low
+    prompt: "y"
+YAML
+"$SFH" run s24.yaml --runs-dir s24-runs -q > s24.out 2> s24.err
+check "S2-4: resuming a read session at full is refused" 1 $?
+contains "S2-4: the error names both levels" "access read" s24.err
+contains "S2-4: the error names the escape hatch" "allow_access_override" s24.err
+S24_LOG="$(find s24-runs -type f -name 'log.jsonl' -print -quit)"
+contains "S2-4: the session records the access it was created under" '"access":"read"' "$S24_LOG"
+cat > s24-override.yaml <<'YAML'
+name: s24-override
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: high
+    tool: claude
+    bin: "echo"
+    access: full
+    allow_access_override: true
+    continue_from: low
+    prompt: "y"
+YAML
+"$SFH" run s24-override.yaml -q > s24-override.out 2> s24-override.err
+check "S2-4: allow_access_override permits the escalation" 0 $?
+cat > s24-same.yaml <<'YAML'
+name: s24-same
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: again
+    tool: claude
+    bin: "echo"
+    access: read
+    continue_from: low
+    prompt: "y"
+YAML
+"$SFH" run s24-same.yaml -q > s24-same.out 2>&1
+check "S2-4: resuming at the same access level is allowed" 0 $?
+cat > s24-fork.yaml <<'YAML'
+name: s24-fork
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: branch
+    tool: claude
+    bin: "echo"
+    access: full
+    fork_from: low
+    prompt: "y"
+YAML
+"$SFH" run s24-fork.yaml -q > s24-fork.out 2> s24-fork.err
+check "S2-4: forking a read session at full is refused too" 1 $?
+
+# --- S3-1: template expansion in a string cmd is disabled by default ----------
+# The audit's payload contains NO banned metacharacter, yet tar would execute
+# code through --checkpoint-action. So the metacharacter blacklist cannot be
+# the boundary: expansion itself is refused unless the step opts in.
+cat > s31.yaml <<'YAML'
+name: s31
+steps:
+  - id: lister
+    cmd: ["echo", "--checkpoint=1 --checkpoint-action=exec='sh payload.sh' harmless.txt"]
+  - id: pack
+    cmd: "tar -cf backup.tar {{steps.lister.output}}"
+YAML
+"$SFH" validate s31.yaml > s31.out 2>&1
+check "S3-1: template expansion in a string cmd is rejected" 2 $?
+contains "S3-1: the error points at the array form" 'cmd: [' s31.out
+contains "S3-1: the error names the escape hatch" "unsafe_shell_template" s31.out
+"$SFH" run s31.yaml -q > s31-run.out 2> s31-run.err
+check "S3-1: run refuses the flow before any step executes" 2 $?
+
+# The same hostile value through the array form is data, not shell syntax: it
+# arrives as one argument, intact, and nothing executes it.
+cat > s31-argv.yaml <<'YAML'
+name: s31-argv
+steps:
+  - id: lister
+    cmd: ["echo", "--checkpoint=1 --checkpoint-action=exec='sh payload.sh' harmless.txt"]
+  - id: pack
+    cmd: ["printf", "ARG=%s\n", "{{steps.lister.output | trim}}"]
+YAML
+"$SFH" run s31-argv.yaml -q > s31-argv.out 2>&1
+check "S3-1: the array form carries the hostile value as data" 0 $?
+contains "S3-1: the value arrives intact as one argument" "ARG=--checkpoint=1 --checkpoint-action=exec='sh payload.sh' harmless.txt" s31-argv.out
+
+# The explicit opt-in expands as before (metacharacter check still applies).
+cat > s31-optin.yaml <<'YAML'
+name: s31-optin
+vars: { f: "harmless.txt" }
+steps:
+  - id: pack
+    unsafe_shell_template: true
+    cmd: "echo packing {{vars.f}}"
+YAML
+"$SFH" run s31-optin.yaml -q > s31-optin.out 2>&1
+check "S3-1: unsafe_shell_template allows shell templating" 0 $?
+contains "S3-1: the opt-in expands the template" "packing harmless.txt" s31-optin.out
+
+# --- S3-2: only resolved (tool, bin) pairs are ever executed ------------------
+# A profile that no step references must never be probed: its bin is data.
+cat > evil-probe.sh <<'SH'
+#!/bin/sh
+touch EVIL-PROBE-RAN
+echo evil 1.0
+SH
+chmod +x evil-probe.sh
+cat > s32.yaml <<'YAML'
+name: s32
+profiles:
+  aaa-unused: { tool: codex, bin: "./evil-probe.sh" }
+steps:
+  - id: real
+    tool: codex
+    bin: "echo"
+    access: read
+    prompt: "x"
+YAML
+rm -f EVIL-PROBE-RAN
+"$SFH" run s32.yaml --runs-dir s32-runs -q > s32.out 2>&1
+check "S3-2: a flow with an unused hostile profile runs" 0 $?
+if [ -f EVIL-PROBE-RAN ]; then
+  echo "FAIL - S3-2: the unused profile's bin was executed"
+  fail=$((fail + 1))
+else
+  echo "ok   - S3-2: the unused profile's bin was never executed"
+  pass=$((pass + 1))
+fi
+S32_META="$(dirname "$(find s32-runs -type f -name 'log.jsonl' -print -quit)")/meta.json"
+contains "S3-2: provenance records the resolved bin" '"bin": "echo"' "$S32_META"
+if grep -qF "evil-probe" "$S32_META"; then
+  echo "FAIL - S3-2: the unused profile leaked into provenance"
+  fail=$((fail + 1))
+else
+  echo "ok   - S3-2: the unused profile does not appear in provenance"
+  pass=$((pass + 1))
+fi
+contains "S3-4: meta records the fingerprint algorithm" '"flow_fingerprint_algo": "sha256"' "$S32_META"
+# doctor resolves the same way and must not launch the unused bin either.
+rm -f EVIL-PROBE-RAN
+"$SFH" doctor s32.yaml --runs-dir s32-doctor > s32-doctor.out 2>&1
+check "S3-2: doctor probes the resolved bin (echo stands in)" 0 $?
+if [ -f EVIL-PROBE-RAN ]; then
+  echo "FAIL - S3-2: doctor executed the unused profile's bin"
+  fail=$((fail + 1))
+else
+  echo "ok   - S3-2: doctor never executed the unused profile's bin"
+  pass=$((pass + 1))
+fi
+contains "S3-2: doctor names the resolved program" "echo" s32-doctor.out
+
+# --- S3-3: run artifacts are owner-only and gitignore is verified -------------
+cat > s33.yaml <<'YAML'
+name: s33
+steps:
+  - id: a
+    cmd: ["echo", "secret-output"]
+YAML
+"$SFH" run s33.yaml --runs-dir s33-runs -q > s33.out 2>&1
+check "S3-3: the permissions fixture runs" 0 $?
+S33_DIR="$(dirname "$(find s33-runs -type f -name 'log.jsonl' -print -quit)")"
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ok   - S3-3: permission bits not enforceable on Windows (skipped)"
+    pass=$((pass + 1))
+    ;;
+  *)
+    perm_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+    check "S3-3: the runs root is 0700" 700 "$(perm_of s33-runs)"
+    check "S3-3: the run dir is 0700" 700 "$(perm_of "$S33_DIR")"
+    check "S3-3: meta.json is 0600" 600 "$(perm_of "$S33_DIR/meta.json")"
+    check "S3-3: the prompt file is 0600" 600 "$(perm_of "$S33_DIR/a.prompt.txt")"
+    ;;
+esac
+
+# A hostile repo pre-places an EMPTY .gitignore; sfh must not trust it.
+mkdir -p s33-empty/runs
+: > s33-empty/runs/.gitignore
+"$SFH" run s33.yaml --runs-dir s33-empty/runs -q > /dev/null 2> s33-empty.err
+check "S3-3: a run against a pre-existing empty .gitignore works" 0 $?
+contains "S3-3: sfh warns that it is appending" "appending" s33-empty.err
+if grep -qxF '*' s33-empty/runs/.gitignore; then
+  echo "ok   - S3-3: sfh appended a star pattern to the empty .gitignore"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S3-3: no star pattern was appended to the empty .gitignore"
+  fail=$((fail + 1))
+fi
+# A star inside a COMMENT does not count as ignoring everything.
+mkdir -p s33-comment/runs
+printf '# *\n' > s33-comment/runs/.gitignore
+"$SFH" run s33.yaml --runs-dir s33-comment/runs -q > /dev/null 2> s33-comment.err
+contains "S3-3: a commented-out star is not trusted" "appending" s33-comment.err
+# A correct .gitignore is left byte-identical.
+mkdir -p s33-ok/runs
+printf 'keep-this\n*\n' > s33-ok/runs/.gitignore
+cp s33-ok/runs/.gitignore s33-ok-before.txt
+"$SFH" run s33.yaml --runs-dir s33-ok/runs -q > /dev/null 2> s33-ok.err
+if cmp -s s33-ok-before.txt s33-ok/runs/.gitignore; then
+  echo "ok   - S3-3: a correct .gitignore is left untouched"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S3-3: a correct .gitignore was modified"
+  fail=$((fail + 1))
+fi
+if grep -qF "appending" s33-ok.err; then
+  echo "FAIL - S3-3: sfh warned about a .gitignore that already ignores everything"
+  fail=$((fail + 1))
+else
+  echo "ok   - S3-3: no warning for a .gitignore that already ignores everything"
+  pass=$((pass + 1))
+fi
+
+# --- S3-4: the flow fingerprint is SHA-256 ------------------------------------
+S34_META="$(dirname "$(find s33-runs -type f -name 'log.jsonl' -print -quit)")/meta.json"
+S34_FP="$(sed -n 's/.*"flow_fingerprint": "\([0-9a-f]*\)".*/\1/p' "$S34_META")"
+if [ "${#S34_FP}" = "64" ]; then
+  echo "ok   - S3-4: the recorded flow fingerprint is 64 hex chars"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S3-4: flow fingerprint is '${S34_FP}' (${#S34_FP} chars, want 64)"
+  fail=$((fail + 1))
+fi
+contains "S3-4: meta names the algorithm" '"flow_fingerprint_algo": "sha256"' "$S34_META"
 
 echo
 echo "engine behaviour: $pass passed, $fail failed"

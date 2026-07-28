@@ -1,0 +1,317 @@
+# v1 強化・第2ラウンド。第1ラウンドの反省を3つ反映:
+#
+#  1. レビュアーの子に on_error: continue。1体が落ちても判定に到達させる
+#     (第1ラウンドは1体が死んでグループごとハード失敗し、判定に届かなかった)
+#  2. レビュアーは `git diff main` を読む。`main...HEAD` は未コミットだと空になる
+#  3. レビュアーに「テストは実行できない・する必要もない」と明示する
+#     (read-only サンドボックスなので一時ファイルが作れず、それで1体が死んだ。
+#      fmt/clippy/test/behaviour はゲートが既に通している)
+#
+#   sfh run examples/v1-harden-r2.yaml --detach
+name: v1-harden-r2
+
+vars:
+  prior: ".sfh/runs/20260728-040544-v1-harden"
+
+profiles:
+  qwen:
+    tool: opencode
+    model: alibaba-token-plan/qwen3.8-max-preview
+    access: full
+  rev:
+    tool: codex
+    bin: 'C:\Users\nanoc\AppData\Local\OpenAI\Codex\bin\69066b736e1e17a4\codex.exe'
+    model: gpt-5.6-sol
+    effort: high
+    access: read
+
+defaults:
+  timeout_sec: 3600
+  max_visits: 6
+  max_cost_usd: 80.0
+  wall_clock_sec: 43200
+  max_emit_chars: 100000
+  tool_max_parallel:
+    codex: 3
+    opencode: 1
+
+steps:
+  # main の上で走らせない安全弁。
+  - id: prep_verify
+    cmd: ["git", "branch", "--show-current"]
+    route:
+      - when_last_line_contains: "sfh/v1-harden"
+        goto: track_new
+      - goto: fail
+
+  # 未追跡ファイル(contain.rs / sha256.rs)を git に載せる。
+  # これをやらないとレビュアーの `git diff` に新規ファイルが現れない。
+  - id: track_new
+    cmd: ["git", "add", "-A"]
+    route: [{ goto: prior_findings }]
+
+  # 第1ラウンドで2体が出した指摘を読み込む。捨てるには惜しい内容。
+  - id: prior_findings
+    cmd: ["sh", "-c", "cat '{{vars.prior}}/rev_regression.chain.txt' '{{vars.prior}}/rev_complete.chain.txt' 2>/dev/null"]
+    unsafe_shell_template: true
+    route: [{ goto: fix1 }]
+
+  - id: fix1
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化。**レビューの指摘に対応**します。
+
+      あなたが先ほど入れた S1〜S3 の修正を、codex 2体が独立にレビューしました。
+      結論は両者とも **REVIEW-FAIL** です。指摘の要旨は「鍵が甘い」ではなく
+      **「鍵が効きすぎて正当な利用者まで閉め出している」** および
+      **「一部が fail-open のまま残っている」** です。
+
+      ## 特に重い指摘(必ず直すこと)
+
+      ### R-1【致命的・3OS】macOS で `sfh stop` が必ず失敗する
+      プロセス所有確認に `/proc/<pid>/exe` を使っていますが、**macOS に /proc はありません**。
+      Windows / macOS / Linux の完全同一挙動は sfh の絶対条件です。
+      macOS では `sysctl KERN_PROCARGS2` か `proc_pidpath`、あるいは
+      OS 非依存の別手段(nonce を PID に結び付ける等)を使うこと。
+      **どのOSでも所有確認が機能することを、コード上で説明できる形にすること。**
+
+      ### R-2【致命的】修正前に作った run が resume できない
+      fingerprint を FNV(16桁)から SHA-256(64桁)に変えましたが、
+      比較側が旧アルゴリズムを判別せず文字列比較しています。
+      `flow_fingerprint_algo` を meta に**書いているのに読んでいません**。
+      旧 run はフロー未変更でも「別バージョン」と判定されます。
+      案内される `--force-resume` は本物の変更検査まで無効化するので移行策になりません。
+      → 記録された algo を読み、旧 run は旧アルゴリズムで比較すること。
+
+      ### R-3【致命的】旧 sfh で走っている detached run を停止できない
+      nonce を必須にしたため、nonce を持たない旧 run は `stop` だけ拒否されます
+      (`status` / `wait` は使えるのに)。
+      → nonce が無い run は「旧形式」と判定し、**プロセス所有確認だけで停止を許す**など、
+        移行経路を用意すること。ただし偽造 status.json を受け入れないこと。
+
+      ### R-4【中】新規 detach でも nonce 競合がある
+      親が nonce を作り、detached 子も同じ箇所で別 nonce に更新するため、
+      一瞬 status.json と run dir の nonce が食い違い、その間の `stop` が誤拒否されます。
+      → nonce は一箇所でだけ生成し、子はそれを引き継ぐこと。
+
+      ### R-5【中】権限フラグ検出が誤検出する
+      引数の**意味**を見ずに文字列一致で拒否しています。例えば
+      `args: ["-c", "sandbox_mode=read-only"]` は権限を**狭める**のに拒否されます。
+      しかもエラーが `access: full` を勧めるので**逆方向の案内**です。
+      → 値まで見て、権限を広げる場合だけ拒否すること。判定に迷うものは通すこと
+        (誤検出は正しいフローを止めるので、見逃しより害が大きい)。
+        エラー文も「full にしろ」ではなく、正しい直し方を案内すること。
+
+      ### R-6【中】安全な flow name まで拒否し、しかも validate と run で挙動が違う
+      `name: "研究 2026.07"` が拒否されます。空白・ピリオド・日本語を一律禁止したためです。
+      さらに `sfh validate` には同じ検査が無いので、**validate 成功 → run 失敗**になります。
+      → 禁止すべきはパス区切りと `..` とヌル文字など**経路に影響する文字だけ**です。
+        日本語・空白・ピリオドは許可すること。
+        検査は `flow::validate` に置き、`sfh validate` でも同じ結果になること。
+        schema/flow.schema.json にも反映すること。
+
+      ### R-7【中】`--runs-dir` の既存パーミッションを勝手に変える
+      ユーザーが指定した既存ディレクトリにも無条件で 0700 を設定するため、
+      共有用 0770 のディレクトリが Linux/macOS でだけ壊れます(Windows では変わらない)。
+      → **sfh が作ったディレクトリだけ** 0700 にすること。既存のものは変更しない。
+
+      ## 網羅性レビューが「部分的」と判定した項目(全部直すこと)
+
+      - **S1-1**: `wait` は先に `detached.out.txt` を読むが封じ込め確認が無い。
+        run dir 内の外向き symlink で任意ファイルを出力できる。
+        また封じ込め違反で拒否したあとも `wait` は成功終了する
+        → **非ゼロ終了にすること**。固定名の成果物も canonicalize すること。
+      - **S1-2**: 実行ファイル確認が名前に `"sfh"` を**含むか**だけなので
+        `sfh-helper` のような無関係プロセスを殺せる → 厳密一致にすること。
+        テストが「PID 1 が生きていること」を確認しておらず、
+        kill 成功メッセージは stderr なのに stdout だけを検索している → テストも直すこと。
+      - **S1-3**: flow name 制約が `flow::validate` と JSON Schema に無い(R-6 と同じ)。
+      - **S1-4**: resume のパスエラーを `.ok()` で握り潰しているため、
+        **不正パスを拒否せず空出力として再開する** → 再開自体を失敗させること。
+        `out_file` は lexical な相対パス検査だけで canonicalize していない → 3フィールドすべて封じ込めること。
+        テストも `chain_file` の絶対パスしか見ていない → `out_file` / `precompact_file` / symlink を足すこと。
+      - **S2-4**: ログの access が欠落・不正だと `None` になり、**警告だけで full 再開を許す**。
+        単体テストがその fail-open を明示的に期待している。
+        → `allow_access_override: true` が無ければ **fail-closed** にすること。テストも直すこと。
+      - **S3-3**: `.gitignore` の作成・追記失敗をすべて無視し、追記後の再検証もしない
+        → 失敗を返し、書き込み後に実際に保護されたか再確認すること。
+
+      ## レビュー全文(上の要旨より詳しい。必ず読むこと)
+      {{steps.prior_findings.output}}
+
+      ## やってはいけないこと
+      - 既存のテストを消したり緩めたりしない(**fail-open を期待しているテストは
+        fail-closed を期待するように直すこと。これは緩和ではなく強化です**)
+      - clippy を黙らせるための #[allow(...)] を足さない
+      - 新しい外部クレートを追加しない
+      - 質問せず、解釈を出力に明記して進めること(無人で回っています)
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+      R-1〜R-7 と「部分的」項目それぞれに挙動テストを足すこと。
+
+  - id: check1
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 2400
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: stage
+      - goto: fix1
+
+  # 新規ファイルをレビュアーの diff に載せる。
+  - id: stage
+    cmd: ["git", "add", "-A"]
+    route: [{ goto: review }]
+
+  - id: review
+    max_parallel: 3
+    max_visits: 5
+    on_max_visits: goto:unresolved
+    parallel:
+      - id: rev_break
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**攻撃側**レビュアーです。
+          セキュリティ修正を**破ろうとしてください**。
+
+          ## 環境の制約(重要・時間を無駄にしないこと)
+          あなたは**読み取り専用**で動いています。ファイル作成もテスト実行もできません。
+          `cargo test` を試みると書き込み権限が無くて失敗します。**試さないでください。**
+          fmt / clippy / cargo test / 挙動テスト / 全 examples の validate は
+          **決定論的なゲートが既に通しています**。あなたの仕事は**コードを読むこと**です。
+
+          差分は `git --no-pager diff main` で見えます
+          (`main...HEAD` ではありません。作業は未コミットの場合があります)。
+
+          ## 探すもの
+          - パス封じ込めの回避: symlink / UNC / 8.3形式 / 大文字小文字 /
+            `..` のエンコード違い / 存在しないパスでの canonicalize の挙動
+          - プロセス所有確認の偽装(実行ファイル名の部分一致、PID再利用、nonce の偽造)
+          - fail-open が残っている箇所(判定不能なときに通していないか)
+          - access 検査がテンプレート展開後にも効いているか
+          - 攻撃者が管理する run dir を `wait` / `stop` / `--resume` に渡す経路
+
+          ## 出力
+          発見した回避経路を、再現手順つきで列挙してください。
+          **最後の行に `REVIEW-PASS`(破れなかった)か `REVIEW-FAIL`(破れた)を
+          単独で書くこと。** 他の語を最後の行に書かないこと。
+
+      - id: rev_regression
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**回帰**レビュアーです。
+          セキュリティ修正が**正当な利用者を閉め出していないか**を見ます。
+
+          ## 環境の制約(重要)
+          読み取り専用です。テストは実行できませんし、する必要もありません。
+          決定論的ゲートが fmt / clippy / cargo test / 挙動テスト /
+          全 examples の validate を既に通しています。**コードを読んでください。**
+          差分は `git --no-pager diff main` です。
+
+          ## 前回あなたが指摘し、今回直されたはずのもの
+          R-1 macOS で stop が必ず失敗する(/proc を全 Unix で使っていた)
+          R-2 旧 run が resume できない(FNV→SHA-256 の移行漏れ)
+          R-3 旧 detached run を停止できない(nonce 必須化)
+          R-4 新規 detach の nonce 競合
+          R-5 権限フラグの誤検出(`-c sandbox_mode=read-only` を拒否していた)
+          R-6 安全な flow name の拒否と、validate/run の挙動不一致
+          R-7 `--runs-dir` の既存パーミッション改変
+
+          ## 探すもの
+          上記が本当に直ったか。加えて、**新たな回帰**:
+          - Windows / macOS / Linux で挙動が割れる箇所
+          - `--resume` がライブ実行と食い違う箇所
+          - detach / status / wait / stop の連携
+          - parallel / foreach / continue_from / fork_from との相互作用
+          - 正しいフローを誤って拒否していないか(誤検出は害です)
+          - エラーメッセージが正しい直し方を案内しているか
+
+          ## 出力
+          **最後の行に `REVIEW-PASS`(回帰なし)か `REVIEW-FAIL`(回帰あり)を
+          単独で書くこと。** 他の語を最後の行に書かないこと。
+
+      - id: rev_complete
+        use: rev
+        on_error: continue
+        prompt: |
+          あなたは sfh (D:\AI\SimpleFlowHarness) の**網羅性**レビュアーです。
+
+          ## 環境の制約(重要)
+          読み取り専用です。テストは実行できませんし、する必要もありません。
+          決定論的ゲートが既に通しています。**コードとテストのソースを読んでください。**
+          差分は `git --no-pager diff main` です。
+
+          ## 判定対象
+          前回あなたが「部分的」と判定した項目が、本当に完成したか:
+          - S1-1 `wait`: `detached.out.txt` の封じ込め、拒否時の非ゼロ終了
+          - S1-2 `stop`: 実行ファイル名の厳密一致、テストが実際に無関係プロセスの
+                 生存を確認しているか、stderr を検索しているか
+          - S1-3 flow name 制約が `flow::validate` と JSON Schema にあるか
+          - S1-4 resume: パスエラーを握り潰さず再開を失敗させるか、
+                 `out_file` / `precompact_file` も canonicalize しているか
+          - S2-4 セッション access が欠落・不正なときに fail-closed か、
+                 **テストが fail-open を期待していないか**
+          - S3-3 `.gitignore` の書き込み失敗を返し、書き込み後に再検証しているか
+          加えて R-1〜R-7 が実装されテストされているか。
+
+          「入っている」と判定するには、**その挙動を確認できるコードまたはテスト**を
+          指せること。コミットメッセージや README の記述は根拠になりません。
+          **テストが弱い(正常系だけ、fail-open を期待している)場合は不足として扱うこと。**
+
+          ## 出力
+          項目ごとの判定を表で示し、不足を列挙してください。
+          **最後の行に `REVIEW-PASS`(全項目が実装されテストされている)か
+          `REVIEW-FAIL`(不足あり)を単独で書くこと。** 他の語を最後の行に書かないこと。
+
+  # 合否は AI ではなく grep が数える。3体全員が PASS のときだけ先へ。
+  # 1体が落ちて出力が無くても、PASS が減るだけで正しく差し戻しへ向かう。
+  - id: verdict
+    cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS$' - || true); echo \"PASSES=$n\""]
+    stdin: prompt
+    prompt: "{{steps.review.outputs}}"
+    on_error: continue
+    route:
+      - when_last_line_is: "PASSES=3"
+        goto: wrap
+      - goto: fix2
+
+  - id: fix2
+    use: qwen
+    prompt: |
+      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化。**レビュー指摘への対応**です。
+
+      codex 3体が独立にレビューし、全員一致の合格が出ませんでした。
+      以下が3体分の指摘です。**指摘された箇所を全て直してください。**
+
+      指摘に同意できない場合は、直さずに**理由をコードのコメントに書き**、
+      なぜ現状で正しいのかを説明すること(次のレビューでその説明が読まれます)。
+      質問はしないこと。無人で回っています。
+
+      **fail-open を期待しているテストがあれば、fail-closed を期待するように
+      直すこと。** テストを緩めるのではなく、強化する方向です。
+
+      {{steps.review.outputs | tail:500}}
+
+      ## 完了条件
+      cargo fmt / clippy -D warnings / cargo test / cargo build --release /
+      bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+
+  - id: check2
+    cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
+    on_error: continue
+    timeout_sec: 2400
+    route:
+      - when_last_line_contains: "EXIT=0"
+        goto: stage
+      - goto: fix2
+
+  - id: unresolved
+    cmd: ["sh", "-c", "echo 'UNRESOLVED: reviewers did not reach unanimous pass'; git --no-pager diff --stat main"]
+    route: [{ goto: end }]
+
+  - id: wrap
+    cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED'; git --no-pager diff --stat main; echo '--- tests ---'; cargo test 2>&1 | tail -3; bash tests/engine_behaviour.sh 2>&1 | tail -2"]

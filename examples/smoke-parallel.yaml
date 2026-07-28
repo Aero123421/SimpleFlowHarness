@@ -17,23 +17,23 @@ steps:
     notes: append
     parallel:
       - id: fan_a
-        cmd: "echo idea-A for {{vars.topic}}"
+        cmd: ["echo", "idea-A for {{vars.topic}}"]
       - id: fan_b
-        cmd: "echo idea-B for {{vars.topic}}"
+        cmd: ["echo", "idea-B for {{vars.topic}}"]
       - id: fan_c
-        cmd: "echo idea-C for {{vars.topic}}"
+        cmd: ["echo", "idea-C for {{vars.topic}}"]
     route:
       - when_contains: "idea-B"
         goto: verify
       - goto: fail
 
   # varsの複数行リストを1行1項目に分割してfan-out
-  # (シェル文字列cmdなので、shで裸の括弧が構文エラーにならないよう全体をクォート)
+  # (配列形式なのでシェルを介さず、括弧や空白もそのまま1引数として渡る)
   - id: verify
     foreach:
       from: "{{vars.hypos}}"
     max_parallel: 2
-    cmd: 'echo "checking {{item}} ({{item_index}})"'
+    cmd: ["echo", "checking {{item}} ({{item_index}})"]
     route:
       - when_contains: "checking gamma"
         goto: merge
@@ -41,4 +41,4 @@ steps:
 
   # フィルタとnotesの参照テスト
   - id: merge
-    cmd: 'echo "first=[{{steps.verify.outputs | head:1}}] fanB=[{{steps.fan_b.output | trim}}] notes=[{{notes | head:1}}]"'
+    cmd: ["echo", "first=[{{steps.verify.outputs | head:1}}] fanB=[{{steps.fan_b.output | trim}}] notes=[{{notes | head:1}}]"]

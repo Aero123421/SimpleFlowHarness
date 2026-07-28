@@ -209,8 +209,11 @@ fn detached_command(
     out_file: &Path,
     err_file: &Path,
 ) -> Result<Command, String> {
-    let mk = |p: &Path| {
-        std::fs::File::create(p).map_err(|e| format!("cannot create {}: {e}", p.display()))
+    let mk = |p: &Path| -> Result<std::fs::File, String> {
+        let f =
+            std::fs::File::create(p).map_err(|e| format!("cannot create {}: {e}", p.display()))?;
+        crate::contain::restrict_file(&f);
+        Ok(f)
     };
     let mut c = Command::new(exe);
     c.args(args);
@@ -363,6 +366,51 @@ pub fn kill_pid_tree(pid: u32) -> bool {
         libc::kill(pid as i32, libc::SIGKILL);
     }
     !pid_alive(pid)
+}
+
+/// Check whether the given pid belongs to a running sfh process.
+/// Used by `sfh stop` to avoid killing unrelated processes.
+#[cfg(windows)]
+pub fn pid_is_sfh(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok == 0 {
+            return false;
+        }
+        let name = String::from_utf16_lossy(&buf[..len as usize]);
+        let lower = name.to_lowercase();
+        lower.contains("sfh")
+    }
+}
+
+/// Check whether the given pid belongs to a running sfh process.
+#[cfg(unix)]
+pub fn pid_is_sfh(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let exe = format!("/proc/{pid}/exe");
+    match std::fs::read_link(&exe) {
+        Ok(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().contains("sfh"))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// Is this pid still running? Pid reuse makes it advisory, so callers pair it
@@ -560,7 +608,11 @@ fn spawn_reader<R: Read + Send + 'static>(
 ) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut sink = tee.and_then(|p| std::fs::File::create(p).ok());
+        let mut sink = tee.and_then(|p| {
+            let f = std::fs::File::create(p).ok()?;
+            crate::contain::restrict_file(&f);
+            Some(f)
+        });
         let mut buf = Vec::new();
         let mut tmp = [0u8; 65536];
         let mut truncated = false;

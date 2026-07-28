@@ -1,3 +1,4 @@
+mod contain;
 mod doctor;
 mod engine;
 mod execute;
@@ -5,6 +6,7 @@ mod flow;
 mod leaf;
 mod preset;
 mod runs;
+mod sha256;
 mod template;
 mod watch;
 

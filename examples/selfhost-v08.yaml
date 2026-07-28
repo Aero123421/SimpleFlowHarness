@@ -32,6 +32,9 @@ defaults:
 # codex はオーバーエンジニアリング癖があるので、やらないことを明示する。
 steps:
   - id: prep
+    # `||` はシェル連結なので配列形式にはできない。vars.branch はこのフロー自身の
+    # 変数(AI出力ではない)なので、明示したうえでシェル展開を許可している。
+    unsafe_shell_template: true
     cmd: "git switch -c {{vars.branch}} || git switch {{vars.branch}}"
     on_error: continue
 
