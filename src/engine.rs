@@ -164,7 +164,12 @@ fn precheck(
                 .map_err(|e| format!("step '{}' {label}: {e}", s.id))
         };
         let shell_chk = |ctx: &template::Ctx, text: &str| -> Result<(), String> {
-            if s.unsafe_shell_template.unwrap_or(false) {
+            // flow.legacy_resume: the lenient loader already warned about this
+            // exact template and let it through so a 0.x run could be resumed.
+            // Refusing it again here made that warning a lie - the resume died
+            // one step later. The METACHARACTER check still applies; only the
+            // blanket "no templates in shell text" rule is relaxed.
+            if s.unsafe_shell_template.unwrap_or(false) || flow.legacy_resume {
                 template::render_checked(text, ctx, &leaf::shell_metachar_check)
                     .map(|_| ())
                     .map_err(|e| format!("step '{}' cmd: {e}", s.id))
@@ -492,19 +497,33 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 // A step is only "ok" when the log POSITIVELY records exit 0,
                 // timed_out false and interrupted false; anything absent or
                 // ambiguous is treated as not-ok and re-run (rev_break #12).
-                // `failed` is written only by aggregate_end (step_end has no
-                // such field), so it is required to be false only when PRESENT;
-                // requiring it outright would fail every legitimate step_end
-                // resume. A present-but-mistyped `failed` is not-ok.
+                // The two writers emit DIFFERENT field sets, so "fail closed on
+                // a missing field" has to ask each event for the fields its own
+                // writer produces: step_end carries exit/timed_out/interrupted,
+                // aggregate_end carries exit/failed. Demanding the union marked
+                // every honestly written aggregate_end as not-ok, which dropped
+                // fan-out groups out of last_success and left a resumed run
+                // emitting the wrong step at the end.
+                //
+                // Fields the event does not owe are still not allowed to
+                // contradict: present-but-true, or present-but-mistyped, is
+                // never a success.
                 let exit_raw = v.get("exit").and_then(|x| x.as_i64());
                 let timed_out_raw = v.get("timed_out").and_then(|x| x.as_bool());
                 let interrupted_raw = v.get("interrupted").and_then(|x| x.as_bool());
                 let failed_raw = v.get("failed").and_then(|x| x.as_bool());
-                let failed_absent_or_false = v.get("failed").is_none() || failed_raw == Some(false);
+                let absent_or_false =
+                    |key: &str, parsed: Option<bool>| v.get(key).is_none() || parsed == Some(false);
+                let owed_fields_false = if ev == "step_end" {
+                    timed_out_raw == Some(false) && interrupted_raw == Some(false)
+                } else {
+                    failed_raw == Some(false)
+                };
                 let ok = exit_raw == Some(0)
-                    && timed_out_raw == Some(false)
-                    && interrupted_raw == Some(false)
-                    && failed_absent_or_false;
+                    && absent_or_false("timed_out", timed_out_raw)
+                    && absent_or_false("interrupted", interrupted_raw)
+                    && absent_or_false("failed", failed_raw)
+                    && owed_fields_false;
                 // A SUCCESSFUL fan-out member: remember it under its PARENT
                 // group so a resume that re-enters the group skips it instead
                 // of spending money and sessions a second time (rev_regression:
@@ -663,6 +682,10 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                                         .get("access")
                                         .and_then(|x| x.as_str())
                                         .and_then(|a| preset::Access::parse(Some(a)).ok()),
+                                    // Present-but-unparsable stays `true`: the
+                                    // key IS there, it is just not a level, and
+                                    // that is an edit rather than an old run.
+                                    access_recorded: s.get("access").is_some(),
                                 },
                             );
                         }
@@ -705,19 +728,31 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
     // SAME number, which the original key already covers. Keeping both makes
     // the crash-with-aggregate and kill-without-aggregate paths agree.
     //
-    // Only the last recorded visit is mirrored. An earlier visit's members
-    // belong to a lap that finished, and a flow that deliberately routes back
-    // to the group is asking for a fresh run of every member.
-    let mut last_visit: HashMap<String, u32> = HashMap::new();
-    for (group, visit) in st.completed_members.keys() {
-        let e = last_visit.entry(group.clone()).or_insert(0);
-        *e = (*e).max(*visit);
-    }
-    for (group, visit) in last_visit {
-        if let Some(set) = st.completed_members.get(&(group.clone(), visit)).cloned() {
-            st.completed_members
-                .entry((group, visit + 1))
-                .or_insert(set);
+    // ONLY for the group this resume restarts at, and only its last visit.
+    // Mirroring every group broke a flow that deliberately routes back into a
+    // fan-out: the group succeeds at visit 1, a later step fails, and the
+    // resume reaches the group again at visit 2 through that route - where
+    // every member would be skipped as "already done" when the flow was
+    // explicitly asking for another lap. st.start names the one group whose
+    // interrupted work this resume is continuing; any group it reaches after
+    // that, it reaches on purpose.
+    if let Some(resume_at) = st.start.clone() {
+        let last = st
+            .completed_members
+            .keys()
+            .filter(|(group, _)| *group == resume_at)
+            .map(|(_, visit)| *visit)
+            .max();
+        if let Some(visit) = last {
+            if let Some(set) = st
+                .completed_members
+                .get(&(resume_at.clone(), visit))
+                .cloned()
+            {
+                st.completed_members
+                    .entry((resume_at, visit + 1))
+                    .or_insert(set);
+            }
         }
     }
     Ok(st)
@@ -772,7 +807,12 @@ fn reconcile_session_access(
                 );
                 info.access = None;
             }
-            None if legacy_era => {
+            // A genuinely pre-1.0 run has NO access key, which is honest. A run
+            // that has the key but whose value is not a level has been edited,
+            // and claiming to be old must not launder that: without
+            // access_recorded here, setting `sfh_version: 0.x` and corrupting
+            // the level got the same free fill as an authentic old run.
+            None if legacy_era && !info.access_recorded => {
                 info.access = Some(primary.access);
             }
             _ => {}
@@ -992,8 +1032,16 @@ fn gitignore_ignores_everything(text: &str) -> bool {
 /// used to refuse `--resume` of a run whose flow has changed. SHA-256 because
 /// this is a security boundary: with FNV-1a a crafted flow could collide with
 /// another and slip a changed flow past the resume guard.
+/// Line endings are normalised first. The same flow file checked out on
+/// Windows and on Linux differs by a CR on every line, and hashing the raw
+/// bytes made those two "different versions of the flow" - so a run dir moved
+/// between machines, or a working copy re-checked-out under a different
+/// core.autocrlf, could not be resumed even though nothing about the flow had
+/// changed. Every other cross-OS decision in sfh is byte-identical; this one
+/// has to be too. A CR that is NOT part of a line ending still changes the
+/// hash, so this is not a way to smuggle an edit past the check.
 fn fingerprint(s: &str) -> String {
-    crate::sha256::hex(s.as_bytes())
+    crate::sha256::hex(s.replace("\r\n", "\n").as_bytes())
 }
 
 /// The FNV-1a 64 fingerprint sfh <= 0.9 recorded in meta.json. Kept ONLY so
@@ -1012,7 +1060,12 @@ fn legacy_fingerprint_fnv(s: &str) -> String {
 
 /// Recorded next to the fingerprint in meta.json so resume compares like with
 /// like instead of guessing which algorithm wrote the stored value.
-const FINGERPRINT_ALGO: &str = "sha256";
+const FINGERPRINT_ALGO: &str = "sha256-nl";
+/// What sfh 0.9 recorded: the same SHA-256, but over the raw bytes, so a
+/// CRLF working copy and an LF one disagreed. Runs written by 0.9 are still
+/// verified the way 0.9 computed it - re-hashing them the new way would
+/// report every unchanged flow as changed.
+const RAW_SHA_FINGERPRINT_ALGO: &str = "sha256";
 /// meta.json dirs without a flow_fingerprint_algo field were written before
 /// the field existed, when the algorithm was FNV-1a.
 const LEGACY_FINGERPRINT_ALGO: &str = "fnv1a";
@@ -1036,6 +1089,7 @@ fn check_flow_fingerprint(
         .unwrap_or(LEGACY_FINGERPRINT_ALGO);
     let expected = match old_algo {
         FINGERPRINT_ALGO => fingerprint(flow_text),
+        RAW_SHA_FINGERPRINT_ALGO => crate::sha256::hex(flow_text.as_bytes()),
         LEGACY_FINGERPRINT_ALGO => legacy_fingerprint_fnv(flow_text),
         other => {
             return Err(format!(
@@ -1310,7 +1364,23 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // filled from the flow's own declaration instead - that is what the
         // step actually ran under, and it keeps pre-1.0 runs resumable at
         // write/full without an override (rev_regression: old continue_from).
-        if !opts.force_resume {
+        if opts.force_resume {
+            // --force-resume waives the FINGERPRINT check, which is exactly the
+            // thing that made the flow a trustworthy yardstick for the recorded
+            // access. Skipping the cross-check here left the log's own claim as
+            // the only evidence, so editing a read session to "access":"full"
+            // and adding --force-resume walked straight past the escalation
+            // guard. It is not a substitute for allow_access_override.
+            //
+            // Drop every restored level to unknown instead. The guard in
+            // prepare_leaf fails closed on that, and a caller who really means
+            // to resume these sessions says so per step with
+            // allow_access_override: true.
+            for info in resumed.sessions.values_mut() {
+                info.access = None;
+                info.access_recorded = true;
+            }
+        } else {
             reconcile_session_access(&mut resumed.sessions, &flow, legacy_era);
         }
         if resumed.completed {
@@ -1919,6 +1989,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 cwd: d.cwd.clone(),
                                 marker: d.session_marker.clone(),
                                 access: d.access,
+                                // Opened by this process, so the level is
+                                // first-hand rather than read back from a log.
+                                access_recorded: true,
                             },
                         );
                     }
@@ -2196,6 +2269,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             cwd: d.cwd.clone(),
                             marker: d.session_marker.clone(),
                             access: d.access,
+                            // Opened by this process: first-hand.
+                            access_recorded: true,
                         },
                     );
                 }
@@ -2832,6 +2907,7 @@ fn dry_run(
                                 cwd: None,
                                 marker: None,
                                 access: Some(eff.access),
+                                access_recorded: true,
                             },
                         );
                     }
@@ -3296,6 +3372,34 @@ mod tests {
         assert_eq!(
             fingerprint(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        // The SAME flow checked out with CRLF and with LF is the same flow.
+        // Hashing raw bytes made those two different versions of it, so a run
+        // dir could not travel between a Windows and a Unix working copy - and
+        // sfh's whole premise is that a flow file behaves identically on all
+        // three. Every other cross-OS decision here is byte-identical.
+        assert_eq!(
+            fingerprint("name: x\nsteps:\n  - id: a\n"),
+            fingerprint("name: x\r\nsteps:\r\n  - id: a\r\n")
+        );
+        // Still a change-detector: a lone CR that is not a line ending, and a
+        // real edit, both move the hash.
+        assert_ne!(fingerprint("a\rb"), fingerprint("ab"));
+        assert_ne!(
+            fingerprint("name: x\nsteps:\n"),
+            fingerprint("name: y\nsteps:\n")
+        );
+        // Runs written by 0.9 recorded the RAW hash under a different algo id,
+        // and must keep verifying the way 0.9 computed them.
+        assert_ne!(FINGERPRINT_ALGO, RAW_SHA_FINGERPRINT_ALGO);
+        assert_eq!(
+            crate::sha256::hex("a\r\nb".as_bytes()),
+            crate::sha256::hex("a\r\nb".as_bytes())
+        );
+        assert_ne!(
+            fingerprint("a\r\nb"),
+            crate::sha256::hex("a\r\nb".as_bytes())
         );
     }
 

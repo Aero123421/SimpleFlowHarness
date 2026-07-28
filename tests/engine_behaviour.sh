@@ -1442,7 +1442,7 @@ else
   echo "ok   - S3-2: the unused profile does not appear in provenance"
   pass=$((pass + 1))
 fi
-contains "S3-4: meta records the fingerprint algorithm" '"flow_fingerprint_algo": "sha256"' "$S32_META"
+contains "S3-4: meta records the fingerprint algorithm" '"flow_fingerprint_algo": "sha256-nl"' "$S32_META"
 # doctor resolves the same way and must not launch the unused bin either.
 rm -f EVIL-PROBE-RAN
 "$SFH" doctor s32.yaml --runs-dir s32-doctor > s32-doctor.out 2>&1
@@ -1528,7 +1528,7 @@ else
   echo "FAIL - S3-4: flow fingerprint is '${S34_FP}' (${#S34_FP} chars, want 64)"
   fail=$((fail + 1))
 fi
-contains "S3-4: meta names the algorithm" '"flow_fingerprint_algo": "sha256"' "$S34_META"
+contains "S3-4: meta names the algorithm" '"flow_fingerprint_algo": "sha256-nl"' "$S34_META"
 
 # --- R-2: a run made by the old FNV fingerprint can still be resumed ----------
 # Simulate an old run dir: 16-hex fingerprint, no flow_fingerprint_algo field.
@@ -1756,6 +1756,40 @@ else
 fi
 contains "F-2: the resumed aggregate still carries the reused member's output" "out1" "$RREAL_DIR/fan.v2.chain.txt"
 contains "F-2: the flow continued past the fan-out" "fan-finished" rreal2.out
+
+# --- F-2: the same, for foreach, with a real crash and a real resume ---------
+# rfeskip above is the hand-built-log variant and does not exercise the visit
+# bump, so foreach had no real-run coverage at all. Items log under "id[i]";
+# item `beta` fails once and arms its own tripwire.
+cat > rfreal.yaml <<'YAML'
+name: rfreal
+steps:
+  - id: each
+    max_parallel: 2
+    foreach: { from: "alpha\nbeta" }
+    # {{item}} goes in a POSITIONAL argument, never into the script text: the
+    # script text is re-parsed by the shell and the guard refuses templates
+    # there, which is the whole point. $1 arrives as one word regardless.
+    cmd: ['sh', '-c', 'echo "$1" >> rfreal-tally.txt; if [ "$1" = beta ] && [ ! -f rfreal-trip ]; then touch rfreal-trip; exit 7; fi; echo "did-$1"', 'rfreal', '{{item}}']
+  - id: after2
+    cmd: ["echo", "each-finished"]
+YAML
+"$SFH" run rfreal.yaml --runs-dir rfreal-runs -q > rfreal1.out 2> rfreal1.err
+check "F-2: the first foreach pass fails on the one bad item" 1 $?
+RFREAL_DIR="$(ls -d rfreal-runs/*/ | head -1 | sed 's:/*$::')"
+"$SFH" run rfreal.yaml --resume "$RFREAL_DIR" --runs-dir rfreal-runs -q > rfreal2.out 2> rfreal2.err
+check "F-2: the real foreach resume runs to the end" 0 $?
+RFA=$(grep -c '^alpha$' rfreal-tally.txt)
+RFB=$(grep -c '^beta$' rfreal-tally.txt)
+if [ "$RFA" = "1" ] && [ "$RFB" = "2" ]; then
+  echo "ok   - F-2: a real foreach resume reused the finished item and re-ran only the failed one"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F-2: foreach executions were alpha=$RFA beta=$RFB, expected 1 2 (finished items re-ran = double billing)"
+  fail=$((fail + 1))
+fi
+contains "F-2: the resumed foreach aggregate carries the reused item's output" "did-alpha" "$RFREAL_DIR/each.v2.chain.txt"
+contains "F-2: the flow continued past the foreach" "each-finished" rfreal2.out
 
 # --- resume regression: fan-out routing matches live (headerless plain) -------
 # Live routing tests conditions against the headerless plain concatenation; the

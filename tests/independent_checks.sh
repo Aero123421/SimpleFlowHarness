@@ -92,15 +92,36 @@ sec "2. ATTACK / F-6  forged status.json must not report success"
 
 forge() { mkdir -p "$1"; printf '%s' "$2" > "$1/status.json"; }
 
-forge f_failed '{"state":"failed","exit_code":0,"pid":999999,"heartbeat":"20260728-000000","steps":1}'
-if "$SFH" wait f_failed --timeout 5 >/dev/null 2>&1
-  then bad "wait: FAIL-OPEN - forged failed+exit_code:0 returned 0"
-  else ok  "wait: state=failed with exit_code:0 is not success"; fi
+# An exit code is NOT enough here, and assuming it was hid a real leak: `wait`
+# on a forged state:"failed" returns non-zero because the run "failed", while
+# still running print_result and emitting the file the forged status named. A
+# run dir an attacker can write was a file-read primitive, and the non-zero
+# exit made it look like the refusal had worked. Every one of these therefore
+# checks the OUTPUT as well.
+leak_probe() { # leak_probe <dir> <state> <exit_code>
+  mkdir -p "$1"
+  printf 'TOP-SECRET-%s\n' "$2" > "$1/leak.txt"
+  printf '{"state":"%s","exit_code":%s,"pid":999999,"heartbeat":"20260728-000000","steps":1,"emit_step":"x","emit_file":"leak.txt","error":"boom","run_dir":"%s","flow":"x.yaml","sfh_version":"1.0.0","nonce":"deadbeef"}' \
+    "$2" "$3" "$1" > "$1/status.json"
+}
 
-forge f_stopped '{"state":"stopped","exit_code":0,"pid":999999,"heartbeat":"20260728-000000","steps":1}'
-if "$SFH" wait f_stopped --timeout 5 >/dev/null 2>&1
-  then bad "wait: FAIL-OPEN - forged stopped+exit_code:0 returned 0"
-  else ok  "wait: state=stopped with exit_code:0 is not success"; fi
+for st in failed stopped dead done; do
+  leak_probe "f_$st" "$st" 0
+  out="$("$SFH" wait "f_$st" --timeout 5 2>/dev/null)"
+  rc=$?
+  case "$out" in
+    *TOP-SECRET*) bad "wait: LEAKED the emit file of a forged '$st' run dir" ;;
+    *)            ok  "wait: emitted nothing for a forged '$st' run dir" ;;
+  esac
+  if [ "$rc" -ne 0 ]
+    then ok  "wait: forged '$st' with exit_code:0 is not success"
+    else bad "wait: FAIL-OPEN - forged '$st' with exit_code:0 returned 0"; fi
+  out="$("$SFH" status "f_$st" 2>/dev/null)"
+  case "$out" in
+    *TOP-SECRET*) bad "status: LEAKED the emit file of a forged '$st' run dir" ;;
+    *)            ok  "status: emitted nothing for a forged '$st' run dir" ;;
+  esac
+done
 
 forge f_done '{"state":"done","exit_code":0,"pid":999999,"heartbeat":"20260728-000000","steps":1}'
 : > f_done/log.jsonl                       # present but empty - the old-format loophole
@@ -497,15 +518,30 @@ fi
 # from-meta.json half needs a resume and is left to the reviewers.
 sec "13. ATTACK / F-8  every run-derived value must be barred from bin:/cwd:/argv[0]"
 
-printf 'name: f8-notes\nsteps:\n  - id: b\n    tool: codex\n    bin: "{{notes}}"\n    prompt: "hi"\n' > f8a.yaml
+# access: read is REQUIRED here. Without it an AI step is rejected for having
+# no access at all, and this check would pass without the privileged-template
+# guard existing - a reviewer caught exactly that in an earlier version.
+printf 'name: f8-notes\nsteps:\n  - id: b\n    tool: codex\n    access: read\n    bin: "{{notes}}"\n    prompt: "hi"\n' > f8a.yaml
 if "$SFH" validate f8a.yaml >/dev/null 2>&1
   then bad "validate accepted bin: {{notes}} - notes are run-derived"
   else ok  "validate rejected bin: {{notes}}"; fi
+# Control: the same step with a literal bin must validate, so the check above
+# is known to be failing on the template and not on the step's shape.
+printf 'name: f8-notes-ok\nsteps:\n  - id: b\n    tool: codex\n    access: read\n    bin: "codex"\n    prompt: "hi"\n' > f8a_ok.yaml
+if "$SFH" validate f8a_ok.yaml >/dev/null 2>&1
+  then ok  "control: the same step with a literal bin validates"
+  else bad "control: the step shape itself is invalid - the {{notes}} check proves nothing"; fi
 
-printf 'name: f8-item\nsteps:\n  - id: e\n    foreach: ["a", "b"]\n    cmd: ["echo", "x"]\n    cwd: "{{item}}"\n' > f8b.yaml
+# foreach takes {from: ...}; a bare list is a syntax error, which would make
+# this check pass for the wrong reason too.
+printf 'name: f8-item\nsteps:\n  - id: e\n    foreach: { from: "a\\nb" }\n    cmd: ["echo", "x"]\n    cwd: "{{item}}"\n' > f8b.yaml
 if "$SFH" validate f8b.yaml >/dev/null 2>&1
   then bad "validate accepted cwd: {{item}} - foreach items are run-derived"
   else ok  "validate rejected cwd: {{item}}"; fi
+printf 'name: f8-item-ok\nsteps:\n  - id: e\n    foreach: { from: "a\\nb" }\n    cmd: ["echo", "{{item}}"]\n' > f8b_ok.yaml
+if "$SFH" validate f8b_ok.yaml >/dev/null 2>&1
+  then ok  "control: the same foreach with {{item}} in a data slot validates"
+  else bad "control: the foreach shape itself is invalid - the cwd check proves nothing"; fi
 
 printf 'name: f8-argv0\nsteps:\n  - id: a\n    cmd: ["echo", "x"]\n  - id: b\n    cmd: ["{{steps.a.output}}", "hi"]\n' > f8c.yaml
 if "$SFH" validate f8c.yaml >/dev/null 2>&1
@@ -517,6 +553,197 @@ printf 'name: f8-ok\nsteps:\n  - id: a\n    cmd: ["echo", "x"]\n  - id: b\n    c
 if "$SFH" validate f8d.yaml >/dev/null 2>&1
   then ok  "LEGIT: a template in a later argv slot is still allowed"
   else bad "LEGIT: the argv[0] guard now rejects templates in every slot"; fi
+
+# ------------------------------------------------------------- 14. regressions
+# Everything below came out of the three-reviewer panel: each one is a case an
+# earlier version of this file was missing, and each fails on the build that
+# shipped before the panel ran.
+sec "14. cases the reviewers found missing"
+
+# (a) F-2: a flow that deliberately routes BACK into a fan-out must re-run
+# every member. Reusing finished members there is not thrift, it is skipping
+# work the flow explicitly asked for a second time. The first attempt at the
+# F-2 fix mirrored completed members onto the next visit unconditionally and
+# broke exactly this.
+mkdir -p c14 && (
+cd c14 || exit
+# The route must lead back to the FAN-OUT ITSELF, or the case is not tested.
+# Pass 1: fan runs, gate fails, run stops. Resume: gate now says "again" and
+# routes to fan, which must run BOTH members a second time - the flow asked
+# for another lap. Third time through, gate ends the run.
+cat > flow.yaml <<'YAML'
+name: routeback
+steps:
+  - id: fan
+    max_parallel: 2
+    max_visits: 4
+    parallel:
+      - id: m1
+        cmd: ["sh", "-c", "echo m1 >> ../tally.txt; echo o1"]
+      - id: m2
+        cmd: ["sh", "-c", "echo m2 >> ../tally.txt; echo o2"]
+  - id: gate
+    max_visits: 4
+    cmd: ["sh", "-c", "if [ ! -f ../t1 ]; then touch ../t1; exit 5; elif [ ! -f ../t2 ]; then touch ../t2; echo again; else echo done; fi"]
+    route:
+      - when_last_line_is: "again"
+        goto: fan
+      - goto: end
+YAML
+"$SFH" run flow.yaml --runs-dir runs -q >/dev/null 2>&1
+rd="$(ls -d runs/*/ 2>/dev/null | head -1 | sed 's:/*$::')"
+[ -n "$rd" ] && "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q >/dev/null 2>&1
+printf '%s %s\n' \
+  "$(if [ -f ../tally.txt ]; then grep -c '^m1$' ../tally.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally.txt ]; then grep -c '^m2$' ../tally.txt | head -1; else echo 0; fi)" \
+  > ../c14.verdict
+)
+r1=""; r2=""
+[ -f c14.verdict ] && read -r r1 r2 < c14.verdict
+if [ "${r1:-0}" = "2" ] && [ "${r2:-0}" = "2" ]; then
+  ok "F-2: a route back INTO the fan-out re-runs every member, as the flow asked"
+else
+  bad "F-2: a deliberate loop back into the fan-out ran m1=$r1 m2=$r2, expected 2 2 (members wrongly skipped as 'already done')"
+fi
+
+# (b) F-7: --force-resume waives the FINGERPRINT check. It must not also make
+# the run dir's own claim about session access authoritative.
+sess_flow s14.yaml t14 read full
+"$SFH" run s14.yaml --runs-dir r14 -q >/dev/null 2>&1
+rd14="$(newest r14)"
+if [ -z "$rd14" ]; then bad "F-7(force): could not set up the run"; else
+  sed -e 's/"access":"read"/"access":"full"/g' \
+      "$rd14/log.jsonl" > "$rd14/l.new" && mv "$rd14/l.new" "$rd14/log.jsonl"
+  "$SFH" run s14.yaml --resume "$rd14" --force-resume --runs-dir r14 -q >/dev/null 2>e14.txt
+  if blocked_by_access e14.txt
+    then ok  "F-7: --force-resume does not make a forged access:full authoritative"
+    else bad "F-7: FAIL-OPEN - --force-resume trusted the log's own access claim"; fi
+fi
+
+# (c) F-1: a forged `sfh_version: 0.x` must not launder a CORRUPTED level. The
+# 0.x allowance exists for logs with no access key at all.
+sess_flow s14b.yaml t14b read read
+"$SFH" run s14b.yaml --runs-dir r14b -q >/dev/null 2>&1
+rd14b="$(newest r14b)"
+if [ -z "$rd14b" ]; then bad "F-1(0.x+bogus): could not set up the run"; else
+  sed -e 's/"access":"read"/"access":"bogus"/g' \
+      "$rd14b/log.jsonl" > "$rd14b/l.new" && mv "$rd14b/l.new" "$rd14b/log.jsonl"
+  sed -e 's/"sfh_version": *"[^"]*"/"sfh_version":"0.9.0"/' \
+      "$rd14b/meta.json" > "$rd14b/m.new" && mv "$rd14b/m.new" "$rd14b/meta.json"
+  "$SFH" run s14b.yaml --resume "$rd14b" --runs-dir r14b -q >/dev/null 2>e14b.txt
+  if blocked_by_access e14b.txt
+    then ok  "F-1: claiming to be a 0.x run does not launder a corrupted access level"
+    else bad "F-1: FAIL-OPEN - 0.x + a bogus level was filled in like an honest old run"; fi
+fi
+
+# (d) F-10: each honesty field must be checked on its own, and the two writers
+# emit different sets - aggregate_end has no timed_out/interrupted at all, so
+# demanding them marked every honestly written fan-out as not-a-success.
+for field in timed_out interrupted; do
+  rm -rf "r10_$field" t10_$field
+  cp f10.yaml "f10_$field.yaml"
+  sed -i "s/^name: f10-resume/name: f10-$field/" "f10_$field.yaml" 2>/dev/null || true
+  sed -i "s/t10r/t10_$field/" "f10_$field.yaml" 2>/dev/null || true
+  "$SFH" run "f10_$field.yaml" --runs-dir "r10_$field" -q >/dev/null 2>&1
+  rdf="$(newest "r10_$field")"
+  if [ -z "$rdf" ]; then bad "F-10($field): could not set up the run"; continue; fi
+  sed -e "s/,\"$field\":false//g" -e "s/\"$field\":false,//g" \
+      "$rdf/log.jsonl" > "$rdf/l.new" && mv "$rdf/l.new" "$rdf/log.jsonl"
+  outf="$("$SFH" run "f10_$field.yaml" --resume "$rdf" --runs-dir "r10_$field" -q 2>/dev/null)"
+  case "$outf" in
+    *"did not complete"*) ok  "F-10: dropping only '$field' is still not a success" ;;
+    *CLEANTEXT*)          bad "F-10: FAIL-OPEN - dropping only '$field' passed as a success" ;;
+    *)                    ok  "F-10: dropping only '$field' produced no restored output" ;;
+  esac
+done
+
+# (e) F-10, the other direction: a fan-out that really did succeed must come
+# back as a success. aggregate_end never writes timed_out/interrupted, so a
+# loader demanding them treated every completed group as failed.
+mkdir -p c14e && (
+cd c14e || exit
+cat > flow.yaml <<'YAML'
+name: aggok
+steps:
+  - id: fan
+    parallel:
+      - id: q1
+        cmd: ["echo", "AGGCLEAN-1"]
+      - id: q2
+        cmd: ["echo", "AGGCLEAN-2"]
+  - id: gate
+    cmd: ["sh", "-c", "if [ -f ../t14e ]; then echo ok; else touch ../t14e; exit 5; fi"]
+  - id: use
+    cmd: ["echo", "{{steps.fan.output}}"]
+YAML
+"$SFH" run flow.yaml --runs-dir runs -q >/dev/null 2>&1
+rd="$(ls -d runs/*/ 2>/dev/null | head -1 | sed 's:/*$::')"
+[ -n "$rd" ] && "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q > ../c14e.out 2>/dev/null
+)
+if [ -f c14e.out ] && grep -q 'AGGCLEAN-1' c14e.out && ! grep -q 'did not complete' c14e.out
+  then ok  "F-10: a fan-out that really succeeded restores as a success"
+  else bad "F-10: a successfully completed fan-out came back marked as failed"; fi
+
+# (f) F-4: a 0.x run whose flow has a string-form cmd template must actually
+# RESUME, not just pass validation with a warning and then be refused a step
+# later by the same rule.
+mkdir -p c14f/run && (
+cd c14f || exit
+cat > f.yaml <<'YAML'
+name: legacycmd
+steps:
+  - id: a
+    cmd: ["echo", "HELLO"]
+  - id: b
+    cmd: "echo got-{{steps.a.output}}"
+YAML
+printf '{"sfh_version":"0.9.0","flow":"f.yaml","flow_fingerprint":"x","name":"legacycmd","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' > run/meta.json
+{
+  printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}\n'
+  printf '{"ts":"20250101-000001","event":"step_end","step":"a","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":5,"output_hash":"x","chain_file":"a.chain.txt","out_file":"a.out.txt","cmd":"echo HELLO","session":null}\n'
+} > run/log.jsonl
+echo "HELLO" > run/a.chain.txt
+echo "HELLO" > run/a.out.txt
+"$SFH" run f.yaml --resume run --force-resume -q > ../c14f.out 2> ../c14f.err
+)
+if grep -q 'got-HELLO' c14f.out 2>/dev/null
+  then ok  "F-4: a 0.x run with a string-cmd template resumes and runs the step"
+  else bad "F-4: the legacy allowance stops at validate - the step is still refused"; fi
+if grep -q 'legacy resume' c14f.err 2>/dev/null
+  then ok  "F-4: the relaxation is announced rather than silent"
+  else bad "F-4: the legacy allowance is applied with no warning"; fi
+
+# --------------------------------------------------------- 15. line endings
+# A flow file checked out with CRLF and one checked out with LF are the same
+# flow. Fingerprinting the raw bytes made them two different versions, so a run
+# dir could not survive a re-checkout under a different core.autocrlf, let
+# alone a move between a Windows and a Unix working copy.
+sec "15. LEGIT / the same flow with CRLF and LF must resume interchangeably"
+
+mkdir -p c15 && (
+cd c15 || exit
+printf 'name: crlf\nsteps:\n  - id: a\n    cmd: ["echo", "first"]\n  - id: b\n    cmd: ["sh", "-c", "if [ -f ../t15 ]; then echo ok; else touch ../t15; exit 5; fi"]\n' > flow.yaml
+"$SFH" run flow.yaml --runs-dir runs -q >/dev/null 2>&1
+rd="$(ls -d runs/*/ 2>/dev/null | head -1 | sed 's:/*$::')"
+# Same content, CRLF endings - what a Windows checkout produces.
+printf 'name: crlf\r\nsteps:\r\n  - id: a\r\n    cmd: ["echo", "first"]\r\n  - id: b\r\n    cmd: ["sh", "-c", "if [ -f ../t15 ]; then echo ok; else touch ../t15; exit 5; fi"]\r\n' > flow.yaml
+if [ -n "$rd" ]; then
+  "$SFH" run flow.yaml --resume "$rd" --runs-dir runs -q >/dev/null 2>../c15.err
+  echo "$?" > ../c15.rc
+else
+  echo "setup" > ../c15.rc
+fi
+)
+rc15="$(cat c15.rc 2>/dev/null || echo setup)"
+if [ "$rc15" = "setup" ]; then
+  bad "CRLF: could not set up the run"
+elif grep -q "different version" c15.err 2>/dev/null; then
+  bad "CRLF: the same flow with different line endings reads as a changed flow"
+elif [ "$rc15" = "0" ]; then
+  ok "CRLF: a run made from an LF checkout resumes against a CRLF checkout"
+else
+  bad "CRLF: the resume failed (exit $rc15) - see c15.err"
+fi
 
 # ---------------------------------------------------------------- summary
 sec "summary"

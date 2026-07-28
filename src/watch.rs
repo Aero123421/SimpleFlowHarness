@@ -614,20 +614,26 @@ pub fn wait(
             }
         };
         if snap.terminal() {
+            // Do not report anything an untrusted run dir asserted about
+            // itself until the nonce backs it up - and for EVERY terminal
+            // state, not just done. The check used to live inside the "done"
+            // arm, so a forged status.json that said `failed` still reached
+            // print_result and emitted the file it named: a run dir an
+            // attacker can write became a file-read primitive, with the
+            // non-zero exit code making it look like the refusal had worked.
+            // The same applies to dead/stopped, which report content too.
+            //
+            // Before the match, so no arm can be added later that forgets.
+            if let Err(e) = nonce_consistent(&dir, &snap) {
+                eprintln!(
+                    "sfh: refusing to report {} as '{}': {e}",
+                    dir.display(),
+                    snap.state
+                );
+                return 1;
+            }
             match snap.state {
                 "done" => {
-                    // Do not hand a caller a "success" that an untrusted run dir
-                    // asserted about itself: the terminal state must be backed by
-                    // a consistent nonce, the same check `sfh stop` runs. A forged
-                    // status.json that says done/exit 0 without a matching nonce
-                    // file is refused instead of reported as success. Checked
-                    // BEFORE print_result so a forged status emits nothing at all,
-                    // not even from a clean emit path (rev_break #10 - the old
-                    // order printed the result first and checked the nonce after).
-                    if let Err(e) = nonce_consistent(&dir, &snap) {
-                        eprintln!("sfh: refusing to treat {} as done: {e}", dir.display());
-                        return 1;
-                    }
                     if let Err(e) = print_result(&snap) {
                         eprintln!("sfh: {e}");
                         return 1;

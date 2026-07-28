@@ -17,8 +17,15 @@ pub struct SessionInfo {
     pub marker: Option<String>,
     /// Access level the session was created under. A later step may not resume
     /// or fork it at a HIGHER level (untrusted context ingested at read must
-    /// not be promoted to write/full). None = run dir predates the recording.
+    /// not be promoted to write/full). None = not known.
     pub access: Option<preset::Access>,
+    /// Whether the log carried an `access` key at all, which is NOT the same
+    /// question as whether it parsed. A pre-1.0 run honestly has no key and its
+    /// level can be filled in from the flow; a run that has the key but whose
+    /// value is `"bogus"` or `null` has been edited, and no amount of claiming
+    /// to be old should get it the same treatment. Collapsing both to None let
+    /// a forged `sfh_version: 0.x` launder a tampered level.
+    pub access_recorded: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -337,7 +344,12 @@ pub fn shell_script_span(argv: &[String]) -> Option<std::ops::Range<usize>> {
         .next()
         .unwrap_or(prog)
         .to_lowercase();
-    let stem = base.rsplit_once('.').map_or(base.as_str(), |(s, _)| s);
+    // Only the Windows executable suffix comes off. Stripping whatever follows
+    // the last dot turned `sh.py` - an ordinary script that happens to be named
+    // after a shell - into "sh", and refused templates in its arguments for no
+    // reason. `.exe` is the only extension that actually makes cmd.exe the same
+    // program as cmd.
+    let stem = base.strip_suffix(".exe").unwrap_or(base.as_str());
     let sh_family = matches!(
         stem,
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "busybox"
@@ -425,8 +437,14 @@ pub fn shell_metachar_check(key: &str, val: &str) -> Result<(), String> {
 
 /// The refusal text for template expansion that would land in shell-parsed text.
 pub fn shell_expansion_refused(what: &str, key: &str) -> String {
+    // Lead with the positional-argument form. When a step genuinely needs a
+    // shell - a loop, a pipe, a conditional - "avoid the shell" is not an
+    // answer and the reader goes straight to unsafe_shell_template, which is
+    // the one option here that is actually unsafe. Arguments after `sh -c
+    // SCRIPT` arrive as $1, $2 ... inside the script and are never re-parsed,
+    // so they carry an untrusted value safely.
     format!(
-        "{what} would expand '{{{{{key}}}}}' into a shell string, and template expansion in a shell-parsed cmd is disabled by default (the substituted value would be re-parsed by the shell). Use an argv form that does not wrap a shell: cmd: [\"program\", \"--flag\", \"{{{{{key}}}}}\"], or set unsafe_shell_template: true on this step to accept shell templating"
+        "{what} would expand '{{{{{key}}}}}' into a shell string, and template expansion in a shell-parsed cmd is disabled by default (the substituted value would be re-parsed by the shell). Pass it as an argument instead of splicing it into the script:\n  cmd: [\"sh\", \"-c\", \"grep -- \\\"$1\\\" file\", \"step-name\", \"{{{{{key}}}}}\"]\nor, if no shell is needed at all:\n  cmd: [\"program\", \"--flag\", \"{{{{{key}}}}}\"]\nSetting unsafe_shell_template: true accepts shell templating, with only a metacharacter filter that a hostile value can still get past"
     )
 }
 
@@ -535,7 +553,11 @@ pub fn prepare_leaf(
             // character. The safe path is the argv form, which never touches a
             // shell; unsafe_shell_template: true is the explicit opt-in back
             // into shell templating (with the metacharacter check still on).
-            let checked = if step.unsafe_shell_template.unwrap_or(false) {
+            // cx.flow.legacy_resume: the lenient loader accepted this flow for
+            // a 0.x resume and already warned about the template. Refusing it
+            // again at execution time made the warning meaningless and left the
+            // old run unresumable. The metacharacter filter still runs.
+            let checked = if step.unsafe_shell_template.unwrap_or(false) || cx.flow.legacy_resume {
                 template::render_checked(s, &ctx, &shell_metachar_check)
             } else {
                 template::render_checked(s, &ctx, &|key, _| {
@@ -567,7 +589,7 @@ pub fn prepare_leaf(
             for (i, x) in v.iter().enumerate().skip(1) {
                 let rendered = match &script_span {
                     Some(span) if span.contains(&i) => {
-                        if step.unsafe_shell_template.unwrap_or(false) {
+                        if step.unsafe_shell_template.unwrap_or(false) || cx.flow.legacy_resume {
                             template::render_checked(x, &ctx, &shell_metachar_check)
                         } else {
                             template::render_checked(x, &ctx, &|key, _| {
@@ -2305,6 +2327,11 @@ mod tests {
                     cwd: None,
                     marker: None,
                     access: a,
+                    // This case is "the level is unknown at the guard", which
+                    // is what the guard is being tested on; how it got that
+                    // way is reconcile_session_access's business, not this
+                    // function's.
+                    access_recorded: a.is_some(),
                 },
             );
             sessions
@@ -2681,6 +2708,11 @@ mod tests {
         // Not a shell, or no run-string flag: no shell text.
         assert_eq!(s(&["echo", "hi"]), None);
         assert_eq!(s(&["sh", "script.sh"]), None);
+        // A script merely NAMED after a shell is not one. Only ".exe" comes
+        // off, so sh.py stays sh.py.
+        assert_eq!(s(&["sh.py", "-c", "x"]), None);
+        assert_eq!(s(&["bash.sh", "-c", "x"]), None);
+        assert_eq!(s(&["/opt/tools/cmd.pl", "/c", "x"]), None);
         assert_eq!(shell_script_span(&[]), None);
         // A flag with nothing after it must not produce an out-of-range span.
         assert_eq!(s(&["sh", "-c"]), Some(2..2));

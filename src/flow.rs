@@ -15,6 +15,14 @@ pub struct Flow {
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
     pub steps: Vec<Step>,
+    /// Set only by `load_lenient`, never by the YAML - it is the loader saying
+    /// "this flow was accepted under the pre-1.0 rules so a 0.x run could be
+    /// resumed". The relaxation has to travel with the flow: validate warning
+    /// and then letting `precheck` and `prepare_leaf` refuse the same thing a
+    /// moment later meant old runs still could not be resumed, which is the
+    /// whole point of the lenient path.
+    #[serde(skip)]
+    pub legacy_resume: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -264,6 +272,7 @@ pub fn load_lenient(path: &Path) -> Result<Flow, String> {
     let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     merge_global_profiles(&mut flow);
     validate(&flow, true)?;
+    flow.legacy_resume = true;
     Ok(flow)
 }
 
@@ -947,7 +956,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
                 for x in &v[span.start.min(v.len())..span.end.min(v.len())] {
                     if crate::template::contains_template(x) {
                         return Err(format!(
-                            "step '{sid}': cmd wraps a shell and its shell text contains a template, which is disabled by default for the same reason as a string-form cmd (the value is re-parsed by the shell). Avoid the shell:\n  cmd: [\"program\", \"--flag\", \"{{{{steps.x.output}}}}\"]\nor set unsafe_shell_template: true on this step to accept shell templating"
+                            "step '{sid}': cmd wraps a shell and its shell text contains a template, which is disabled by default for the same reason as a string-form cmd (the value is re-parsed by the shell). Pass it as an argument instead of splicing it into the script - arguments after the script become $1, $2 ... inside it and are never re-parsed:\n  cmd: [\"sh\", \"-c\", \"grep -- \\\"$1\\\" file\", \"{sid}\", \"{{{{steps.x.output}}}}\"]\nor, if no shell is needed at all:\n  cmd: [\"program\", \"--flag\", \"{{{{steps.x.output}}}}\"]\nSetting unsafe_shell_template: true accepts shell templating, with only a metacharacter filter that a hostile value can still get past"
                         ));
                     }
                 }
