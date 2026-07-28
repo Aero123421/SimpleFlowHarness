@@ -439,8 +439,11 @@ pub fn pid_is_sfh(pid: u32) -> bool {
 #[cfg(target_os = "macos")]
 pub fn pid_is_sfh(pid: u32) -> bool {
     extern "C" {
-        fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_char, buffersize: u32)
-            -> libc::c_int;
+        fn proc_pidpath(
+            pid: libc::c_int,
+            buffer: *mut libc::c_char,
+            buffersize: u32,
+        ) -> libc::c_int;
     }
     if pid == 0 {
         return false;

@@ -465,7 +465,10 @@ pub fn wait(
         if snap.terminal() {
             match snap.state {
                 "done" => {
-                    print_result(&snap);
+                    if let Err(e) = print_result(&snap) {
+                        eprintln!("sfh: {e}");
+                        return 1;
+                    }
                     if !quiet {
                         eprintln!(
                             "sfh: done. {} steps, ${:.4} reported. run dir: {}",
@@ -480,7 +483,10 @@ pub fn wait(
                         "sfh: FLOW FAILED: {}",
                         snap.error.as_deref().unwrap_or("(no error recorded)")
                     );
-                    print_result(&snap);
+                    if let Err(e) = print_result(&snap) {
+                        eprintln!("sfh: {e}");
+                        return 1;
+                    }
                     eprintln!("sfh: run dir: {}", snap.dir.display());
                 }
                 _ => {

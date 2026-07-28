@@ -22,37 +22,6 @@ pub fn validate_relative(candidate: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve `candidate` against `base` and verify it stays within `base`.
-/// Rejects absolute paths and any `..` traversal that escapes the base.
-/// Returns the canonicalized path on success.
-pub fn contained(base: &Path, candidate: &str) -> Result<PathBuf, String> {
-    validate_relative(candidate)?;
-    let joined = base.join(candidate);
-    let canon_base = base
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve run dir {}: {e}", base.display()))?;
-    let canon = joined.canonicalize().map_err(|e| {
-        format!(
-            "cannot resolve '{}' under {}: {e}",
-            candidate,
-            base.display()
-        )
-    })?;
-    if !canon.starts_with(&canon_base) {
-        return Err(format!(
-            "refusing path '{candidate}': resolves outside the run dir {}",
-            canon_base.display()
-        ));
-    }
-    Ok(canon)
-}
-
-/// Read a file that must be contained within `base`.
-pub fn read_contained(base: &Path, candidate: &str) -> Result<String, String> {
-    let path = contained(base, candidate)?;
-    std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
-}
-
 /// Resolve `candidate` against `base` the way `contained` does, but treat a
 /// MISSING file as `Ok(None)` instead of an error. A path that is absolute,
 /// carries a `..` component, or resolves (symlinks included) outside `base`
@@ -282,5 +251,47 @@ fn fill_random(buf: &mut [u8]) {
             buf.len() as u32,
             2, // BCRYPT_USE_SYSTEM_PREFERRED_RNG
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nonce_current_format() {
+        let (pid, nonce) = parse_nonce("12345 abcdef0123456789abcdef01234567");
+        assert_eq!(pid, Some(12345));
+        assert_eq!(nonce, "abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn parse_nonce_bare_format() {
+        let (pid, nonce) = parse_nonce("abcdef0123456789abcdef01234567");
+        assert_eq!(pid, None);
+        assert_eq!(nonce, "abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn parse_nonce_trims_whitespace() {
+        let (pid, nonce) = parse_nonce("  999 deadbeef  \n");
+        assert_eq!(pid, Some(999));
+        assert_eq!(nonce, "deadbeef");
+    }
+
+    #[test]
+    fn random_nonce_is_32_hex() {
+        let n = random_nonce();
+        assert_eq!(n.len(), 32);
+        assert!(n.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(n, random_nonce());
+    }
+
+    #[test]
+    fn validate_relative_rejects_absolute_and_traversal() {
+        assert!(validate_relative("foo/bar.txt").is_ok());
+        assert!(validate_relative("/etc/passwd").is_err());
+        assert!(validate_relative("../secret").is_err());
+        assert!(validate_relative("a/../../b").is_err());
     }
 }

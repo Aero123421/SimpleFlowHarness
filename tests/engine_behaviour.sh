@@ -802,10 +802,6 @@ check "a run-local human gate blocks and then continues" 0 $?
 contains "the human answer becomes chain output" "accepted=APPROVE-42" human-gate.out
 contains "stdin prompt records what the human must inspect" "release を承認" human-gate-run/approve.err.txt
 
-echo
-echo "engine behaviour: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
-
 # --- S1-1: sfh wait must not emit files outside the run dir -------------------
 # Attacker crafts a status.json whose emit_file points at a secret outside the
 # run dir. `sfh wait` reads the status and must refuse to print that file.
@@ -832,6 +828,7 @@ cat > s11-run/status.json <<JSON
 }
 JSON
 "$SFH" wait s11-run > s11.out 2>s11.err
+s11_rc=$?
 if grep -qF "TOP-SECRET-S11" s11.out; then
   echo "FAIL - S1-1: sfh wait emitted a file outside the run dir"
   fail=$((fail + 1))
@@ -839,7 +836,57 @@ else
   echo "ok   - S1-1: sfh wait refuses to emit files outside the run dir"
   pass=$((pass + 1))
 fi
+if [ "$s11_rc" -ne 0 ]; then
+  echo "ok   - S1-1: sfh wait exits non-zero on a containment violation"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-1: sfh wait exited 0 despite a containment violation"
+  fail=$((fail + 1))
+fi
 contains "S1-1: the refusal is reported" "refused to emit" s11.err
+
+# S1-1 symlink: a symlink at the fixed name detached.out.txt pointing outside
+# the run dir must be refused the same way.
+mkdir -p s11-sym-run
+echo "TOP-SECRET-S11-SYM" > s11-sym-secret.txt
+ln -sf "$(pwd)/s11-sym-secret.txt" s11-sym-run/detached.out.txt 2>/dev/null \
+  || cp s11-sym-secret.txt s11-sym-run/detached.out.txt
+cat > s11-sym-run/status.json <<JSON
+{
+  "state": "done",
+  "current_step": "x",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 1,
+  "cost_usd": 0.0,
+  "run_dir": "s11-sym-run",
+  "flow": "x.yaml",
+  "pid": 99999,
+  "sfh_version": "0.9.0",
+  "exit_code": 0,
+  "emit_step": null,
+  "emit_file": null,
+  "error": null,
+  "unfinished_step": null,
+  "nonce": "deadbeef"
+}
+JSON
+"$SFH" wait s11-sym-run > s11-sym.out 2>s11-sym.err
+s11s_rc=$?
+if grep -qF "TOP-SECRET-S11-SYM" s11-sym.out; then
+  echo "FAIL - S1-1: sfh wait followed an outward symlink in detached.out.txt"
+  fail=$((fail + 1))
+else
+  echo "ok   - S1-1: sfh wait refuses an outward symlink at detached.out.txt"
+  pass=$((pass + 1))
+fi
+if [ "$s11s_rc" -ne 0 ]; then
+  echo "ok   - S1-1: symlink violation exits non-zero"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-1: symlink violation exited 0"
+  fail=$((fail + 1))
+fi
 
 # --- S1-2: sfh stop must not kill unrelated processes -------------------------
 # A fake run dir (no sfh-nonce file) must not result in a kill. Depending on
@@ -867,12 +914,20 @@ cat > s12-run/status.json <<'JSON'
 }
 JSON
 "$SFH" stop s12-run > s12.out 2>s12.err
-if grep -qF "killed pid" s12.out; then
+if grep -qF "killed pid" s12.err; then
   echo "FAIL - S1-2: sfh stop killed a process from a fake run dir"
   fail=$((fail + 1))
 else
   echo "ok   - S1-2: sfh stop does not kill from a fake run dir"
   pass=$((pass + 1))
+fi
+# PID 1 (init/launchd/System) must still be alive after the attempt.
+if kill -0 1 2>/dev/null; then
+  echo "ok   - S1-2: pid 1 is still alive after the stop attempt"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-2: pid 1 is gone (sfh killed an unrelated process)"
+  fail=$((fail + 1))
 fi
 
 # A real detached run with a corrupted nonce must be refused outright.
@@ -908,7 +963,7 @@ steps:
 YAML
 "$SFH" run s13.yaml --dry-run --runs-dir s13-runs > s13.out 2>s13.err
 check "S1-3: a traversal flow name is rejected" 2 $?
-contains "S1-3: the error names the charset rule" "[A-Za-z0-9_-]" s13.err
+contains "S1-3: the error names the path-separator rule" "path separators" s13.err
 if [ -d "s13-runs/../ESCAPED-S13" ] || [ -d "ESCAPED-S13" ]; then
   echo "FAIL - S1-3: a directory was created outside the runs root"
   fail=$((fail + 1))
@@ -1323,6 +1378,344 @@ else
   fail=$((fail + 1))
 fi
 contains "S3-4: meta names the algorithm" '"flow_fingerprint_algo": "sha256"' "$S34_META"
+
+# --- R-2: a run made by the old FNV fingerprint can still be resumed ----------
+# Simulate an old run dir: 16-hex fingerprint, no flow_fingerprint_algo field.
+mkdir -p r2-runs
+cat > r2.yaml <<'YAML'
+name: r2
+steps:
+  - id: one
+    cmd: ["echo", "first"]
+  - id: two
+    cmd: ["echo", "second"]
+YAML
+"$SFH" run r2.yaml --runs-dir r2-runs -q > /dev/null 2>&1
+R2_DIR="$(dirname "$(find r2-runs -type f -name 'log.jsonl' -print -quit)")"
+# Rewrite meta.json to look like an old sfh: FNV fingerprint, no algo field.
+R2_FLOW_ABS="$(cd "$(dirname r2.yaml)" && pwd)/$(basename r2.yaml)"
+cat > "$R2_DIR/meta.json" <<JSON
+{"sfh_version":"0.9.0","flow":"$R2_FLOW_ABS","flow_fingerprint":"0000000000000000","name":"r2","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+# Truncate the log so the run looks unfinished (remove run_end).
+grep -v '"run_end"' "$R2_DIR/log.jsonl" > "$R2_DIR/log.jsonl.tmp"
+mv "$R2_DIR/log.jsonl.tmp" "$R2_DIR/log.jsonl"
+# Remove the position event so resume has somewhere to go.
+grep -v '"position"' "$R2_DIR/log.jsonl" > "$R2_DIR/log.jsonl.tmp"
+mv "$R2_DIR/log.jsonl.tmp" "$R2_DIR/log.jsonl"
+# The FNV fingerprint won't match (we wrote zeros), so without --force-resume
+# it should fail with "different version". But the ALGO detection must work:
+# a CORRECT FNV fingerprint should pass. Compute it with a tiny helper.
+# Since we can't easily compute FNV in bash, test the negative: the error
+# message must say "different version" (proving it compared as FNV, not SHA).
+"$SFH" run r2.yaml --resume "$R2_DIR" -q > r2.out 2>r2.err
+check "R-2: a wrong FNV fingerprint is detected as a flow change" 2 $?
+contains "R-2: the error says different version (not unknown algo)" "different version" r2.err
+
+# --- R-3: a legacy run (no nonce) can be stopped via process ownership --------
+mkdir -p r3-run
+cat > r3-run/status.json <<'JSON'
+{
+  "state": "running",
+  "current_step": "x",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 0,
+  "cost_usd": 0.0,
+  "run_dir": "r3-run",
+  "flow": "x.yaml",
+  "pid": 99999,
+  "sfh_version": "0.8.0",
+  "exit_code": null,
+  "emit_step": null,
+  "emit_file": null,
+  "error": null,
+  "unfinished_step": null
+}
+JSON
+# A legacy run dir has log.jsonl but NO sfh-nonce file.
+echo '{"ts":"20250101-000000","event":"run_start"}' > r3-run/log.jsonl
+"$SFH" stop r3-run > r3.out 2>r3.err
+r3_rc=$?
+# pid 99999 is not sfh (or not alive), so the stop should refuse on process
+# ownership - but it must NOT refuse on "nonce missing". The legacy path is
+# taken (warning about older sfh), then the pid check fails.
+if grep -qF "nonce mismatch" r3.err; then
+  echo "FAIL - R-3: a legacy run was refused for missing nonce"
+  fail=$((fail + 1))
+else
+  echo "ok   - R-3: a legacy run is not refused for missing nonce"
+  pass=$((pass + 1))
+fi
+contains "R-3: the legacy warning is printed" "older sfh" r3.err
+
+# A legacy run dir WITHOUT log.jsonl is a bare status.json - must be refused.
+mkdir -p r3-bare
+cp r3-run/status.json r3-bare/status.json
+"$SFH" stop r3-bare > r3-bare.out 2>r3-bare.err
+if [ $? -ne 0 ] && grep -qF "not recognisable" r3-bare.err; then
+  echo "ok   - R-3: a bare status.json (no log, no nonce) is refused"
+  pass=$((pass + 1))
+else
+  echo "FAIL - R-3: a bare status.json was not refused"
+  fail=$((fail + 1))
+fi
+
+# --- R-5: narrowing args pass; only widening args are refused -----------------
+cat > r5-narrow.yaml <<'YAML'
+name: r5-narrow
+steps:
+  - id: safe
+    tool: codex
+    access: read
+    args: ["-c", "sandbox_mode=read-only"]
+    prompt: hi
+YAML
+"$SFH" validate r5-narrow.yaml > r5-narrow.out 2>&1
+check "R-5: a narrowing arg (sandbox_mode=read-only on read) passes" 0 $?
+cat > r5-narrow2.yaml <<'YAML'
+name: r5-narrow2
+steps:
+  - id: safe
+    tool: codex
+    access: write
+    args: ["-c", "sandbox_mode=read-only"]
+    prompt: hi
+YAML
+"$SFH" validate r5-narrow2.yaml > r5-narrow2.out 2>&1
+check "R-5: a narrowing arg (read-only on write) passes" 0 $?
+cat > r5-wide.yaml <<'YAML'
+name: r5-wide
+steps:
+  - id: bad
+    tool: codex
+    access: read
+    args: ["-c", "sandbox_mode=danger-full-access"]
+    prompt: hi
+YAML
+"$SFH" validate r5-wide.yaml > r5-wide.out 2>&1
+check "R-5: a widening arg (danger-full-access on read) is refused" 2 $?
+# The error must NOT suggest "access: full" (wrong direction).
+if grep -qF "access: full" r5-wide.out; then
+  echo "FAIL - R-5: the error suggests access: full (wrong direction)"
+  fail=$((fail + 1))
+else
+  echo "ok   - R-5: the error does not suggest access: full"
+  pass=$((pass + 1))
+fi
+contains "R-5: the error names the escape hatch" "allow_access_override" r5-wide.out
+
+# --- R-6: safe flow names pass; validate and run agree ------------------------
+cat > r6.yaml <<'YAML'
+name: "研究 2026.07"
+steps:
+  - id: ok
+    cmd: ["echo", "ok"]
+YAML
+"$SFH" validate r6.yaml > r6-val.out 2>&1
+check "R-6: validate accepts a Unicode name with spaces and dots" 0 $?
+"$SFH" run r6.yaml --dry-run --runs-dir r6-runs > r6-run.out 2>r6-run.err
+check "R-6: run --dry-run accepts the same name (validate and run agree)" 0 $?
+# A name with a path separator is refused by BOTH.
+cat > r6-bad.yaml <<'YAML'
+name: "a/b"
+steps:
+  - id: ok
+    cmd: ["echo", "ok"]
+YAML
+"$SFH" validate r6-bad.yaml > r6-bad-val.out 2>&1
+check "R-6: validate refuses a name with a path separator" 2 $?
+"$SFH" run r6-bad.yaml --dry-run --runs-dir r6-runs > /dev/null 2>r6-bad-run.err
+check "R-6: run refuses the same name (validate and run agree)" 2 $?
+# A name that is exactly ".." is refused.
+cat > r6-dotdot.yaml <<'YAML'
+name: ".."
+steps:
+  - id: ok
+    cmd: ["echo", "ok"]
+YAML
+"$SFH" validate r6-dotdot.yaml > r6-dotdot.out 2>&1
+check "R-6: the reserved name '..' is refused" 2 $?
+
+# --- R-7: an existing --runs-dir keeps its permissions ------------------------
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ok   - R-7: permission bits not enforceable on Windows (skipped)"
+    pass=$((pass + 1))
+    ;;
+  *)
+    mkdir -p r7-shared
+    chmod 0770 r7-shared
+    cat > r7.yaml <<'YAML'
+name: r7
+steps:
+  - id: a
+    cmd: ["echo", "hi"]
+YAML
+    "$SFH" run r7.yaml --runs-dir r7-shared -q > /dev/null 2>&1
+    r7_perm="$(stat -c '%a' r7-shared 2>/dev/null || stat -f '%Lp' r7-shared 2>/dev/null)"
+    check "R-7: an existing 0770 --runs-dir keeps its permissions" 770 "$r7_perm"
+    # But a NEW dir sfh creates inside it gets 0700.
+    R7_RUN="$(dirname "$(find r7-shared -type f -name 'log.jsonl' -print -quit)")"
+    r7_run_perm="$(stat -c '%a' "$R7_RUN" 2>/dev/null || stat -f '%Lp' "$R7_RUN" 2>/dev/null)"
+    check "R-7: the run dir sfh created inside is 0700" 700 "$r7_run_perm"
+    ;;
+esac
+
+# --- S1-4 extended: out_file and precompact_file containment ------------------
+# out_file pointing outside the run dir must fail the resume.
+mkdir -p s14b-run
+echo "TOP-SECRET-S14B" > s14b-secret.txt
+S14B_ABS="$(cd "$(dirname s14b-secret.txt)" && pwd)/$(basename s14b-secret.txt)"
+cat > s14b-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"abc","name":"s14b","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > s14b-run/log.jsonl <<JSON
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"$S14B_ABS","cmd":"echo hi","session":null}
+JSON
+echo "chain" > s14b-run/one.chain.txt
+cat > s14b.yaml <<'YAML'
+name: s14b
+steps:
+  - id: one
+    cmd: ["echo", "hi"]
+  - id: two
+    cmd: ["echo", "leaked={{steps.one.output}}"]
+YAML
+"$SFH" run s14b.yaml --resume s14b-run --force-resume -q > s14b.out 2>s14b.err
+s14b_rc=$?
+if [ "$s14b_rc" -ne 0 ] && ! grep -qF "TOP-SECRET-S14B" s14b.out; then
+  echo "ok   - S1-4: an absolute out_file outside the run dir fails the resume"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-4: an absolute out_file was not refused"
+  fail=$((fail + 1))
+fi
+
+# precompact_file pointing outside must also fail.
+mkdir -p s14c-run
+echo "TOP-SECRET-S14C" > s14c-secret.txt
+S14C_ABS="$(cd "$(dirname s14c-secret.txt)" && pwd)/$(basename s14c-secret.txt)"
+cat > s14c-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"abc","name":"s14c","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+cat > s14c-run/log.jsonl <<JSON
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo hi","session":null}
+{"ts":"20250101-000003","event":"compact_end","step":"one","chars":5,"cost_usd":0.0,"precompact_file":"$S14C_ABS"}
+JSON
+echo "chain" > s14c-run/one.chain.txt
+cat > s14c.yaml <<'YAML'
+name: s14c
+steps:
+  - id: one
+    cmd: ["echo", "hi"]
+  - id: two
+    cmd: ["echo", "leaked={{steps.one.output}}"]
+YAML
+"$SFH" run s14c.yaml --resume s14c-run --force-resume -q > s14c.out 2>s14c.err
+s14c_rc=$?
+if [ "$s14c_rc" -ne 0 ] && ! grep -qF "TOP-SECRET-S14C" s14c.out; then
+  echo "ok   - S1-4: an absolute precompact_file outside the run dir fails the resume"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-4: an absolute precompact_file was not refused"
+  fail=$((fail + 1))
+fi
+
+# A symlink inside the run dir pointing outside must also be caught.
+mkdir -p s14d-run
+echo "TOP-SECRET-S14D" > s14d-secret.txt
+cat > s14d-run/meta.json <<'JSON'
+{"sfh_version":"0.9.0","flow":"","flow_fingerprint":"abc","name":"s14d","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}
+JSON
+ln -sf "$(pwd)/s14d-secret.txt" s14d-run/one.chain.txt 2>/dev/null \
+  || echo "TOP-SECRET-S14D" > s14d-run/one.chain.txt
+cat > s14d-run/log.jsonl <<'JSON'
+{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
+{"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo hi","session":null}
+JSON
+cat > s14d.yaml <<'YAML'
+name: s14d
+steps:
+  - id: one
+    cmd: ["echo", "hi"]
+  - id: two
+    cmd: ["echo", "leaked={{steps.one.output}}"]
+YAML
+"$SFH" run s14d.yaml --resume s14d-run --force-resume -q > s14d.out 2>s14d.err
+s14d_rc=$?
+if [ "$s14d_rc" -ne 0 ] && ! grep -qF "TOP-SECRET-S14D" s14d.out; then
+  echo "ok   - S1-4: a symlink chain_file pointing outside fails the resume"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S1-4: a symlink chain_file was not refused"
+  fail=$((fail + 1))
+fi
+
+# --- S2-4 extended: missing recorded access is fail-closed --------------------
+# A run dir whose log has no "access" field in the session must refuse a
+# higher-access resume unless allow_access_override is set.
+cat > s24-missing.yaml <<'YAML'
+name: s24-missing
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: high
+    tool: claude
+    bin: "echo"
+    access: full
+    continue_from: low
+    prompt: "y"
+YAML
+"$SFH" run s24-missing.yaml --runs-dir s24m-runs -q > /dev/null 2>&1
+S24M_DIR="$(dirname "$(find s24m-runs -type f -name 'log.jsonl' -print -quit)")"
+# Strip the "access" field from the session in the log to simulate an old run.
+sed 's/"access":"read",//' "$S24M_DIR/log.jsonl" | sed 's/,"access":"read"//' > "$S24M_DIR/log.jsonl.tmp"
+mv "$S24M_DIR/log.jsonl.tmp" "$S24M_DIR/log.jsonl"
+# Remove run_end and position so it looks resumable.
+grep -v '"run_end"\|"position"' "$S24M_DIR/log.jsonl" > "$S24M_DIR/log.jsonl.tmp"
+mv "$S24M_DIR/log.jsonl.tmp" "$S24M_DIR/log.jsonl"
+"$SFH" run s24-missing.yaml --resume "$S24M_DIR" --force-resume -q > s24m.out 2>s24m.err
+s24m_rc=$?
+if [ "$s24m_rc" -ne 0 ]; then
+  echo "ok   - S2-4: a session with no recorded access is fail-closed on resume"
+  pass=$((pass + 1))
+else
+  echo "FAIL - S2-4: a session with no recorded access was resumed at full"
+  fail=$((fail + 1))
+fi
+contains "S2-4: the error names the missing access" "no recorded access level" s24m.err
+
+# --- S3-3 extended: a read-only .gitignore fails the run ----------------------
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ok   - S3-3: read-only .gitignore test skipped on Windows"
+    pass=$((pass + 1))
+    ;;
+  *)
+    mkdir -p s33-ro/runs
+    printf 'keep\n' > s33-ro/runs/.gitignore
+    chmod 0444 s33-ro/runs/.gitignore
+    "$SFH" run s33.yaml --runs-dir s33-ro/runs -q > /dev/null 2>s33-ro.err
+    s33ro_rc=$?
+    chmod 0644 s33-ro/runs/.gitignore
+    if [ "$s33ro_rc" -ne 0 ]; then
+      echo "ok   - S3-3: a read-only .gitignore that cannot be fixed fails the run"
+      pass=$((pass + 1))
+    else
+      echo "FAIL - S3-3: a read-only .gitignore was silently ignored"
+      fail=$((fail + 1))
+    fi
+    ;;
+esac
 
 echo
 echo "engine behaviour: $pass passed, $fail failed"

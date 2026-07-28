@@ -208,9 +208,7 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
                             .map_err(|e| format!("step '{}' args: {e}", s.id))?,
                     );
                 }
-                if eff.access != preset::Access::Full
-                    && !s.allow_access_override.unwrap_or(false)
-                {
+                if eff.access != preset::Access::Full && !s.allow_access_override.unwrap_or(false) {
                     if let Some(t) = &eff.tool {
                         if let Some(e) = preset::find_escalation(t, eff.access, &rendered_args) {
                             return Err(preset::escalation_error(&s.id, eff.access, &e));
@@ -530,12 +528,7 @@ fn latest_run_dir(root: &Path, flow_path: &Path) -> Option<PathBuf> {
 /// The child's command line is rebuilt from RunOpts rather than filtered out of
 /// argv, so it does not depend on how the caller spelled the flags. The child
 /// inherits `nonce` through SFH_NONCE so both processes record the same value.
-fn detach_run(
-    opts: &RunOpts,
-    run_dir: &Path,
-    is_resume: bool,
-    nonce: &str,
-) -> Result<i32, String> {
+fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> Result<i32, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot locate the sfh executable to detach: {e}"))?;
 
@@ -672,7 +665,9 @@ fn protect_runs_root(root: &Path) -> Result<(), String> {
                 "sfh: warning: {} does not ignore everything; appending '*' so run artifacts cannot be committed",
                 f.display()
             );
-            write_and_verify(&format!("{text}\n# Added by sfh: run artifacts are not source.\n*\n"))
+            write_and_verify(&format!(
+                "{text}\n# Added by sfh: run artifacts are not source.\n*\n"
+            ))
         }
     }
 }
@@ -2592,6 +2587,53 @@ mod tests {
             fingerprint(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn legacy_fingerprint_is_fnv1a_16hex() {
+        let fp = legacy_fingerprint_fnv("hello");
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, legacy_fingerprint_fnv("hello"));
+        assert_ne!(fp, legacy_fingerprint_fnv("world"));
+    }
+
+    #[test]
+    fn check_flow_fingerprint_honours_recorded_algo() {
+        let flow_text = "name: test\nsteps:\n  - id: a\n    cmd: [\"echo\"]\n";
+        let sha_fp = fingerprint(flow_text);
+        let fnv_fp = legacy_fingerprint_fnv(flow_text);
+        let dir = Path::new("/tmp/fake");
+        let flow_path = Path::new("test.yaml");
+
+        let meta_sha = serde_json::json!({
+            "flow_fingerprint": sha_fp,
+            "flow_fingerprint_algo": "sha256"
+        });
+        assert!(check_flow_fingerprint(&meta_sha, flow_text, dir, flow_path).is_ok());
+
+        let meta_fnv = serde_json::json!({
+            "flow_fingerprint": fnv_fp,
+            "flow_fingerprint_algo": "fnv1a"
+        });
+        assert!(check_flow_fingerprint(&meta_fnv, flow_text, dir, flow_path).is_ok());
+
+        let meta_legacy = serde_json::json!({
+            "flow_fingerprint": fnv_fp
+        });
+        assert!(check_flow_fingerprint(&meta_legacy, flow_text, dir, flow_path).is_ok());
+
+        let meta_wrong = serde_json::json!({
+            "flow_fingerprint": sha_fp,
+            "flow_fingerprint_algo": "fnv1a"
+        });
+        assert!(check_flow_fingerprint(&meta_wrong, flow_text, dir, flow_path).is_err());
+
+        let meta_unknown = serde_json::json!({
+            "flow_fingerprint": "abc",
+            "flow_fingerprint_algo": "md5"
+        });
+        assert!(check_flow_fingerprint(&meta_unknown, flow_text, dir, flow_path).is_err());
     }
 
     #[test]

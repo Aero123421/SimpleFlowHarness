@@ -7,7 +7,19 @@
   "required": ["steps"],
   "additionalProperties": false,
   "properties": {
-    "name": { "type": "string", "description": "Used in the run directory name." },
+    "name": {
+      "type": "string",
+      "description": "Used in the run directory name. Unicode, spaces and dots are allowed; path separators (/ \\), control characters, NUL, and the Windows-reserved characters <>:\"|?* are forbidden, as are the reserved names '.' and '..'.",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "const": "." },
+          { "const": ".." },
+          { "pattern": "[/\\\\\\x00-\\x1f\\x7f<>:\"|?*]" },
+          { "pattern": "[ .]$" }
+        ]
+      }
+    },
     "vars": {
       "type": "object",
       "description": "Flow variables, referenced as {{vars.NAME}} and overridable with --var NAME=value.",

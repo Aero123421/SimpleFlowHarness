@@ -465,7 +465,9 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
             });
         }
         let value_of = |takes_value: bool| -> Option<String> {
-            eq_value.clone().or_else(|| takes_value.then(|| args.get(i + 1).cloned()).flatten())
+            eq_value
+                .clone()
+                .or_else(|| takes_value.then(|| args.get(i + 1).cloned()).flatten())
         };
         match tool {
             "codex" => {
@@ -563,7 +565,8 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                         if clean == "build" {
                             return wider(
                                 a,
-                                "the build agent edits files, above the declared 'read'".to_string(),
+                                "the build agent edits files, above the declared 'read'"
+                                    .to_string(),
                                 1,
                                 access,
                             );
@@ -1800,31 +1803,75 @@ mod tests {
         for (tool, access, argv) in [
             ("pi", Access::Read, args(&["--approve"])),
             ("pi", Access::Read, args(&["--tools", "read,edit"])),
-            ("pi", Access::Write, args(&["-t", "read,bash,edit,write,grep,find,ls"])),
+            (
+                "pi",
+                Access::Write,
+                args(&["-t", "read,bash,edit,write,grep,find,ls"]),
+            ),
             ("opencode", Access::Read, args(&["--agent", "build"])),
             ("opencode", Access::Read, args(&["--agent=build"])),
             ("claude", Access::Read, args(&["--tools", "Read,Bash"])),
             ("claude", Access::Read, args(&["--allowedTools", "Bash"])),
-            ("claude", Access::Write, args(&["--allowedTools", "Bash(ls)"])),
-            ("claude", Access::Write, args(&["--permission-mode", "bypassPermissions"])),
-            ("claude", Access::Read, args(&["--permission-mode=acceptEdits"])),
+            (
+                "claude",
+                Access::Write,
+                args(&["--allowedTools", "Bash(ls)"]),
+            ),
+            (
+                "claude",
+                Access::Write,
+                args(&["--permission-mode", "bypassPermissions"]),
+            ),
+            (
+                "claude",
+                Access::Read,
+                args(&["--permission-mode=acceptEdits"]),
+            ),
             ("claude", Access::Read, args(&["--add-dir", "/etc"])),
             ("grok", Access::Write, args(&["--allow", "Bash(ls)"])),
-            ("grok", Access::Read, args(&["--permission-mode", "bypassPermissions"])),
+            (
+                "grok",
+                Access::Read,
+                args(&["--permission-mode", "bypassPermissions"]),
+            ),
             ("agy", Access::Read, args(&["--mode", "accept-edits"])),
             ("codex", Access::Write, args(&["-s", "danger-full-access"])),
-            ("codex", Access::Read, args(&["--sandbox", "workspace-write"])),
-            ("codex", Access::Read, args(&["-c", "sandbox_mode=\"danger-full-access\""])),
+            (
+                "codex",
+                Access::Read,
+                args(&["--sandbox", "workspace-write"]),
+            ),
+            (
+                "codex",
+                Access::Read,
+                args(&["-c", "sandbox_mode=\"danger-full-access\""]),
+            ),
             // a bare -c value element, the way args: actually carries it
-            ("codex", Access::Read, args(&["sandbox_mode=\"workspace-write\""])),
-            ("codex", Access::Read, args(&["-c", "approval_policy=\"on-failure\""])),
+            (
+                "codex",
+                Access::Read,
+                args(&["sandbox_mode=\"workspace-write\""]),
+            ),
+            (
+                "codex",
+                Access::Read,
+                args(&["-c", "approval_policy=\"on-failure\""]),
+            ),
             ("codex", Access::Read, args(&["approval_policy=on-request"])),
             // tool-independent bypasses
             ("claude", Access::Write, args(&["--force"])),
             ("codex", Access::Read, args(&["--yolo"])),
-            ("grok", Access::Read, args(&["--dangerously-skip-permissions"])),
+            (
+                "grok",
+                Access::Read,
+                args(&["--dangerously-skip-permissions"]),
+            ),
             ("agy", Access::Write, args(&["--always-approve"])),
-            ("codex", Access::Write, args(&["--dangerously-bypass-approvals-and-sandbox"])),
+            (
+                "codex",
+                Access::Write,
+                args(&["--dangerously-bypass-approvals-and-sandbox"]),
+            ),
         ] {
             assert!(
                 find_escalation(tool, access, &argv).is_some(),
@@ -1839,35 +1886,87 @@ mod tests {
     fn escalation_detection_lets_narrowing_and_harmless_args_through() {
         for (tool, access, argv) in [
             // THE false positives from the review: these NARROW the permission.
-            ("codex", Access::Read, args(&["-c", "sandbox_mode=read-only"])),
-            ("codex", Access::Read, args(&["-c", "sandbox_mode=\"read-only\""])),
+            (
+                "codex",
+                Access::Read,
+                args(&["-c", "sandbox_mode=read-only"]),
+            ),
+            (
+                "codex",
+                Access::Read,
+                args(&["-c", "sandbox_mode=\"read-only\""]),
+            ),
             ("codex", Access::Read, args(&["-s", "read-only"])),
             ("codex", Access::Write, args(&["-s", "workspace-write"])),
-            ("codex", Access::Write, args(&["-c", "sandbox_mode=\"read-only\""])),
-            ("codex", Access::Read, args(&["-c", "approval_policy=\"never\""])),
+            (
+                "codex",
+                Access::Write,
+                args(&["-c", "sandbox_mode=\"read-only\""]),
+            ),
+            (
+                "codex",
+                Access::Read,
+                args(&["-c", "approval_policy=\"never\""]),
+            ),
             ("codex", Access::Read, args(&["approval_policy=never"])),
-            ("claude", Access::Write, args(&["--permission-mode", "acceptEdits"])),
-            ("claude", Access::Read, args(&["--permission-mode", "dontAsk"])),
+            (
+                "claude",
+                Access::Write,
+                args(&["--permission-mode", "acceptEdits"]),
+            ),
+            (
+                "claude",
+                Access::Read,
+                args(&["--permission-mode", "dontAsk"]),
+            ),
             // a prose value that merely MENTIONS a bypass word is not a bypass
-            ("claude", Access::Read, args(&["--append-system-prompt", "never use bypassPermissions"])),
-            ("claude", Access::Read, args(&["--allowedTools", "WebSearch,WebFetch"])),
-            ("claude", Access::Write, args(&["--allowedTools", "Edit,Write"])),
-            ("grok", Access::Write, args(&["--permission-mode", "acceptEdits"])),
+            (
+                "claude",
+                Access::Read,
+                args(&["--append-system-prompt", "never use bypassPermissions"]),
+            ),
+            (
+                "claude",
+                Access::Read,
+                args(&["--allowedTools", "WebSearch,WebFetch"]),
+            ),
+            (
+                "claude",
+                Access::Write,
+                args(&["--allowedTools", "Edit,Write"]),
+            ),
+            (
+                "grok",
+                Access::Write,
+                args(&["--permission-mode", "acceptEdits"]),
+            ),
             ("grok", Access::Read, args(&["--deny", "Bash"])),
             ("agy", Access::Write, args(&["--mode", "plan"])),
             ("agy", Access::Read, args(&["--mode", "plan"])),
             ("pi", Access::Read, args(&["-t", "read,grep,find,ls"])),
-            ("pi", Access::Write, args(&["--tools", "read,edit,write,grep,find,ls"])),
+            (
+                "pi",
+                Access::Write,
+                args(&["--tools", "read,edit,write,grep,find,ls"]),
+            ),
             ("opencode", Access::Write, args(&["--agent", "build"])),
             ("opencode", Access::Read, args(&["--agent", "plan"])),
             // a custom agent could be anything: ambiguous args are let through
-            ("opencode", Access::Read, args(&["--agent", "my-custom-agent"])),
+            (
+                "opencode",
+                Access::Read,
+                args(&["--agent", "my-custom-agent"]),
+            ),
             ("codex", Access::Read, args(&["-s", "some-future-mode"])),
             ("agy", Access::Read, args(&["--mode", "unknown-mode"])),
             // plain settings and prefix lookalikes
             ("codex", Access::Read, args(&["--model", "gpt"])),
             ("codex", Access::Read, args(&["-m", "gpt"])),
-            ("codex", Access::Read, args(&["-c", "model_reasoning_effort=\"high\""])),
+            (
+                "codex",
+                Access::Read,
+                args(&["-c", "model_reasoning_effort=\"high\""]),
+            ),
             ("claude", Access::Read, args(&["--effort", "high"])),
             ("claude", Access::Read, args(&["--output-format", "json"])),
             ("opencode", Access::Read, args(&["--variant", "high"])),
@@ -1891,17 +1990,21 @@ mod tests {
             );
         }
         // full may carry anything
-        assert!(find_escalation("codex", Access::Full, &args(&["-s", "danger-full-access"])).is_none());
+        assert!(
+            find_escalation("codex", Access::Full, &args(&["-s", "danger-full-access"])).is_none()
+        );
         assert!(find_escalation("pi", Access::Full, &args(&["--approve"])).is_none());
         assert!(find_escalation("claude", Access::Full, &args(&["--force"])).is_none());
     }
 
     #[test]
     fn escalation_error_points_at_removal_not_at_full() {
-        assert!(
-            find_escalation("codex", Access::Read, &args(&["-c", "sandbox_mode=read-only"]))
-                .is_none()
-        );
+        assert!(find_escalation(
+            "codex",
+            Access::Read,
+            &args(&["-c", "sandbox_mode=read-only"])
+        )
+        .is_none());
         let bad = find_escalation("codex", Access::Read, &args(&["-s", "danger-full-access"]))
             .expect("danger-full-access on a read step is an escalation");
         let msg = escalation_error("safe", Access::Read, &bad);

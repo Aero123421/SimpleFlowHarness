@@ -1248,14 +1248,20 @@ mod tests {
     // check must run in validate() so `sfh validate` and `sfh run` agree.
     #[test]
     fn flow_names_forbid_path_characters_only() {
-        for name in ["研究 2026.07", "my flow", "v1.2.3", "a-b_c", "report (final)"] {
+        for name in [
+            "研究 2026.07",
+            "my flow",
+            "v1.2.3",
+            "a-b_c",
+            "report (final)",
+        ] {
             assert!(validate_name(name).is_ok(), "{name}");
             let y = format!("name: '{name}'\nsteps:\n  - id: a\n    cmd: echo hi\n");
             assert!(parse(&y).is_ok(), "validate must accept {name}");
         }
         for name in [
-            "../evil", "a/b", "a\\b", "..", ".", "x:y", "a<b", "a>b", "a*b", "a?b", "a|b",
-            "a\"b", "trail ", "trail.", "", "   ",
+            "../evil", "a/b", "a\\b", "..", ".", "x:y", "a<b", "a>b", "a*b", "a?b", "a|b", "a\"b",
+            "trail ", "trail.", "", "   ",
         ] {
             assert!(validate_name(name).is_err(), "{name}");
         }
@@ -1418,5 +1424,41 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("step 'met'"), "{warnings:?}");
         assert!(warnings[0].contains("step 'unmet'"), "{warnings:?}");
+    }
+
+    #[test]
+    fn validate_name_allows_unicode_spaces_and_dots() {
+        assert!(validate_name("研究 2026.07").is_ok());
+        assert!(validate_name("my flow v2.1").is_ok());
+        assert!(validate_name("hello world").is_ok());
+        assert!(validate_name("a.b.c").is_ok());
+        assert!(validate_name("日本語テスト").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_path_separators_and_traversal() {
+        assert!(validate_name("a/b").is_err());
+        assert!(validate_name("a\\b").is_err());
+        assert!(validate_name("..").is_err());
+        assert!(validate_name(".").is_err());
+        assert!(validate_name("a\0b").is_err());
+        assert!(validate_name("a<b").is_err());
+        assert!(validate_name("a>b").is_err());
+        assert!(validate_name("a:b").is_err());
+        assert!(validate_name("a\"b").is_err());
+        assert!(validate_name("a|b").is_err());
+        assert!(validate_name("a?b").is_err());
+        assert!(validate_name("a*b").is_err());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("  ").is_err());
+        assert!(validate_name("trailing ").is_err());
+        assert!(validate_name("trailing.").is_err());
+    }
+
+    #[test]
+    fn validate_calls_validate_name() {
+        let e = parse("name: \"a/b\"\nsteps:\n  - id: a\n    cmd: echo hi\n").unwrap_err();
+        assert!(e.contains("path separators"), "{e}");
+        assert!(parse("name: \"研究 2026.07\"\nsteps:\n  - id: a\n    cmd: echo hi\n").is_ok());
     }
 }
