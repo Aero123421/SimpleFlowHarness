@@ -421,11 +421,8 @@ pub fn prepare_leaf(
             if !matches!(eff.access, preset::Access::Full)
                 && !step.allow_access_override.unwrap_or(false)
             {
-                if let Some(bad) = args.iter().find(|a| preset::is_escalation_arg(&tool, a)) {
-                    return Err(format!(
-                        "step '{}': args: contains '{bad}', which overrides the declared access level; use access: full, or set allow_access_override: true on this step to accept it",
-                        step.id
-                    ));
+                if let Some(e) = preset::find_escalation(&tool, eff.access, &args) {
+                    return Err(preset::escalation_error(&step.id, eff.access, &e));
                 }
             }
             let inp = preset::PresetInput {
@@ -473,11 +470,24 @@ pub fn prepare_leaf(
                             eff.access.as_str()
                         ));
                     }
+                    // Missing OR UNPARSEABLE recorded access (a run dir that
+                    // predates the recording, or a log.jsonl an attacker edited
+                    // to drop the field). Warn-and-continue would be fail-open:
+                    // deleting one field from an attacker-controlled run dir
+                    // would be enough to resume a read session at full. So this
+                    // is fail-closed unless the step explicitly opted in.
                     None => {
-                        eprintln!(
-                            "sfh: warning: step '{}': the session of '{target}' has no recorded access level (run dir predates access recording); access escalation cannot be verified",
-                            step.id
-                        );
+                        if step.allow_access_override.unwrap_or(false) {
+                            eprintln!(
+                                "sfh: warning: step '{}': the session of '{target}' has no recorded access level (run dir predates access recording, or the log was altered); proceeding because allow_access_override is set",
+                                step.id
+                            );
+                        } else {
+                            return Err(format!(
+                                "step '{}': {what} '{target}' has no recorded access level (the run dir predates access recording, or the log was altered), so an access escalation cannot be ruled out - refusing to resume (set allow_access_override: true on this step to accept)",
+                                step.id
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -2012,9 +2022,11 @@ mod tests {
         )
         .is_err());
 
-        // old run dirs without a recorded level warn but are not blocked
+        // A session with no recorded level (old run dir, or an edited log) is
+        // fail-CLOSED: an attacker who controls the run dir could otherwise
+        // delete the field and resume a read session at full.
         let sessions_unknown = with_access(None);
-        prepare_leaf(
+        let e = prepare_leaf(
             &ctx(
                 &flow,
                 &vars,
@@ -2030,7 +2042,34 @@ mod tests {
             &[],
             None,
         )
-        .expect("unknown recorded access cannot be compared");
+        .err()
+        .expect("an unknown recorded access level must fail closed");
+        assert!(e.contains("no recorded access level"), "{e}");
+        assert!(e.contains("allow_access_override"), "{e}");
+
+        // the explicit opt-in downgrades the refusal to a warning
+        let mut opted_unknown: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: low\n    tool: claude\n    access: read\n    prompt: x\n  - id: high\n    tool: claude\n    access: full\n    allow_access_override: true\n    continue_from: low\n    prompt: y\n",
+        )
+        .unwrap();
+        let high_uo = opted_unknown.steps.pop().unwrap();
+        prepare_leaf(
+            &ctx(
+                &flow,
+                &vars,
+                &outputs,
+                &step_ids,
+                &dir,
+                &sessions_unknown,
+                &needed,
+            ),
+            &high_uo,
+            1,
+            "high",
+            &[],
+            None,
+        )
+        .expect("allow_access_override accepts an unknown recorded level");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -379,58 +379,338 @@ const CLAUDE_READ_TOOLS: &str = "Read,Glob,Grep,WebSearch,WebFetch,TodoWrite";
 /// need commands say so with `args:`, or use `access: full` and mean it.
 const CLAUDE_WRITE_ALLOWED: &str = "WebSearch,WebFetch";
 
-/// Flags a user could put in `args:` that escalate past `access:` regardless of
-/// the tool. Flag-shaped entries match a whole argv element or its `--flag=...`
-/// form; bare values (permission-mode names) match as substrings.
-pub const GLOBAL_ESCALATION_FLAGS: [&str; 7] = [
+/// Boolean flags that mean "approve everything" on any tool. Matched as a WHOLE
+/// argv element (or its --flag=... form) - a prefix match would turn a harmless
+/// --force-of-nature into a bypass.
+const GLOBAL_BYPASS_FLAGS: [&str; 5] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
-    "bypassPermissions",
-    "danger-full-access",
     "--always-approve",
     "--yolo",
     "--force",
 ];
 
-/// Per-tool `args:` that change what the tool is allowed to do. The preset
-/// itself emits several of these (pi --tools, claude --permission-mode, ...);
-/// the check applies to USER args only, never to the argv sfh builds.
-/// Entries ending in '=' match a value namespace (codex -c sandbox_mode=...).
-pub fn escalation_flags(tool: &str) -> &'static [&'static str] {
-    match tool {
-        "codex" => &["-s", "--sandbox", "sandbox_mode=", "approval_policy="],
-        "claude" => &[
-            "--tools",
-            "--allowedTools",
-            "--permission-mode",
-            "--add-dir",
-        ],
-        "opencode" => &["--agent"],
-        "grok" => &["--allow", "--permission-mode"],
-        "agy" => &["--mode"],
-        "pi" => &["--approve", "--tools", "-t"],
-        _ => &[],
+/// The first arg that widens permissions past `access`, with the reason.
+///
+/// The check is VALUE-AWARE on purpose: `args: ["-c", "sandbox_mode=read-only"]`
+/// on a read step NARROWS the permission and must pass, while the old substring
+/// match refused it and then suggested `access: full` - pointing the user the
+/// wrong way. Only args that raise the tier above the declared one are
+/// reported; a value sfh cannot classify is let through, because a false
+/// positive stops a correct flow while a miss is still caught by the tool's
+/// own sandbox. A step that is not `full` may carry a widening arg only with an
+/// explicit allow_access_override: true (enforced by the caller, fail-closed).
+pub struct Escalation {
+    /// The offending arg, plus its value when that is a separate element.
+    pub arg: String,
+    /// Why this widens the declared permission.
+    pub reason: String,
+}
+
+/// Privilege tier of a value, on the same scale as `Access::rank`
+/// (0 = read, 1 = write, 2 = full). `None` = cannot classify: let through.
+fn tier_name(rank: u8) -> &'static str {
+    match rank {
+        0 => "read",
+        1 => "write",
+        _ => "full",
     }
 }
 
-fn escalation_pattern_matches(pattern: &str, arg: &str) -> bool {
-    if pattern.ends_with('=') {
-        arg.starts_with(pattern)
-    } else if pattern.starts_with('-') {
-        arg == pattern || arg.starts_with(&format!("{pattern}="))
+fn wider(arg: &str, reason: String, value_rank: u8, access: Access) -> Option<Escalation> {
+    if value_rank > access.rank() {
+        Some(Escalation {
+            arg: arg.to_string(),
+            reason,
+        })
     } else {
-        arg.contains(pattern)
+        None
     }
 }
 
-/// True when one user-supplied arg would override the declared access level.
-/// A step that is not `full` may carry such an arg only with an explicit
-/// allow_access_override: true (enforced by the caller, fail-closed).
-pub fn is_escalation_arg(tool: &str, arg: &str) -> bool {
-    GLOBAL_ESCALATION_FLAGS
+fn codex_sandbox_rank(mode: &str) -> Option<u8> {
+    match mode.trim().trim_matches('"').trim() {
+        "read-only" => Some(0),
+        "workspace-write" => Some(1),
+        "danger-full-access" => Some(2),
+        _ => None,
+    }
+}
+
+fn permission_mode_rank(mode: &str) -> Option<u8> {
+    // claude and grok share the mode vocabulary.
+    match mode.trim().trim_matches('"').trim() {
+        "plan" | "dontAsk" | "default" => Some(0),
+        "acceptEdits" => Some(1),
+        "bypassPermissions" => Some(2),
+        _ => None,
+    }
+}
+
+fn unquote(v: &str) -> String {
+    v.trim().trim_matches('"').trim().to_string()
+}
+
+pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Escalation> {
+    for (i, a) in args.iter().enumerate() {
+        // Tool-independent "approve everything" switches.
+        let (flag, eq_value) = match a.split_once('=') {
+            Some((f, v)) => (f.to_string(), Some(v.to_string())),
+            None => (a.clone(), None),
+        };
+        if GLOBAL_BYPASS_FLAGS.contains(&flag.as_str()) && access != Access::Full {
+            return Some(Escalation {
+                arg: a.clone(),
+                reason: "bypasses all permission checks (= full access)".to_string(),
+            });
+        }
+        let value_of = |takes_value: bool| -> Option<String> {
+            eq_value.clone().or_else(|| takes_value.then(|| args.get(i + 1).cloned()).flatten())
+        };
+        match tool {
+            "codex" => {
+                // -s/--sandbox <mode>, or a bare -c value element sandbox_mode=<mode>.
+                let mode = if flag == "-s" || flag == "--sandbox" {
+                    value_of(true)
+                } else if flag == "sandbox_mode" {
+                    Some(eq_value.clone().unwrap_or_default())
+                } else {
+                    None
+                };
+                if let Some(m) = mode {
+                    let clean = unquote(&m);
+                    if let Some(r) = codex_sandbox_rank(&clean) {
+                        return wider(
+                            a,
+                            format!(
+                                "sandbox mode '{clean}' is the {} tier, above the declared '{}'",
+                                tier_name(r),
+                                access.as_str()
+                            ),
+                            r,
+                            access,
+                        );
+                    }
+                }
+                // approval_policy=<policy> as a bare -c value: anything except
+                // "never" auto-approves at least some actions.
+                if flag == "approval_policy" {
+                    if let Some(v) = eq_value {
+                        let clean = unquote(&v);
+                        let rank = match clean.as_str() {
+                            "never" => Some(0),
+                            "on-failure" | "on-request" | "unapproved" => Some(2),
+                            _ => None,
+                        };
+                        if let Some(r) = rank {
+                            return wider(
+                                a,
+                                format!("approval_policy '{clean}' auto-approves tool calls"),
+                                r,
+                                access,
+                            );
+                        }
+                    }
+                }
+            }
+            "claude" => {
+                if flag == "--permission-mode" {
+                    if let Some(v) = value_of(true) {
+                        let clean = unquote(&v);
+                        if let Some(r) = permission_mode_rank(&clean) {
+                            return wider(
+                                a,
+                                format!(
+                                    "permission mode '{clean}' is the {} tier, above the declared '{}'",
+                                    tier_name(r),
+                                    access.as_str()
+                                ),
+                                r,
+                                access,
+                            );
+                        }
+                    }
+                } else if flag == "--tools" || flag == "--allowedTools" {
+                    if let Some(v) = value_of(true) {
+                        let r = claude_tool_list_rank(&v);
+                        return wider(
+                            a,
+                            format!(
+                                "the tool list grants the {} tier, above the declared '{}'",
+                                tier_name(r),
+                                access.as_str()
+                            ),
+                            r,
+                            access,
+                        );
+                    }
+                } else if flag == "--add-dir" {
+                    return wider(
+                        a,
+                        "grants access to directories outside the workspace".to_string(),
+                        2,
+                        access,
+                    );
+                }
+            }
+            "opencode" => {
+                // The agent selects the permission set; "build" is the known
+                // write tier. A custom agent could be anything, so anything
+                // else is let through (a miss is still the user's own config).
+                if flag == "--agent" {
+                    if let Some(v) = value_of(true) {
+                        let clean = unquote(&v);
+                        if clean == "build" {
+                            return wider(
+                                a,
+                                "the build agent edits files, above the declared 'read'".to_string(),
+                                1,
+                                access,
+                            );
+                        }
+                    }
+                }
+            }
+            "grok" => {
+                if flag == "--permission-mode" {
+                    if let Some(v) = value_of(true) {
+                        let clean = unquote(&v);
+                        if let Some(r) = permission_mode_rank(&clean) {
+                            return wider(
+                                a,
+                                format!(
+                                    "permission mode '{clean}' is the {} tier, above the declared '{}'",
+                                    tier_name(r),
+                                    access.as_str()
+                                ),
+                                r,
+                                access,
+                            );
+                        }
+                    }
+                } else if flag == "--allow" {
+                    if let Some(v) = value_of(true) {
+                        let head = v
+                            .split(['(', ':', '='])
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_lowercase();
+                        let r = match head.as_str() {
+                            "bash" => 2,
+                            "edit" | "write" => 1,
+                            _ => 0,
+                        };
+                        return wider(
+                            a,
+                            format!(
+                                "allowing '{v}' grants the {} tier, above the declared '{}'",
+                                tier_name(r),
+                                access.as_str()
+                            ),
+                            r,
+                            access,
+                        );
+                    }
+                }
+            }
+            "agy" => {
+                if flag == "--mode" {
+                    if let Some(v) = value_of(true) {
+                        let clean = unquote(&v);
+                        let rank = match clean.as_str() {
+                            "plan" => Some(0),
+                            "accept-edits" => Some(1),
+                            _ => None,
+                        };
+                        if let Some(r) = rank {
+                            return wider(
+                                a,
+                                format!(
+                                    "mode '{clean}' is the {} tier, above the declared '{}'",
+                                    tier_name(r),
+                                    access.as_str()
+                                ),
+                                r,
+                                access,
+                            );
+                        }
+                    }
+                }
+            }
+            "pi" => {
+                if flag == "--approve" && access != Access::Full {
+                    return Some(Escalation {
+                        arg: a.clone(),
+                        reason: "auto-approves every action (= full access)".to_string(),
+                    });
+                }
+                if flag == "--tools" || flag == "-t" {
+                    if let Some(v) = value_of(true) {
+                        let r = pi_tool_list_rank(&v);
+                        return wider(
+                            a,
+                            format!(
+                                "the tool list grants the {} tier, above the declared '{}'",
+                                tier_name(r),
+                                access.as_str()
+                            ),
+                            r,
+                            access,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// claude --tools/--allowedTools: Bash is a shell (= full), edit-family tools
+/// are the write tier, anything else (Read, Grep, WebFetch...) stays read.
+fn claude_tool_list_rank(list: &str) -> u8 {
+    let tools: Vec<String> = list
+        .split(',')
+        .map(|t| t.trim().trim_matches('"').to_lowercase())
+        .collect();
+    if tools.iter().any(|t| t.starts_with("bash")) {
+        2
+    } else if tools
         .iter()
-        .chain(escalation_flags(tool).iter())
-        .any(|p| escalation_pattern_matches(p, arg))
+        .any(|t| matches!(t.as_str(), "edit" | "write" | "multiedit" | "notebookedit"))
+    {
+        1
+    } else {
+        0
+    }
+}
+
+/// pi --tools/-t: bash is full, edit/write are the write tier.
+fn pi_tool_list_rank(list: &str) -> u8 {
+    let tools: Vec<String> = list
+        .split(',')
+        .map(|t| t.trim().trim_matches('"').to_lowercase())
+        .collect();
+    if tools.iter().any(|t| t == "bash") {
+        2
+    } else if tools.iter().any(|t| t == "edit" || t == "write") {
+        1
+    } else {
+        0
+    }
+}
+
+/// The shared error text for a widening arg. Deliberately does NOT suggest
+/// `access: full`: the right fix is usually to remove or narrow the arg, and
+/// pointing at full would escalate the flow in the wrong direction.
+pub fn escalation_error(step_id: &str, access: Access, e: &Escalation) -> String {
+    format!(
+        "step '{step_id}': args: contains '{}', which overrides the declared access level ({}). Remove the arg or keep it within access: {}, or set allow_access_override: true on this step to accept it",
+        e.arg,
+        e.reason,
+        access.as_str()
+    )
 }
 
 fn push(a: &mut Vec<String>, items: &[&str]) {
@@ -1505,64 +1785,131 @@ mod tests {
         }
     }
 
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
     // The audit found seven strings checked by naive contains: pi's -t (which
     // the README itself suggested for adding Bash), claude's --allowedTools,
     // codex's -c sandbox_mode=... and friends all slipped through. Each tool's
-    // permission levers must be caught, and harmless lookalikes must not be.
+    // permission levers must be caught - and the check must look at the VALUE,
+    // so an arg that NARROWS the permission (sandbox_mode=read-only on a read
+    // step) is not a false positive.
     #[test]
     fn escalation_detection_covers_each_tools_permission_levers() {
-        for (tool, arg) in [
-            ("pi", "--approve"),
-            ("pi", "--tools"),
-            ("pi", "-t"),
-            ("opencode", "--agent"),
-            ("opencode", "--agent=build"),
-            ("claude", "--tools"),
-            ("claude", "--allowedTools"),
-            ("claude", "--permission-mode"),
-            ("claude", "--permission-mode=bypassPermissions"),
-            ("grok", "--allow"),
-            ("grok", "--permission-mode"),
-            ("agy", "--mode"),
-            ("codex", "-s"),
-            ("codex", "--sandbox"),
-            ("codex", "sandbox_mode=\"danger-full-access\""),
-            ("codex", "approval_policy=\"on-failure\""),
+        for (tool, access, argv) in [
+            ("pi", Access::Read, args(&["--approve"])),
+            ("pi", Access::Read, args(&["--tools", "read,edit"])),
+            ("pi", Access::Write, args(&["-t", "read,bash,edit,write,grep,find,ls"])),
+            ("opencode", Access::Read, args(&["--agent", "build"])),
+            ("opencode", Access::Read, args(&["--agent=build"])),
+            ("claude", Access::Read, args(&["--tools", "Read,Bash"])),
+            ("claude", Access::Read, args(&["--allowedTools", "Bash"])),
+            ("claude", Access::Write, args(&["--allowedTools", "Bash(ls)"])),
+            ("claude", Access::Write, args(&["--permission-mode", "bypassPermissions"])),
+            ("claude", Access::Read, args(&["--permission-mode=acceptEdits"])),
+            ("claude", Access::Read, args(&["--add-dir", "/etc"])),
+            ("grok", Access::Write, args(&["--allow", "Bash(ls)"])),
+            ("grok", Access::Read, args(&["--permission-mode", "bypassPermissions"])),
+            ("agy", Access::Read, args(&["--mode", "accept-edits"])),
+            ("codex", Access::Write, args(&["-s", "danger-full-access"])),
+            ("codex", Access::Read, args(&["--sandbox", "workspace-write"])),
+            ("codex", Access::Read, args(&["-c", "sandbox_mode=\"danger-full-access\""])),
+            // a bare -c value element, the way args: actually carries it
+            ("codex", Access::Read, args(&["sandbox_mode=\"workspace-write\""])),
+            ("codex", Access::Read, args(&["-c", "approval_policy=\"on-failure\""])),
+            ("codex", Access::Read, args(&["approval_policy=on-request"])),
             // tool-independent bypasses
-            ("claude", "--force"),
-            ("codex", "--yolo"),
-            ("grok", "bypassPermissions"),
-            ("agy", "--dangerously-skip-permissions"),
+            ("claude", Access::Write, args(&["--force"])),
+            ("codex", Access::Read, args(&["--yolo"])),
+            ("grok", Access::Read, args(&["--dangerously-skip-permissions"])),
+            ("agy", Access::Write, args(&["--always-approve"])),
+            ("codex", Access::Write, args(&["--dangerously-bypass-approvals-and-sandbox"])),
         ] {
             assert!(
-                is_escalation_arg(tool, arg),
-                "{tool}: {arg} slipped through"
+                find_escalation(tool, access, &argv).is_some(),
+                "{tool} at {:?}: {:?} slipped through",
+                access,
+                argv
             );
         }
-        for (tool, arg) in [
-            ("codex", "--model"),
-            ("codex", "-m"),
-            ("codex", "model_reasoning_effort=\"high\""),
-            ("claude", "--effort"),
-            ("claude", "--output-format"),
-            ("opencode", "--variant"),
-            ("grok", "--reasoning-effort"),
-            ("grok", "--deny"),
-            ("agy", "--model"),
-            ("agy", "--agent"),
-            ("pi", "--thinking"),
-            ("pi", "--no-approve"),
-            ("pi", "--no-extensions"),
-            ("pi", "--session-id"),
-            ("cursor", "--mode"),
-            ("cursor", "--trust"),
-            ("codex", "--force-of-nature"),
-            ("agy", "--modest"),
+    }
+
+    #[test]
+    fn escalation_detection_lets_narrowing_and_harmless_args_through() {
+        for (tool, access, argv) in [
+            // THE false positives from the review: these NARROW the permission.
+            ("codex", Access::Read, args(&["-c", "sandbox_mode=read-only"])),
+            ("codex", Access::Read, args(&["-c", "sandbox_mode=\"read-only\""])),
+            ("codex", Access::Read, args(&["-s", "read-only"])),
+            ("codex", Access::Write, args(&["-s", "workspace-write"])),
+            ("codex", Access::Write, args(&["-c", "sandbox_mode=\"read-only\""])),
+            ("codex", Access::Read, args(&["-c", "approval_policy=\"never\""])),
+            ("codex", Access::Read, args(&["approval_policy=never"])),
+            ("claude", Access::Write, args(&["--permission-mode", "acceptEdits"])),
+            ("claude", Access::Read, args(&["--permission-mode", "dontAsk"])),
+            // a prose value that merely MENTIONS a bypass word is not a bypass
+            ("claude", Access::Read, args(&["--append-system-prompt", "never use bypassPermissions"])),
+            ("claude", Access::Read, args(&["--allowedTools", "WebSearch,WebFetch"])),
+            ("claude", Access::Write, args(&["--allowedTools", "Edit,Write"])),
+            ("grok", Access::Write, args(&["--permission-mode", "acceptEdits"])),
+            ("grok", Access::Read, args(&["--deny", "Bash"])),
+            ("agy", Access::Write, args(&["--mode", "plan"])),
+            ("agy", Access::Read, args(&["--mode", "plan"])),
+            ("pi", Access::Read, args(&["-t", "read,grep,find,ls"])),
+            ("pi", Access::Write, args(&["--tools", "read,edit,write,grep,find,ls"])),
+            ("opencode", Access::Write, args(&["--agent", "build"])),
+            ("opencode", Access::Read, args(&["--agent", "plan"])),
+            // a custom agent could be anything: ambiguous args are let through
+            ("opencode", Access::Read, args(&["--agent", "my-custom-agent"])),
+            ("codex", Access::Read, args(&["-s", "some-future-mode"])),
+            ("agy", Access::Read, args(&["--mode", "unknown-mode"])),
+            // plain settings and prefix lookalikes
+            ("codex", Access::Read, args(&["--model", "gpt"])),
+            ("codex", Access::Read, args(&["-m", "gpt"])),
+            ("codex", Access::Read, args(&["-c", "model_reasoning_effort=\"high\""])),
+            ("claude", Access::Read, args(&["--effort", "high"])),
+            ("claude", Access::Read, args(&["--output-format", "json"])),
+            ("opencode", Access::Read, args(&["--variant", "high"])),
+            ("grok", Access::Read, args(&["--reasoning-effort", "high"])),
+            ("agy", Access::Read, args(&["--model", "gemini"])),
+            ("agy", Access::Read, args(&["--agent", "x"])),
+            ("pi", Access::Read, args(&["--thinking", "high"])),
+            ("pi", Access::Read, args(&["--no-approve"])),
+            ("pi", Access::Read, args(&["--no-extensions"])),
+            ("pi", Access::Read, args(&["--session-id", "abc"])),
+            ("cursor", Access::Read, args(&["--mode", "plan"])),
+            ("cursor", Access::Read, args(&["--trust"])),
+            ("codex", Access::Read, args(&["--force-of-nature"])),
+            ("agy", Access::Read, args(&["--modest"])),
         ] {
             assert!(
-                !is_escalation_arg(tool, arg),
-                "{tool}: {arg} is a false positive"
+                find_escalation(tool, access, &argv).is_none(),
+                "{tool} at {:?}: {:?} is a false positive",
+                access,
+                argv
             );
         }
+        // full may carry anything
+        assert!(find_escalation("codex", Access::Full, &args(&["-s", "danger-full-access"])).is_none());
+        assert!(find_escalation("pi", Access::Full, &args(&["--approve"])).is_none());
+        assert!(find_escalation("claude", Access::Full, &args(&["--force"])).is_none());
+    }
+
+    #[test]
+    fn escalation_error_points_at_removal_not_at_full() {
+        assert!(
+            find_escalation("codex", Access::Read, &args(&["-c", "sandbox_mode=read-only"]))
+                .is_none()
+        );
+        let bad = find_escalation("codex", Access::Read, &args(&["-s", "danger-full-access"]))
+            .expect("danger-full-access on a read step is an escalation");
+        let msg = escalation_error("safe", Access::Read, &bad);
+        assert!(msg.contains("overrides the declared access level"), "{msg}");
+        assert!(msg.contains("allow_access_override"), "{msg}");
+        assert!(msg.contains("access: read"), "{msg}");
+        // The old message told users to reach for access: full - the exact
+        // wrong direction. The fix is to remove or narrow the arg.
+        assert!(!msg.contains("use access: full"), "{msg}");
     }
 }

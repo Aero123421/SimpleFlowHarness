@@ -202,12 +202,14 @@ pub struct Detached {
 }
 
 /// stdout/stderr to the given files (truncating), stdin closed: nothing is
-/// lost and no console is held open.
+/// lost and no console is held open. `env` is set on the child only (the
+/// parent's own environment is untouched).
 fn detached_command(
     exe: &Path,
     args: &[String],
     out_file: &Path,
     err_file: &Path,
+    env: &[(&str, &str)],
 ) -> Result<Command, String> {
     let mk = |p: &Path| -> Result<std::fs::File, String> {
         let f =
@@ -217,6 +219,9 @@ fn detached_command(
     };
     let mut c = Command::new(exe);
     c.args(args);
+    for (k, v) in env {
+        c.env(k, v);
+    }
     c.stdin(Stdio::null());
     c.stdout(Stdio::from(mk(out_file)?));
     c.stderr(Stdio::from(mk(err_file)?));
@@ -230,6 +235,7 @@ pub fn spawn_detached(
     args: &[String],
     out_file: &Path,
     err_file: &Path,
+    env: &[(&str, &str)],
 ) -> Result<Detached, String> {
     use std::os::windows::process::CommandExt;
     // Win32 process-creation flags. CREATE_BREAKAWAY_FROM_JOB is the one that
@@ -240,7 +246,7 @@ pub fn spawn_detached(
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const BASE: u32 = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
 
-    let mut c = detached_command(exe, args, out_file, err_file)?;
+    let mut c = detached_command(exe, args, out_file, err_file, env)?;
     c.creation_flags(BASE | CREATE_BREAKAWAY_FROM_JOB);
     match c.spawn() {
         Ok(child) => Ok(Detached {
@@ -250,7 +256,7 @@ pub fn spawn_detached(
         // A job without JOB_OBJECT_LIMIT_BREAKAWAY_OK rejects the flag outright.
         // Running anyway beats not running, but say so plainly.
         Err(e) => {
-            let mut c = detached_command(exe, args, out_file, err_file)?;
+            let mut c = detached_command(exe, args, out_file, err_file, env)?;
             c.creation_flags(BASE);
             let child = c
                 .spawn()
@@ -276,9 +282,10 @@ pub fn spawn_detached(
     args: &[String],
     out_file: &Path,
     err_file: &Path,
+    env: &[(&str, &str)],
 ) -> Result<Detached, String> {
     use std::os::unix::process::CommandExt;
-    let mut c = detached_command(exe, args, out_file, err_file)?;
+    let mut c = detached_command(exe, args, out_file, err_file, env)?;
     unsafe {
         // New session: no controlling terminal, so closing the caller's
         // terminal does not SIGHUP the run. Deliberately no PR_SET_PDEATHSIG -
@@ -370,6 +377,20 @@ pub fn kill_pid_tree(pid: u32) -> bool {
 
 /// Check whether the given pid belongs to a running sfh process.
 /// Used by `sfh stop` to avoid killing unrelated processes.
+///
+/// The ownership question has to work identically on Windows, macOS and Linux,
+/// but each OS answers "what executable is this pid running?" differently, so
+/// below there is one `pid_exe_path` per OS feeding ONE shared comparison:
+/// - Windows: QueryFullProcessImageNameW on a PROCESS_QUERY_LIMITED_INFORMATION
+///   handle (no elevated rights needed for one's own processes).
+/// - Linux: readlink /proc/<pid>/exe.
+/// - macOS: proc_pidpath(3) from libSystem - macOS has NO /proc, so the old
+///   readlink path made `sfh stop` fail for every run on macOS.
+///
+/// The comparison is an EXACT file-stem match against our own executable: a
+/// detached run is always a copy of the current binary, so that is precisely
+/// the expected name, and a substring match would let `sfh stop` kill an
+/// unrelated `sfh-helper` (or, renamed, anything containing "sfh").
 #[cfg(windows)]
 pub fn pid_is_sfh(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -391,25 +412,84 @@ pub fn pid_is_sfh(pid: u32) -> bool {
         if ok == 0 {
             return false;
         }
-        let name = String::from_utf16_lossy(&buf[..len as usize]);
-        let lower = name.to_lowercase();
-        lower.contains("sfh")
+        exe_path_is_ours(&String::from_utf16_lossy(&buf[..len as usize]))
     }
 }
 
-/// Check whether the given pid belongs to a running sfh process.
-#[cfg(unix)]
+/// Check whether the given pid belongs to a running sfh process (Linux:
+/// /proc/<pid>/exe).
+#[cfg(target_os = "linux")]
 pub fn pid_is_sfh(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    let exe = format!("/proc/{pid}/exe");
-    match std::fs::read_link(&exe) {
-        Ok(p) => p
-            .file_name()
-            .map(|n| n.to_string_lossy().contains("sfh"))
-            .unwrap_or(false),
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(p) => {
+            // A binary deleted while running reads as "/path/sfh (deleted)".
+            let s = p.to_string_lossy();
+            let s = s.strip_suffix(" (deleted)").unwrap_or(&s);
+            exe_path_is_ours(s)
+        }
         Err(_) => false,
+    }
+}
+
+/// Check whether the given pid belongs to a running sfh process (macOS:
+/// proc_pidpath; there is no /proc).
+#[cfg(target_os = "macos")]
+pub fn pid_is_sfh(pid: u32) -> bool {
+    extern "C" {
+        fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_char, buffersize: u32)
+            -> libc::c_int;
+    }
+    if pid == 0 {
+        return false;
+    }
+    // PROC_PIDPATHINFO_MAXSIZE in <sys/proc_info.h>.
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let n = unsafe { proc_pidpath(pid as libc::c_int, buf.as_mut_ptr(), buf.len() as u32) };
+    if n <= 0 {
+        return false;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+    exe_path_is_ours(&path)
+}
+
+/// Other Unix targets: try procfs if it happens to be mounted, otherwise
+/// refuse - sfh's supported platforms are Windows/macOS/Linux, and refusing
+/// is the safe direction for one we cannot verify.
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+pub fn pid_is_sfh(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(p) => exe_path_is_ours(&p.to_string_lossy()),
+        Err(_) => false,
+    }
+}
+
+/// True when `exe_path` is the same program as the running sfh: an exact,
+/// case-insensitive file-stem match (sfh.exe and sfh compare equal; sfh-helper
+/// does not). Falls back to the name "sfh" when our own path is unavailable.
+fn exe_path_is_ours(exe_path: &str) -> bool {
+    let stem = |p: &str| {
+        Path::new(p)
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    };
+    let target = stem(exe_path);
+    if target.is_empty() {
+        return false;
+    }
+    match std::env::current_exe().ok().map(|p| {
+        p.file_stem()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    }) {
+        Some(own) if !own.is_empty() => target == own,
+        _ => target == "sfh",
     }
 }
 

@@ -1,6 +1,6 @@
-use crate::{contain, execute, flow, leaf, preset, template};
+use crate::{execute, flow, leaf, preset, template};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -196,26 +196,8 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
                         chk(body_ctx, label, t)?;
                     }
                 }
-                // args may render into permission flags (vars are known now;
-                // step outputs render empty here and are re-checked right
-                // before each spawn). The whole rendered argv is checked at
-                // once so flag+value pairs are read together. Fail-closed like
-                // validation.
-                let mut rendered_args = Vec::with_capacity(eff.args.len());
                 for a in &eff.args {
-                    rendered_args.push(
-                        template::render(a, body_ctx)
-                            .map_err(|e| format!("step '{}' args: {e}", s.id))?,
-                    );
-                }
-                if eff.access != preset::Access::Full
-                    && !s.allow_access_override.unwrap_or(false)
-                {
-                    if let Some(t) = &eff.tool {
-                        if let Some(e) = preset::find_escalation(t, eff.access, &rendered_args) {
-                            return Err(preset::escalation_error(&s.id, eff.access, &e));
-                        }
-                    }
+                    chk(body_ctx, "args", a)?;
                 }
                 for v in eff.env.values() {
                     chk(body_ctx, "env", v)?;
@@ -319,12 +301,10 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             // is already right. `outputs` has to be walked back to what was
             // summarized, or a resumed run sees strictly less than a live one.
             "compact_end" | "compact_failed" => {
-                // A path that escapes the run dir fails the resume outright;
-                // only a genuinely absent file reads as None (S1-4).
-                let precompact = match v.get("precompact_file").and_then(|x| x.as_str()) {
-                    Some(p) => contain::read_contained_opt(run_dir, p)?,
-                    None => None,
-                };
+                let precompact = v
+                    .get("precompact_file")
+                    .and_then(|x| x.as_str())
+                    .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok());
                 if let (Some(e), Some(p)) = (st.outputs.get_mut(&step), precompact.as_ref()) {
                     e.outputs = p.trim_end().to_string();
                 }
@@ -383,14 +363,12 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                         .and_then(|x| x.as_bool())
                         .unwrap_or(false)
                     && !v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false);
-                // A run dir is untrusted input on --resume: the artifact paths
-                // recorded in the log must stay inside it, symlinks resolved.
-                // A path pointing elsewhere used to be swallowed into empty
-                // output; it now fails the whole resume instead (S1-4).
-                let chain = match v.get("chain_file").and_then(|x| x.as_str()) {
-                    Some(p) => contain::read_contained_opt(run_dir, p)?.unwrap_or_default(),
-                    None => String::new(),
+                let rd = |k: &str| -> Option<String> {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
                 };
+                let chain = rd("chain_file").unwrap_or_default();
                 let exit = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
                 let timed_out = v
                     .get("timed_out")
@@ -407,20 +385,15 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 // noise into a resumed prompt. Uncompacted steps have no
                 // separate original, so chain is the original. A compacted
                 // step patches this from its compact_end event below.
-                // out_file gets the same canonicalized containment check as
-                // chain_file: the old lexical-only test let a symlink inside
-                // the run dir point at an arbitrary path (S1-4).
-                let out_canon = match v.get("out_file").and_then(|x| x.as_str()) {
-                    Some(p) => contain::contained_opt(run_dir, p)?,
-                    None => None,
-                };
-                let file = out_canon
-                    .as_ref()
-                    .map(|p| p.display().to_string())
+                let file = v
+                    .get("out_file")
+                    .and_then(|x| x.as_str())
+                    .map(|p| run_dir.join(p).display().to_string())
                     .unwrap_or_default();
-                let stderr_file = out_canon
-                    .as_ref()
-                    .map(|p| stderr_file_for(p).display().to_string())
+                let stderr_file = v
+                    .get("out_file")
+                    .and_then(|x| x.as_str())
+                    .map(|p| stderr_file_for(&run_dir.join(p)).display().to_string())
                     .filter(|p| Path::new(p).exists())
                     .unwrap_or_default();
                 st.outputs.insert(
@@ -435,9 +408,7 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 );
                 if !is_child {
                     if let Some(p) = v.get("chain_file").and_then(|x| x.as_str()) {
-                        if let Some(canon) = contain::contained_opt(run_dir, p)? {
-                            st.chain_files.insert(step.clone(), canon);
-                        }
+                        st.chain_files.insert(step.clone(), run_dir.join(p));
                     }
                     if ok {
                         st.last_success = Some(step.clone());
@@ -464,12 +435,6 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                                         .get("marker")
                                         .and_then(|x| x.as_str())
                                         .map(String::from),
-                                    // Absent in logs written before access was
-                                    // recorded: the resume guard warns on None.
-                                    access: s
-                                        .get("access")
-                                        .and_then(|x| x.as_str())
-                                        .and_then(|a| preset::Access::parse(Some(a)).ok()),
                                 },
                             );
                         }
@@ -528,14 +493,8 @@ fn latest_run_dir(root: &Path, flow_path: &Path) -> Option<PathBuf> {
 
 /// Hand this run to a background copy of sfh, print the run dir, and return.
 /// The child's command line is rebuilt from RunOpts rather than filtered out of
-/// argv, so it does not depend on how the caller spelled the flags. The child
-/// inherits `nonce` through SFH_NONCE so both processes record the same value.
-fn detach_run(
-    opts: &RunOpts,
-    run_dir: &Path,
-    is_resume: bool,
-    nonce: &str,
-) -> Result<i32, String> {
+/// argv, so it does not depend on how the caller spelled the flags.
+fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot locate the sfh executable to detach: {e}"))?;
 
@@ -580,17 +539,10 @@ fn detach_run(
         &args,
         &run_dir.join("detached.out.txt"),
         &run_dir.join("detached.err.txt"),
-        &[("SFH_NONCE", nonce)],
     )?;
     if let Some(w) = &d.warning {
         eprintln!("sfh: warning: {w}");
     }
-    // Bind the nonce to the child's pid BEFORE anything else touches the run
-    // dir, so a `sfh stop` landing right after the detach already sees a
-    // consistent (pid, nonce) pair. The child rewrites the same bytes with its
-    // own pid - which is exactly d.pid - so there is no window of disagreement.
-    contain::write_nonce(run_dir, d.pid, nonce)
-        .map_err(|e| format!("cannot write the stop nonce: {e}"))?;
     // Seed status.json only if the child has not already written its own, so
     // `sfh status` has something to report either way and neither clobbers.
     if !status_path.exists() {
@@ -610,7 +562,6 @@ fn detach_run(
                 emit_file: None,
                 error: None,
                 unfinished_step: None,
-                nonce: nonce.to_string(),
             },
         );
     }
@@ -628,129 +579,26 @@ fn detach_run(
 
 /// Drop a self-ignoring .gitignore into the runs root, the way cargo does for
 /// target/. Run dirs hold rendered prompts, model output and session ids in
-/// plaintext inside the user's own repo; one `git add -A` should not be able
-/// to publish them. A hostile repo can pre-place an EMPTY .gitignore to make
-/// the old "skip if exists" behaviour leave everything tracked, so an existing
-/// file is verified: unless an effective `*` pattern is present, sfh appends
-/// one and says so.
-fn protect_runs_root(root: &Path) -> Result<(), String> {
-    contain::mkdir_private(root)
-        .map_err(|e| format!("cannot create runs dir {}: {e}", root.display()))?;
+/// plaintext inside the user's own repo; one `git add -A` should not be able to
+/// publish them. Never overwrites an existing file.
+fn protect_runs_root(root: &Path) {
     let f = root.join(".gitignore");
-    const BODY: &str = "# Created by sfh. Run artifacts are not source.\n*\n";
-    // Write AND re-read: a failure used to be silently ignored, so a
-    // read-only .gitignore left every run artifact committable while the run
-    // proceeded as if protected (S3-3).
-    let write_and_verify = |text: &str| -> Result<(), String> {
-        contain::write_private(&f, text).map_err(|e| {
-            format!(
-                "cannot write {} ({e}); run artifacts would be committable, so this run refuses to start",
-                f.display()
-            )
-        })?;
-        let back = std::fs::read_to_string(&f).map_err(|e| {
-            format!(
-                "cannot re-read {} after writing it ({e}); cannot confirm run artifacts are protected",
-                f.display()
-            )
-        })?;
-        if !gitignore_ignores_everything(&back) {
-            return Err(format!(
-                "{} was written but still does not ignore everything; run artifacts could be committed",
-                f.display()
-            ));
-        }
-        Ok(())
-    };
-    match std::fs::read_to_string(&f) {
-        Err(_) => write_and_verify(BODY),
-        Ok(text) => {
-            if gitignore_ignores_everything(&text) {
-                return Ok(());
-            }
-            eprintln!(
-                "sfh: warning: {} does not ignore everything; appending '*' so run artifacts cannot be committed",
-                f.display()
-            );
-            write_and_verify(&format!("{text}\n# Added by sfh: run artifacts are not source.\n*\n"))
-        }
+    if f.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(root).is_ok() {
+        let _ = std::fs::write(&f, "# Created by sfh. Run artifacts are not source.\n*\n");
     }
 }
 
-/// True when the gitignore has an effective pattern that ignores every entry:
-/// a non-comment line that is exactly `*` (or `/*`). A `*` inside a comment or
-/// a pattern like `*.log` does NOT count - git would still track the rest.
-fn gitignore_ignores_everything(text: &str) -> bool {
-    text.lines().any(|l| {
-        let t = l.trim();
-        !t.is_empty() && !t.starts_with('#') && (t == "*" || t == "/*")
-    })
-}
-
-/// Change-detection fingerprint of the flow file, recorded in meta.json and
-/// used to refuse `--resume` of a run whose flow has changed. SHA-256 because
-/// this is a security boundary: with FNV-1a a crafted flow could collide with
-/// another and slip a changed flow past the resume guard.
+/// Cheap change-detection fingerprint (FNV-1a); not a security hash.
 fn fingerprint(s: &str) -> String {
-    crate::sha256::hex(s.as_bytes())
-}
-
-/// The FNV-1a 64 fingerprint sfh <= 0.9 recorded in meta.json. Kept ONLY so
-/// --resume can verify run dirs that predate the SHA-256 switch: such a dir
-/// records no flow_fingerprint_algo, and comparing its 16-hex value against a
-/// 64-hex SHA would report EVERY unchanged flow as "a different version",
-/// making old runs unresumable. New runs always record sha256.
-fn legacy_fingerprint_fnv(s: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}")
-}
-
-/// Recorded next to the fingerprint in meta.json so resume compares like with
-/// like instead of guessing which algorithm wrote the stored value.
-const FINGERPRINT_ALGO: &str = "sha256";
-/// meta.json dirs without a flow_fingerprint_algo field were written before
-/// the field existed, when the algorithm was FNV-1a.
-const LEGACY_FINGERPRINT_ALGO: &str = "fnv1a";
-
-/// Verify that the flow file has not changed since the run dir was created,
-/// honouring the algorithm the dir actually recorded (R-2). Returns Ok(())
-/// when unchanged, Err when the flow differs or cannot be verified.
-fn check_flow_fingerprint(
-    meta: &serde_json::Value,
-    flow_text: &str,
-    dir: &Path,
-    flow_path: &Path,
-) -> Result<(), String> {
-    let old_fp = meta
-        .get("flow_fingerprint")
-        .and_then(|x| x.as_str())
-        .unwrap_or("");
-    let old_algo = meta
-        .get("flow_fingerprint_algo")
-        .and_then(|x| x.as_str())
-        .unwrap_or(LEGACY_FINGERPRINT_ALGO);
-    let expected = match old_algo {
-        FINGERPRINT_ALGO => fingerprint(flow_text),
-        LEGACY_FINGERPRINT_ALGO => legacy_fingerprint_fnv(flow_text),
-        other => {
-            return Err(format!(
-                "{} records an unknown flow_fingerprint_algo '{other}'; the flow cannot be verified as unchanged (use --force-resume to resume anyway)",
-                dir.display()
-            ))
-        }
-    };
-    if old_fp != expected {
-        return Err(format!(
-            "{} was produced by a different version of {} (the flow file has changed since that run; use --force-resume to resume anyway)",
-            dir.display(),
-            flow_path.display()
-        ));
-    }
-    Ok(())
 }
 
 struct Status {
@@ -771,9 +619,6 @@ struct Status {
     emit_file: Option<String>,
     error: Option<String>,
     unfinished_step: Option<UnfinishedStep>,
-    /// Random token proving this status.json was written by the sfh that owns
-    /// the run dir. `sfh stop` refuses to kill without a matching nonce file.
-    nonce: String,
 }
 
 fn write_status(path: &Path, s: &Status) {
@@ -801,7 +646,6 @@ fn write_status(path: &Path, s: &Status) {
         "emit_file": s.emit_file,
         "error": s.error,
         "unfinished_step": unfinished_step,
-        "nonce": s.nonce,
     });
     let text = serde_json::to_string_pretty(&v).unwrap_or_default();
     // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
@@ -809,11 +653,11 @@ fn write_status(path: &Path, s: &Status) {
     // is atomic on both platforms, so a reader sees the old or the new file and
     // never a torn one.
     let tmp = path.with_extension("json.tmp");
-    if contain::write_private(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
         return;
     }
     let _ = std::fs::remove_file(&tmp);
-    let _ = contain::write_private(path, &text);
+    let _ = std::fs::write(path, &text);
 }
 
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
@@ -837,11 +681,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .runs_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
-    protect_runs_root(&runs_root)?;
-    // Same rule `sfh validate` enforces through flow::validate: only characters
-    // that would affect the run dir PATH are forbidden (R-6).
+    protect_runs_root(&runs_root);
     let name = flow.name.clone().unwrap_or_else(|| "flow".into());
-    flow::validate_name(&name)?;
 
     // Which steps must produce resumable sessions (continue_from targets).
     let mut needed_sessions: HashSet<String> = HashSet::new();
@@ -868,7 +709,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     if opts.dry_run {
         let base = format!("{}-{}-dryrun", utc_stamp(), name);
         run_dir = abs(&runs_root.join(base));
-        contain::mkdir_private(&run_dir)
+        std::fs::create_dir_all(&run_dir)
             .map_err(|e| format!("cannot create run dir {}: {e}", run_dir.display()))?;
     } else if let Some(dir) = resume_target(opts, &runs_root)? {
         let dir = abs(&dir);
@@ -876,8 +717,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or(json!({}));
-        if !opts.force_resume {
-            check_flow_fingerprint(&meta, &flow_text, &dir, &opts.flow_path)?;
+        let old_fp = meta
+            .get("flow_fingerprint")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        if old_fp != flow_fp && !opts.force_resume {
+            return Err(format!(
+                "{} was produced by a different version of {} (use --force-resume to override)",
+                dir.display(),
+                opts.flow_path.display()
+            ));
         }
         resumed = load_resume(&dir)?;
         if resumed.completed {
@@ -904,7 +753,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // The detaching parent already picked (and created) this directory so
         // it could print the path before the background copy came up.
         let d = abs(d);
-        contain::mkdir_private(&d)
+        std::fs::create_dir_all(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = d;
     } else {
@@ -915,39 +764,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             n += 1;
             d = runs_root.join(format!("{base}-{n}"));
         }
-        contain::mkdir_private(&d)
+        std::fs::create_dir_all(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = abs(&d);
-    }
-    // Defense-in-depth: even though `name` is charset-validated, confirm the
-    // resolved run dir is actually under the runs root (guards symlink tricks).
-    if !is_resume && opts.run_dir.is_none() && !contain::is_under(&runs_root, &run_dir) {
-        return Err(format!(
-            "run dir {} escapes the runs root {}",
-            run_dir.display(),
-            runs_root.display()
-        ));
-    }
-    // The nonce is minted in exactly ONE place per attempt. A detached child
-    // inherits the parent's value through SFH_NONCE instead of minting its own,
-    // so status.json and sfh-nonce can never disagree, even for the instant the
-    // old "both sides generate" design left open (R-4). The nonce file binds
-    // the token to the owning pid (see contain::write_nonce), which is what
-    // lets `sfh stop` refuse a status.json rewritten to point at another pid.
-    let nonce = match std::env::var("SFH_NONCE") {
-        Ok(n) if !n.trim().is_empty() => {
-            // Consume it: a flow step that launches sfh itself must not carry
-            // this run's nonce into the nested run.
-            std::env::remove_var("SFH_NONCE");
-            n.trim().to_string()
-        }
-        _ => contain::random_nonce(),
-    };
-    if !opts.detach {
-        // The detaching parent writes the file itself, after the spawn, when
-        // it knows the child's pid (in detach_run).
-        contain::write_nonce(&run_dir, std::process::id(), &nonce)
-            .map_err(|e| format!("cannot write the stop nonce: {e}"))?;
     }
     let notes_file = run_dir.join("notes.md");
 
@@ -966,34 +785,29 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // Everything above this point is validation, so a broken flow still fails
     // in the caller's face instead of dying silently in the background.
     if opts.detach {
-        return detach_run(opts, &run_dir, is_resume, &nonce);
+        return detach_run(opts, &run_dir, is_resume);
     }
 
-    let mut log = contain::append_private(&run_dir.join("log.jsonl"))
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(run_dir.join("log.jsonl"))
         .map_err(|e| format!("cannot open log: {e}"))?;
 
-    // Provenance: which sfh, which tool builds. Cheap, no AI calls. Probe only
-    // the (tool, bin) pairs the flow actually resolves to: an unused profile's
-    // bin is data, and data must never be executed.
+    // Provenance: which sfh, which tool builds. Cheap, no AI calls.
     let mut tool_versions = serde_json::Map::new();
     if !is_resume {
-        let mut by_tool: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
-        for rt in flow.resolved_tools() {
-            by_tool.entry(rt.tool).or_default().insert(rt.bin);
-        }
-        for (tool, bins) in by_tool {
-            let entries: Vec<serde_json::Value> = bins
-                .into_iter()
-                .map(|bin| {
-                    let program = bin.unwrap_or_else(|| preset::default_program(&tool));
-                    let version = execute::probe_version(&program);
-                    json!({"bin": program, "version": version})
-                })
-                .collect();
-            if entries.len() == 1 {
-                tool_versions.insert(tool, entries.into_iter().next().unwrap());
+        for t in flow.tools_used() {
+            let bin = flow
+                .profiles
+                .values()
+                .find(|p| p.tool.as_deref() == Some(t.as_str()) && p.bin.is_some())
+                .and_then(|p| p.bin.clone())
+                .unwrap_or_else(|| t.clone());
+            if let Some(v) = execute::probe_version(&bin) {
+                tool_versions.insert(t.clone(), json!({"bin": bin, "version": v}));
             } else {
-                tool_versions.insert(tool, json!(entries));
+                tool_versions.insert(t.clone(), json!({"bin": bin, "version": null}));
             }
         }
     }
@@ -1002,7 +816,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "sfh_version": VERSION,
         "flow": abs(&opts.flow_path).display().to_string(),
         "flow_fingerprint": flow_fp,
-        "flow_fingerprint_algo": FINGERPRINT_ALGO,
         "name": name,
         "started_utc": started,
         "os": std::env::consts::OS,
@@ -1010,8 +823,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "tools": tool_versions,
         "resumed": is_resume,
     });
-    let _ = contain::write_private(
-        &run_dir.join("meta.json"),
+    let _ = std::fs::write(
+        run_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
     );
     log_event(
@@ -1040,7 +853,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         emit_file: None,
         error: None,
         unfinished_step: resumed.unfinished_step.clone(),
-        nonce: nonce.clone(),
     }));
     {
         let s = Arc::clone(&status);
@@ -1431,7 +1243,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 id: sid.clone(),
                                 cwd: d.cwd.clone(),
                                 marker: d.session_marker.clone(),
-                                access: d.access,
                             },
                         );
                     }
@@ -1641,7 +1452,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             id: sid.clone(),
                             cwd: d.cwd.clone(),
                             marker: d.session_marker.clone(),
-                            access: d.access,
                         },
                     );
                 }
@@ -1683,7 +1493,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // documented as the pre-compact original - including after
                     // a --resume, which can only read files.
                     let pre_name = format!("{gtag}.precompact.txt");
-                    let _ = contain::write_private(&run_dir.join(&pre_name), &chain_output);
+                    let _ = std::fs::write(run_dir.join(&pre_name), &chain_output);
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
@@ -1734,10 +1544,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             }
                         }
                     }
-                    let _ = contain::write_private(
-                        &run_dir.join(format!("{gtag}.chain.txt")),
-                        &chain_output,
-                    );
+                    let _ =
+                        std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), &chain_output);
                 }
             }
 
@@ -1747,7 +1555,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
             // ---- notes ----
             if step.notes.as_deref() == Some("append") && !errored {
-                let mut f = contain::append_private(&notes_file)
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&notes_file)
                     .map_err(|e| format!("cannot open notes: {e}"))?;
                 let _ = writeln!(
                     f,
@@ -1882,8 +1693,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             json!(if result.is_ok() { "ok" } else { "failed" }),
         );
     }
-    let _ = contain::write_private(
-        &run_dir.join("meta.json"),
+    let _ = std::fs::write(
+        run_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta_final).unwrap_or_default(),
     );
 
@@ -2023,8 +1834,8 @@ fn write_aggregate(
     failed: bool,
 ) {
     let gfile = run_dir.join(format!("{gtag}.out.txt"));
-    let _ = contain::write_private(&gfile, agg);
-    let _ = contain::write_private(&run_dir.join(format!("{gtag}.chain.txt")), agg);
+    let _ = std::fs::write(&gfile, agg);
+    let _ = std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), agg);
     outputs.insert(
         step_id.to_string(),
         template::StepOutput {
@@ -2107,7 +1918,7 @@ fn run_compact(
     let prompt = format!("{instr}\n\n---\n{body}");
     let ctag = format!("{tag}.compact");
     let prompt_file = run_dir.join(format!("{ctag}.prompt.txt"));
-    contain::write_private(&prompt_file, &prompt).map_err(|e| e.to_string())?;
+    std::fs::write(&prompt_file, &prompt).map_err(|e| e.to_string())?;
     let last = run_dir.join(format!("{ctag}.last.txt"));
     let paths = preset::BuildPaths {
         last_msg: &last,
@@ -2153,7 +1964,6 @@ fn run_compact(
         err_file: run_dir.join(format!("{ctag}.err.txt")),
         chain_file: run_dir.join(format!("{ctag}.chain.txt")),
         tool: Some(tool),
-        access: Some(preset::Access::Read),
         allow_empty: false,
         retry: leaf::RetryCfg::default(),
         quiet,
@@ -2243,16 +2053,16 @@ fn dry_run(
     let step_ids = flow.step_ids();
     let outputs: BTreeMap<String, template::StepOutput> = BTreeMap::new();
     let mut sessions: HashMap<String, leaf::SessionInfo> = HashMap::new();
-    // Fake sessions so continue_from/fork_from steps can render their resume
-    // command. The target's own access comes along, so a dry run already shows
-    // the escalation guard refusing a higher-access resume.
+    // Fake sessions so continue_from steps can render their resume command.
     for s in &flow.steps {
-        let mut targets: Vec<&String> = Vec::new();
-        for st in std::iter::once(s).chain(s.parallel.iter().flat_map(|cs| cs.iter())) {
-            for t in [&st.continue_from, &st.fork_from].into_iter().flatten() {
-                targets.push(t);
-            }
-        }
+        let targets: Vec<&String> = std::iter::once(&s.continue_from)
+            .chain(
+                s.parallel
+                    .iter()
+                    .flat_map(|cs| cs.iter().map(|c| &c.continue_from)),
+            )
+            .flatten()
+            .collect();
         for t in targets {
             if let Some(target_step) = flow.find_step(t) {
                 if let Ok(eff) = leaf::effective(flow, target_step) {
@@ -2264,7 +2074,6 @@ fn dry_run(
                                 id: "<session-id>".into(),
                                 cwd: None,
                                 marker: None,
-                                access: Some(eff.access),
                             },
                         );
                     }
@@ -2447,7 +2256,7 @@ fn log_step_end(
 ) {
     let session = match (&d.tool, &d.session_id) {
         (Some(t), Some(id)) => {
-            json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker, "access": d.access.map(|a| a.as_str())})
+            json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker})
         }
         _ => serde_json::Value::Null,
     };
@@ -2586,12 +2395,7 @@ mod tests {
     fn fingerprint_detects_flow_edits() {
         assert_eq!(fingerprint("a"), fingerprint("a"));
         assert_ne!(fingerprint("a"), fingerprint("b"));
-        assert_eq!(fingerprint("").len(), 64);
-        // The resume guard trusts this value; pin it to the known SHA-256 of "".
-        assert_eq!(
-            fingerprint(""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
+        assert_eq!(fingerprint("").len(), 16);
     }
 
     #[test]

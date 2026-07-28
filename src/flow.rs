@@ -412,9 +412,48 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "_-".contains(c))
 }
 
+/// The flow name becomes part of the run directory name, so the ONLY forbidden
+/// characters are ones that would change or break that path: path separators,
+/// NUL and other control characters, the characters Windows cannot use in a
+/// name, and the reserved names "." / "..". Unicode, spaces and dots are fine
+/// ("研究 2026.07" is a perfectly good directory name on all three platforms).
+/// Lives here (not in the engine) so `sfh validate` and `sfh run` agree.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("flow name must not be empty".into());
+    }
+    if name == "." || name == ".." {
+        return Err(format!(
+            "flow name '{name}' is a reserved directory name (it would escape the runs root)"
+        ));
+    }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return Err(format!(
+            "flow name '{name}' must not end with a space or a dot (Windows strips them from directory names, which would silently move the run dir)"
+        ));
+    }
+    for c in name.chars() {
+        let forbidden = c == '/'
+            || c == '\\'
+            || c == '\0'
+            || (c as u32) < 0x20
+            || c as u32 == 0x7f
+            || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*');
+        if forbidden {
+            return Err(format!(
+                "flow name '{name}' cannot be used as a directory name: only path separators, control characters and <>:\"|?* are forbidden (spaces, dots and Unicode are fine)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate(flow: &Flow) -> Result<(), String> {
     if flow.steps.is_empty() {
         return Err("flow has no steps".into());
+    }
+    if let Some(n) = &flow.name {
+        validate_name(n)?;
     }
     let mut seen = HashSet::new();
     for s in &flow.steps {
@@ -791,27 +830,30 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool) -> Result<(), String> {
                 "step '{sid}': cursor headless has only two permission tiers (read = deny-all, full = approve-all); access: write is not supported - pick read or full"
             ));
         }
-        // Args that override the declared access are a validation error unless
-        // the step explicitly opts in. Args containing templates are re-checked
-        // after rendering, both in the precheck and right before each spawn.
-        // Fallback-profile args are covered by the same runtime check.
+        // Args that WIDEN the declared access are a validation error unless the
+        // step explicitly opts in. The check reads the arg VALUES, so an arg
+        // that narrows the permission (sandbox_mode=read-only on a read step)
+        // passes. Args containing templates are re-checked after rendering,
+        // both in the precheck and right before each spawn. Fallback-profile
+        // args are covered by the same runtime check.
         if acc != "full" && !s.allow_access_override.unwrap_or(false) {
             if let Some(t) = flow.step_tool(s) {
+                let access = crate::preset::Access::parse(Some(acc))
+                    .map_err(|e| format!("step '{sid}': {e}"))?;
                 let prof_args = s
                     .use_
                     .as_ref()
                     .and_then(|u| flow.profiles.get(u))
                     .map(|p| p.args.as_slice())
                     .unwrap_or(&[]);
-                for a in prof_args.iter().chain(s.args.iter()) {
-                    if a.contains("{{") {
-                        continue;
-                    }
-                    if crate::preset::is_escalation_arg(&t, a) {
-                        return Err(format!(
-                            "step '{sid}': args: contains '{a}', which overrides the declared access level; use access: full, or set allow_access_override: true on this step to accept it"
-                        ));
-                    }
+                let literal: Vec<String> = prof_args
+                    .iter()
+                    .chain(s.args.iter())
+                    .filter(|a| !a.contains("{{"))
+                    .cloned()
+                    .collect();
+                if let Some(e) = crate::preset::find_escalation(&t, access, &literal) {
+                    return Err(crate::preset::escalation_error(sid, access, &e));
                 }
             }
         }
@@ -1199,6 +1241,27 @@ mod tests {
             "name: t\nvars: {f: \"--force\"}\nsteps:\n  - id: a\n    tool: claude\n    access: read\n    args: [\"{{vars.f}}\"]\n    prompt: x\n"
         )
         .is_ok());
+    }
+
+    // The name becomes part of the run dir path: only PATH-affecting characters
+    // are forbidden. Unicode, spaces and dots are legitimate names, and the
+    // check must run in validate() so `sfh validate` and `sfh run` agree.
+    #[test]
+    fn flow_names_forbid_path_characters_only() {
+        for name in ["研究 2026.07", "my flow", "v1.2.3", "a-b_c", "report (final)"] {
+            assert!(validate_name(name).is_ok(), "{name}");
+            let y = format!("name: '{name}'\nsteps:\n  - id: a\n    cmd: echo hi\n");
+            assert!(parse(&y).is_ok(), "validate must accept {name}");
+        }
+        for name in [
+            "../evil", "a/b", "a\\b", "..", ".", "x:y", "a<b", "a>b", "a*b", "a?b", "a|b",
+            "a\"b", "trail ", "trail.", "", "   ",
+        ] {
+            assert!(validate_name(name).is_err(), "{name}");
+        }
+        // and the same rejection happens through validate(), not just run
+        let e = parse("name: '../evil'\nsteps:\n  - id: a\n    cmd: echo hi\n").unwrap_err();
+        assert!(e.contains("flow name"), "{e}");
     }
 
     #[test]

@@ -317,18 +317,60 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
 
 /// Verify that a run directory genuinely belongs to sfh before killing its pid.
 /// Checks: (1) the nonce in status.json matches the nonce file in the run dir,
-/// (2) the target process is actually sfh. Either check failing is fatal.
+/// (2) the pid recorded in the nonce file (when present) matches status.json,
+/// so a status.json rewritten to point at somebody else's process is refused,
+/// (3) the target process is actually this sfh executable. Any failure is fatal.
+///
+/// Runs started by an OLDER sfh have no nonce on either side; those are a
+/// recognised legacy format and may be stopped on process ownership alone,
+/// but only when the directory is visibly a real run (log.jsonl) - a bare
+/// status.json is trivial to forge and is not enough (R-3).
 fn verify_run_ownership(dir: &Path, snap: &Snapshot) -> bool {
-    let nonce_file = dir.join("sfh-nonce");
-    let file_nonce = std::fs::read_to_string(&nonce_file)
+    let file_raw = std::fs::read_to_string(dir.join("sfh-nonce"))
         .ok()
-        .map(|s| s.trim().to_string());
-    match (&file_nonce, &snap.nonce) {
-        (Some(f), Some(s)) if !f.is_empty() && f == s => {}
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match (&file_raw, &snap.nonce) {
+        (Some(raw), Some(s)) if !s.is_empty() => {
+            let (file_pid, file_nonce) = contain::parse_nonce(raw);
+            if &file_nonce != s {
+                eprintln!(
+                    "sfh: refusing to stop {}: the nonce in status.json does not match the run dir's sfh-nonce file \
+                     (status.json was tampered with, or the dir was copied from another run)",
+                    dir.display()
+                );
+                return false;
+            }
+            if let Some(fp) = file_pid {
+                if fp != snap.pid {
+                    eprintln!(
+                        "sfh: refusing to stop {}: status.json names pid {} but the nonce belongs to pid {} \
+                         (status.json was rewritten to point at another process)",
+                        dir.display(),
+                        snap.pid,
+                        fp
+                    );
+                    return false;
+                }
+            }
+        }
+        (None, None) => {
+            if !dir.join("log.jsonl").exists() {
+                eprintln!(
+                    "sfh: refusing to stop {}: no nonce and no log.jsonl - not recognisable as an sfh run dir",
+                    dir.display()
+                );
+                return false;
+            }
+            eprintln!(
+                "sfh: warning: {} was started by an older sfh that wrote no stop nonce; verifying the process itself instead",
+                dir.display()
+            );
+        }
         _ => {
             eprintln!(
-                "sfh: refusing to stop {}: nonce mismatch or missing \
-                 (run dir was not created by this version of sfh, or status.json was tampered with)",
+                "sfh: refusing to stop {}: nonce present on only one side \
+                 (status.json or the run dir was tampered with)",
                 dir.display()
             );
             return false;
@@ -336,7 +378,7 @@ fn verify_run_ownership(dir: &Path, snap: &Snapshot) -> bool {
     }
     if !execute::pid_is_sfh(snap.pid) {
         eprintln!(
-            "sfh: refusing to kill pid {}: it does not appear to be an sfh process",
+            "sfh: refusing to kill pid {}: it is not running the same sfh executable as this one",
             snap.pid
         );
         return false;
@@ -347,30 +389,52 @@ fn verify_run_ownership(dir: &Path, snap: &Snapshot) -> bool {
 /// Print what a foreground run would have printed to stdout.
 /// The detached child's stdout was captured verbatim, so prefer that; fall back
 /// to the emitted step's chain file for runs that were never detached.
-fn print_result(snap: &Snapshot) {
+///
+/// Every path is canonicalized and required to stay under the run dir BEFORE it
+/// is read: status.json is attacker-reachable, and so is the run dir's own
+/// file table - a symlink planted at the fixed name detached.out.txt used to
+/// print an arbitrary file. A violation is an error, not a silent skip, so
+/// `sfh wait` can exit non-zero instead of reporting success (S1-1).
+fn print_result(snap: &Snapshot) -> Result<(), String> {
     let detached = snap.dir.join("detached.out.txt");
-    if let Ok(t) = std::fs::read_to_string(&detached) {
-        if !t.trim().is_empty() {
-            let mut o = std::io::stdout();
-            let _ = o.write_all(t.as_bytes());
-            let _ = o.flush();
-            return;
+    if detached.symlink_metadata().is_ok() {
+        if !contain::is_under(&snap.dir, &detached) {
+            return Err(format!(
+                "refused to emit '{}': it resolves outside the run dir {}",
+                detached.display(),
+                snap.dir.display()
+            ));
+        }
+        if let Ok(t) = std::fs::read_to_string(&detached) {
+            if !t.trim().is_empty() {
+                let mut o = std::io::stdout();
+                let _ = o.write_all(t.as_bytes());
+                let _ = o.flush();
+                return Ok(());
+            }
         }
     }
     if let Some(f) = &snap.emit_file {
+        // Recorded emit paths are absolute, but a forged status.json can carry
+        // a relative one: anchor it to the run dir before the containment check
+        // instead of letting it resolve against the caller's cwd.
         let fp = Path::new(f);
-        if !contain::is_under(&snap.dir, fp) {
-            eprintln!(
-                "sfh: refused to emit '{}': not under run dir {}",
-                f,
+        let fp = if fp.is_absolute() {
+            fp.to_path_buf()
+        } else {
+            snap.dir.join(fp)
+        };
+        if !contain::is_under(&snap.dir, &fp) {
+            return Err(format!(
+                "refused to emit '{f}': not under run dir {}",
                 snap.dir.display()
-            );
-            return;
+            ));
         }
-        if let Ok(t) = std::fs::read_to_string(fp) {
+        if let Ok(t) = std::fs::read_to_string(&fp) {
             println!("{}", t.trim_end());
         }
     }
+    Ok(())
 }
 
 pub fn wait(

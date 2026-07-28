@@ -53,6 +53,78 @@ pub fn read_contained(base: &Path, candidate: &str) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
+/// Resolve `candidate` against `base` the way `contained` does, but treat a
+/// MISSING file as `Ok(None)` instead of an error. A path that is absolute,
+/// carries a `..` component, or resolves (symlinks included) outside `base`
+/// is still a hard error: a run dir is untrusted input on --resume, and an
+/// artifact that vanished after the log was written is ordinary, but an
+/// artifact that points somewhere else is an attack.
+pub fn contained_opt(base: &Path, candidate: &str) -> Result<Option<PathBuf>, String> {
+    validate_relative(candidate)?;
+    let joined = base.join(candidate);
+    match joined.symlink_metadata() {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "cannot stat '{}' under {}: {e}",
+                candidate,
+                base.display()
+            ))
+        }
+    }
+    let canon_base = base
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve run dir {}: {e}", base.display()))?;
+    let canon = joined.canonicalize().map_err(|e| {
+        format!(
+            "cannot resolve '{}' under {}: {e}",
+            candidate,
+            base.display()
+        )
+    })?;
+    if !canon.starts_with(&canon_base) {
+        return Err(format!(
+            "refusing path '{candidate}': resolves outside the run dir {}",
+            canon_base.display()
+        ));
+    }
+    Ok(Some(canon))
+}
+
+/// Read a file that must be contained within `base`; a missing file reads as
+/// `Ok(None)` (see `contained_opt`).
+pub fn read_contained_opt(base: &Path, candidate: &str) -> Result<Option<String>, String> {
+    match contained_opt(base, candidate)? {
+        Some(p) => std::fs::read_to_string(&p)
+            .map(Some)
+            .map_err(|e| format!("cannot read {}: {e}", p.display())),
+        None => Ok(None),
+    }
+}
+
+/// Write the stop nonce for a run dir, binding the random token to the pid
+/// that owns the run. `sfh stop` requires BOTH the token and the pid to match
+/// status.json, so a run dir copied elsewhere - or a status.json rewritten to
+/// point at somebody else's process - fails the check even though an attacker
+/// who controls the directory can write both files.
+pub fn write_nonce(dir: &Path, pid: u32, nonce: &str) -> std::io::Result<()> {
+    write_private(&dir.join("sfh-nonce"), format!("{pid} {nonce}"))
+}
+
+/// Parse an sfh-nonce file: "<pid> <nonce>" (current format) or a bare
+/// "<nonce>" (a nonce written before pid binding existed).
+pub fn parse_nonce(raw: &str) -> (Option<u32>, String) {
+    let t = raw.trim();
+    match t.split_once(' ') {
+        Some((p, n)) if !n.trim().is_empty() => match p.trim().parse::<u32>() {
+            Ok(pid) => (Some(pid), n.trim().to_string()),
+            Err(_) => (None, t.to_string()),
+        },
+        _ => (None, t.to_string()),
+    }
+}
+
 /// Verify that `child` is contained within `parent` (both must exist).
 pub fn is_under(parent: &Path, child: &Path) -> bool {
     match (parent.canonicalize(), child.canonicalize()) {
@@ -132,16 +204,44 @@ pub fn append_private(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-/// create_dir_all plus 0700 on Unix for the final directory, so a run root or
-/// run dir is not left world-traversable under a permissive umask.
+/// create_dir_all plus 0700 on Unix - but ONLY for directories this call
+/// creates. A runs root the user already had (e.g. a group-shared 0770 dir
+/// handed to --runs-dir) keeps its existing permissions: sfh may tighten what
+/// it makes, never what it was given.
 pub fn mkdir_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut created: Vec<PathBuf> = Vec::new();
+    #[cfg(unix)]
+    {
+        // Walk up to the deepest existing ancestor; everything below it is ours.
+        let mut cur: &Path = path;
+        loop {
+            match std::fs::metadata(cur) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    created.push(cur.to_path_buf());
+                    match cur.parent() {
+                        Some(p) if !p.as_os_str().is_empty() => cur = p,
+                        _ => break,
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(path)?.permissions();
-        p.set_mode(0o700);
-        std::fs::set_permissions(path, p)?;
+        for d in created {
+            if let Ok(m) = std::fs::metadata(&d) {
+                let mut p = m.permissions();
+                if p.mode() & 0o777 != 0o700 {
+                    p.set_mode(0o700);
+                    std::fs::set_permissions(&d, p)?;
+                }
+            }
+        }
     }
     Ok(())
 }
