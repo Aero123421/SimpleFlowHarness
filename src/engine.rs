@@ -367,6 +367,8 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
     let mut st = ResumeState::default();
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
+    // group id -> (visit of its most recent aggregate_end, whether it failed).
+    let mut last_aggregate: HashMap<String, (u32, bool)> = HashMap::new();
     for line in log.lines() {
         // A malformed line is skipped, not a hard error: the log is append-only
         // and the last line is routinely torn when sfh is killed mid-write, so
@@ -536,6 +538,16 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 } else {
                     failed_raw == Some(false)
                 };
+                // How this group's most recent lap ENDED, kept per group rather
+                // than inferred later. Deciding whether a resume is continuing
+                // an interrupted batch or starting a fresh lap by looking at
+                // proxies - the highest visit that has completed members, or
+                // whether some visit is still open - got the answer wrong three
+                // times in three review rounds. The question is simply "did the
+                // last aggregate_end for this group say failed", so record that.
+                if ev == "aggregate_end" && !is_child {
+                    last_aggregate.insert(step.clone(), (visit, failed_raw != Some(false)));
+                }
                 let ok = exit_raw == Some(0)
                     && absent_or_false("timed_out", timed_out_raw)
                     && absent_or_false("interrupted", interrupted_raw)
@@ -730,9 +742,6 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             _ => {}
         }
     }
-    // Which (step, visit) pairs opened without ever closing. Needed below and
-    // `unfinished` is consumed on the next line.
-    let still_open: HashSet<(String, u32)> = unfinished.keys().cloned().collect();
     st.unfinished_step = unfinished.into_values().next_back();
     if st.pending_route.is_none() && !st.completed {
         if let Some(u) = &st.unfinished_step {
@@ -742,42 +751,31 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             st.start = last_step;
         }
     }
-    // A fan-out that fails still logs an aggregate_end, so `visits` restores
-    // the crashed visit and the resume re-enters the group at visit + 1 - but
-    // the members that finished were recorded under the CRASHED visit. Without
-    // this the lookup misses every one of them and the resume silently re-runs,
+    // A fan-out that FAILS still logs an aggregate_end, so `visits` restores
+    // that visit and the resume re-enters the group one higher - while the
+    // members that finished are recorded under the visit that crashed. Without
+    // carrying them forward the lookup misses every one and the resume re-runs,
     // and re-bills, the whole batch. That is the F-2 double-billing bug: the
-    // skip logic below was right, the key it looked under was one lap stale.
+    // skip logic was right, the key it looked under was one lap stale.
     //
-    // Mirror onto the next visit rather than moving: a group killed hard enough
-    // to leave no aggregate_end restores no visit at all and re-enters at the
-    // SAME number, which the original key already covers. Keeping both makes
-    // the crash-with-aggregate and kill-without-aggregate paths agree.
+    // The condition is exactly: this resume restarts at the group, and the
+    // group's most recent lap ended in FAILURE at the visit whose members we
+    // are carrying. Nothing else qualifies, and the three narrower conditions
+    // tried before this all leaked one of these cases:
     //
-    // ONLY for the group this resume restarts at, and only its last visit.
-    // Mirroring every group broke a flow that deliberately routes back into a
-    // fan-out: the group succeeds at visit 1, a later step fails, and the
-    // resume reaches the group again at visit 2 through that route - where
-    // every member would be skipped as "already done" when the flow was
-    // explicitly asking for another lap. st.start names the one group whose
-    // interrupted work this resume is continuing; any group it reaches after
-    // that, it reaches on purpose.
-    // And ONLY when that visit actually ended. A group killed hard enough to
-    // leave no aggregate_end is still open, so the resume continues the SAME
-    // visit and the original key already covers it - mirroring anyway planted
-    // a set at visit + 1 that a deliberate route-back later in the same
-    // resumed process would pick up, skipping members the flow had just asked
-    // to run again. Two different crashes, opposite corrections; the presence
-    // of the aggregate_end is what tells them apart.
+    //   killed with no aggregate_end -> no entry here, and the resume re-enters
+    //     the SAME visit, which the original key already covers. Carrying
+    //     forward as well planted a set that a later route-back picked up.
+    //   lap SUCCEEDED, flow routed back, crash before the new lap finished ->
+    //     failed=false, so no carry. The old "highest visit with completed
+    //     members" test saw visit 1 and skipped the whole of visit 2, which the
+    //     flow had deliberately asked for.
+    //   two crashes running -> the second lap logs its own failed aggregate_end
+    //     and its carried members are in the log as member_restored, so the
+    //     third attempt carries from visit 2, not visit 1.
     if let Some(resume_at) = st.start.clone() {
-        let last = st
-            .completed_members
-            .keys()
-            .filter(|(group, _)| *group == resume_at)
-            .map(|(_, visit)| *visit)
-            .max();
-        if let Some(visit) = last {
-            if !still_open.contains(&(resume_at.clone(), visit)) {
+        if let Some(&(visit, failed)) = last_aggregate.get(&resume_at) {
+            if failed {
                 if let Some(set) = st
                     .completed_members
                     .get(&(resume_at.clone(), visit))

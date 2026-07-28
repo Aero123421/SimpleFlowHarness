@@ -1032,6 +1032,66 @@ else
   bad "F-2: hard-kill resume then route-back ran h1=$p1 h2=$p2, expected 1 2"
 fi
 
+# ------------------------------------------------------- 18. fourth round
+sec "18. cases the fourth review round found missing"
+
+# F-2 once more, and this is the shape three previous conditions all leaked:
+# a lap that SUCCEEDED, a route back into the group, and a crash before the
+# new lap finished. The carry-forward keyed off "highest visit with completed
+# members", saw visit 1, and skipped the whole of visit 2 - which the flow had
+# deliberately asked for. Built by hand because the crash has to land in a
+# specific window.
+mkdir -p c18 && (
+cd c18 || exit
+cat > flow.yaml <<'YAML'
+name: afterloop
+steps:
+  - id: fan
+    max_parallel: 2
+    max_visits: 4
+    parallel:
+      - id: k1
+        cmd: ["sh", "-c", "echo k1 >> ../tally18.txt; echo o1"]
+      - id: k2
+        cmd: ["sh", "-c", "echo k2 >> ../tally18.txt; echo o2"]
+  - id: gate
+    max_visits: 4
+    cmd: ["sh", "-c", "if [ ! -f ../g18 ]; then touch ../g18; echo again; else echo done; fi"]
+    route:
+      - when_last_line_is: "again"
+        goto: fan
+      - goto: end
+YAML
+mkdir -p run
+printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":"afterloop","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' > run/meta.json
+# visit 1 of the fan SUCCEEDED, gate routed back to fan, and the process died
+# before visit 2 produced anything. Both members must run again.
+{
+  printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
+  printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}\n'
+  printf '{"ts":"20250101-000002","event":"step_end","step":"k1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"k1.chain.txt","out_file":"k1.out.txt","cmd":"echo o1","session":null}\n'
+  printf '{"ts":"20250101-000003","event":"step_end","step":"k2","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"k2.chain.txt","out_file":"k2.out.txt","cmd":"echo o2","session":null}\n'
+  printf '{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"exit":0,"failed":false,"out_file":"fan.out.txt","plain_file":"fan.plain.txt","output_hash":"x"}\n'
+  printf '{"ts":"20250101-000005","event":"step_end","step":"gate","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":5,"output_hash":"x","chain_file":"gate.chain.txt","out_file":"gate.out.txt","cmd":"gate","session":null}\n'
+  printf '{"ts":"20250101-000006","event":"position","after":"gate","next":"fan","via":"rule"}\n'
+} > run/log.jsonl
+for n in k1 k2 fan gate; do echo "o-$n" > "run/$n.chain.txt"; echo "o-$n" > "run/$n.out.txt"; done
+echo "o-fan" > run/fan.plain.txt
+touch ../g18   # the gate already routed once; on resume it must end the run
+"$SFH" run flow.yaml --resume run --force-resume -q > ../c18.out 2> ../c18.err
+printf '%s %s\n' \
+  "$(if [ -f ../tally18.txt ]; then grep -c '^k1$' ../tally18.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally18.txt ]; then grep -c '^k2$' ../tally18.txt | head -1; else echo 0; fi)" \
+  > ../c18.verdict
+)
+v1=""; v2=""
+[ -f c18.verdict ] && read -r v1 v2 < c18.verdict
+if [ "${v1:-0}" = "1" ] && [ "${v2:-0}" = "1" ]; then
+  ok "F-2: a crash after a SUCCESSFUL lap and a route-back re-runs the new lap in full"
+else
+  bad "F-2: after a successful lap plus route-back, members ran k1=$v1 k2=$v2, expected 1 1 (the new lap was skipped)"
+fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"
