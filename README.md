@@ -238,6 +238,56 @@ sfh が起動したプロセスが完了しなかったという配管上の事�
 foreach の集約では失敗した要素のヘッダと本文だけが標識され、成功した要素は
 そのまま残る。バナーもレンダリング後の文字列なので `max_prompt_chars` に算入される。
 
+### 合議: `when_members`(N体の票を数えて分岐する)
+
+fan-out の**メンバーごとの成否と最終行**を数える route 述語。`parallel:` /
+`foreach:` を持つステップの route でだけ使える。
+
+```yaml
+  - id: review
+    max_parallel: 3
+    parallel:
+      - { id: rev_a, use: rev, on_error: continue, prompt: "…最後の行に REVIEW-PASS か REVIEW-FAIL…" }
+      - { id: rev_b, use: rev, on_error: continue, prompt: "…" }
+      - { id: rev_c, use: rev, on_error: continue, prompt: "…" }
+    route:
+      - when_members: { last_line_is: "REVIEW-PASS", at_least: 3 }   # or all: true
+        goto: wrap
+      - goto: fix        # 数えられない出力・失敗・タイムアウトは全部こちら
+```
+
+1票と数える条件は**次の両方**:
+
+1. そのメンバーが正常終了している(`exit == 0` かつ timeout でも中断でもない)。
+2. そのメンバー**自身の**出力の最終非空行が `last_line_is` と**完全一致**する
+   (前後の空白と CR は落とす)。
+
+**なぜ文字列で数えてはいけないか。** グループの判定テキストは各メンバーの生出力を
+連結したものだが、そこには**失敗の印が付かない**(`[sfh: FAILED]` バナーが付くのは
+ラベル付き集約 `{{steps.ID.outputs}}` の側だけ)。つまり「REVIEW-PASS と言った」と
+「REVIEW-PASS と言った上で exit 1 した」がテキスト上は同一である。`sh -c "grep -c …"`
+での集計はこれを区別できず、さらに本文中に引用された単独行まで票に数え、そもそも
+グループの route は連結全体の最終行しか見ない。`when_members` は sfh 自身が持つ
+メンバー別の記録から数えるので、この3つとも起こらない。
+
+- 量化子は `at_least: <n>`(n ≥ 1)か `all: true` の**どちらか一方が必須**。
+- **母数が0なら常に不成立**。`all: true` の空集合真(foreach が0件生成した場合)は
+  「全員一致」ではなく「誰も何も決めていない」であり、fail-closed 側に倒す。
+- 同一規則内で他の述語(`when_contains` 等)と併用できない(validate エラー)。
+  「AND で繋ぐ」意味論は作らない — 別々の規則に分けること。
+- 合議イディオムではメンバーに `on_error: continue` を付けるのが正。付けないと
+  1体の失敗がグループ自体の失敗になり、route が**評価されない**(on_error 経路に入る)。
+- `position` イベントに `votes` / `voters` が残るので、何票入って誰が入れたのかは
+  ログから読める(下記)。
+
+**既知の限界**:
+
+| 事柄 | 挙動 |
+|---|---|
+| `parallel` で `at_least` がメンバー数を超える | validate がエラーにする(構成が静的に分かるため) |
+| `foreach` で `at_least` が生成件数を超える | 件数は実行時にしか分からないので validate は通る。実行時は永遠に不成立(catch-all へ) |
+| 判定行が200文字を超える | 記録される最終行は200文字で切られ、比較もその形で行う(live と resume の判定を一致させるため)。リテラルの `last_line_is` が200文字超なら validate がエラーにする |
+
 ### セッション再開: `continue_from:`(コンテキスト最強の節約)
 
 ```yaml
@@ -759,6 +809,22 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 `via` が `fallthrough` / `on_error` / `max_visits` の position は規則を見ていないので、
 この 2 キーは付かない(「どの規則か」を騙らないため)。
 
+`when_members` の規則が一致した position には、さらに `votes`(票数)と
+`voters`(投票したメンバーの id 配列)が付く。
+
+`aggregate_end`(parallel / foreach 共通)には `members` が入る:
+
+```json
+"members": [{"id": "rev_a", "ok": true, "exit": 0, "last_line": "REVIEW-PASS"}, …]
+```
+
+**この記録が resume 時の唯一の情報源である。** 集約テキストは run ディレクトリに
+残るが、どのメンバーが完走したかはテキストからは分からない(前述のとおり失敗の印が
+付かない)。したがって、v1.1 より前に作られた run にフローを編集して `when_members` を
+足し `--force-resume` した場合、sfh は**黙って catch-all に落とさずエラーで止まる**
+(`this run predates per-member route records; re-run the group step or remove when_members`)。
+run の世代によって分岐が静かに変わるくらいなら止まるほうがよい、という判断。
+
 `step_end` には `os`(`windows` / `linux` / `macos`)が入る。ログは書いた機械と別の機械で
 読まれるのが普通なので、「こっちでは通る」の一次資料をログ自身に持たせる。
 
@@ -805,8 +871,8 @@ grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next
 ## 開発
 
 ```bash
-cargo test                              # 126本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト352本
+cargo test                              # 132本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト399本
 ```
 
 挙動テストは冒頭で `tests/stub/session_stub.rs` を `rustc` で1回ビルドする。

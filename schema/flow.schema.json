@@ -116,6 +116,18 @@
         "when_last_line_contains": { "type": "string", "description": "Deterministic verdict trailer check." },
         "when_last_line_is": { "type": "string", "description": "Exact match against the trimmed last non-empty line." },
         "when_last_line_matches": { "type": "string" },
+        "when_members": {
+          "type": "object",
+          "required": ["last_line_is"],
+          "additionalProperties": false,
+          "description": "Count the fan-out members that ended cleanly AND signed off with this exact line. Only on a parallel:/foreach: step, and only alone in its rule.",
+          "properties": {
+            "last_line_is": { "type": "string", "description": "The exact line a member must end on to be counted." },
+            "at_least": { "type": "integer", "minimum": 1, "description": "Match when at least this many members voted." },
+            "all": { "const": true, "description": "Match when every member voted. Never matches an empty fan-out." }
+          },
+          "oneOf": [{ "required": ["at_least"] }, { "required": ["all"] }]
+        },
         "goto": { "type": "string", "description": "step id | end (exit 0) | fail (exit 1) | stuck (exit 4: work saved, needs a human)" }
       }
     },

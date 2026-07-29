@@ -230,9 +230,44 @@ pub struct Route {
     /// Exact match against the trimmed last non-empty line.
     pub when_last_line_is: Option<String>,
     pub when_last_line_matches: Option<String>,
+    /// Count the members of THIS step's fan-out that reported a given verdict.
+    /// Only on a `parallel:`/`foreach:` step, and only alone in its rule (see
+    /// validate). See `WhenMembers`.
+    pub when_members: Option<WhenMembers>,
     /// Step id, or one of the three terminals: "end" (finish, success),
     /// "fail" (finish, failure) or "stuck" (finish, needs a human - exit 4).
     pub goto: String,
+}
+
+/// "How many of the fan-out's members ended cleanly AND signed off with exactly
+/// this line" - the deterministic way to hold a vote among N independent
+/// judges.
+///
+/// It exists because counting the verdicts out of the group's aggregated text
+/// cannot be made correct. That text is the members' output concatenated with
+/// no per-member marking of success: a member that printed the winning line and
+/// then exited 1 is, in the text, indistinguishable from one that passed. The
+/// count therefore comes from sfh's own per-member record, never from a string
+/// search - and the member's OWN last line is what counts, so a needle quoted
+/// mid-answer is not a vote.
+///
+/// Exactly one quantifier: `at_least: <n>` (n >= 1) or `all: true`. There is no
+/// `contains`/regex variant on purpose - a vote is an exact word or it is not a
+/// vote.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WhenMembers {
+    /// The exact line a member must end on to be counted. Templated like the
+    /// other route conditions, then compared for equality against the member's
+    /// trimmed last non-empty line.
+    pub last_line_is: String,
+    /// Match when at least this many members voted. Mutually exclusive with
+    /// `all`.
+    pub at_least: Option<u32>,
+    /// Match when EVERY member voted. A fan-out with no members never matches:
+    /// "all of nothing" is true in logic and would turn a foreach that produced
+    /// zero workers into unanimous agreement.
+    pub all: Option<bool>,
 }
 
 /// Goto targets that end the flow instead of naming a step.
@@ -707,6 +742,7 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         }
         for (i, r) in s.route.iter().enumerate() {
             check_goto(&format!("step '{}' route[{i}]", s.id), &r.goto)?;
+            check_when_members(s, i, r)?;
             for rx in [&r.when_matches, &r.when_last_line_matches]
                 .into_iter()
                 .flatten()
@@ -737,6 +773,93 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     }
     for warning in branch_fallthrough_warnings(flow) {
         eprintln!("sfh: warning: {warning}");
+    }
+    Ok(())
+}
+
+/// Everything about a `when_members` rule that can be settled without running
+/// anything. All of it fails the flow rather than warning: a route rule that
+/// cannot match is not a smaller version of one that can, it is a branch the
+/// author believes in and will never take.
+fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
+    let Some(wm) = &r.when_members else {
+        return Ok(());
+    };
+    let at = format!("step '{}' route[{i}]", s.id);
+    if s.parallel.is_none() && s.foreach.is_none() {
+        return Err(format!(
+            "{at}: when_members counts the members of a fan-out, so it needs parallel: or foreach: on the same step. For a single step's own verdict use when_last_line_is"
+        ));
+    }
+    // No AND with the text predicates. They read the members' output glued
+    // together, when_members reads each member's record separately, and a rule
+    // that mixed them would answer two different questions about two different
+    // texts under one goto - with no way to see which half failed.
+    for (name, present) in [
+        ("when_contains", r.when_contains.is_some()),
+        ("when_matches", r.when_matches.is_some()),
+        (
+            "when_last_line_contains",
+            r.when_last_line_contains.is_some(),
+        ),
+        ("when_last_line_is", r.when_last_line_is.is_some()),
+        ("when_last_line_matches", r.when_last_line_matches.is_some()),
+    ] {
+        if present {
+            return Err(format!(
+                "{at}: when_members cannot share a rule with {name} - one counts members, the other searches the group's combined text. Give each its own rule"
+            ));
+        }
+    }
+    match (wm.at_least, wm.all) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{at}: when_members takes at_least: <n> or all: true, not both"
+            ))
+        }
+        (None, None) => {
+            return Err(format!(
+                "{at}: when_members needs a quantifier - at_least: <n> or all: true"
+            ))
+        }
+        (Some(0), None) => {
+            return Err(format!(
+                "{at}: when_members at_least must be 1 or more - at_least: 0 would match a fan-out in which nobody agreed"
+            ))
+        }
+        // Nothing sensible to do with it: the only meaning would be "match when
+        // not all agreed", which is what the catch-all rule after it already is.
+        (None, Some(false)) => {
+            return Err(format!(
+                "{at}: when_members all: false can never match - use all: true, or let the next rule catch the disagreement"
+            ))
+        }
+        _ => {}
+    }
+    // A parallel group's size is written in the flow, so asking for more votes
+    // than it can ever cast is a typo the author should hear about now. A
+    // foreach's size is only known once the previous step has spoken, so the
+    // same mistake there can only fail closed at run time (documented).
+    if let (Some(n), Some(children)) = (wm.at_least, &s.parallel) {
+        if n as usize > children.len() {
+            return Err(format!(
+                "{at}: when_members at_least is {n} but the parallel group has {} members, so the rule can never match",
+                children.len()
+            ));
+        }
+    }
+    // The recorded verdict line is cut to this length, and the comparison uses
+    // the cut form so that a live decision and a resumed one cannot disagree.
+    // A longer needle therefore could not match anything; say so now instead of
+    // quietly never firing. A templated one is only known at run time (also
+    // documented).
+    if !wm.last_line_is.contains("{{")
+        && wm.last_line_is.chars().count() > crate::engine::ROUTE_LINE_CHARS
+    {
+        return Err(format!(
+            "{at}: when_members last_line_is is longer than {} characters, which is where the recorded verdict line is cut, so it could never match",
+            crate::engine::ROUTE_LINE_CHARS
+        ));
     }
     Ok(())
 }
