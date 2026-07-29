@@ -141,13 +141,13 @@ profiles:                    # 名前付きツール設定。ステップから 
 defaults:                    # 全ステップの既定値(すべて任意)
   timeout_sec: 3600
   max_visits: 3              # 同一ステップの最大実行回数(既定5)
-  max_total_steps: 100       # 実行するリーフ総数の上限(fan-out前に判定)
+  max_total_steps: 100       # engineが予定するleaf runの上限(fan-out/fallback/compactを含む)
   max_parallel: 4            # parallel/foreach の同時実行数の既定
-  tool_max_parallel:         # ツール別の同時実行上限(レート制限対策)
+  tool_max_parallel:         # ツール別の同時実行上限(レート制限対策。各値は1以上)
     opencode: 2
   max_prompt_chars: 80000    # レンダリング後プロンプトがこれを超えたら実行前に失敗
   max_emit_chars: 200000     # stdoutに出す最大文字数(既定20万。超過分は切って保存先を案内)
-  max_cost_usd: 5.0          # 報告されたコストの累計がこれを超えたら中断
+  max_cost_usd: 5.0          # finiteかつ0以上。報告コスト累計が超えたら中断
   wall_clock_sec: 7200       # フロー全体の実時間上限
   on_budget: goto:wrap       # 上限−reserve に達したら中断せずここへ着地(1 run 1回)
   budget_reserve:            # 着地連鎖のために各上限から取り置く分(宣言した上限には必須)
@@ -222,6 +222,10 @@ steps:
       {{steps.ideas.outputs}}        # 集約全文
       {{steps.idea_tech.output}}     # 子は個別にも参照できる
 ```
+
+`parallel:` の親は集約と分岐だけを担当するため、leaf 専用の `retry` / `retry_on` /
+`hang_after_sec` / `fallback` は子ごとに置く。親に置いた設定を黙って無視することはなく、
+`sfh validate` が `carries only` エラーで拒否する。
 
 ### 動的並列: `foreach:`(前段の出力の件数だけワーカー起動)
 
@@ -369,7 +373,7 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 
 > Summarize the text below in at most {target} characters, in the same language as the text. It will be passed to another AI agent as context, so keep every conclusion, number, file path and open question. Output only the summary.
 
-要約器が失敗した場合はsfhが**先頭+末尾を機械的に残す**(head+tail)。原文は `<id>.precompact.txt` に保存され、`--resume` してもそれが `{{steps.x.outputs}}` に復元される。
+要約器が失敗した場合はsfhが**先頭+末尾を機械的に残す**(head+tail)。原文は `<id>.precompact.txt` に保存され、`--resume` してもそれが `{{steps.x.outputs}}` に復元される。fallback と compact の呼び出しも `max_total_steps` に含まれ、上限を超える呼び出しは準備・spawn 前に拒否される。`retry.max` が作る同一 leaf 内の追加 attempt はこの論理 leaf 数とは別枠なので、外部呼び出し回数を厳密に絞る場合は `retry.max` も合わせて制限する。
 
 ### コストとトークンの会計
 
@@ -379,6 +383,8 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 - `sfh runs list --json` / `sfh runs show <dir> --json` で後から機械集計できる。`visit` は最大訪問番号、`repeat` は同じステップで同一 `output_hash` が連続した時の初回を除く最大反復回数
 - `runs list` の末尾(`--json` では `total_cost_usd`)は、`-n` 適用後に選ばれたrun群の報告済みコスト合計
 - `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)。中断ではなく畳ませたいなら [`on_budget`](#予算の崖を着地パスに-on_budget) で着地パスへ回す
+- 同じ leaf を retry した場合、`step_end` のトークン数・コストは**全 attempt の累計**。最後の成功 attempt だけで失敗分の課金を上書きしない
+- 外部ツールが負数または NaN のコストを返しても支出は減らさず 0 として記録し、正の無限大は有限上限を確実に止める最大値として扱う。不正値は stderr と `<id>.err.txt` に警告する
 - コスト報告があるのは claude / grok / opencode。codex と agy はトークン数のみ
 
 ### 失敗からの回復
@@ -392,7 +398,11 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 
 成功した `step_end` の直後、次の `position` を記録する前に sfh が停止していた場合は、
 そのステップを再実行せず、保存済み chain 出力に対して route 規則だけを再評価し、
-決定を `position` イベントとして追記する。一方、`step_start` はあるが対応する
+決定を `position` イベントとして追記する。失敗した `step_end` / `aggregate_end` も、
+`on_error: continue` または `on_error: goto:*` が宣言されていれば、保存済み exit・stderr・
+出力から未記録の on_error と route だけを再生する。外部 probe や fan-out メンバーは
+二重実行しない。既定の `on_error: fail` は従来どおり、その失敗ステップを再試行できる。
+一方、`step_start` はあるが対応する
 `step_end` が無いコマンドは完了したか判定できないため再実行する。resume 前に
 コマンドライン付きで警告し、同じ情報を `status.json.unfinished_step` にも残す。
 
@@ -471,7 +481,7 @@ steps:
 | `sfh runs show` | `budget  : landed on cost after $58.0312 / 1204s -> goto wrap` |
 | `--dry-run` | `budget landing: goto wrap (cost reserve $2.00, wall reserve 900s)` — `route:` に現れない唯一の goto なので、ここで可視化する |
 
-**validate が拒否するもの**: 跳び先が実在しない / `goto:` を付けていない / `budget_reserve` だけで `on_budget` が無い(reserve は「どれだけ早く着地するか」を決めるだけなので、単体では何もしない) / `on_budget` があるのに `max_cost_usd` も `wall_clock_sec` も無い(上限が無ければ閾値も無い)/ **宣言した上限のどれかに reserve が無い(または 0)**。
+**validate が拒否するもの**: `max_cost_usd` が負数・NaN・無限大 / 跳び先が実在しない / `goto:` を付けていない / `budget_reserve` だけで `on_budget` が無い(reserve は「どれだけ早く着地するか」を決めるだけなので、単体では何もしない) / `on_budget` があるのに `max_cost_usd` も `wall_clock_sec` も無い(上限が無ければ閾値も無い)/ **宣言した上限のどれかに reserve が無い(または 0)**。
 
 最後のものが一番効く。reserve が 0 だと閾値は上限そのものになり、着地はするが**その次のループ先頭で上限検査が同じ値で発火して**、着地連鎖が 1 ステップも走らないまま従来のエラーで終わる — `budget_landing` イベントと `-> goto wrap` の表示だけが増えて、結果は何も変わらない。軸ごとに独立なので、コスト側に reserve を書いても時間側の着地は買えない。
 
@@ -1051,8 +1061,8 @@ grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next
 ## 開発
 
 ```bash
-cargo test                              # 140本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト508本
+cargo test                              # Windows 151本 / Unix 152本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト: Windows 545本 / Unix 551本
 ```
 
 挙動テストは冒頭で `tests/stub/session_stub.rs` を `rustc` で1回ビルドする。

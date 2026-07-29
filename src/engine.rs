@@ -337,6 +337,13 @@ enum FlowEnd {
     },
 }
 
+enum ErrorDisposition {
+    Continue,
+    Goto(usize),
+    Completed,
+    Stuck,
+}
+
 /// The `on_budget` landing (F5): where to jump, and the point on each axis at
 /// which to jump there. Threshold = ceiling - reserve, cost and wall-clock
 /// independently, so a run gets a wrap-up chain BEFORE the ceiling that would
@@ -396,11 +403,34 @@ fn failed_output(step: &str, text: &str, exit: i32, timed_out: bool) -> String {
     )
 }
 
+fn claim_leaf_runs(
+    total: &mut u32,
+    additional: u32,
+    max_total: u32,
+    step: &str,
+) -> Result<(), String> {
+    let next = total.checked_add(additional).ok_or_else(|| {
+        format!(
+            "step '{step}' would overflow the total leaf-run counter (max_total_steps={max_total})"
+        )
+    })?;
+    if next > max_total {
+        return Err(format!(
+            "step '{step}' would bring total leaf runs to {next} over max_total_steps ({max_total})"
+        ));
+    }
+    *total = next;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct PendingRoute {
     step: String,
     visit: u32,
     route_text: String,
+    /// The recorded step completed with failure. Resume must replay on_error
+    /// before considering ordinary routes, exactly as the live path does.
+    errored: bool,
     /// True when route_text came from a fan-out's headerless plain output.
     /// Compaction rewrites the chain file but never changes what live routing
     /// matched against, so a plain-sourced route must NOT be patched from the
@@ -485,7 +515,15 @@ struct ResumeState {
     completed_members: HashMap<(String, u32), HashSet<String>>,
 }
 
+#[cfg(test)]
 fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
+    load_resume_for_flow(run_dir, None)
+}
+
+fn load_resume_for_flow(
+    run_dir: &Path,
+    current_flow: Option<&flow::Flow>,
+) -> Result<ResumeState, String> {
     // Contained, no-follow read: log.jsonl is a fixed name in a directory an
     // attacker controls on --resume, and a symlink there used to be followed
     // to an external JSONL file that was then ingested as the run's entire
@@ -716,6 +754,20 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     && absent_or_false("interrupted", interrupted_raw)
                     && absent_or_false("failed", failed_raw)
                     && owed_fields_false;
+                // A failed process result is still a completed result. If sfh
+                // died after writing step_end/aggregate_end but before writing
+                // the on_error position, resuming must replay that decision
+                // rather than probe the external system a second time. Keep
+                // malformed or interrupted records on the conservative re-run
+                // path: every field that event type owes must be present and
+                // typed, and an interrupted leaf has not completed its work.
+                let exit_is_i32 = exit_raw.and_then(|x| i32::try_from(x).ok()).is_some();
+                let completed_event = exit_is_i32
+                    && if ev == "step_end" {
+                        timed_out_raw.is_some() && interrupted_raw == Some(false)
+                    } else {
+                        failed_raw.is_some()
+                    };
                 // A SUCCESSFUL fan-out member: remember it under its PARENT
                 // group so a resume that re-enters the group skips it instead
                 // of spending money and sessions a second time (rev_regression:
@@ -822,30 +874,41 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     if ok {
                         st.last_success = Some(step.clone());
                     }
-                    st.pending_route = if ev == "step_end" && ok {
-                        Some(PendingRoute {
-                            step: step.clone(),
-                            visit,
-                            route_text: chain.trim_end().to_string(),
-                            from_plain: false,
-                            members: None,
-                        })
-                    } else if ev == "aggregate_end" && ok {
-                        // Runs written before plain_file existed have no
-                        // headerless copy: leave the route unset (as before)
-                        // so the fan-out re-runs rather than routing on
-                        // headered text live never matched against.
-                        let members = restored_members(&v);
-                        plain.map(|p| PendingRoute {
-                            step: step.clone(),
-                            visit,
-                            route_text: p.trim_end().to_string(),
-                            from_plain: true,
-                            members,
-                        })
-                    } else {
-                        None
-                    };
+                    let replay_failed_control = !ok
+                        && current_flow
+                            .and_then(|f| f.steps.iter().find(|candidate| candidate.id == step))
+                            .and_then(|candidate| candidate.on_error.as_deref())
+                            .is_some_and(|action| action != "fail");
+                    st.pending_route =
+                        if ev == "step_end" && completed_event && (ok || replay_failed_control) {
+                            Some(PendingRoute {
+                                step: step.clone(),
+                                visit,
+                                route_text: chain.trim_end().to_string(),
+                                errored: !ok,
+                                from_plain: false,
+                                members: None,
+                            })
+                        } else if ev == "aggregate_end"
+                            && completed_event
+                            && (ok || replay_failed_control)
+                        {
+                            // Runs written before plain_file existed have no
+                            // headerless copy: leave the route unset (as before)
+                            // so the fan-out re-runs rather than routing on
+                            // headered text live never matched against.
+                            let members = restored_members(&v);
+                            plain.map(|p| PendingRoute {
+                                step: step.clone(),
+                                visit,
+                                route_text: p.trim_end().to_string(),
+                                errored: !ok,
+                                from_plain: true,
+                                members,
+                            })
+                        } else {
+                            None
+                        };
                 }
                 // Trust model for the recorded session (rev_break #11): the
                 // session id/marker/access restored here come from log.jsonl,
@@ -1636,7 +1699,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // The resumed dir was protected when it was first created; nothing
         // here writes to the runs root, so its state is not this run's
         // concern (and the root may be absent or read-only by design).
-        resumed = load_resume(&dir)?;
+        resumed = load_resume_for_flow(&dir, Some(&flow))?;
         // Cross-check the recorded session access against the flow (which the
         // fingerprint check above verified is unchanged, unless --force-resume
         // waived it): a log edited to claim a higher access than the flow
@@ -1882,7 +1945,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     if is_resume && !opts.quiet {
         if let Some(p) = &pending_route {
             eprintln!(
-                "sfh: resuming {} by re-evaluating routing after step '{}' ({} steps already done, ${cost_usd:.4} spent)",
+                "sfh: resuming {} by replaying pending control flow after step '{}' ({} steps already done, ${cost_usd:.4} spent)",
                 run_dir.display(),
                 p.step,
                 total
@@ -1925,110 +1988,129 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 )
             })?;
             let step = &flow.steps[completed_idx];
-            let gtag = if pending.visit == 1 {
-                step.id.clone()
-            } else {
-                format!("{}.v{}", step.id, pending.visit)
-            };
-            let pf = run_dir.join(format!("{gtag}.prompt.txt"));
-            let prep_ctx = leaf::PrepCtx {
-                flow: &flow,
-                vars: &vars,
-                outputs: &outputs,
-                step_ids: &step_ids,
-                run_dir: &run_dir,
-                flow_dir: &flow_dir,
-                notes_file: &notes_file,
-                sessions: &sessions,
-                needed_sessions: &needed_sessions,
-                tainted_vars: &tainted_vars,
-                // Nothing is executed on this path - it only re-evaluates a
-                // recorded route - so there is no child to time.
-                run_clock: None,
-                // The restored spend is real; the clock is this attempt's, the
-                // same one wall_clock_sec is judged on.
-                budget: leaf::BudgetVars::new(
-                    &flow.defaults,
-                    cost_usd,
-                    flow_start.elapsed().as_secs(),
-                ),
-                quiet: opts.quiet,
-                verbose: opts.verbose,
-            };
-            let builtins = leaf::make_builtins(&prep_ctx, &step.id, pending.visit, &pf, &[]);
-            let ctx = template::Ctx {
-                vars: &vars,
-                outputs: &outputs,
-                step_ids: &step_ids,
-                builtins,
-            };
-            // Which of the "no members" cases this is comes from the FLOW, not
-            // from the record: if the flow says this step is a fan-out, its
-            // members were countable and a missing snapshot is a gap to refuse,
-            // not an empty set to route on.
-            //
-            // The size has to come from the flow too. A snapshot of N members
-            // satisfies `all: true` on its own terms, so a flow edited to
-            // declare N+1 (which requires --force-resume, which is exactly when
-            // this happens) would report unanimity on a group the new member was
-            // never asked about - a live run of the same flow takes the other
-            // branch. validate already compares `at_least` against the declared
-            // size statically; this is the same comparison at the one moment the
-            // two can disagree.
-            let members = if let Some(children) = &step.parallel {
-                match &pending.members {
-                    Some(m) if m.len() != children.len() => Members::Mismatch {
-                        recorded: m.len(),
-                        declared: children.len(),
-                    },
-                    Some(m) => Members::Known(m),
-                    None => Members::Unrecorded,
-                }
-            } else if step.foreach.is_some() {
-                // A foreach's size is whatever the upstream step produced, so
-                // there is no declared count to check it against.
-                match &pending.members {
-                    Some(m) => Members::Known(m),
-                    None => Members::Unrecorded,
+            let replay_route = if pending.errored {
+                match apply_on_error(&mut log, step, &index_of, &run_dir)? {
+                    ErrorDisposition::Continue => true,
+                    ErrorDisposition::Goto(next) => {
+                        cur = next;
+                        false
+                    }
+                    ErrorDisposition::Completed => return Ok(FlowEnd::Completed),
+                    ErrorDisposition::Stuck => {
+                        return Ok(FlowEnd::Stuck {
+                            after: step.id.clone(),
+                        })
+                    }
                 }
             } else {
-                Members::NotAGroup
+                true
             };
-            let target = evaluate_route(step, &pending.route_text, &ctx, &run_dir, members)?;
-            match target.as_ref().map(|h| (h.goto.as_str(), h)) {
-                None => {
-                    log_position(
-                        &mut log,
-                        &step.id,
-                        next_label(completed_idx + 1, &flow),
-                        PositionVia::Fallthrough,
-                        None,
-                    );
-                    cur = completed_idx + 1;
-                    if cur >= n_steps {
+            if replay_route {
+                let gtag = if pending.visit == 1 {
+                    step.id.clone()
+                } else {
+                    format!("{}.v{}", step.id, pending.visit)
+                };
+                let pf = run_dir.join(format!("{gtag}.prompt.txt"));
+                let prep_ctx = leaf::PrepCtx {
+                    flow: &flow,
+                    vars: &vars,
+                    outputs: &outputs,
+                    step_ids: &step_ids,
+                    run_dir: &run_dir,
+                    flow_dir: &flow_dir,
+                    notes_file: &notes_file,
+                    sessions: &sessions,
+                    needed_sessions: &needed_sessions,
+                    tainted_vars: &tainted_vars,
+                    // Nothing is executed on this path - it only re-evaluates a
+                    // recorded route - so there is no child to time.
+                    run_clock: None,
+                    // The restored spend is real; the clock is this attempt's, the
+                    // same one wall_clock_sec is judged on.
+                    budget: leaf::BudgetVars::new(
+                        &flow.defaults,
+                        cost_usd,
+                        flow_start.elapsed().as_secs(),
+                    ),
+                    quiet: opts.quiet,
+                    verbose: opts.verbose,
+                };
+                let builtins = leaf::make_builtins(&prep_ctx, &step.id, pending.visit, &pf, &[]);
+                let ctx = template::Ctx {
+                    vars: &vars,
+                    outputs: &outputs,
+                    step_ids: &step_ids,
+                    builtins,
+                };
+                // Which of the "no members" cases this is comes from the FLOW, not
+                // from the record: if the flow says this step is a fan-out, its
+                // members were countable and a missing snapshot is a gap to refuse,
+                // not an empty set to route on.
+                //
+                // The size has to come from the flow too. A snapshot of N members
+                // satisfies `all: true` on its own terms, so a flow edited to
+                // declare N+1 (which requires --force-resume, which is exactly when
+                // this happens) would report unanimity on a group the new member was
+                // never asked about - a live run of the same flow takes the other
+                // branch. validate already compares `at_least` against the declared
+                // size statically; this is the same comparison at the one moment the
+                // two can disagree.
+                let members = if let Some(children) = &step.parallel {
+                    match &pending.members {
+                        Some(m) if m.len() != children.len() => Members::Mismatch {
+                            recorded: m.len(),
+                            declared: children.len(),
+                        },
+                        Some(m) => Members::Known(m),
+                        None => Members::Unrecorded,
+                    }
+                } else if step.foreach.is_some() {
+                    // A foreach's size is whatever the upstream step produced, so
+                    // there is no declared count to check it against.
+                    match &pending.members {
+                        Some(m) => Members::Known(m),
+                        None => Members::Unrecorded,
+                    }
+                } else {
+                    Members::NotAGroup
+                };
+                let target = evaluate_route(step, &pending.route_text, &ctx, &run_dir, members)?;
+                match target.as_ref().map(|h| (h.goto.as_str(), h)) {
+                    None => {
+                        log_position(
+                            &mut log,
+                            &step.id,
+                            next_label(completed_idx + 1, &flow),
+                            PositionVia::Fallthrough,
+                            None,
+                        );
+                        cur = completed_idx + 1;
+                        if cur >= n_steps {
+                            return Ok(FlowEnd::Completed);
+                        }
+                    }
+                    Some(("end", hit)) => {
+                        log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
                         return Ok(FlowEnd::Completed);
                     }
-                }
-                Some(("end", hit)) => {
-                    log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
-                    return Ok(FlowEnd::Completed);
-                }
-                Some(("fail", hit)) => {
-                    log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
-                    return Err(format!("step '{}' routed to fail", step.id));
-                }
-                Some(("stuck", hit)) => {
-                    log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit));
-                    return Ok(FlowEnd::Stuck {
-                        after: step.id.clone(),
-                    });
-                }
-                Some((id, hit)) => {
-                    if !opts.quiet {
-                        eprintln!("sfh: [{}] -> goto {id}", step.id);
+                    Some(("fail", hit)) => {
+                        log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
+                        return Err(format!("step '{}' routed to fail", step.id));
                     }
-                    log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit));
-                    cur = index_of[id];
+                    Some(("stuck", hit)) => {
+                        log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit));
+                        return Ok(FlowEnd::Stuck {
+                            after: step.id.clone(),
+                        });
+                    }
+                    Some((id, hit)) => {
+                        if !opts.quiet {
+                            eprintln!("sfh: [{}] -> goto {id}", step.id);
+                        }
+                        log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit));
+                        cur = index_of[id];
+                    }
                 }
             }
         }
@@ -2281,7 +2363,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             if execute::interrupted() {
                                 break;
                             }
-                            cost_usd += $done.usage.cost_usd.unwrap_or(0.0);
+                            cost_usd += $done.usage.reported_cost();
                             log_step_end(
                                 &mut log,
                                 &$label,
@@ -2289,6 +2371,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 visit,
                                 &$done,
                             );
+                            claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
                             if !opts.quiet {
                                 eprintln!("sfh: [{}] falling back to profile '{fb}'", $label);
                             }
@@ -2301,7 +2384,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 &mut log,
                                 json!({"ts": utc_stamp(), "event": "fallback", "step": $label, "profile": fb, "cmd": prep.inv.describe()}),
                             );
-                            total += 1;
                             let alt = leaf::exec_leaf(prep);
                             let ok = alt.ok();
                             $done = alt;
@@ -2354,14 +2436,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     preps.push(leaf::prepare_leaf(&cx, c, visit, &ctag, &[], None)?);
                     fresh_idx.push(ci);
                 }
-                if total + preps.len() as u32 > max_total {
-                    return Err(format!(
-                            "step '{}' would bring total leaf runs to {} over max_total_steps ({max_total})",
-                            step.id,
-                            total + preps.len() as u32
-                        ));
-                }
-                total += preps.len() as u32;
+                claim_leaf_runs(&mut total, preps.len() as u32, max_total, &step.id)?;
                 let mp = step
                     .max_parallel
                     .or(flow.defaults.max_parallel)
@@ -2459,7 +2534,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             hard_fail = true;
                         }
                     }
-                    cost_usd += d.usage.cost_usd.unwrap_or(0.0);
+                    cost_usd += d.usage.reported_cost();
                     outputs.insert(
                         c.id.clone(),
                         template::StepOutput {
@@ -2593,14 +2668,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     )?);
                     fresh_idx.push(i);
                 }
-                if total + preps.len() as u32 > max_total {
-                    return Err(format!(
-                            "step '{}' would bring total leaf runs to {} over max_total_steps ({max_total})",
-                            step.id,
-                            total + preps.len() as u32
-                        ));
-                }
-                total += preps.len() as u32;
+                claim_leaf_runs(&mut total, preps.len() as u32, max_total, &step.id)?;
                 let mp = step
                     .max_parallel
                     .or(flow.defaults.max_parallel)
@@ -2696,7 +2764,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             eprintln!("sfh: [{}] stderr| {line}", d.tag);
                         }
                     }
-                    cost_usd += d.usage.cost_usd.unwrap_or(0.0);
+                    cost_usd += d.usage.reported_cost();
                     log_step_end(&mut log, &label, Some(&step.id), visit, d);
                     let failed_header = if d.ok() {
                         String::new()
@@ -2742,10 +2810,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 );
                 (agg, plain, hard_fail, Some(verdicts))
             } else {
-                if total + 1 > max_total {
-                    return Err(format!("exceeded max_total_steps ({max_total})"));
-                }
-                total += 1;
+                claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
                 let mut done = {
                     let cx = mk_cx!(&outputs, &sessions);
                     let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
@@ -2761,8 +2826,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         if execute::interrupted() {
                             break;
                         }
-                        cost_usd += done.usage.cost_usd.unwrap_or(0.0);
+                        cost_usd += done.usage.reported_cost();
                         log_step_end(&mut log, &step.id, None, visit, &done);
+                        claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
                         if !opts.quiet {
                             eprintln!("sfh: [{}] falling back to profile '{fb}'", step.id);
                         }
@@ -2773,7 +2839,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             &mut log,
                             json!({"ts": utc_stamp(), "event": "fallback", "step": step.id, "profile": fb, "cmd": prep.inv.describe()}),
                         );
-                        total += 1;
                         let alt = leaf::exec_leaf(prep);
                         let ok = alt.ok();
                         done = alt;
@@ -2792,7 +2857,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         eprintln!("sfh: [{}] stderr| {line}", d.tag);
                     }
                 }
-                cost_usd += d.usage.cost_usd.unwrap_or(0.0);
+                cost_usd += d.usage.reported_cost();
                 if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
                     sessions.insert(
                         step.id.clone(),
@@ -2841,7 +2906,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             comp.when_over
                         );
                     }
-                    total += 1;
+                    claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
                     // Keep what is about to be summarized: the chain file gets
                     // overwritten with the summary, and {{steps.X.outputs}} is
                     // documented as the pre-compact original - including after
@@ -2874,7 +2939,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     };
                     match run_compact(comp, compact_run) {
                         Ok((sum, usage)) => {
-                            cost_usd += usage.cost_usd.unwrap_or(0.0);
+                            cost_usd += usage.reported_cost();
                             log_event(
                                 &mut log,
                                 json!({"ts": utc_stamp(), "event": "compact_end", "step": step.id, "chars": sum.chars().count(), "cost_usd": usage.cost_usd, "precompact_file": pre_name}),
@@ -2934,70 +2999,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
             // ---- error handling ----
             if errored {
-                match step.on_error.as_deref().unwrap_or("fail") {
-                    "continue" => {}
-                    oe if oe.starts_with("goto:") => match &oe[5..] {
-                        "end" => {
-                            log_position(
-                                &mut log,
-                                &step.id,
-                                "end".into(),
-                                PositionVia::OnError,
-                                None,
-                            );
-                            return Ok(FlowEnd::Completed);
-                        }
-                        "fail" => {
-                            log_position(
-                                &mut log,
-                                &step.id,
-                                "fail".into(),
-                                PositionVia::OnError,
-                                None,
-                            );
-                            return Err(format!(
-                                "step '{}' failed and on_error routed to fail",
-                                step.id
-                            ));
-                        }
-                        "stuck" => {
-                            log_position(
-                                &mut log,
-                                &step.id,
-                                "stuck".into(),
-                                PositionVia::OnError,
-                                None,
-                            );
-                            return Ok(FlowEnd::Stuck {
-                                after: step.id.clone(),
-                            });
-                        }
-                        id => match index_of.get(id) {
-                            Some(i) => {
-                                log_position(
-                                    &mut log,
-                                    &step.id,
-                                    id.to_string(),
-                                    PositionVia::OnError,
-                                    None,
-                                );
-                                cur = *i;
-                                continue;
-                            }
-                            None => {
-                                return Err(format!(
-                                    "step '{}': on_error goto target '{id}' not found",
-                                    step.id
-                                ))
-                            }
-                        },
-                    },
-                    _ => {
-                        return Err(format!(
-                            "step '{}' failed - see {}",
-                            step.id,
-                            run_dir.display()
-                        ))
+                match apply_on_error(&mut log, step, &index_of, &run_dir)? {
+                    ErrorDisposition::Continue => {}
+                    ErrorDisposition::Goto(next) => {
+                        cur = next;
+                        continue;
+                    }
+                    ErrorDisposition::Completed => return Ok(FlowEnd::Completed),
+                    ErrorDisposition::Stuck => {
+                        return Ok(FlowEnd::Stuck {
+                            after: step.id.clone(),
+                        })
                     }
                 }
             }
@@ -4059,6 +4071,46 @@ fn log_position(
     log_event(f, ev);
 }
 
+fn apply_on_error(
+    log: &mut std::fs::File,
+    step: &flow::Step,
+    index_of: &HashMap<String, usize>,
+    run_dir: &Path,
+) -> Result<ErrorDisposition, String> {
+    match step.on_error.as_deref().unwrap_or("fail") {
+        "continue" => Ok(ErrorDisposition::Continue),
+        oe if oe.starts_with("goto:") => match &oe[5..] {
+            "end" => {
+                log_position(log, &step.id, "end".into(), PositionVia::OnError, None);
+                Ok(ErrorDisposition::Completed)
+            }
+            "fail" => {
+                log_position(log, &step.id, "fail".into(), PositionVia::OnError, None);
+                Err(format!(
+                    "step '{}' failed and on_error routed to fail",
+                    step.id
+                ))
+            }
+            "stuck" => {
+                log_position(log, &step.id, "stuck".into(), PositionVia::OnError, None);
+                Ok(ErrorDisposition::Stuck)
+            }
+            id => {
+                let next = index_of.get(id).copied().ok_or_else(|| {
+                    format!("step '{}': on_error goto target '{id}' not found", step.id)
+                })?;
+                log_position(log, &step.id, id.to_string(), PositionVia::OnError, None);
+                Ok(ErrorDisposition::Goto(next))
+            }
+        },
+        _ => Err(format!(
+            "step '{}' failed - see {}",
+            step.id,
+            run_dir.display()
+        )),
+    }
+}
+
 fn log_step_end(
     f: &mut std::fs::File,
     step: &str,
@@ -4220,6 +4272,15 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_leaf_run_claim_obeys_the_total_limit() {
+        let mut total = 0;
+        claim_leaf_runs(&mut total, 1, 1, "primary").unwrap();
+        let error = claim_leaf_runs(&mut total, 1, 1, "fallback").unwrap_err();
+        assert!(error.contains("max_total_steps (1)"), "{error}");
+        assert_eq!(total, 1, "a rejected claim must not mutate the count");
+    }
 
     fn route(
         when_contains: Option<&str>,
@@ -4501,6 +4562,51 @@ mod tests {
             Some(1),
             "an absent exit restores as a failure code"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_replays_failed_on_error_control_without_reprobing() {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-resume-failed-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("probe.chain.txt"), "guard refused\n").unwrap();
+        std::fs::write(dir.join("probe.out.txt"), "guard refused\n").unwrap();
+        std::fs::write(dir.join("probe.err.txt"), "permission denied\n").unwrap();
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"step_end\",\"step\":\"probe\",\"visit\":1,\"exit\":3,\"timed_out\":false,\"interrupted\":false,\"chain_file\":\"probe.chain.txt\",\"out_file\":\"probe.out.txt\"}\n",
+        )
+        .unwrap();
+
+        let continuing: flow::Flow = serde_yaml_ng::from_str(
+            "name: t\nsteps:\n  - id: probe\n    cmd: echo probe\n    on_error: continue\n  - id: next\n    cmd: echo next\n",
+        )
+        .unwrap();
+        let resumed =
+            load_resume_for_flow(&dir, Some(&continuing)).expect("load failed probe for resume");
+        let pending = resumed
+            .pending_route
+            .as_ref()
+            .expect("on_error control is the only missing action");
+        assert!(pending.errored);
+        assert_eq!(pending.step, "probe");
+        assert_eq!(pending.route_text, "guard refused");
+        assert_eq!(resumed.outputs["probe"].exit, 3);
+        assert!(
+            resumed.outputs["probe"].output.contains("did not complete"),
+            "downstream output must retain the failure banner"
+        );
+
+        // An ordinary failed step intentionally remains retryable on resume.
+        let retrying: flow::Flow =
+            serde_yaml_ng::from_str("name: t\nsteps:\n  - id: probe\n    cmd: echo probe\n")
+                .unwrap();
+        let resumed =
+            load_resume_for_flow(&dir, Some(&retrying)).expect("load retryable failed probe");
+        assert!(resumed.pending_route.is_none());
+        assert_eq!(resumed.start.as_deref(), Some("probe"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

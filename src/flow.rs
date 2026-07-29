@@ -687,6 +687,20 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             }
         }
     }
+    if let Some(cost) = flow.defaults.max_cost_usd {
+        if !(cost.is_finite() && cost >= 0.0) {
+            return Err(format!(
+                "defaults.max_cost_usd must be a finite number >= 0 (got {cost})"
+            ));
+        }
+    }
+    for (tool, limit) in &flow.defaults.tool_max_parallel {
+        if *limit == 0 {
+            return Err(format!(
+                "defaults.tool_max_parallel.{tool} must be >= 1 (0 would block that tool forever)"
+            ));
+        }
+    }
     if let Some(r) = &flow.defaults.retry_on {
         check_retry_on("defaults", r)?;
     }
@@ -1120,6 +1134,8 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             || s.timeout_sec.is_some()
             || s.max_prompt_chars.is_some()
             || s.retry.is_some()
+            || s.retry_on.is_some()
+            || s.hang_after_sec.is_some()
             || !s.fallback.is_empty()
             || !s.env.is_empty()
             || !s.env_remove.is_empty()
@@ -1813,6 +1829,36 @@ mod tests {
                 .unwrap_err()
                 .contains("retry_on")
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_budget_and_tool_parallel_values() {
+        for value in ["-0.01", ".nan", ".inf", "-.inf"] {
+            let error = parse(&format!(
+                "name: t\ndefaults:\n  max_cost_usd: {value}\nsteps:\n  - id: a\n    cmd: echo hi\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("max_cost_usd"), "{value}: {error}");
+            assert!(error.contains("finite number >= 0"), "{value}: {error}");
+        }
+
+        let error = parse(
+            "name: t\ndefaults:\n  tool_max_parallel: {claude: 0}\nsteps:\n  - id: a\n    cmd: echo hi\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("tool_max_parallel.claude"), "{error}");
+        assert!(error.contains("forever"), "{error}");
+    }
+
+    #[test]
+    fn rejects_leaf_retry_settings_silently_attached_to_a_group() {
+        for field in ["retry_on: any", "hang_after_sec: 0"] {
+            let error = parse(&format!(
+                "name: t\nsteps:\n  - id: g\n    {field}\n    parallel:\n      - id: c\n        cmd: echo hi\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("carries only"), "{field}: {error}");
+        }
     }
 
     #[test]

@@ -454,6 +454,60 @@ else
 fi
 contains "notes preserve the pre-compact original" "ORIGINAL-BEFORE-COMPACT-0123456789" "$COMPACT_NOTES"
 
+# max_total_steps covers every engine-scheduled leaf run, including recovery
+# and summarization paths. Those two paths used to increment the count without
+# checking it, so a limit of one still executed a second external command.
+cat > max-total-fallback.yaml <<'YAML'
+name: max-total-fallback
+defaults:
+  max_total_steps: 1
+profiles:
+  broken: { tool: codex, bin: "false", access: read }
+  works:  { tool: codex, bin: "echo", access: read }
+steps:
+  - id: primary
+    use: broken
+    fallback: [works]
+    prompt: "must not reach the fallback"
+YAML
+"$SFH" run max-total-fallback.yaml --runs-dir max-total-fallback-runs -q \
+  > max-total-fallback.out 2> max-total-fallback.err
+check "max_total_steps blocks a fallback leaf beyond the limit" 1 $?
+contains "the fallback limit error names max_total_steps" "max_total_steps (1)" max-total-fallback.err
+MAX_TOTAL_FB_LOG="$(find max-total-fallback-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -qF '"event":"fallback"' "$MAX_TOTAL_FB_LOG"; then
+  echo "FAIL - a fallback was spawned beyond max_total_steps"
+  fail=$((fail + 1))
+else
+  echo "ok   - no fallback was spawned beyond max_total_steps"
+  pass=$((pass + 1))
+fi
+
+cat > max-total-compact.yaml <<'YAML'
+name: max-total-compact
+defaults:
+  max_total_steps: 1
+steps:
+  - id: source
+    cmd: ["printf", "LONG-OUTPUT-FOR-COMPACTION"]
+    compact:
+      when_over: 1
+      tool: codex
+      bin: "echo"
+YAML
+"$SFH" run max-total-compact.yaml --runs-dir max-total-compact-runs -q \
+  > max-total-compact.out 2> max-total-compact.err
+check "max_total_steps blocks a compactor leaf beyond the limit" 1 $?
+contains "the compactor limit error names max_total_steps" "max_total_steps (1)" max-total-compact.err
+MAX_TOTAL_COMPACT_LOG="$(find max-total-compact-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -qF '"event":"compact_start"' "$MAX_TOTAL_COMPACT_LOG"; then
+  echo "FAIL - a compactor was spawned beyond max_total_steps"
+  fail=$((fail + 1))
+else
+  echo "ok   - no compactor was spawned beyond max_total_steps"
+  pass=$((pass + 1))
+fi
+
 # --- empty output from a cmd step is allowed, shell injection is not ----------
 # With unsafe_shell_template the step opts back into shell templating; sfh then
 # applies the metacharacter check, which still catches shell DELIMITERS. (That
@@ -911,6 +965,130 @@ contains "the second attempt stdout has an a2 artifact" "SECOND-STDOUT" "$RETRY_
 contains "the first attempt stderr is preserved" "FIRST-STDERR" "$RETRY_DIR/retry.err.txt"
 contains "the second attempt stderr has an a2 artifact" "SECOND-STDERR" "$RETRY_DIR/retry.a2.err.txt"
 contains "the second attempt chain has an a2 artifact" "SECOND-STDOUT" "$RETRY_DIR/retry.a2.chain.txt"
+
+# Every attempt is billable even though retries are represented by one
+# step_end. Before v1.1.1 the successful attempt replaced the failed one's
+# Usage, so two $0.10 attempts looked like $0.10 and the next step ran under a
+# $0.15 ceiling.
+rm -f retry-cost.marker retry-cost-next.marker
+cat > retry-cost.yaml <<YAML
+name: retry-cost
+defaults:
+  max_cost_usd: 0.15
+steps:
+  - id: paid
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    retry: { max: 1, backoff_sec: 0 }
+    retry_on: any
+    env:
+      SFH_STUB_COST: "0.10"
+      SFH_STUB_FAIL_ONCE: "retry-cost.marker"
+    prompt: "fail once, then recover"
+  - id: forbidden
+    cmd: ["sh", "-c", "printf 'ran\n' > retry-cost-next.marker"]
+YAML
+"$SFH" run retry-cost.yaml --runs-dir retry-cost-runs -q > retry-cost.out 2> retry-cost.err
+check "retry accounting stops before the next step after two paid attempts" 1 $?
+RETRY_COST_LOG="$(find retry-cost-runs -type f -name 'log.jsonl' -print -quit)"
+contains "retry accounting records both attempts" '"attempts":2' "$RETRY_COST_LOG"
+contains "retry accounting accumulates both costs" '"cost_usd":0.2' "$RETRY_COST_LOG"
+contains "retry accounting accumulates input tokens" '"input_tokens":22' "$RETRY_COST_LOG"
+contains "retry accounting accumulates output tokens" '"output_tokens":14' "$RETRY_COST_LOG"
+if [ -e retry-cost-next.marker ]; then
+  echo "FAIL - the cost guard let the post-retry step run"
+  fail=$((fail + 1))
+else
+  echo "ok   - the cost guard blocked the post-retry step"
+  pass=$((pass + 1))
+fi
+
+# A provider's negative report is invalid accounting input, not a refund. The
+# old live path added it verbatim even though resume clamped the same record.
+rm -f negative-cost-next.marker
+cat > negative-cost.yaml <<YAML
+name: negative-cost
+defaults:
+  max_cost_usd: 0.10
+steps:
+  - id: positive_one
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    env: { SFH_STUB_COST: "0.09" }
+    prompt: "first charge"
+  - id: invalid_refund
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    env: { SFH_STUB_COST: "-0.09" }
+    prompt: "invalid refund"
+  - id: positive_two
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    env: { SFH_STUB_COST: "0.09" }
+    prompt: "second charge"
+  - id: forbidden
+    cmd: ["sh", "-c", "printf 'ran\n' > negative-cost-next.marker"]
+YAML
+"$SFH" run negative-cost.yaml --runs-dir negative-cost-runs -q > negative-cost.out 2> negative-cost.err
+check "a negative provider cost cannot refund earlier spend" 1 $?
+NEGATIVE_COST_LOG="$(find negative-cost-runs -type f -name 'log.jsonl' -print -quit)"
+contains "the invalid cost is normalized in the durable log" '"cost_usd":0.0' "$NEGATIVE_COST_LOG"
+contains "the invalid report is visible to the operator" "invalid cost_usd" negative-cost.err
+if [ -e negative-cost-next.marker ]; then
+  echo "FAIL - a negative report refunded spend and let the next step run"
+  fail=$((fail + 1))
+else
+  echo "ok   - negative reported cost did not refund spend"
+  pass=$((pass + 1))
+fi
+
+# Runtime validation must match the JSON schema. Non-finite/negative ceilings
+# used to parse successfully; NaN then made every `cost > limit` check false.
+for bad_cost in -0.01 .nan .inf; do
+  cat > "bad-cost-${bad_cost//[^A-Za-z0-9]/_}.yaml" <<YAML
+name: bad-cost
+defaults:
+  max_cost_usd: $bad_cost
+steps:
+  - id: one
+    cmd: ["echo", "one"]
+YAML
+  BAD_COST_FILE="bad-cost-${bad_cost//[^A-Za-z0-9]/_}.yaml"
+  "$SFH" validate "$BAD_COST_FILE" > bad-cost.out 2> bad-cost.err
+  check "validate rejects max_cost_usd=$bad_cost" 2 $?
+  contains "the bad ceiling error names max_cost_usd" "max_cost_usd" bad-cost.err
+done
+
+cat > zero-tool-limit.yaml <<'YAML'
+name: zero-tool-limit
+defaults:
+  tool_max_parallel: { claude: 0 }
+steps:
+  - id: one
+    cmd: ["echo", "one"]
+YAML
+"$SFH" validate zero-tool-limit.yaml > zero-tool-limit.out 2> zero-tool-limit.err
+check "validate rejects a tool concurrency limit that would deadlock" 2 $?
+contains "the zero-limit error explains the permanent block" "block that tool forever" zero-tool-limit.err
+
+for group_field in "retry_on: any" "hang_after_sec: 0"; do
+  cat > bad-group-leaf-setting.yaml <<YAML
+name: bad-group-leaf-setting
+steps:
+  - id: fan
+    $group_field
+    parallel:
+      - id: child
+        cmd: ["echo", "child"]
+YAML
+  "$SFH" validate bad-group-leaf-setting.yaml > bad-group.out 2> bad-group.err
+  check "parallel group rejects ignored leaf setting '$group_field'" 2 $?
+  contains "the group-setting error lists the allowed surface" "carries only" bad-group.err
+done
 
 # --- runs subcommands ---------------------------------------------------------
 "$SFH" runs list > runs.out 2>&1
@@ -3336,6 +3514,79 @@ contains "F6: a missing stderr file makes when_stderr_matches fail closed" \
   "F6-INCONCLUSIVE" f6gone.out
 F6GONE_PROBE="$(grep -F '"event":"step_start"' "$F6GONE_DIR/log.jsonl" | grep -cF '"step":"probe"' | tr -d '[:space:]')"
 check "F6: the fail-closed resume did not re-run the probe either" 1 "$F6GONE_PROBE"
+
+# A failed probe is also complete when step_end records a typed exit, timeout,
+# and interruption state. If sfh stops in the gap before its on_error position,
+# resume must replay on_error + route from that record, not execute the external
+# probe again (which may mutate state or give a different answer).
+rm -f f6-failed-probe-count
+cat > f6failedres.yaml <<'YAML'
+name: f6failedres
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'probe\n' >> f6-failed-probe-count; printf 'sfh: refusing to resume: no recorded access level\n' >&2; printf 'PROBE-REFUSED\n'; exit 3"]
+    on_error: continue
+    route:
+      - {when_exit: 3, when_stderr_matches: "refusing to resume", goto: verified}
+      - {goto: inconclusive}
+  - id: verified
+    cmd: ["echo", "F6-FAILED-VERIFIED"]
+    route: [{goto: end}]
+  - id: inconclusive
+    cmd: ["echo", "F6-FAILED-INCONCLUSIVE"]
+    route: [{goto: fail}]
+YAML
+"$SFH" run f6failedres.yaml --runs-dir f6failedres-runs -q > f6failed-live.out 2> f6failed-live.err
+check "F6: the failed-probe flow runs live" 0 $?
+F6FAILED_DIR="$(dirname "$(find f6failedres-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_end"/ && /"step":"probe"/ { exit }' \
+  "$F6FAILED_DIR/log.jsonl" > "$F6FAILED_DIR/log.cut"
+mv "$F6FAILED_DIR/log.cut" "$F6FAILED_DIR/log.jsonl"
+"$SFH" run f6failedres.yaml --resume "$F6FAILED_DIR" -q > f6failed-resume.out 2> f6failed-resume.err
+check "F6: resume completes from a recorded failed probe" 0 $?
+contains "F6: failed-probe resume takes the recorded diagnostic branch" \
+  "F6-FAILED-VERIFIED" f6failed-resume.out
+F6FAILED_CALLS="$(wc -l < f6-failed-probe-count | tr -d '[:space:]')"
+check "F6: failed-probe resume does not execute the probe twice" 1 "$F6FAILED_CALLS"
+F6FAILED_STARTS="$(grep -F '"event":"step_start"' "$F6FAILED_DIR/log.jsonl" | grep -cF '"step":"probe"' | tr -d '[:space:]')"
+check "F6: failed-probe log contains one probe start across resume" 1 "$F6FAILED_STARTS"
+
+# The same crash gap exists for a failed aggregate_end. Its member snapshot and
+# headerless route text are already durable, so on_error: continue can be
+# replayed without re-running a failed member.
+rm -f f6-failed-group-count
+cat > f6failedgroup.yaml <<'YAML'
+name: f6failedgroup
+steps:
+  - id: fan
+    on_error: continue
+    parallel:
+      - id: child
+        cmd: ["sh", "-c", "printf 'child\n' >> f6-failed-group-count; printf 'CHILD-FAILED\n'; exit 7"]
+    route:
+      - {when_exit: 1, goto: expected}
+      - {goto: wrong}
+  - id: expected
+    cmd: ["echo", "F6-FAILED-GROUP-EXPECTED"]
+    route: [{goto: end}]
+  - id: wrong
+    cmd: ["echo", "F6-FAILED-GROUP-WRONG"]
+    route: [{goto: fail}]
+YAML
+"$SFH" run f6failedgroup.yaml --runs-dir f6failedgroup-runs -q \
+  > f6failedgroup-live.out 2> f6failedgroup-live.err
+check "F6: the failed-group flow runs live" 0 $?
+F6FAILEDGROUP_DIR="$(dirname "$(find f6failedgroup-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"aggregate_end"/ && /"step":"fan"/ { exit }' \
+  "$F6FAILEDGROUP_DIR/log.jsonl" > "$F6FAILEDGROUP_DIR/log.cut"
+mv "$F6FAILEDGROUP_DIR/log.cut" "$F6FAILEDGROUP_DIR/log.jsonl"
+"$SFH" run f6failedgroup.yaml --resume "$F6FAILEDGROUP_DIR" -q \
+  > f6failedgroup-resume.out 2> f6failedgroup-resume.err
+check "F6: resume completes from a recorded failed aggregate" 0 $?
+contains "F6: failed aggregate resumes through the expected branch" \
+  "F6-FAILED-GROUP-EXPECTED" f6failedgroup-resume.out
+F6FAILEDGROUP_CALLS="$(wc -l < f6-failed-group-count | tr -d '[:space:]')"
+check "F6: failed aggregate resume does not re-run its member" 1 "$F6FAILEDGROUP_CALLS"
 
 # --- F6: validate checks the new regex like the other two --------------------
 cat > f6badrx.yaml <<'YAML'

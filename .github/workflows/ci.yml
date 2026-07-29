@@ -7,6 +7,7 @@ on:
     # on main: three OS runners that nothing reaches are not a gate.
     branches: ['**']
   pull_request:
+  workflow_call:
 
 jobs:
   test:
@@ -20,7 +21,7 @@ jobs:
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --release -- -D warnings
+        run: cargo clippy --release --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test --release
       - name: Build

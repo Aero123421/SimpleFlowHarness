@@ -1281,7 +1281,8 @@ fn parse_cursor_json(stdout: &str) -> ParsedOut {
 /// message_end. Usage is per message, so it is summed across the run.
 fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
     let mut o = ParsedOut::default();
-    let (mut inp, mut outp, mut cost) = (0u64, 0u64, 0f64);
+    let (mut inp, mut outp) = (0u64, 0u64);
+    let mut reported_usage = preset::Usage::default();
     let mut saw_usage = false;
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
@@ -1329,11 +1330,13 @@ fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
                     saw_usage = true;
                     inp += u.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
                     outp += u.get("output").and_then(|x| x.as_u64()).unwrap_or(0);
-                    cost += u
+                    if let Some(cost) = u
                         .get("cost")
                         .and_then(|c| c.get("total"))
                         .and_then(|x| x.as_f64())
-                        .unwrap_or(0.0);
+                    {
+                        reported_usage.add_reported_cost(cost);
+                    }
                 }
             }
             _ => {}
@@ -1342,7 +1345,11 @@ fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
     if saw_usage {
         o.usage.input_tokens = Some(inp);
         o.usage.output_tokens = Some(outp);
-        o.usage.cost_usd = Some(cost);
+        if reported_usage.cost_usd.is_none() {
+            reported_usage.cost_usd = Some(0.0);
+        }
+        o.usage.cost_usd = reported_usage.cost_usd;
+        o.usage.invalid_cost = reported_usage.invalid_cost;
     }
     o
 }
@@ -1351,6 +1358,7 @@ fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
 pub fn exec_leaf(prep: Prepared) -> LeafDone {
     let cfg = prep.retry;
     let mut attempt = 0u32;
+    let mut cumulative_usage = preset::Usage::default();
     loop {
         let mut attempt_prep = prep.clone();
         if attempt > 0 {
@@ -1367,6 +1375,8 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
                 .with_file_name(format!("{}.a{number}.chain.txt", prep.tag));
         }
         let mut done = exec_once(attempt_prep);
+        cumulative_usage.accumulate(&done.usage);
+        done.usage = cumulative_usage.clone();
         done.attempts = attempt + 1;
         if done.ok() || done.interrupted || attempt >= cfg.max {
             return done;
@@ -1543,7 +1553,7 @@ fn exec_once(p: Prepared) -> LeafDone {
     let _ = contain::write_private(&p.out_file, &stdout_clean);
     let _ = contain::write_private(&p.err_file, &stderr_clean);
 
-    let parsed = match parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)) {
+    let mut parsed = match parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)) {
         Ok(o) => o,
         Err(e) => {
             // A containment violation reading the tool's artifact is a failure
@@ -1556,6 +1566,12 @@ fn exec_once(p: Prepared) -> LeafDone {
             }
         }
     };
+    if parsed.usage.sanitize_reported() {
+        let warning = "provider reported an invalid cost_usd; the value was normalized without refunding prior spend";
+        eprintln!("sfh: warning: [{}] {warning}", p.tag);
+        stderr_clean.push_str(&format!("\nsfh: {warning}\n"));
+        let _ = contain::write_private(&p.err_file, &stderr_clean);
+    }
     let mut exit_code = outcome.exit_code;
     // Several tools report success/failure in-band and get the exit code wrong.
     if parsed.failed && exit_code == 0 {
@@ -1770,7 +1786,7 @@ fn parse_opencode_ndjson(stdout: &str) -> ParsedOut {
                         o.usage.output_tokens = num(tk.get("output"));
                     }
                     if let Some(c) = part.get("cost").and_then(|x| x.as_f64()) {
-                        o.usage.cost_usd = Some(o.usage.cost_usd.unwrap_or(0.0) + c);
+                        o.usage.add_reported_cost(c);
                     }
                 }
             }
@@ -1872,7 +1888,14 @@ pub struct ToolGate {
 }
 
 impl ToolGate {
-    pub fn new(limits: HashMap<String, u32>) -> Arc<ToolGate> {
+    pub fn new(mut limits: HashMap<String, u32>) -> Arc<ToolGate> {
+        // Flow validation rejects zero. Keep this constructor safe as well:
+        // tests and future callers can build a gate directly, and a zero here
+        // used to wait on the condition variable forever before any child was
+        // spawned (so neither the step timeout nor idle detection could help).
+        for limit in limits.values_mut() {
+            *limit = (*limit).max(1);
+        }
         Arc::new(ToolGate {
             limits,
             state: Mutex::new(HashMap::new()),
@@ -2134,6 +2157,14 @@ pub fn last_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_tool_gate_limit_is_defensively_bounded_instead_of_deadlocking() {
+        let gate = ToolGate::new(HashMap::from([("claude".to_string(), 0)]));
+        let held = gate.acquire(&Some("claude".to_string()));
+        assert_eq!(held.as_deref(), Some("claude"));
+        gate.release(held);
+    }
 
     #[test]
     fn clean_text_strips_ansi_and_collapses_progress_frames() {

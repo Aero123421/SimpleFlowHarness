@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.1.1 — 2026-07-29
+
+### 修正
+
+- 再試行した leaf のトークン数・報告コストを全 attempt 分累積するようにした。失敗した
+  attempt の支出が最後の成功値で上書きされず、`max_cost_usd` をすり抜けない。
+- 外部ツールが返す負数・NaN・無限大のコストを会計境界で正規化した。負数は過去の支出を
+  払い戻さず、正の無限大は有限予算を fail-closed で止める。`max_cost_usd` 自体も
+  finite かつ 0 以上でなければ validate が拒否する。
+- 失敗した probe / fan-out が `step_end` / `aggregate_end` を記録した直後に停止した run を
+  resume するとき、`on_error: continue` / `goto:*` と route だけを再生するようにした。
+  外部 probe を二重実行せず、記録済み exit / stderr / 出力をそのまま使う。
+- `tool_max_parallel: 0` を validate で拒否し、直接生成された `ToolGate` も 1 に丸める。
+  child spawn 前に永久待機する経路をなくした。
+- `max_total_steps` を primary だけでなく fallback と compact の leaf run にも適用した。
+- `parallel:` group に置かれた leaf 専用の `retry_on` / `hang_after_sec` を黙って無視せず
+  validate エラーにした。
+- process 終了と pipe reader の競合で最後の出力を見落とし、`idle_ms` を過大計上して
+  正常終了を hang 扱いする可能性を修正した。
+
+### リリース品質
+
+- release は 3 OS の全 CI と install 手順検証を通過してから build し、全 5 platform の
+  asset と checksum が揃った後に一度だけ公開する。matrix の途中失敗による partial
+  release を防止した。
+- CI の Clippy を `--all-targets -D warnings` に統一した。
+- v1.1 仕様書の実装済み phase / checklist、README のテスト記録を同期し、
+  ローカル `.claude/worktrees/` を追跡対象から除外した。
+
 ## v1.1.0
 
 ### 破壊的変更

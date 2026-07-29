@@ -881,13 +881,10 @@ pub fn run_cmd(
         std::thread::sleep(Duration::from_millis(100));
     };
     untrack(pid);
-    // Measured here, not after the drain: the question is how long the child
-    // was silent when it died, and the drain deadline that follows can add
-    // minutes of waiting on a grandchild that is holding the pipe.
-    let idle_ms = {
-        let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        elapsed.saturating_sub(activity.last_ms.load(Ordering::Relaxed))
-    };
+    // Keep the time of death fixed. Reader threads may still be holding a
+    // final buffered chunk at this instant; their activity snapshot is taken
+    // after the drain below, then clamped back to this point.
+    let death_elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Drain the pipes with a deadline: a grandchild that inherited the write
     // ends can otherwise hold them open forever after the child exited.
@@ -926,6 +923,12 @@ pub fn run_cmd(
     if let Some(t) = stdin_thread {
         let _ = t.join();
     }
+    // A final stdout/stderr chunk can be read just after try_wait observed the
+    // process exit. Sampling before the pipe drain made that healthy final
+    // output invisible and exaggerated idle_ms into a false hang. Activity
+    // observed during the drain cannot be later than the child's death for
+    // this calculation, so clamp it to that fixed instant.
+    let idle_ms = idle_at(death_elapsed_ms, activity.last_ms.load(Ordering::Relaxed));
     Ok(ExecOutcome {
         exit_code: status.code().unwrap_or(-1),
         timed_out,
@@ -935,6 +938,10 @@ pub fn run_cmd(
         dur_ms: start.elapsed().as_millis(),
         idle_ms,
     })
+}
+
+fn idle_at(death_elapsed_ms: u64, last_activity_ms: u64) -> u64 {
+    death_elapsed_ms.saturating_sub(last_activity_ms.min(death_elapsed_ms))
 }
 
 /// Per-stream capture cap; the reader keeps draining past it (discarding) so
@@ -1130,6 +1137,16 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_clock_includes_final_pipe_activity_without_counting_drain_time() {
+        assert_eq!(idle_at(1_000, 250), 750);
+        assert_eq!(idle_at(1_000, 1_000), 0);
+        // A reader can timestamp a buffered final chunk just after the process
+        // death snapshot. Clamp it to death instead of underflowing or treating
+        // the drain itself as runtime.
+        assert_eq!(idle_at(1_000, 1_025), 0);
+    }
 
     #[test]
     fn exe_match_is_exact_stem_not_substring() {
