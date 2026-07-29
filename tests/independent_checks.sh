@@ -1403,6 +1403,55 @@ if "$SFH" validate f23c.yaml >/dev/null 2>&1
   then bad "-Command came first, so its tail is command text - the template must be refused"
   else ok  "-Command first still claims the whole tail, -File in it and all"; fi
 
+# -------------------------------------------------------- 24. tenth round
+sec "24. cases the tenth review round found missing"
+
+# The SWITCH itself can be a template. The check runs before rendering - that
+# is the point of it - so an argument still holding {{...}} could turn into
+# -Command at run time. It read as a bare word, and the code in the next
+# argument went through as ordinary data.
+cat > f24a.yaml <<'YAML'
+name: tswitch
+steps:
+  - id: mode
+    cmd: ["echo", "-Command"]
+  - id: invoke
+    cmd:
+      - pwsh
+      - "{{steps.mode.output | trim}}"
+      - "Write-Output {{steps.mode.output}}"
+YAML
+if "$SFH" validate f24a.yaml >/dev/null 2>&1
+  then bad "validate accepted a TEMPLATED switch that becomes -Command at run time"
+  else ok  "validate refuses a shell whose switch is not knowable until render"; fi
+
+# The same trick with sh.
+cat > f24b.yaml <<'YAML'
+name: tswitch-sh
+steps:
+  - id: mode
+    cmd: ["echo", "-c"]
+  - id: invoke
+    cmd: ["sh", "{{steps.mode.output | trim}}", "echo {{steps.mode.output}}"]
+YAML
+if "$SFH" validate f24b.yaml >/dev/null 2>&1
+  then bad "validate accepted a templated switch in front of sh"
+  else ok  "validate refuses a templated switch in front of sh too"; fi
+
+# A template AFTER a real script flag is already classified, so the positional
+# form still works - the fail-closed rule must not swallow it.
+cat > f24c.yaml <<'YAML'
+name: tswitch-ok
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["sh", "-c", "cat -- \"$1\"", "b", "{{steps.a.output}}"]
+YAML
+if "$SFH" validate f24c.yaml >/dev/null 2>&1
+  then ok  "LEGIT: a positional argument after a real -c is still allowed"
+  else bad "LEGIT: the templated-switch rule swallowed the positional form"; fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"

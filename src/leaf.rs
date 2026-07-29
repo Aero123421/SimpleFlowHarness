@@ -363,6 +363,18 @@ pub fn shell_script_span(argv: &[String]) -> Option<std::ops::Range<usize>> {
         return None;
     }
     for (i, a) in argv.iter().enumerate().skip(1) {
+        // The SWITCH itself can be a template. This runs before rendering -
+        // that is the point, the answer has to be known before anything is
+        // spent - so an argument still holding {{...}} could turn into
+        // -Command, -c, /C or anything else at run time:
+        //   cmd: ["pwsh", "{{steps.mode.output}}", "Write-Output {{x}}"]
+        // read as a bare word here, and the third argument then rendered as
+        // ordinary data straight into PowerShell. Once the classification
+        // depends on a value that does not exist yet, the only honest answer
+        // is that everything from here on might be shell text.
+        if template::contains_template(a) {
+            return Some(i..argv.len());
+        }
         let low = a.to_lowercase();
         if sh_family && (low == "-c" || low == "-lc" || low == "-ec") {
             return Some(i + 1..(i + 2).min(argv.len()));
@@ -2778,6 +2790,18 @@ mod tests {
         // re-joins.
         assert_eq!(s(&["pwsh", "-Command", "x", "-File", "s.ps1"]), Some(2..5));
 
+        // A templated SWITCH cannot be classified before it is rendered, so
+        // everything from it on is treated as shell text and any template in
+        // there is refused. Without this, ["pwsh","{{x}}","code {{y}}"] read as
+        // a bare word and the code went through as ordinary data.
+        assert_eq!(s(&["pwsh", "{{steps.a.output}}", "code"]), Some(1..3));
+        assert_eq!(s(&["sh", "{{steps.a.output}}", "-c", "x"]), Some(1..4));
+        // A template AFTER the script flag has already been classified, so the
+        // positional-argument form is untouched.
+        assert_eq!(
+            s(&["sh", "-c", "cat \"$1\"", "n", "{{steps.a.output}}"]),
+            Some(2..3)
+        );
         // Not a shell, or no run-string flag: no shell text.
         assert_eq!(s(&["echo", "hi"]), None);
         assert_eq!(s(&["sh", "script.sh"]), None);
