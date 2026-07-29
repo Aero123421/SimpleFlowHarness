@@ -40,7 +40,13 @@ pub struct RetryCfg {
     pub max: u32,
     pub backoff_sec: u64,
     pub mode: RetryMode,
+    /// Silence, in seconds, that makes a timeout count as a hang rather than as
+    /// honest overrun. Only `RetryMode::Transient` consults it.
+    pub hang_after_sec: u64,
 }
+
+/// Default silence before a timeout is read as a hang (seconds).
+pub const DEFAULT_HANG_AFTER_SEC: u64 = 300;
 
 impl Default for RetryCfg {
     fn default() -> Self {
@@ -48,6 +54,7 @@ impl Default for RetryCfg {
             max: 0,
             backoff_sec: 5,
             mode: RetryMode::Transient,
+            hang_after_sec: DEFAULT_HANG_AFTER_SEC,
         }
     }
 }
@@ -87,6 +94,9 @@ pub struct Prepared {
     pub access: Option<preset::Access>,
     pub allow_empty: bool,
     pub retry: RetryCfg,
+    /// Run-level activity clock every child of this run touches when it writes
+    /// anything, so `status.json` can say how long the whole run has been quiet.
+    pub run_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -97,6 +107,8 @@ pub struct LeafDone {
     pub timed_out: bool,
     pub interrupted: bool,
     pub dur_ms: u128,
+    /// Silence before the child exited or was killed (see ExecOutcome::idle_ms).
+    pub idle_ms: u64,
     pub attempts: u32,
     pub chain_output: String,
     pub stderr_clean: String,
@@ -236,16 +248,22 @@ pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
         "never" => RetryMode::Never,
         _ => RetryMode::Transient,
     };
+    let hang_after_sec = step
+        .hang_after_sec
+        .or(flow.defaults.hang_after_sec)
+        .unwrap_or(DEFAULT_HANG_AFTER_SEC);
     match r {
         Some(r) => RetryCfg {
             max: r.max,
             backoff_sec: r.backoff_sec.unwrap_or(5),
             mode,
+            hang_after_sec,
         },
         None => RetryCfg {
             max: 0,
             backoff_sec: 5,
             mode,
+            hang_after_sec,
         },
     }
 }
@@ -266,6 +284,8 @@ pub struct PrepCtx<'a> {
     /// not overridden by an explicit --var: run-derived UNTRUSTED input, barred
     /// from executed-privileged template sinks (rev_break #12).
     pub tainted_vars: &'a HashSet<String>,
+    /// Run-level activity clock handed to every leaf this context prepares.
+    pub run_clock: Option<&'a Arc<std::sync::atomic::AtomicU64>>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -962,6 +982,7 @@ pub fn prepare_leaf(
         // Custom commands may legitimately print nothing; agent steps may not.
         allow_empty: step.allow_empty.unwrap_or(!is_preset),
         retry: retry_cfg(cx.flow, step),
+        run_clock: cx.run_clock.cloned(),
         quiet: cx.quiet,
         verbose: cx.verbose,
     })
@@ -1263,9 +1284,15 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
         let retryable = match cfg.mode {
             RetryMode::Never => false,
             RetryMode::Any => true,
+            // A timeout used to be categorically non-transient, which was right
+            // for "the model was still working when the clock ran out" and
+            // wrong for "the pipe went dead 38 minutes ago" (B-12). The idle
+            // clock separates them: silence longer than hang_after_sec is a
+            // hang, and a hang is exactly the kind of failure a retry fixes.
             RetryMode::Transient => {
-                !done.timed_out
-                    && execute::is_transient_failure(&done.stderr_clean, &done.chain_output)
+                (!done.timed_out
+                    && execute::is_transient_failure(&done.stderr_clean, &done.chain_output))
+                    || (done.timed_out && done.idle_ms >= cfg.hang_after_sec.saturating_mul(1000))
             }
         };
         if !retryable {
@@ -1273,10 +1300,14 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
         }
         let wait = cfg.backoff_sec.saturating_mul(1u64 << attempt.min(5));
         if !prep.quiet {
+            let why = if done.timed_out {
+                format!("timed out after {}s of silence", done.idle_ms / 1000)
+            } else {
+                format!("exit={}", done.exit_code)
+            };
             eprintln!(
-                "sfh: [{}] transient failure (exit={}), retrying in {wait}s ({}/{})",
+                "sfh: [{}] transient failure ({why}), retrying in {wait}s ({}/{})",
                 prep.tag,
-                done.exit_code,
                 attempt + 1,
                 cfg.max
             );
@@ -1362,6 +1393,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             timed_out: false,
             interrupted: false,
             dur_ms: 0,
+            idle_ms: 0,
             attempts: 1,
             chain_output: String::new(),
             stderr_clean: why,
@@ -1382,9 +1414,12 @@ fn exec_once(p: Prepared) -> LeafDone {
         p.timeout,
         &p.env_remove,
         &p.env_set,
-        // Tee to the step's out file so a long step is observable while it
-        // runs; the cleaned text replaces it once the child exits.
-        Some(p.out_file.clone()),
+        execute::Observe {
+            // Tee to the step's out file so a long step is observable while it
+            // runs; the cleaned text replaces it once the child exits.
+            tee: Some(p.out_file.clone()),
+            run_clock: p.run_clock.clone(),
+        },
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -1398,6 +1433,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 timed_out: false,
                 interrupted: execute::interrupted(),
                 dur_ms: 0,
+                idle_ms: 0,
                 attempts: 1,
                 chain_output: String::new(),
                 stderr_clean: e,
@@ -1501,6 +1537,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         timed_out: outcome.timed_out,
         interrupted: outcome.interrupted,
         dur_ms: outcome.dur_ms,
+        idle_ms: outcome.idle_ms,
         attempts: 1,
         chain_output,
         stderr_clean,
@@ -1920,6 +1957,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         timed_out: false,
         interrupted: false,
         dur_ms: 0,
+        idle_ms: 0,
         attempts: 1,
         chain_output: String::new(),
         stderr_clean: "sfh: internal error: worker thread died before producing a result".into(),
@@ -2356,6 +2394,7 @@ mod tests {
             sessions,
             needed_sessions: needed,
             tainted_vars: no_tainted_vars(),
+            run_clock: None,
             quiet: true,
             verbose: false,
         }
@@ -3010,6 +3049,7 @@ mod tests {
             sessions: &sessions,
             needed_sessions: &needed,
             tainted_vars: &tainted,
+            run_clock: None,
             quiet: true,
             verbose: false,
         };

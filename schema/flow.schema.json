@@ -84,6 +84,7 @@
         "wall_clock_sec": { "type": "integer", "minimum": 1 },
         "retry": { "$ref": "#/definitions/retry" },
         "retry_on": { "enum": ["transient", "any", "never"], "default": "transient" },
+        "hang_after_sec": { "type": "integer", "minimum": 0, "default": 300, "description": "Silence after which a timeout counts as a hang rather than honest overrun, so retry_on: transient retries it. Measured across stdout AND stderr." },
         "fork_warmup": { "enum": ["auto", "always", "never"], "default": "auto", "description": "Stagger forks of one parent so the provider prompt cache warms first. auto = only where it measurably pays (claude)." },
         "env": { "type": "object", "additionalProperties": { "type": "string" } }
       }
@@ -202,6 +203,7 @@
         "fork_from": { "type": "string", "description": "Branch that step's session: inherit its context but write to a new session. claude/opencode/grok/pi only; several steps may fork the same parent." },
         "retry": { "$ref": "#/definitions/retry" },
         "retry_on": { "enum": ["transient", "any", "never"] },
+        "hang_after_sec": { "type": "integer", "minimum": 0, "description": "Silence after which this step's timeout counts as a hang (default 300, or defaults.hang_after_sec)." },
         "fallback": {
           "type": "array",
           "items": { "type": "string" },

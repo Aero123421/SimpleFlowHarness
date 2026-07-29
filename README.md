@@ -151,6 +151,7 @@ defaults:                    # 全ステップの既定値(すべて任意)
   wall_clock_sec: 7200       # フロー全体の実時間上限
   retry: { max: 2, backoff_sec: 5 }   # 失敗時のリトライ(指数バックオフ)
   retry_on: transient        # transient(既定,429/5xx/切断など) | any | never
+  hang_after_sec: 300        # この秒数以上無出力のままタイムアウトしたら「ハング」=一過性と分類(既定300)
   fork_warmup: auto          # fork_from時のウォームアップ auto(既定) | always | never
   env: { MY_VAR: value }     # 全子プロセスに渡す環境変数
 
@@ -173,6 +174,7 @@ steps:
     on_error: fail           # fail(既定) | continue | goto:<id> | goto:end | goto:fail
     on_max_visits: goto:end  # 差し戻し回数を使い切った時の降格先(既定fail=フロー終了)
     retry: { max: 2 }        # このステップだけのリトライ
+    hang_after_sec: 600      # このステップだけのハング判定しきい値(既定はdefaults、無指定なら300)
     fallback: [cheap2]       # リトライ後も落ちたら、このプロファイルで再挑戦(別ツールでも可)
     allow_empty: false       # 空の最終メッセージを失敗扱いにする(AIステップの既定)
     env: { FOO: bar }        # このステップの子プロセスにだけ渡す
@@ -337,6 +339,7 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 コマンドライン付きで警告し、同じ情報を `status.json.unfinished_step` にも残す。
 
 - **リトライ**: `retry: {max: 2, backoff_sec: 5}` — 既定では 429 / 5xx / 接続断など**一過性と判定できる失敗のみ**再試行(指数バックオフ)。`retry_on: any` で何でも、`never` で無効
+- **ハングは一過性に数える**: タイムアウトは従来まとめて非一過性だった。`hang_after_sec`(既定300)以上**何も出力しないまま**タイムアウトした試行だけは「時間切れ」ではなく「パイプが死んだ」と分類し、`retry_on: transient` の再試行対象にする。出力を出し続けたまま時間切れになった試行は従来どおり再試行しない(同じ予算を二度焼くだけだから)
 - **フォールバック**: `fallback: [profile_a, profile_b]` — リトライ後も落ちたら別プロファイル(別プロバイダ・別モデルでも可)で再挑戦
 - **差し戻しループの降格**: `on_max_visits: goto:summarize` — 3回REVISEされたら諦めて要約に進む、が書ける(既定はフロー失敗)
 
@@ -375,10 +378,35 @@ run dir の `status.json` が3秒ごとに更新される。`sfh status` を使�
 
 ```json
 { "state": "running", "current_step": "execute", "heartbeat_utc": "20260727-135338",
+  "step_started_utc": "20260727-131240", "last_output_utc": "20260727-131512", "visit": 2,
   "steps_done": 5, "cost_usd": 0.0974, "pid": 64012 }
 ```
 
 終了時には `exit_code` / `emit_step` / `emit_file` / `error` が追記される(`sfh wait` はこれを見て結果を返す)。
+
+### 二つの時計 — 「経過時間」と「最終出力からの時間」
+
+`state: running` と生きているpidとハートビートは、**112分間一言も出力しないまま固まっていた実行**を全部「正常稼働中」と報告した。経過時間だけでは、40分かかるステップが働いているのか、38分前に黙って死んだのかが区別できない。そこで観測している側の事実、つまり**子プロセスの出力が最後に届いた時刻**を記録して出す:
+
+```
+running  3 steps, $0.3100 - fix (visit 2), 41m elapsed, 38m since last output, 2s since heartbeat
+```
+
+- `status.json`: `step_started_utc`(現ステップの開始)/ `last_output_utc`(全子プロセス横断の最終出力。まだ誰も何も出していなければ `null`)/ `visit`(現ステップの周回数)。`sfh status --json` にも同じ3キーが出る
+- `log.jsonl` の `step_end`: `idle_ms` — 終了(またはkill)時点で何ミリ秒黙っていたか。一度も出力しなければ実行時間そのもの
+- 計測は **stdout と stderr の両方**。進捗をstderrにしか出さないCLIがあるため、片方だけを見るとその全タイムアウトがハング扱いになる
+- 打ち切りはしない。sfhはこの時計で**プロセスを殺さない**(分類と露出だけ)。停滞で止めたい場合は、この値をポーリングして呼び出し元が `sfh stop` を打つ
+
+**既知の退化**: sfhが観測できるのはパイプの活動であって、モデルの活動ではない。最後にJSONを一塊で吐くプリセットでは idle ≒ 経過時間になり、ハング分類は「タイムアウトなら常に1回リトライ」へ退化する。
+
+| プリセット | stdoutの出方(sfhの解析形式) | idle時計 |
+|---|---|---|
+| codex / opencode / pi | イベントを逐次(JSONL / NDJSON) | 実効。無言ハングと純粋な時間超過を区別できる |
+| claude / grok / agy | 最後にJSONを一塊 | **退化**。idle ≒ 経過時間 → タイムアウトは常に1回リトライ |
+| cursor | 最後にJSONを一塊(experimental) | 同上 |
+| `cmd:` | コマンド次第 | コマンド次第。逐次出力するコマンドなら実効 |
+
+退化した側でも、ゼロ出力で死んだ試行を1回だけ再試行する損失はゼロなので、この退化は許容している。区別が本当に要るステップは、進捗を吐く `cmd:` で包むか `hang_after_sec` をタイムアウトより長くして分類自体を切ること。
 
 Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済みのAI CLIプロセスは道連れで終了する**(Windowsはjob object、Linuxは`PR_SET_PDEATHSIG`+プロセスグループkill)。放置されたエージェントが課金し続ける事故を防ぐ。`--detach` で起動した実行だけがこの規則の例外で、これは明示的に要求された場合に限られる。
 
@@ -438,7 +466,7 @@ codex-local:
 
 > **sfh は自分の配管については判断する。仕事については絶対に判断しない。**
 
-「能力を足さず、順番と分岐だけ」という説明はもう正確ではない。`compact:` はsfhが選んだモデルと指示で下流の文脈を書き換え、`retry_on: transient` は既知の一過性エラー表現を照合して再試行を決める。どちらも配管を維持するための判断である。一方、成果物が正しいか、レビューに合格したか、作業が停滞したかはsfhには決めさせない。その判定はユーザーが `cmd:` と `route:` で明示し、sfhは終了コード・出力・訪問・コストという観測事実だけを記録する。
+「能力を足さず、順番と分岐だけ」という説明はもう正確ではない。`compact:` はsfhが選んだモデルと指示で下流の文脈を書き換え、`retry_on: transient` は既知の一過性エラー表現を照合して再試行を決める。`hang_after_sec` の無出力判定も同種で、パイプが黙った時間を見て再試行の可否を決める。いずれも配管を維持するための判断である。一方、成果物が正しいか、レビューに合格したか、作業が停滞したかはsfhには決めさせない。その判定はユーザーが `cmd:` と `route:` で明示し、sfhは終了コード・出力・訪問・コストという観測事実だけを記録する。
 
 ## カスタムコマンド(エスケープハッチ)
 
@@ -607,6 +635,8 @@ sfh runs list --runs-dir evruns --json
 
 どの差分を進捗と呼ぶかは、後段のユーザー所有コマンドで決める。sfhが `output_hash` の反復だけを見て自動停止してはいけない。chain outputはエージェントの最終メッセージであって成果物ではなく、同じ「完了しました」が続いてもワークツリーは進んでいる場合があるからである。
 
+`status.json` の `last_output_utc`(上の「二つの時計」)はこれとは別の話で、**パイプが黙っている**ことしか意味しない。喋り続けながら何も作っていないエージェントは、そちらでは検知できない。
+
 ### 差し戻しループ内の `fork_from`
 
 ```yaml
@@ -656,6 +686,7 @@ sfh runs list --runs-dir evruns --json
   meta.json        実行時の変数・sfhバージョン・各CLIの実バイナリとバージョン・合計コスト
   log.jsonl        ステップ毎のexit/所要時間/トークン/コスト/セッションID/コマンドライン
   status.json      3秒ごとに更新される生存信号(state/current_step/cost_usd/pid)
+                   step_started_utc / last_output_utc / visit で停滞が分かる
                    終了時に exit_code / emit_step / emit_file / error が入る
                    resume時の再実行リスクは unfinished_step に入る
   detached.*.txt   --detach 実行のstdout/stderr(sfh wait はここを返す)
@@ -707,8 +738,8 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 ## 開発
 
 ```bash
-cargo test                              # 86本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト191本
+cargo test                              # 124本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト289本
 ```
 
 CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。

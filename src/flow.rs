@@ -52,6 +52,9 @@ pub struct Defaults {
     pub retry: Option<Retry>,
     /// transient (default) | any | never
     pub retry_on: Option<String>,
+    /// How long a step may be silent before a timeout counts as a hang rather
+    /// than as honest overrun (default 300). Only `retry_on: transient` uses it.
+    pub hang_after_sec: Option<u64>,
     /// Env applied to every child process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -164,6 +167,9 @@ pub struct Step {
     pub fork_from: Option<String>,
     pub retry: Option<Retry>,
     pub retry_on: Option<String>,
+    /// Silence (seconds) after which this step's timeout is classified as a
+    /// hang, which `retry_on: transient` does retry. Overrides defaults.
+    pub hang_after_sec: Option<u64>,
     /// Profiles to try (in order) if the step still fails after its retries.
     #[serde(default)]
     pub fallback: Vec<String>,

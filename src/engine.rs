@@ -3,6 +3,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1014,6 +1015,11 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
             state: "running",
             step: String::new(),
             started: utc_stamp(),
+            // The seed knows nothing about steps yet; the child overwrites this
+            // file with the real clocks as soon as it enters its first step.
+            step_started: None,
+            visit: 0,
+            last_output: Arc::new(AtomicU64::new(0)),
             steps_done: 0,
             cost_usd: 0.0,
             run_dir: run_dir.display().to_string(),
@@ -1214,6 +1220,15 @@ struct Status {
     state: &'static str,
     step: String,
     started: String,
+    /// When the current step was entered, and which visit it is. Elapsed time
+    /// for the WHOLE run says nothing about whether the step in front of you is
+    /// moving; these two plus `last_output` are what tell a poller that.
+    step_started: Option<String>,
+    visit: u32,
+    /// Unix-epoch seconds of the last output from ANY child of this run, or 0
+    /// if none has spoken yet. Written by the reader threads (execute::Observe),
+    /// read by the heartbeat, so a status write always carries a fresh value.
+    last_output: Arc<AtomicU64>,
     steps_done: u32,
     cost_usd: f64,
     run_dir: String,
@@ -1245,10 +1260,17 @@ fn status_json(s: &Status) -> String {
             "will_rerun": true,
         })
     });
+    let last_output = match s.last_output.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => serde_json::Value::Null,
+        secs => json!(utc_stamp_at(secs)),
+    };
     let v = json!({
         "state": s.state,
         "current_step": s.step,
         "started_utc": s.started,
+        "step_started_utc": s.step_started,
+        "last_output_utc": last_output,
+        "visit": s.visit,
         "heartbeat_utc": utc_stamp(),
         "steps_done": s.steps_done,
         "cost_usd": s.cost_usd,
@@ -1629,6 +1651,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     );
 
     // ---- live status file + heartbeat so a parent agent can poll liveness ----
+    // The run-level activity clock: every child's reader thread stores the
+    // moment it read anything here, so the heartbeat can publish "nothing has
+    // been said for N minutes" without asking any single step.
+    let run_clock = Arc::new(AtomicU64::new(0));
     let status_path = run_dir.join("status.json");
     let status = Arc::new(Mutex::new(Status {
         state: "running",
@@ -1639,6 +1665,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .or_else(|| resumed.start.clone())
             .unwrap_or_default(),
         started: started.clone(),
+        step_started: None,
+        visit: 0,
+        last_output: Arc::clone(&run_clock),
         steps_done: resumed.total,
         cost_usd: resumed.cost_usd,
         run_dir: run_dir.display().to_string(),
@@ -1749,6 +1778,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 sessions: &sessions,
                 needed_sessions: &needed_sessions,
                 tainted_vars: &tainted_vars,
+                // Nothing is executed on this path - it only re-evaluates a
+                // recorded route - so there is no child to time.
+                run_clock: None,
                 quiet: opts.quiet,
                 verbose: opts.verbose,
             };
@@ -1884,6 +1916,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 }
             }
             visits.insert(step.id.clone(), visit);
+            // Only now is the visit number known, and only a step that actually
+            // runs gets a start time: a step turned away by the max_visits gate
+            // above never began, and dating it would put a clock on nothing.
+            {
+                let mut g = status.lock().unwrap();
+                g.step_started = Some(utc_stamp());
+                g.visit = visit;
+            }
             let gtag = if visit == 1 {
                 step.id.clone()
             } else {
@@ -1904,6 +1944,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         sessions: $sessions,
                         needed_sessions: &needed_sessions,
                         tainted_vars: &tainted_vars,
+                        run_clock: Some(&run_clock),
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     }
@@ -2452,6 +2493,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         original: &chain_output,
                         run_dir: &run_dir,
                         tag: &gtag,
+                        run_clock: &run_clock,
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     };
@@ -2814,6 +2856,9 @@ struct CompactRun<'a, 'ctx> {
     original: &'a str,
     run_dir: &'a Path,
     tag: &'a str,
+    /// The summarizer is a child of this run like any other, so its output
+    /// counts as the run being alive.
+    run_clock: &'a Arc<AtomicU64>,
     quiet: bool,
     verbose: bool,
 }
@@ -2828,6 +2873,7 @@ fn run_compact(
         original,
         run_dir,
         tag,
+        run_clock,
         quiet,
         verbose,
     } = run;
@@ -2916,6 +2962,7 @@ fn run_compact(
         access: Some(preset::Access::Read),
         allow_empty: false,
         retry: leaf::RetryCfg::default(),
+        run_clock: Some(Arc::clone(run_clock)),
         quiet,
         verbose,
     };
@@ -3047,6 +3094,8 @@ fn dry_run(
         sessions: &sessions,
         needed_sessions,
         tainted_vars,
+        // A dry run renders and prints; it spawns nothing to time.
+        run_clock: None,
         quiet: true,
         verbose: false,
     };
@@ -3249,6 +3298,7 @@ fn log_step_end(
             "ts": utc_stamp(), "event": "step_end", "step": step, "parent": parent,
             "visit": visit, "exit": d.exit_code, "timed_out": d.timed_out,
             "interrupted": d.interrupted, "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
+            "idle_ms": d.idle_ms,
             "output_chars": d.chain_output.chars().count(),
             "output_hash": fingerprint(&d.chain_output),
             "input_tokens": d.usage.input_tokens, "output_tokens": d.usage.output_tokens,
@@ -3306,10 +3356,11 @@ fn abs(p: &Path) -> PathBuf {
 }
 
 pub fn utc_stamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    utc_stamp_at(execute::epoch_secs())
+}
+
+/// The same stamp for a recorded instant rather than for now.
+pub fn utc_stamp_at(secs: u64) -> String {
     let days = (secs / 86400) as i64;
     let rem = secs % 86400;
     let (y, m, d) = civil_from_days(days);
@@ -3319,6 +3370,43 @@ pub fn utc_stamp() -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+/// Inverse of `utc_stamp`: "YYYYMMDD-HHMMSS" -> unix epoch seconds. `sfh status`
+/// reports "how long ago" from stamps another process wrote, so it has to be
+/// able to read its own format back. Anything that does not parse exactly is
+/// None - a status.json is untrusted input, and a half-understood timestamp
+/// must not become a confident number on screen.
+pub fn parse_utc_stamp(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 15
+        || b[8] != b'-'
+        || !b
+            .iter()
+            .enumerate()
+            .all(|(i, c)| i == 8 || c.is_ascii_digit())
+    {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s[r].parse::<i64>().ok();
+    let (y, mo, d) = (n(0..4)?, n(4..6)?, n(6..8)?);
+    let (h, mi, sec) = (n(9..11)?, n(11..13)?, n(13..15)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let days = days_from_civil(y, mo as u32, d as u32);
+    u64::try_from(days * 86400 + h * 3600 + mi * 60 + sec).ok()
+}
+
+/// Howard Hinnant's days_from_civil: (y, m, d) UTC -> days since 1970-01-01.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Howard Hinnant's civil_from_days: days since 1970-01-01 -> (y, m, d), UTC.
@@ -3549,6 +3637,28 @@ mod tests {
             fingerprint("a\r\nb"),
             crate::sha256::hex("a\r\nb".as_bytes())
         );
+    }
+
+    #[test]
+    fn utc_stamps_round_trip_and_reject_junk() {
+        // `sfh status` subtracts a stamp another process wrote from now, so the
+        // parse has to be the exact inverse of the writer - a silently wrong
+        // epoch would print a confident, invented "38m since last output".
+        for secs in [0u64, 1_000_000_000, 1_769_000_000, 4_102_444_800] {
+            assert_eq!(parse_utc_stamp(&utc_stamp_at(secs)), Some(secs));
+        }
+        for bad in [
+            "",
+            "20260729",
+            "20260729-1749",
+            "20260729-17490",
+            "20260729_174900",
+            "2026072a-174900",
+            "20261329-174900",
+            "20260729-254900",
+        ] {
+            assert_eq!(parse_utc_stamp(bad), None, "{bad} must not parse");
+        }
     }
 
     #[test]
