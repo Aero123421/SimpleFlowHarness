@@ -4191,9 +4191,15 @@ mod tests {
                 step_ids: &ids,
                 builtins: BTreeMap::new(),
             };
-            let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."), Members::NotAGroup)
-                .unwrap()
-                .expect("some rule always matches here");
+            let hit = evaluate_route(
+                &flow.steps[0],
+                "PROBE-DONE",
+                &ctx,
+                Path::new("."),
+                Members::NotAGroup,
+            )
+            .unwrap()
+            .expect("some rule always matches here");
             assert_eq!(hit.goto, want, "exit {exit}");
             assert_eq!(hit.rule, rule, "exit {exit}");
         }
@@ -4206,9 +4212,15 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."), Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            Path::new("."),
+            Members::NotAGroup,
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(hit.via, PositionVia::Rule));
     }
 
@@ -4228,9 +4240,15 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."), Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            Path::new("."),
+            Members::NotAGroup,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.goto, "other");
     }
 
