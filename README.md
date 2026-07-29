@@ -377,7 +377,7 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 - 進捗表示に `$0.0661` のように出る / `log.jsonl` の各 `step_end` に `input_tokens` `output_tokens` `cost_usd`
 - `sfh runs list --json` / `sfh runs show <dir> --json` で後から機械集計できる。`visit` は最大訪問番号、`repeat` は同じステップで同一 `output_hash` が連続した時の初回を除く最大反復回数
 - `runs list` の末尾(`--json` では `total_cost_usd`)は、`-n` 適用後に選ばれたrun群の報告済みコスト合計
-- `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)。中断ではなく畳ませたいなら [`on_budget`](#予算の崖を着地パスにon_budget) で着地パスへ回す
+- `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)。中断ではなく畳ませたいなら [`on_budget`](#予算の崖を着地パスに-on_budget) で着地パスへ回す
 - コスト報告があるのは claude / grok / opencode。codex と agy はトークン数のみ
 
 ### 失敗からの回復
@@ -658,6 +658,68 @@ steps:
 
 `max_visits` は実行後ではなく**ステップ入場時**に検査する。`implement → review → implement` で両者の上限が同じなら、毎周先に入る `implement` が先に上限を超えるため、`on_max_visits` もそこへ置く。
 
+### 収束する差し戻しループの書き方
+
+差し戻しループが止まらない原因は、たいてい実装役ではなく**レビュアーに与えた問いの形**にある。
+
+> **終端条件の無い問いを循環に入れてはいけない。**
+
+「まだ穴はあるか」「他に改善点は」は、サンドボックスを持たず外部CLIを起動するプログラムに対しては常に yes になる。周回するたびに新しい指摘が生まれ、`max_visits` を使い切るまで走り続けて、最後は何も終わっていない。判定対象は**閉じた列挙**にすること。
+
+**実測**(sfh 自身の v1.0 強化ラウンド、`examples/v1-harden-r3.yaml` の冒頭コメントに記録):
+
+| レビュアーに与えた問い | 周回ごとの指摘件数 |
+|---|---|
+| 「まだ回避経路はあるか」(終端条件なし) | 13 → 16 と**発散**した |
+| 閉じた11項目の判定表だけ | 3 → 4 → 0 と**収束**した |
+
+閉じたリスト側で 3 → 4 と一度増えているのは、直した項目が別項目の未達を露出させたためで、**列挙が閉じているので必ず 0 に向かう**。発散した側にはその保証が無い。
+
+```yaml
+vars:
+  checklist: |
+    F-1 セッション access の欠落・不正判定
+    F-2 parallel / foreach resume の完了済みメンバー再利用
+    F-3 旧 run の access 記録なしの扱い
+steps:
+  - id: fix
+    tool: codex
+    access: full
+    max_visits: 4
+    on_max_visits: goto:stuck        # 収束しなかったことを exit 4 で申告する
+    notes: append                    # 試行台帳。毎周ここへ全文が積まれる
+    prompt: |
+      次の項目のうち、**未達と判定されたものだけ**を直せ。完了した項目は触るな。
+      {{vars.checklist}}
+
+      これまでの試行:
+      {{notes | tail:120}}
+
+      前回のレビュー:
+      {{steps.review.output | tail:200}}
+  - id: review
+    tool: codex
+    access: read
+    prompt: |
+      次の**閉じたリスト**だけを判定せよ。
+      {{vars.checklist}}
+
+      リスト外で気づいたことは末尾に「## 追加所見」として書け。
+      **それを FAIL の理由にしてはならない**(次のラウンドの入力になる)。
+
+      最終行に、未達項目の**残数だけ**を `FINDINGS: <n>` の形式で書け。
+    route:
+      - when_last_line_is: "FINDINGS: 0"
+        goto: end
+      - goto: fix                    # 数えられない出力も差し戻す(fail-closed)
+```
+
+- **残数を最終行で数えさせる**。`FINDINGS: 0` は「合格だと思う」ではなく「閉じたリストに未達が残っていない」であり、レビュアーの気分ではなく列挙に紐付く。`when_last_line_is` は完全一致なので、本文中で「FINDINGS: 0 を目指す」と書かれても発火しない
+- **`max_visits` と `on_max_visits` は必ず併記する。** 収束の保証は「必ず収束する」ではなく「収束しなければ**止まる**」で作る。降格先は `goto: stuck`(exit 4)が正しい — 未収束は成功でも配管の失敗でもない
+- **新発見は FAIL の理由にさせない。** 「追加所見」として記録だけさせ、次のラウンドの `checklist` に入れるかは人間が決める。これをしないと、リストを閉じた意味が周回ごとに溶ける
+- **修正役には `notes: append` で試行台帳を持たせる。** 参照は `{{notes | tail:120}}` のように末尾だけにする。裸の `{{notes}}` は周回ごとに膨らみ、下流の `max_prompt_chars` に達したステップで初めて失敗する(そこまでの呼び出しは課金済み)
+- レビュアーを複数体にするなら、票を数えるのは `sh -c "grep -c ..."` ではなく [`when_members`](#合議-when_membersn体の票を数えて分岐する)。文字列で数えると「合格と書いた上で落ちたメンバー」を1票に数える
+
 ### 終了コードでルーティングする決定論的検証器
 
 検証器は配列形式の `cmd:` で直接起動し、失敗時だけ `on_error:` で修正役へ送る。修正役は保存済みstderrを `{{steps.test.stderr_file}}` から読むため、シェルを挟まずWindows / macOS / Linuxで同じになる。
@@ -674,6 +736,10 @@ steps:
     prompt: "{{steps.test.stderr_file}} を読んでテストを直してください"
     route: [{goto: test}]
 ```
+
+**PASS はそれを出した環境にスコープされる。** `cargo test` が Windows で通ったという事実は、Linux で通るという事実ではない。**サポートを主張する環境ごとに1ゲート置くこと。** sfh 自身が v1.0.0 で、11ラウンドのレビューと279件の挙動テストを Windows だけで通した末に、Linux と macOS では**コンパイルすら通らない**バイナリを出した(レビュアーはコードを読むだけでコンパイルせず、Unix 専用の挙動テストは Windows では丸ごとスキップされる)。
+
+実例は [examples/cross-os-gate.yaml](examples/cross-os-gate.yaml) — Windows のテスト / Linux ターゲットへの型検査(リンカ不要なので Windows から打てる)/ WSL での挙動テスト、の3ゲート。ただしあれは**WSL のディストリ名とパスを直書きしたマシンローカルなフロー**で、他マシンへそのまま持っていける類のものではない。環境ごとのゲートは環境に固有になる — 逃げ道は無い。
 
 `sh -c` は複数コマンドをどうしても連結するときだけ使い、Windowsでは別途Git Bashが必要になる。
 
@@ -713,6 +779,8 @@ steps:
   live でも resume でも**ファイルを読む**ので両者が食い違わない。読み取りは先頭 4 MB まで。
   **ファイルが無い場合は不成立**(手で消した run ディレクトリを resume した等)。証拠の欠落は合格にしない。
 - どちらも既存述語と AND で併用できる(1 つの規則に書いた条件は全て満たす必要がある)。
+  ただし [`when_members`](#合議-when_membersn体の票を数えて分岐する) とだけは同居できない(validate エラー) —
+  あちらはメンバーを数え、こちらはグループ全体を判定するので、AND で混ぜると意味が壊れる。
 - resume での再評価は live と一致する。`exit` も `stderr_file` も `step_end` から復元済みなので、
   この 2 述語のために追加で永続化するものは無い。
 
@@ -982,4 +1050,4 @@ bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動�
 sfhをビルドしたのと同じRustツールチェーンが要る。スタブはcargoのターゲットではない
 (`tests/` 直下に置くと統合テストとして拾われてしまうのでサブディレクトリに置いてある)。
 
-CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。
+CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。**トリガーは全ブランチへの push**(main だけにしていた頃、作業ブランチが最後まで push されず、Linux と macOS でコンパイルの通らない v1.0.0 が出た。誰も到達しない 3 OS ランナーはゲートではない)。手元で先回りしたいときは [examples/cross-os-gate.yaml](examples/cross-os-gate.yaml) を使う。

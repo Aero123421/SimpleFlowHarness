@@ -3563,6 +3563,20 @@ fn dry_run(
             if let Some(c) = &r.when_last_line_matches {
                 cond.push(format!("last line matches {c:?}"));
             }
+            if let Some(c) = &r.when_exit {
+                cond.push(format!("exit is {c}"));
+            }
+            if let Some(c) = &r.when_stderr_matches {
+                cond.push(format!("stderr matches {c:?}"));
+            }
+            if let Some(m) = &r.when_members {
+                let quantifier = match (m.all, m.at_least) {
+                    (Some(true), _) => "all".to_string(),
+                    (_, Some(n)) => format!("at least {n}"),
+                    _ => "no".to_string(),
+                };
+                cond.push(format!("{quantifier} members end on {:?}", m.last_line_is));
+            }
             let cond = if cond.is_empty() {
                 "always".to_string()
             } else {

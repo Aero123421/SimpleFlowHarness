@@ -48,8 +48,9 @@ STATUS / WAIT / STOP OPTIONS:
   status [run-dir] [--runs-dir d] [--json]
   wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
   stop   [run-dir] [--runs-dir d]
-  status exit codes: 0 = done, 1 = failed/dead/stopped, 2 = cannot tell, 3 = running
-  wait exits with the flow's own code, or 3 if --timeout elapsed first
+  status exit codes: 0 = done, 1 = failed/dead/stopped, 2 = cannot tell,
+                     3 = running, 4 = stuck (a step routed to `goto: stuck`)
+  wait exits with the flow's own code (0/1/4), or 3 if --timeout elapsed first
   (a wait timeout does NOT cancel the run - use `sfh stop` for that)
 
 DOCTOR OPTIONS:
