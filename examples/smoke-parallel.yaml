@@ -1,10 +1,11 @@
-# v0.2機能のスモークテスト(AI呼び出しなし)。
+# parallel / foreach のクロスプラットフォームスモークテスト(AI呼び出しなし)。
 #   sfh run examples/smoke-parallel.yaml -v
-# parallel集約 -> foreach fan-out -> フィルタ/notes参照 まで一気に確認する。
+# 固定文字列cmdはplatform shellで動かし、動的なforeach入力は実行されるcommandへ
+# 混ぜない。parallel集約 -> foreach fan-out -> member投票までを一気に確認する。
+api_version: 1
 name: smoke2
 
 vars:
-  topic: demo
   hypos: |
     alpha
     beta
@@ -17,28 +18,30 @@ steps:
     notes: append
     parallel:
       - id: fan_a
-        cmd: ["echo", "idea-A for {{vars.topic}}"]
+        cmd: "echo idea-A for demo"
       - id: fan_b
-        cmd: ["echo", "idea-B for {{vars.topic}}"]
+        cmd: "echo idea-B for demo"
       - id: fan_c
-        cmd: ["echo", "idea-C for {{vars.topic}}"]
+        cmd: "echo idea-C for demo"
     route:
       - when_contains: "idea-B"
         goto: verify
       - goto: fail
 
-  # varsの複数行リストを1行1項目に分割してfan-out
-  # (配列形式なのでシェルを介さず、括弧や空白もそのまま1引数として渡る)
+  # varsの複数行リストを1行1項目に分割してfan-out。fixture commandは固定で、
+  # itemを実行文字列へ流さない。
   - id: verify
     foreach:
       from: "{{vars.hypos}}"
     max_parallel: 2
-    cmd: ["echo", "checking {{item}} ({{item_index}})"]
+    cmd: "echo checked"
     route:
-      - when_contains: "checking gamma"
+      - when_members:
+          all: true
+          last_line_is: "checked"
         goto: merge
       - goto: fail
 
-  # フィルタとnotesの参照テスト
+  # fanのnotesとverifyの集約成果物はrun dirへ残る。
   - id: merge
-    cmd: ["echo", "first=[{{steps.verify.outputs | head:1}}] fanB=[{{steps.fan_b.output | trim}}] notes=[{{notes | head:1}}]"]
+    cmd: "echo smoke2-complete"

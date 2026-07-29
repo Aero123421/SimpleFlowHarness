@@ -115,6 +115,28 @@ pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
+/// Stop accepting more work and terminate every child currently owned by this
+/// process. Used for internal durability failures (for example status/log
+/// persistence), where continuing to call paid tools would make the run
+/// impossible to resume safely.
+pub fn request_interrupt() {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    for slot in TRACKED.iter() {
+        let pid = slot.load(Ordering::SeqCst);
+        if pid <= 0 {
+            continue;
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let _ = kill_pid_tree(pid as u32);
+        }
+    }
+}
+
 fn track(pid: i32) {
     for slot in TRACKED.iter() {
         if slot
@@ -175,7 +197,7 @@ mod unix_guard {
 mod windows_guard {
     use super::*;
     use std::sync::OnceLock;
-    use windows_sys::Win32::Foundation::{BOOL, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -203,10 +225,17 @@ mod windows_guard {
         // run ends up blocking the very caller it was supposed to free.
         // Redirected stdio is unaffected: Rust marks those handles itself.
         super::windows_no_inherit_std();
-        JOB.get_or_init(|| unsafe {
+        JOB.get_or_init(|| configured_job().unwrap_or_default());
+    }
+
+    fn configured_job() -> Result<usize, String> {
+        unsafe {
             let job: HANDLE = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
-                return 0;
+                return Err(format!(
+                    "cannot create a Windows process job: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             // KILL_ON_JOB_CLOSE and nothing else. JOB_OBJECT_LIMIT_BREAKAWAY_OK
@@ -218,25 +247,68 @@ mod windows_guard {
             // it. The guarantee that nothing outlives sfh is worth more than
             // letting a flow step launch its own detached run.
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(
+            let configured = SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
                 &info as *const _ as *const std::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
-            job as usize
-        });
+            if configured == 0 {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(format!("cannot configure a Windows process job: {error}"));
+            }
+            Ok(job as usize)
+        }
     }
 
-    pub fn adopt(child: &Child) {
+    pub struct ChildJob(usize);
+
+    impl Drop for ChildJob {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0 as HANDLE);
+            }
+        }
+    }
+
+    pub fn adopt(child: &Child) -> Result<ChildJob, String> {
         use std::os::windows::io::AsRawHandle;
-        let Some(&job) = JOB.get() else { return };
+        let Some(&job) = JOB.get() else {
+            return Err("the Windows process job was not initialized".into());
+        };
         if job == 0 {
-            return;
+            return Err("the Windows process job could not be created or configured".into());
         }
-        unsafe {
-            AssignProcessToJobObject(job as HANDLE, child.as_raw_handle() as HANDLE);
+        let assigned =
+            unsafe { AssignProcessToJobObject(job as HANDLE, child.as_raw_handle() as HANDLE) };
+        if assigned == 0 {
+            return Err(format!(
+                "cannot attach child pid {} to the kill-on-close Windows job: {}",
+                child.id(),
+                std::io::Error::last_os_error()
+            ));
         }
+        // A process-wide job guarantees cleanup if sfh itself is killed. A
+        // second, nested job scopes cleanup to this one leaf: closing it after
+        // the direct child exits kills background grandchildren immediately,
+        // without terminating unrelated parallel siblings. Windows 8+ supports
+        // this nesting when neither job uses UI restrictions.
+        let leaf_job = configured_job()?;
+        let assigned = unsafe {
+            AssignProcessToJobObject(leaf_job as HANDLE, child.as_raw_handle() as HANDLE)
+        };
+        if assigned == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(leaf_job as HANDLE);
+            }
+            return Err(format!(
+                "cannot attach child pid {} to its per-leaf Windows job: {error}",
+                child.id()
+            ));
+        }
+        Ok(ChildJob(leaf_job))
     }
 }
 
@@ -833,7 +905,17 @@ pub fn run_cmd(
         .spawn()
         .map_err(|e| format!("failed to spawn [{}]: {e}", inv.describe()))?;
     #[cfg(windows)]
-    windows_guard::adopt(&child);
+    let leaf_job = match windows_guard::adopt(&child) {
+        Ok(job) => job,
+        Err(e) => {
+            // The child has not received its prompt yet. Fail before paid work
+            // and tear down any descendants it managed to open during process
+            // startup; running unowned would violate the no-orphan contract.
+            kill_tree(&mut child);
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     let pid = child.id() as i32;
     track(pid);
 
@@ -849,14 +931,17 @@ pub fn run_cmd(
         last_ms: Arc::new(AtomicU64::new(0)),
         run_clock: obs.run_clock.clone(),
     };
+    let tee_enabled = Arc::new(AtomicBool::new(true));
     let rx_out = spawn_reader(
         child.stdout.take().expect("stdout piped"),
         obs.tee,
+        Arc::clone(&tee_enabled),
         activity.clone(),
     );
     let rx_err = spawn_reader(
         child.stderr.take().expect("stderr piped"),
         None,
+        Arc::clone(&tee_enabled),
         activity.clone(),
     );
 
@@ -880,7 +965,28 @@ pub fn run_cmd(
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    // The signal handler kills tracked process groups directly. The child can
+    // therefore become waitable between `try_wait` and the loop's interrupt
+    // check; preserve the run-level cause instead of reporting an ordinary
+    // exit merely because reaping won that race.
+    was_interrupted |= interrupted();
     untrack(pid);
+    #[cfg(windows)]
+    drop(leaf_job);
+    #[cfg(unix)]
+    unsafe {
+        // A command may exit after backgrounding a descendant that still owns
+        // stdout/stderr. The descendant is part of this leaf, not a detached
+        // workflow, so close the whole session even on a nominal root exit.
+        // Otherwise the pipe drain can stall for minutes and the process can
+        // outlive both its step and a normally exiting sfh.
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    // The live tee is only an observability aid while the child is running.
+    // Stop reopening it before the durable canonical snapshot is published.
+    // A grandchild can keep the pipe reader blocked after a timeout, but it
+    // must not keep a Windows file handle open or append after publication.
+    tee_enabled.store(false, Ordering::SeqCst);
     // Keep the time of death fixed. Reader threads may still be holding a
     // final buffered chunk at this instant; their activity snapshot is taken
     // after the drain below, then clamped back to this point.
@@ -932,7 +1038,10 @@ pub fn run_cmd(
     Ok(ExecOutcome {
         exit_code: status.code().unwrap_or(-1),
         timed_out,
-        interrupted: was_interrupted,
+        // Catch a signal that arrived while the already-dead child's pipes
+        // were being drained as well. The engine treats cancellation as
+        // stronger than a completed leaf.
+        interrupted: was_interrupted || interrupted(),
         stdout,
         stderr,
         dur_ms: start.elapsed().as_millis(),
@@ -955,11 +1064,12 @@ const MAX_CAPTURE: usize = 32 * 1024 * 1024;
 fn spawn_reader<R: Read + Send + 'static>(
     mut r: R,
     tee: Option<std::path::PathBuf>,
+    tee_enabled: Arc<AtomicBool>,
     activity: Activity,
 ) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut sink = tee.and_then(|p| {
+        let tee = tee.and_then(|p| {
             // no-follow on the final component: the tee target is a predictable
             // <tag>.out.txt inside a run dir that is untrusted on a resumed run,
             // and File::create FOLLOWS a symlink - a planted link let the child's
@@ -969,7 +1079,8 @@ fn spawn_reader<R: Read + Send + 'static>(
             // memory instead of writing outside the run dir (rev_break #3).
             let f = crate::contain::create_nofollow(&p).ok()?;
             crate::contain::restrict_file(&f);
-            Some(f)
+            drop(f);
+            Some(p)
         });
         let mut buf = Vec::new();
         let mut tmp = [0u8; 65536];
@@ -984,11 +1095,19 @@ fn spawn_reader<R: Read + Send + 'static>(
                     activity.touch();
                     if buf.len() < MAX_CAPTURE {
                         let take = n.min(MAX_CAPTURE - buf.len());
-                        if let Some(f) = sink.as_mut() {
-                            // Same cap as the in-memory capture, so a runaway
-                            // tool cannot fill the disk through this path.
-                            let _ = f.write_all(&tmp[..take]);
-                            let _ = f.flush();
+                        if tee_enabled.load(Ordering::SeqCst) {
+                            if let Some(path) = &tee {
+                                // Same cap as the in-memory capture, so a runaway
+                                // tool cannot fill the disk through this path.
+                                // Open only for the duration of one chunk. On
+                                // Windows a reader blocked on an inherited pipe
+                                // must never hold the destination open across
+                                // the later atomic canonical replacement.
+                                if let Ok(mut f) = crate::contain::append_private(path) {
+                                    let _ = f.write_all(&tmp[..take]);
+                                    let _ = f.flush();
+                                }
+                            }
                         }
                         buf.extend_from_slice(&tmp[..take]);
                         if take < n {
@@ -1137,6 +1256,71 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blocked_pipe_reader_does_not_hold_the_canonical_output_open() {
+        use std::io::Read;
+        use std::sync::mpsc;
+
+        struct OneChunkThenBlock {
+            sent: bool,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl Read for OneChunkThenBlock {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.sent {
+                    self.sent = true;
+                    buf[..7].copy_from_slice(b"partial");
+                    return Ok(7);
+                }
+                let _ = self.release.recv();
+                Ok(0)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-blocked-tee-{}-{}",
+            std::process::id(),
+            epoch_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("step.out.txt");
+        let (release_tx, release_rx) = mpsc::channel();
+        let reader = OneChunkThenBlock {
+            sent: false,
+            release: release_rx,
+        };
+        let tee_enabled = Arc::new(AtomicBool::new(true));
+        let captured = spawn_reader(
+            reader,
+            Some(output.clone()),
+            Arc::clone(&tee_enabled),
+            Activity {
+                start: Instant::now(),
+                last_ms: Arc::new(AtomicU64::new(0)),
+                run_clock: None,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::fs::read(&output).ok().as_deref() != Some(b"partial") {
+            assert!(
+                Instant::now() < deadline,
+                "the live tee never published its first chunk"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        tee_enabled.store(false, Ordering::SeqCst);
+        crate::contain::write_private_atomic(&output, b"canonical").unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            captured.recv_timeout(Duration::from_secs(2)).unwrap().0,
+            b"partial"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"canonical");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn idle_clock_includes_final_pipe_activity_without_counting_drain_time() {

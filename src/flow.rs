@@ -1,11 +1,14 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml_ng as yaml;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Flow {
+    /// Public flow format version. Omitted files are read as version 1 for
+    /// backwards compatibility; new examples write it explicitly.
+    pub api_version: Option<u32>,
     pub name: Option<String>,
     #[serde(default)]
     pub vars: BTreeMap<String, yaml::Value>,
@@ -25,7 +28,7 @@ pub struct Flow {
     pub legacy_resume: bool,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     pub tool: Option<String>,
@@ -74,7 +77,7 @@ pub struct Defaults {
 /// How much of each ceiling `on_budget` keeps back for the landing chain. The
 /// landing threshold is `ceiling - reserve` on each axis INDEPENDENTLY: cost
 /// and wall-clock never borrow from one another.
-#[derive(Deserialize, Default, Clone, Copy)]
+#[derive(Deserialize, Serialize, Default, Clone, Copy)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetReserve {
     pub cost_usd: Option<f64>,
@@ -105,7 +108,7 @@ impl Defaults {
     }
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub tool: Option<String>,
@@ -122,7 +125,7 @@ pub struct Profile {
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Deserialize, Serialize, Clone, Copy)]
 #[serde(deny_unknown_fields)]
 pub struct Retry {
     /// Extra attempts after the first (0 = no retry).
@@ -131,7 +134,7 @@ pub struct Retry {
     pub backoff_sec: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
     pub id: String,
@@ -222,7 +225,7 @@ pub struct Step {
     pub env_remove: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Foreach {
     /// Template rendered, then split into items.
@@ -231,7 +234,7 @@ pub struct Foreach {
     pub split: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Compact {
     /// Compress when chain output exceeds this many chars.
@@ -253,7 +256,7 @@ pub struct Compact {
     pub timeout_sec: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Cmd {
     Shell(String),
@@ -261,15 +264,14 @@ pub enum Cmd {
 }
 
 /// One `route:` rule. Every `when_*` present in a rule must hold (AND); a rule
-/// with none is the catch-all. Adding one here means adding it to four other
-/// places: schema/flow.schema.json, the catch-all test in `evaluate_route`
-/// (a rule with a condition must not log as `via: catch_all`), any exclusivity
-/// check that enumerates predicates, and - if its text is templated -
+/// with none is the catch-all. Adding one here means adding it to
+/// schema/flow.schema.json, `Route::is_catch_all`, any exclusivity check that
+/// enumerates predicates, and - if its text is templated -
 /// `engine::precheck`'s route-condition list. The precheck one is the easiest
 /// to miss and the most expensive: without it a template typo survives validate
 /// and dry-run and only kills the run after the guarded step has been billed
 /// (that is exactly what happened to `when_stderr_matches`).
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
     pub when_contains: Option<String>,
@@ -301,6 +303,19 @@ pub struct Route {
     pub goto: String,
 }
 
+impl Route {
+    pub fn is_catch_all(&self) -> bool {
+        self.when_contains.is_none()
+            && self.when_matches.is_none()
+            && self.when_last_line_contains.is_none()
+            && self.when_last_line_is.is_none()
+            && self.when_last_line_matches.is_none()
+            && self.when_exit.is_none()
+            && self.when_stderr_matches.is_none()
+            && self.when_members.is_none()
+    }
+}
+
 /// "How many of the fan-out's members ended cleanly AND signed off with exactly
 /// this line" - the deterministic way to hold a vote among N independent
 /// judges.
@@ -316,7 +331,7 @@ pub struct Route {
 /// Exactly one quantifier: `at_least: <n>` (n >= 1) or `all: true`. There is no
 /// `contains`/regex variant on purpose - a vote is an exact word or it is not a
 /// vote.
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct WhenMembers {
     /// The exact line a member must end on to be counted. Templated like the
@@ -334,11 +349,8 @@ pub struct WhenMembers {
 
 /// Goto targets that end the flow instead of naming a step.
 ///
-/// Only `stuck` is ALSO refused as a step id (see validate). `end` and `fail`
-/// have shadowed a same-named step since v0.1 - a flow that has one is already
-/// written around it, and turning that into a hard error now would break
-/// working flows for no gain. `stuck` is new, so it is reserved before anyone
-/// can write a flow that depends on the ambiguity.
+/// All terminal names are refused as step ids (case-insensitively) so a route
+/// target can never silently shadow a real node.
 pub const TERMINALS: [&str; 3] = ["end", "fail", "stuck"];
 
 pub const TOOLS: [&str; 7] = ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"];
@@ -357,7 +369,7 @@ pub fn load(path: &Path) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    merge_global_profiles(&mut flow);
+    merge_global_profiles(&mut flow)?;
     validate(&flow, false)?;
     Ok(flow)
 }
@@ -383,7 +395,7 @@ pub fn load_lenient(path: &Path) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    merge_global_profiles(&mut flow);
+    merge_global_profiles(&mut flow)?;
     validate(&flow, true)?;
     flow.legacy_resume = true;
     Ok(flow)
@@ -392,21 +404,21 @@ pub fn load_lenient(path: &Path) -> Result<Flow, String> {
 /// Merge machine-level profiles from ~/.sfh/profiles.yaml (a bare name->profile map).
 /// Flow-level profiles win on name conflicts. This keeps flow files portable while
 /// machine-specific things (bin: paths, provider/model choices) live outside the repo.
-fn merge_global_profiles(flow: &mut Flow) {
+fn merge_global_profiles(flow: &mut Flow) -> Result<(), String> {
     let Some(p) = global_profiles_path() else {
-        return;
+        return Ok(());
     };
-    let Ok(text) = std::fs::read_to_string(&p) else {
-        return;
+    let text = match std::fs::read_to_string(&p) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot read global profiles {}: {e}", p.display())),
     };
-    match yaml::from_str::<BTreeMap<String, Profile>>(&text) {
-        Ok(globals) => {
-            for (k, v) in globals {
-                flow.profiles.entry(k).or_insert(v);
-            }
-        }
-        Err(e) => eprintln!("sfh: warning: ignoring {}: {e}", p.display()),
+    let globals = yaml::from_str::<BTreeMap<String, Profile>>(&text)
+        .map_err(|e| format!("{}: invalid global profiles: {e}", p.display()))?;
+    for (k, v) in globals {
+        flow.profiles.entry(k).or_insert(v);
     }
+    Ok(())
 }
 
 pub fn global_profiles_path() -> Option<std::path::PathBuf> {
@@ -419,6 +431,84 @@ pub fn global_profiles_path() -> Option<std::path::PathBuf> {
 }
 
 impl Flow {
+    /// Canonical execution-relevant representation after global profiles have
+    /// been merged. Profiles that no step can select are omitted: changing an
+    /// unrelated machine-local profile must not block resume of this flow.
+    /// Inline profile edits remain covered by the separate raw-flow
+    /// fingerprint, whether referenced or not.
+    pub fn effective_config_json(&self) -> Result<String, String> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|e| format!("cannot serialize effective flow configuration: {e}"))?;
+        let referenced = self.referenced_profiles();
+        if let Some(profiles) = value.get_mut("profiles").and_then(|v| v.as_object_mut()) {
+            profiles.retain(|name, _| referenced.contains(name));
+        }
+        serde_json::to_string(&value)
+            .map_err(|e| format!("cannot serialize effective flow configuration: {e}"))
+    }
+
+    /// Human-facing merged configuration. Unlike the fingerprint projection,
+    /// this deliberately includes unused profiles so `sfh config show` can be
+    /// used to diagnose the complete merge result.
+    pub fn effective_config_json_pretty(&self, show_secrets: bool) -> Result<String, String> {
+        fn redact_env(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        if key == "env" {
+                            if let serde_json::Value::Object(env) = child {
+                                for value in env.values_mut() {
+                                    *value = serde_json::Value::String("<redacted>".to_string());
+                                }
+                            }
+                        } else {
+                            redact_env(child);
+                        }
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        redact_env(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut value = serde_json::to_value(self)
+            .map_err(|e| format!("cannot serialize effective flow configuration: {e}"))?;
+        if !show_secrets {
+            redact_env(&mut value);
+        }
+        serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("cannot serialize effective flow configuration: {e}"))
+    }
+
+    fn referenced_profiles(&self) -> BTreeSet<String> {
+        fn collect(step: &Step, out: &mut BTreeSet<String>) {
+            if let Some(profile) = &step.use_ {
+                out.insert(profile.clone());
+            }
+            out.extend(step.fallback.iter().cloned());
+            if let Some(compact) = &step.compact {
+                if let Some(profile) = &compact.use_ {
+                    out.insert(profile.clone());
+                }
+            }
+            if let Some(children) = &step.parallel {
+                for child in children {
+                    collect(child, out);
+                }
+            }
+        }
+
+        let mut profiles = BTreeSet::new();
+        for step in &self.steps {
+            collect(step, &mut profiles);
+        }
+        profiles
+    }
+
     pub fn vars_string_map(&self) -> Result<BTreeMap<String, String>, String> {
         let mut out = BTreeMap::new();
         for (k, v) in &self.vars {
@@ -606,6 +696,13 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 }
 
 fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
+    if let Some(version) = flow.api_version {
+        if version != 1 {
+            return Err(format!(
+                "unsupported api_version {version}; this sfh supports api_version: 1"
+            ));
+        }
+    }
     if flow.steps.is_empty() {
         return Err("flow has no steps".into());
     }
@@ -613,13 +710,12 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         validate_name(n)?;
     }
     let mut seen = HashSet::new();
-    // Compared ignoring case for the same reason ids are: `Stuck` and `stuck`
-    // are one name on Windows and macOS, so a rule that only caught the exact
-    // spelling would let the ambiguity back in on two of the three OSes.
+    // Compared ignoring case for the same reason ids are: terminal names and
+    // artifact names must have one meaning on every supported filesystem.
     let reserved_id = |id: &str| -> Result<(), String> {
-        if id.eq_ignore_ascii_case("stuck") {
+        if TERMINALS.iter().any(|t| id.eq_ignore_ascii_case(t)) {
             return Err(format!(
-                "step id '{id}' is reserved: 'stuck' is a goto target that ends the run for a human to look at (exit 4), so it cannot also name a step (compared ignoring case). Rename the step"
+                "step id '{id}' is reserved: end/fail/stuck are terminal goto targets, so they cannot also name steps (compared ignoring case). Rename the step"
             ));
         }
         Ok(())
@@ -672,9 +768,15 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             ))
         }
     };
+    let mut profile_names = HashSet::new();
     for (name, p) in &flow.profiles {
         if !valid_id(name) {
             return Err(format!("profile name '{name}' must use only [A-Za-z0-9_-]"));
+        }
+        if !profile_names.insert(name.to_ascii_lowercase()) {
+            return Err(format!(
+                "duplicate profile name '{name}' (profile names are compared ignoring case because fallback artifact names must not collide on Windows or macOS)"
+            ));
         }
         if let Some(t) = &p.tool {
             if !TOOLS.contains(&t.as_str()) {
@@ -686,7 +788,30 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 return Err(format!("profile '{name}': access must be read/write/full"));
             }
         }
+        positive_u64(&format!("profile '{name}'.timeout_sec"), p.timeout_sec)?;
     }
+    if let Some(t) = &flow.defaults.tool {
+        if !TOOLS.contains(&t.as_str()) {
+            return Err(format!(
+                "defaults.tool: unknown tool '{t}' (use one of {})",
+                TOOLS.join("/")
+            ));
+        }
+    }
+    if let Some(a) = &flow.defaults.access {
+        if !["read", "write", "full"].contains(&a.as_str()) {
+            return Err(format!(
+                "defaults.access must be read/write/full, got '{a}'"
+            ));
+        }
+    }
+    positive_u64("defaults.timeout_sec", flow.defaults.timeout_sec)?;
+    positive_u32("defaults.max_visits", flow.defaults.max_visits)?;
+    positive_u32("defaults.max_total_steps", flow.defaults.max_total_steps)?;
+    positive_u32("defaults.max_parallel", flow.defaults.max_parallel)?;
+    positive_u64("defaults.max_prompt_chars", flow.defaults.max_prompt_chars)?;
+    positive_u64("defaults.max_emit_chars", flow.defaults.max_emit_chars)?;
+    positive_u64("defaults.wall_clock_sec", flow.defaults.wall_clock_sec)?;
     if let Some(cost) = flow.defaults.max_cost_usd {
         if !(cost.is_finite() && cost >= 0.0) {
             return Err(format!(
@@ -695,6 +820,11 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         }
     }
     for (tool, limit) in &flow.defaults.tool_max_parallel {
+        if !TOOLS.contains(&tool.as_str()) {
+            return Err(format!(
+                "defaults.tool_max_parallel.{tool}: unknown preset tool"
+            ));
+        }
         if *limit == 0 {
             return Err(format!(
                 "defaults.tool_max_parallel.{tool} must be >= 1 (0 would block that tool forever)"
@@ -905,6 +1035,15 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 }
             }
         }
+        if let Some(catch_all) = s.route.iter().position(Route::is_catch_all) {
+            if catch_all + 1 != s.route.len() {
+                return Err(format!(
+                    "step '{}': route[{catch_all}] is unconditional, so the {} rule(s) after it can never match; put the catch-all last",
+                    s.id,
+                    s.route.len() - catch_all - 1
+                ));
+            }
+        }
         for left in 0..s.route.len() {
             let Some(a) = &s.route[left].when_last_line_contains else {
                 continue;
@@ -926,7 +1065,24 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     for warning in branch_fallthrough_warnings(flow) {
         eprintln!("sfh: warning: {warning}");
     }
+    validate_session_dominance(flow)?;
     Ok(())
+}
+
+fn positive_u64(ctx: &str, value: Option<u64>) -> Result<(), String> {
+    if value == Some(0) {
+        Err(format!("{ctx} must be >= 1"))
+    } else {
+        Ok(())
+    }
+}
+
+fn positive_u32(ctx: &str, value: Option<u32>) -> Result<(), String> {
+    if value == Some(0) {
+        Err(format!("{ctx} must be >= 1"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Everything about a `when_members` rule that can be settled without running
@@ -1066,6 +1222,417 @@ fn branch_fallthrough_warnings(flow: &Flow) -> Vec<String> {
     warnings
 }
 
+pub fn strict_warnings(flow: &Flow) -> Vec<String> {
+    let mut warnings = branch_fallthrough_warnings(flow);
+    if flow.api_version.is_none() {
+        warnings.push(
+            "api_version is omitted; add `api_version: 1` so future format migrations are explicit"
+                .into(),
+        );
+    }
+    for step in &flow.steps {
+        if !step.route.is_empty() && !step.route.iter().any(Route::is_catch_all) {
+            warnings.push(format!(
+                "step '{}': route has no catch-all and therefore falls through implicitly when no condition matches; add an explicit final goto",
+                step.id
+            ));
+        }
+    }
+
+    let n = flow.steps.len();
+    let index: HashMap<&str, usize> = flow
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let mut edges: Vec<HashSet<usize>> = (0..n).map(|_| HashSet::new()).collect();
+    for (i, step) in flow.steps.iter().enumerate() {
+        for route in &step.route {
+            if let Some(&to) = index.get(route.goto.as_str()) {
+                edges[i].insert(to);
+            }
+        }
+        if !step.route.iter().any(Route::is_catch_all) && i + 1 < n {
+            edges[i].insert(i + 1);
+        }
+        for action in [step.on_error.as_deref(), step.on_max_visits.as_deref()] {
+            if let Some(target) = action.and_then(|a| a.strip_prefix("goto:")) {
+                if let Some(&to) = index.get(target) {
+                    edges[i].insert(to);
+                }
+            }
+        }
+        if step.on_error.as_deref() == Some("continue") && i + 1 < n {
+            edges[i].insert(i + 1);
+        }
+        if step.on_max_visits.as_deref() == Some("continue") && i + 1 < n {
+            edges[i].insert(i + 1);
+        }
+    }
+    let mut reachable = HashSet::new();
+    let mut stack = Vec::new();
+    if n > 0 {
+        reachable.insert(0);
+        stack.push(0);
+    }
+    if let Some(target) = flow.defaults.budget_goto() {
+        if let Some(&to) = index.get(target) {
+            if reachable.insert(to) {
+                stack.push(to);
+            }
+        }
+    }
+    while let Some(node) = stack.pop() {
+        for &next in &edges[node] {
+            if reachable.insert(next) {
+                stack.push(next);
+            }
+        }
+    }
+    for (i, step) in flow.steps.iter().enumerate() {
+        if !reachable.contains(&i) {
+            warnings.push(format!(
+                "step '{}' is unreachable from the flow entry, routes, error actions and on_budget",
+                step.id
+            ));
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+/// Prove that every session source is guaranteed to have executed before its
+/// consumer. Existence checks alone accept forward references and branch joins
+/// that can reach a consumer without ever creating the requested session.
+fn validate_session_dominance(flow: &Flow) -> Result<(), String> {
+    let n = flow.steps.len();
+    let entry = n;
+    let top_index: HashMap<&str, usize> = flow
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let mut owner: HashMap<&str, usize> = HashMap::new();
+    let mut source: HashMap<&str, &Step> = HashMap::new();
+    for (i, step) in flow.steps.iter().enumerate() {
+        owner.insert(step.id.as_str(), i);
+        source.insert(step.id.as_str(), step);
+        if let Some(children) = &step.parallel {
+            for child in children {
+                owner.insert(child.id.as_str(), i);
+                source.insert(child.id.as_str(), child);
+            }
+        }
+    }
+
+    let mut edges: Vec<HashSet<usize>> = (0..=n).map(|_| HashSet::new()).collect();
+    if n > 0 {
+        edges[entry].insert(0);
+    }
+    if let Some(target) = flow.defaults.budget_goto() {
+        if let Some(&idx) = top_index.get(target) {
+            // on_budget may land before the normal predecessor has executed.
+            edges[entry].insert(idx);
+        }
+    }
+    for (i, step) in flow.steps.iter().enumerate() {
+        for route in &step.route {
+            if let Some(&to) = top_index.get(route.goto.as_str()) {
+                edges[i].insert(to);
+            }
+        }
+        if !step.route.iter().any(Route::is_catch_all) && i + 1 < n {
+            edges[i].insert(i + 1);
+        }
+        for action in [step.on_error.as_deref(), step.on_max_visits.as_deref()] {
+            if let Some(target) = action.and_then(|a| a.strip_prefix("goto:")) {
+                if let Some(&to) = top_index.get(target) {
+                    edges[i].insert(to);
+                }
+            }
+        }
+        if step.on_error.as_deref() == Some("continue") && i + 1 < n {
+            edges[i].insert(i + 1);
+        }
+        if step.on_max_visits.as_deref() == Some("continue") && i + 1 < n {
+            edges[i].insert(i + 1);
+        }
+    }
+
+    let mut reachable = HashSet::from([entry]);
+    let mut stack = vec![entry];
+    while let Some(node) = stack.pop() {
+        for &next in &edges[node] {
+            if reachable.insert(next) {
+                stack.push(next);
+            }
+        }
+    }
+    let universe = reachable.clone();
+    let mut dom: Vec<HashSet<usize>> = (0..=n)
+        .map(|node| {
+            if node == entry {
+                HashSet::from([entry])
+            } else if reachable.contains(&node) {
+                universe.clone()
+            } else {
+                HashSet::new()
+            }
+        })
+        .collect();
+    let mut predecessors: Vec<Vec<usize>> = (0..=n).map(|_| Vec::new()).collect();
+    for (from, nexts) in edges.iter().enumerate() {
+        for &to in nexts {
+            predecessors[to].push(from);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for node in 0..n {
+            if !reachable.contains(&node) {
+                continue;
+            }
+            let mut incoming = predecessors[node]
+                .iter()
+                .filter(|p| reachable.contains(p))
+                .map(|p| dom[*p].clone());
+            let mut next = incoming.next().unwrap_or_default();
+            for other in incoming {
+                next.retain(|candidate| other.contains(candidate));
+            }
+            next.insert(node);
+            if next != dom[node] {
+                dom[node] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let source_can_fail_open = |step: &Step| {
+        matches!(step.on_error.as_deref(), Some("continue"))
+            || step
+                .on_error
+                .as_deref()
+                .and_then(|a| a.strip_prefix("goto:"))
+                .is_some_and(|target| !TERMINALS.contains(&target))
+    };
+    let check = |consumer: &Step, consumer_owner: usize| -> Result<(), String> {
+        for (kind, target) in [
+            ("continue_from", consumer.continue_from.as_deref()),
+            ("fork_from", consumer.fork_from.as_deref()),
+        ] {
+            let Some(target) = target else { continue };
+            let Some(&target_owner) = owner.get(target) else {
+                continue; // existence is reported by the earlier validation.
+            };
+            if reachable.contains(&consumer_owner) && !dom[consumer_owner].contains(&target_owner) {
+                return Err(format!(
+                    "step '{}': {kind} target '{target}' is not guaranteed to run before this step on every control-flow path",
+                    consumer.id
+                ));
+            }
+            if let Some(target_step) = source.get(target) {
+                if source_can_fail_open(target_step) {
+                    return Err(format!(
+                        "step '{}': {kind} target '{target}' may fail and continue without creating a session; make the source fail closed or route failures to a terminal",
+                        consumer.id
+                    ));
+                }
+                // A parallel child can be fail-closed itself while its owning
+                // group deliberately continues or jumps after that child
+                // fails. In that case the group dominates this consumer but
+                // the requested child session does not exist.
+                let owner_step = &flow.steps[target_owner];
+                if target_step.id != owner_step.id && source_can_fail_open(owner_step) {
+                    return Err(format!(
+                        "step '{}': {kind} target '{target}' is a child of parallel group '{}', whose on_error can continue after the child failed without creating a session; make the group fail closed or route failures to a terminal",
+                        consumer.id, owner_step.id
+                    ));
+                }
+                // A source with cross-provider fallbacks has no stable session
+                // type. The downstream step cannot know whether it is being
+                // handed (for example) a Claude or Codex session, so accepting
+                // this would defer a deterministic configuration error until
+                // after the fallback has already spent money.
+                let mut session_tools = BTreeSet::new();
+                for override_profile in std::iter::once(None)
+                    .chain(target_step.fallback.iter().map(|name| Some(name.as_str())))
+                {
+                    if let Ok(effective) =
+                        crate::leaf::effective_with(flow, target_step, override_profile)
+                    {
+                        if let Some(tool) = effective.tool {
+                            session_tools.insert(tool);
+                        }
+                    }
+                }
+                if session_tools.len() > 1 {
+                    return Err(format!(
+                        "step '{}': {kind} target '{target}' can finish under different tools through fallback ({}) and therefore has no stable session provider; keep all source fallbacks on one tool or do not reuse its session",
+                        consumer.id,
+                        session_tools.into_iter().collect::<Vec<_>>().join("/")
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
+    for (i, step) in flow.steps.iter().enumerate() {
+        check(step, i)?;
+        if let Some(children) = &step.parallel {
+            for child in children {
+                check(child, i)?;
+            }
+        }
+    }
+
+    let check_templates = |consumer: &Step,
+                           consumer_owner: usize,
+                           is_top: bool|
+     -> Result<(), String> {
+        for (label, text) in template_fields(flow, consumer) {
+            for dependency in crate::template::step_refs(&text) {
+                if dependency.optional {
+                    continue;
+                }
+                let Some(&target_owner) = owner.get(dependency.id.as_str()) else {
+                    continue; // unknown ids are reported by precheck.
+                };
+                if target_owner == consumer_owner {
+                    let after_current = label == "route" || label == "compact.instruction";
+                    let target_is_own_child = is_top
+                        && consumer
+                            .parallel
+                            .as_ref()
+                            .is_some_and(|children| children.iter().any(|c| c.id == dependency.id));
+                    let target_is_self = consumer.id == dependency.id;
+                    if (target_is_self && after_current)
+                        || (target_is_own_child && label == "route")
+                    {
+                        continue;
+                    }
+                    return Err(format!(
+                            "step '{}': {label} references steps.{} before that output is guaranteed to exist; add `| optional`/`| default:...` only if the missing branch is intentional",
+                            consumer.id, dependency.id
+                        ));
+                }
+                if reachable.contains(&consumer_owner)
+                    && !dom[consumer_owner].contains(&target_owner)
+                {
+                    return Err(format!(
+                            "step '{}': {label} references steps.{} but that step does not dominate this consumer on every control-flow path; mark the reference `| optional`/`| default:...` or fix the routing",
+                            consumer.id, dependency.id
+                        ));
+                }
+            }
+        }
+        Ok(())
+    };
+    for (i, step) in flow.steps.iter().enumerate() {
+        check_templates(step, i, true)?;
+        if let Some(children) = &step.parallel {
+            for child in children {
+                check_templates(child, i, false)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn template_fields(flow: &Flow, step: &Step) -> Vec<(&'static str, String)> {
+    fn push_opt(
+        fields: &mut Vec<(&'static str, String)>,
+        label: &'static str,
+        value: Option<&String>,
+    ) {
+        if let Some(value) = value {
+            fields.push((label, value.clone()));
+        }
+    }
+    let mut fields = Vec::new();
+    push_opt(&mut fields, "prompt", step.prompt.as_ref());
+    push_opt(&mut fields, "bin", step.bin.as_ref());
+    push_opt(&mut fields, "model", step.model.as_ref());
+    push_opt(&mut fields, "effort", step.effort.as_ref());
+    push_opt(&mut fields, "agent", step.agent.as_ref());
+    push_opt(&mut fields, "cwd", step.cwd.as_ref());
+    for arg in &step.args {
+        fields.push(("args", arg.clone()));
+    }
+    match &step.cmd {
+        Some(Cmd::Shell(command)) => fields.push(("cmd", command.clone())),
+        Some(Cmd::Argv(args)) => fields.extend(args.iter().cloned().map(|arg| ("cmd", arg))),
+        None => {}
+    }
+    for value in step.env.values() {
+        fields.push(("env", value.clone()));
+    }
+    if let Some(foreach) = &step.foreach {
+        fields.push(("foreach.from", foreach.from.clone()));
+    }
+    for route in &step.route {
+        for value in [
+            &route.when_contains,
+            &route.when_matches,
+            &route.when_last_line_contains,
+            &route.when_last_line_is,
+            &route.when_last_line_matches,
+            &route.when_stderr_matches,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fields.push(("route", value.clone()));
+        }
+        if let Some(members) = &route.when_members {
+            fields.push(("route", members.last_line_is.clone()));
+        }
+    }
+    if let Some(compact) = &step.compact {
+        push_opt(
+            &mut fields,
+            "compact.instruction",
+            compact.instruction.as_ref(),
+        );
+    }
+    if !step.is_group() {
+        // Match prepare_leaf/precheck exactly: only values that survive the
+        // step > profile > defaults merge are runtime dependencies. Checking
+        // every raw layer rejects valid flows when, for example, a step's cwd
+        // safely overrides a profile/default cwd that references another
+        // branch. Fallbacks are separate executable variants and must all be
+        // included.
+        let variants =
+            std::iter::once(None).chain(step.fallback.iter().map(|name| Some(name.as_str())));
+        for profile_override in variants {
+            if let Ok(effective) = crate::leaf::effective_with(flow, step, profile_override) {
+                for (label, value) in [
+                    ("bin", &effective.bin),
+                    ("model", &effective.model),
+                    ("effort", &effective.effort),
+                    ("agent", &effective.agent),
+                    ("cwd", &effective.cwd),
+                ] {
+                    push_opt(&mut fields, label, value.as_ref());
+                }
+                for arg in &effective.args {
+                    fields.push(("args", arg.clone()));
+                }
+                for value in effective.env.values() {
+                    fields.push(("env", value.clone()));
+                }
+            }
+        }
+    }
+    fields
+}
+
 fn check_retry_on(ctx: &str, v: &str) -> Result<(), String> {
     if ["transient", "any", "never"].contains(&v) {
         Ok(())
@@ -1092,6 +1659,12 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
     // legacy-era resume restores the pre-1.0 write default instead (load_lenient).
     let require_access = !legacy;
     let sid = &s.id;
+    positive_u64(&format!("step '{sid}'.timeout_sec"), s.timeout_sec)?;
+    positive_u32(&format!("step '{sid}'.max_visits"), s.max_visits)?;
+    positive_u64(
+        &format!("step '{sid}'.max_prompt_chars"),
+        s.max_prompt_chars,
+    )?;
     if is_child {
         if !s.route.is_empty() {
             return Err(format!(
@@ -1158,6 +1731,14 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             return Err(format!("step '{sid}': unknown profile '{f}' in fallback:"));
         }
     }
+    let mut fallback_names = HashSet::new();
+    for fallback in &s.fallback {
+        if !fallback_names.insert(fallback.to_ascii_lowercase()) {
+            return Err(format!(
+                "step '{sid}': fallback profile '{fallback}' is listed more than once (compared ignoring case); repeated fallbacks would overwrite each other's durable artifacts"
+            ));
+        }
+    }
     if let Some(r) = &s.retry_on {
         check_retry_on(&format!("step '{sid}'"), r)?;
     }
@@ -1214,6 +1795,43 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             return Err(format!(
                 "step '{sid}': cursor headless has only two permission tiers (read = deny-all, full = approve-all); access: write is not supported - pick read or full"
             ));
+        }
+        // `use:` and `fallback:` are independent profile selections. Access
+        // from the primary profile must not leak into a fallback that never
+        // declared it: effective_with would otherwise parse the missing value
+        // as the historical implicit `write`, bypassing the mandatory-access
+        // contract only on the recovery path.
+        for fallback in &s.fallback {
+            let profile = &flow.profiles[fallback];
+            let fallback_access = s
+                .access
+                .as_deref()
+                .or(profile.access.as_deref())
+                .or(flow.defaults.access.as_deref());
+            let fallback_access = match fallback_access {
+                Some(access) => access,
+                None if require_access => {
+                    return Err(format!(
+                        "step '{sid}': fallback profile '{fallback}' has no resolved access level; set access: read/write/full on the step, that fallback profile, or defaults"
+                    ));
+                }
+                None => {
+                    eprintln!(
+                        "sfh: warning: step '{sid}' fallback profile '{fallback}' has no access level; defaulting to 'write' only for this legacy resume"
+                    );
+                    "write"
+                }
+            };
+            let fallback_tool = profile
+                .tool
+                .as_deref()
+                .or(s.tool.as_deref())
+                .or(flow.defaults.tool.as_deref());
+            if fallback_tool == Some("cursor") && fallback_access == "write" {
+                return Err(format!(
+                    "step '{sid}': fallback profile '{fallback}' resolves cursor with access: write, but cursor headless supports only read or full"
+                ));
+            }
         }
         // Args that WIDEN the declared access are a validation error unless the
         // step explicitly opts in. The check reads the arg VALUES, so an arg
@@ -1395,6 +2013,15 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
                 return Err(format!("step '{sid}': compact uses unknown profile '{u}'"));
             }
         }
+        positive_u64(
+            &format!("step '{sid}'.compact.target_chars"),
+            c.target_chars,
+        )?;
+        positive_u64(
+            &format!("step '{sid}'.compact.max_input_chars"),
+            c.max_input_chars,
+        )?;
+        positive_u64(&format!("step '{sid}'.compact.timeout_sec"), c.timeout_sec)?;
         let has_tool = c.tool.is_some()
             || c.use_
                 .as_ref()
@@ -1405,6 +2032,17 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             return Err(format!(
                 "step '{sid}': compact needs use: <profile> or tool:"
             ));
+        }
+        let compact_tool = c.tool.as_ref().or_else(|| {
+            c.use_
+                .as_ref()
+                .and_then(|u| flow.profiles.get(u))
+                .and_then(|p| p.tool.as_ref())
+        });
+        if let Some(t) = compact_tool {
+            if !TOOLS.contains(&t.as_str()) {
+                return Err(format!("step '{sid}': compact resolves unknown tool '{t}'"));
+            }
         }
     }
     group_common(s)
@@ -2055,6 +2693,43 @@ mod tests {
     }
 
     #[test]
+    fn effective_fingerprint_ignores_only_unreferenced_profiles() {
+        let mut flow: Flow = yaml::from_str(
+            "api_version: 1\nprofiles:\n  used: {tool: claude, access: read}\n  fallback: {tool: grok, access: read}\n  compact: {tool: opencode, access: read}\n  unrelated: {tool: codex, access: read, model: old, env: {API_TOKEN: supersecret}}\nsteps:\n  - id: work\n    use: used\n    fallback: [fallback]\n    prompt: x\n    compact: {when_over: 100, use: compact}\n",
+        )
+        .unwrap();
+        let original = flow.effective_config_json().unwrap();
+
+        flow.profiles.get_mut("unrelated").unwrap().model = Some("new".into());
+        assert_eq!(
+            flow.effective_config_json().unwrap(),
+            original,
+            "an unrelated global profile must not make this flow unresumable"
+        );
+
+        flow.profiles.get_mut("fallback").unwrap().model = Some("new".into());
+        assert_ne!(
+            flow.effective_config_json().unwrap(),
+            original,
+            "fallback and compact profiles are execution-relevant too"
+        );
+
+        let shown = flow.effective_config_json_pretty(false).unwrap();
+        assert!(
+            shown.contains("\"unrelated\""),
+            "config show should retain the complete merge result"
+        );
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(!shown.contains("supersecret"), "{shown}");
+        assert!(
+            flow.effective_config_json_pretty(true)
+                .unwrap()
+                .contains("supersecret"),
+            "--show-secrets must be the explicit way to inspect env values"
+        );
+    }
+
+    #[test]
     fn identifies_unterminated_consecutive_branches() {
         let flow: Flow = yaml::from_str(
             "steps:\n  - id: choose\n    cmd: echo verdict\n    route:\n      - {when_last_line_is: MET, goto: met}\n      - {when_last_line_is: UNMET, goto: unmet}\n      - {when_last_line_is: UNCLEAR, goto: unclear}\n  - id: met\n    cmd: echo met\n  - id: unmet\n    cmd: echo unmet\n    route: [{goto: end}]\n  - id: unclear\n    cmd: echo unclear\n",
@@ -2100,5 +2775,212 @@ mod tests {
         let e = parse("name: \"a/b\"\nsteps:\n  - id: a\n    cmd: echo hi\n").unwrap_err();
         assert!(e.contains("path separators"), "{e}");
         assert!(parse("name: \"研究 2026.07\"\nsteps:\n  - id: a\n    cmd: echo hi\n").is_ok());
+    }
+
+    #[test]
+    fn api_version_and_all_terminal_ids_are_unambiguous() {
+        assert!(parse(
+            "api_version: 1\nname: t\nsteps:\n  - id: work\n    cmd: [\"echo\", \"ok\"]\n"
+        )
+        .is_ok());
+        let error =
+            parse("api_version: 2\nname: t\nsteps:\n  - id: work\n    cmd: [\"echo\", \"ok\"]\n")
+                .unwrap_err();
+        assert!(error.contains("api_version"), "{error}");
+
+        for id in ["end", "END", "Fail", "STUCK"] {
+            let error = parse(&format!(
+                "api_version: 1\nsteps:\n  - id: {id}\n    cmd: [\"echo\", \"ok\"]\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("is reserved"), "{id}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_catch_all_routes_that_hide_later_rules() {
+        let error = parse(
+            "api_version: 1\nsteps:\n  - id: choose\n    cmd: [\"echo\", \"ok\"]\n    route:\n      - {goto: end}\n      - {when_last_line_is: ok, goto: fail}\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("catch-all"), "{error}");
+        assert!(error.contains("last"), "{error}");
+    }
+
+    #[test]
+    fn code_validation_matches_schema_minima_and_tool_vocabulary() {
+        for (field, value) in [
+            ("timeout_sec", "0"),
+            ("max_visits", "0"),
+            ("max_total_steps", "0"),
+            ("max_parallel", "0"),
+            ("max_prompt_chars", "0"),
+            ("max_emit_chars", "0"),
+            ("wall_clock_sec", "0"),
+        ] {
+            let error = parse(&format!(
+                "api_version: 1\ndefaults:\n  {field}: {value}\nsteps:\n  - id: work\n    cmd: [\"echo\", \"ok\"]\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+        let error = parse(
+            "api_version: 1\ndefaults:\n  tool: imaginary\nsteps:\n  - id: work\n    prompt: x\n    access: read\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown tool"), "{error}");
+        let error = parse(
+            "api_version: 1\ndefaults:\n  tool_max_parallel: {imaginary: 1}\nsteps:\n  - id: work\n    cmd: [\"echo\", \"ok\"]\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("tool_max_parallel"), "{error}");
+        assert!(error.contains("unknown preset tool"), "{error}");
+    }
+
+    #[test]
+    fn fallback_profiles_have_stable_names_artifacts_and_access() {
+        let case_collision = parse(
+            "api_version: 1\nprofiles:\n  Backup: {tool: claude, access: read}\n  backup: {tool: claude, access: read}\nsteps:\n  - id: work\n    use: Backup\n    prompt: x\n",
+        )
+        .unwrap_err();
+        assert!(
+            case_collision.contains("duplicate profile name"),
+            "{case_collision}"
+        );
+
+        let repeated = parse(
+            "api_version: 1\nprofiles:\n  primary: {tool: claude, access: read}\n  backup: {tool: claude, access: read}\nsteps:\n  - id: work\n    use: primary\n    fallback: [backup, backup]\n    prompt: x\n",
+        )
+        .unwrap_err();
+        assert!(repeated.contains("listed more than once"), "{repeated}");
+
+        let missing_access = parse(
+            "api_version: 1\nprofiles:\n  primary: {tool: claude, access: read}\n  backup: {tool: claude}\nsteps:\n  - id: work\n    use: primary\n    fallback: [backup]\n    prompt: x\n",
+        )
+        .unwrap_err();
+        assert!(
+            missing_access.contains("fallback profile 'backup'")
+                && missing_access.contains("access"),
+            "{missing_access}"
+        );
+    }
+
+    #[test]
+    fn session_sources_must_dominate_and_must_fail_closed() {
+        let future = parse(
+            "api_version: 1\nsteps:\n  - id: consumer\n    tool: claude\n    access: read\n    continue_from: source\n    prompt: continue\n  - id: source\n    tool: claude\n    access: read\n    prompt: start\n",
+        )
+        .unwrap_err();
+        assert!(future.contains("not guaranteed to run before"), "{future}");
+
+        let fail_open = parse(
+            "api_version: 1\nsteps:\n  - id: source\n    tool: claude\n    access: read\n    on_error: continue\n    prompt: start\n  - id: consumer\n    tool: claude\n    access: read\n    continue_from: source\n    prompt: continue\n",
+        )
+        .unwrap_err();
+        assert!(fail_open.contains("may fail and continue"), "{fail_open}");
+
+        let group_fail_open = parse(
+            "api_version: 1\nsteps:\n  - id: source_group\n    on_error: continue\n    parallel:\n      - id: source\n        tool: claude\n        access: read\n        prompt: start\n  - id: consumer\n    tool: claude\n    access: read\n    continue_from: source\n    prompt: continue\n",
+        )
+        .unwrap_err();
+        assert!(
+            group_fail_open.contains("parallel group 'source_group'")
+                && group_fail_open.contains("without creating a session"),
+            "{group_fail_open}"
+        );
+
+        let provider_changes = parse(
+            "api_version: 1\nprofiles:\n  primary: {tool: claude, access: read}\n  backup: {tool: codex, access: read}\nsteps:\n  - id: source\n    use: primary\n    fallback: [backup]\n    prompt: start\n  - id: consumer\n    tool: claude\n    access: read\n    continue_from: source\n    prompt: continue\n",
+        )
+        .unwrap_err();
+        assert!(
+            provider_changes.contains("no stable session provider"),
+            "{provider_changes}"
+        );
+    }
+
+    #[test]
+    fn step_templates_require_dominance_unless_explicitly_optional() {
+        let future = parse(
+            "api_version: 1\nsteps:\n  - id: consumer\n    tool: claude\n    access: read\n    prompt: '{{steps.source.output}}'\n  - id: source\n    cmd: [\"echo\", \"answer\"]\n",
+        )
+        .unwrap_err();
+        assert!(future.contains("does not dominate"), "{future}");
+
+        let branched = "api_version: 1\nsteps:\n  - id: choose\n    cmd: [\"echo\", \"pick\"]\n    route:\n      - {when_last_line_is: source, goto: source}\n      - {goto: join}\n  - id: source\n    cmd: [\"echo\", \"answer\"]\n    route: [{goto: join}]\n  - id: join\n    tool: claude\n    access: read\n    prompt: '{{steps.source.output | optional}}'\n";
+        assert!(parse(branched).is_ok());
+        let required = branched.replace(" | optional", "");
+        let error = parse(&required).unwrap_err();
+        assert!(error.contains("does not dominate"), "{error}");
+    }
+
+    #[test]
+    fn template_dominance_checks_only_effective_merged_settings() {
+        let overridden = "api_version: 1
+defaults:
+  cwd: '{{steps.branch_only.output}}'
+  env:
+    ANSWER: '{{steps.branch_only.output}}'
+profiles:
+  primary:
+    tool: claude
+    access: read
+    cwd: '{{steps.branch_only.output}}'
+    env:
+      ANSWER: '{{steps.branch_only.output}}'
+steps:
+  - id: choose
+    cmd: [\"echo\", \"pick\"]
+    cwd: .
+    env: {ANSWER: fixed}
+    route:
+      - {when_last_line_is: branch, goto: branch_only}
+      - {goto: consumer}
+  - id: branch_only
+    cmd: [\"echo\", \"answer\"]
+    cwd: .
+    env: {ANSWER: fixed}
+    route: [{goto: consumer}]
+  - id: consumer
+    use: primary
+    cwd: .
+    env:
+      ANSWER: fixed
+    prompt: work
+";
+        let parsed = parse(overridden);
+        assert!(
+            parsed.is_ok(),
+            "overridden profile/default templates are not runtime dependencies: {:?}",
+            parsed.err()
+        );
+
+        let active = overridden.replacen(
+            "  - id: consumer\n    use: primary\n    cwd: .\n    env:\n      ANSWER: fixed\n",
+            "  - id: consumer\n    use: primary\n    cwd: .\n",
+            1,
+        );
+        let error = parse(&active).unwrap_err();
+        assert!(error.contains("does not dominate"), "{error}");
+
+        let fallback = overridden.replace(
+            "  primary:\n    tool: claude\n",
+            "  fallback:\n    tool: claude\n    access: read\n    model: '{{steps.branch_only.output}}'\n  primary:\n    tool: claude\n",
+        )
+        .replace("    use: primary\n", "    use: primary\n    fallback: [fallback]\n");
+        let error = parse(&fallback).unwrap_err();
+        assert!(error.contains("does not dominate"), "{error}");
+    }
+
+    #[test]
+    fn strict_mode_exposes_implicit_and_unreachable_control_flow() {
+        let flow: Flow = yaml::from_str(
+            "steps:\n  - id: first\n    cmd: [\"echo\", \"x\"]\n    route:\n      - {when_last_line_is: x, goto: end}\n  - id: unreachable\n    cmd: [\"echo\", \"never\"]\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+        let warnings = strict_warnings(&flow).join("\n");
+        assert!(warnings.contains("api_version is omitted"), "{warnings}");
+        assert!(warnings.contains("no catch-all"), "{warnings}");
     }
 }

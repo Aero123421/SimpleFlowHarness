@@ -5,14 +5,27 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
+  release-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Tag, package, and changelog agree
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "$GITHUB_REF_NAME" = "v$version"
+          grep -F "## v$version " CHANGELOG.md
+
   build:
-    needs: verify
+    needs: [verify, release-contract]
     strategy:
       fail-fast: false
       matrix:
@@ -37,22 +50,22 @@ jobs:
             asset: sfh-linux-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Add target
         run: rustup target add ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir pkg
           cp target/${{ matrix.target }}/release/sfh pkg/
-          cp README.md LICENSE pkg/
+          cp README.md README.en.md LICENSE pkg/
           # Flat member names ("sfh", not "./sfh") so `tar xz sfh` works with GNU tar too.
-          tar czf ${{ matrix.asset }} -C pkg sfh README.md LICENSE
+          tar czf ${{ matrix.asset }} -C pkg sfh README.md README.en.md LICENSE
           shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
           # Verify the archive the way the README tells users to extract it.
           # A cross-built binary cannot run on this host, so only unpack it.
@@ -64,7 +77,7 @@ jobs:
         run: |
           New-Item -ItemType Directory pkg | Out-Null
           Copy-Item target/${{ matrix.target }}/release/sfh.exe pkg/
-          Copy-Item README.md, LICENSE pkg/
+          Copy-Item README.md, README.en.md, LICENSE pkg/
           Compress-Archive -Path pkg/* -DestinationPath ${{ matrix.asset }} -Force
           $h = (Get-FileHash ${{ matrix.asset }} -Algorithm SHA256).Hash.ToLower()
           # LF, not CRLF: Out-File's default trailing CRLF makes the filename
@@ -73,7 +86,7 @@ jobs:
           Expand-Archive ${{ matrix.asset }} -DestinationPath verify -Force
           ./verify/sfh.exe --version
       - name: Stage release asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -85,15 +98,17 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download complete release set
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           fail_on_unmatched_files: true

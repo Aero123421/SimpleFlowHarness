@@ -14,6 +14,7 @@
 #   - 差し戻しの入力は「不足と判定された項目だけ」に絞る(毎回500行を読み直させない)
 #
 #   sfh run examples/v1-harden-r3.yaml --detach
+api_version: 1
 name: v1-harden-r3
 
 profiles:
@@ -52,7 +53,7 @@ steps:
   - id: fixA
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化・最終ラウンド、バッチA。
+      sfh ({{flow_dir}}) のセキュリティ強化・最終ラウンド、バッチA。
       **セキュリティ修正が正当な利用者を閉め出している箇所**を直します。
 
       ## F-2【高】parallel / foreach の途中で落ちると完了済みメンバーまで再実行される
@@ -105,7 +106,7 @@ steps:
       (単に再開が成功するだけでは不十分。旧実装でも通ってしまう)。
 
       前回の検証結果(初回は空):
-      {{steps.checkA.output | tail:120}}
+      {{steps.checkA.output | optional | tail:120}}
 
   - id: checkA
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
@@ -121,7 +122,7 @@ steps:
   - id: fixB
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化・最終ラウンド、バッチB。
+      sfh ({{flow_dir}}) のセキュリティ強化・最終ラウンド、バッチB。
       **判定できないときに拒否ではなく許可している箇所**を直します。
 
       原則: **run ディレクトリは信頼できない入力。判定に必要な情報が
@@ -198,7 +199,7 @@ steps:
       正常系だけを通すテストは、修正を検証したことになりません。
 
       前回の検証結果(初回は空):
-      {{steps.checkB.output | tail:120}}
+      {{steps.checkB.output | optional | tail:120}}
 
   - id: checkB
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
@@ -224,7 +225,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) のレビュアーです。
+          あなたは sfh ({{flow_dir}}) のレビュアーです。
           自分たちのオープンソースプロジェクトに入れた修正のレビューです。
 
           ## 環境の制約
@@ -266,7 +267,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**テスト品質**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**テスト品質**レビュアーです。
 
           ## 環境の制約
           読み取り専用です。テストは実行できませんし、する必要もありません。
@@ -310,7 +311,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**移植性**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**移植性**レビュアーです。
 
           ## 環境の制約
           読み取り専用です。テストは実行できません。**コードを読んでください。**
@@ -365,7 +366,7 @@ steps:
   - id: fixC
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化・最終ラウンド。**レビュー指摘への対応**。
+      sfh ({{flow_dir}}) のセキュリティ強化・最終ラウンド。**レビュー指摘への対応**。
 
       codex 3体が F-1〜F-11 の11項目を、実装 / テスト品質 / 移植性 の3観点で
       独立に判定しました。全員一致の合格が出ていません。

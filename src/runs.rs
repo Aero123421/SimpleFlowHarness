@@ -1,16 +1,35 @@
 //! `sfh runs` - browse and prune the evidence trail.
 
+use crate::contain;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 fn run_dirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(canon_root) = root.canonicalize() else {
+        return Vec::new();
+    };
     let mut v: Vec<PathBuf> = match std::fs::read_dir(root) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
+            // Do not follow a symlink/junction planted in the runs root. This
+            // matters especially to `runs clean`, which deletes these paths.
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .map(|e| e.path())
-            .filter(|p| p.is_dir() && p.join("log.jsonl").exists())
+            .filter(|p| {
+                p.canonicalize()
+                    .map(|resolved| resolved.starts_with(&canon_root))
+                    .unwrap_or(false)
+            })
+            // A fixed-name artifact is untrusted input too. Requiring a
+            // contained, no-follow read prevents list/show/clean from treating
+            // a log.jsonl symlink as evidence that this is an sfh run.
+            .filter(|p| {
+                contain::read_contained_opt(p, "log.jsonl")
+                    .map(|log| log.is_some())
+                    .unwrap_or(false)
+            })
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -19,9 +38,10 @@ fn run_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 fn read_json(dir: &Path, name: &str) -> Value {
-    std::fs::read_to_string(dir.join(name))
+    contain::read_contained_opt(dir, name)
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+        .flatten()
+        .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or(Value::Null)
 }
 
@@ -162,7 +182,9 @@ struct BudgetLanding {
 /// one landing, and if a tampered log carries two, reporting the first is the
 /// same "earliest recorded fact" rule the rest of the resume path uses.
 fn budget_landing(dir: &Path) -> Option<BudgetLanding> {
-    let log = std::fs::read_to_string(dir.join("log.jsonl")).ok()?;
+    let log = contain::read_contained_opt(dir, "log.jsonl")
+        .ok()
+        .flatten()?;
     for line in log.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -195,7 +217,10 @@ fn budget_landing(dir: &Path) -> Option<BudgetLanding> {
 }
 
 fn step_summaries(dir: &Path) -> Vec<StepSummary> {
-    let log = std::fs::read_to_string(dir.join("log.jsonl")).unwrap_or_default();
+    let log = contain::read_contained_opt(dir, "log.jsonl")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let mut leaves: BTreeMap<String, StepAccumulator> = BTreeMap::new();
     let mut aggregates: BTreeMap<String, StepAccumulator> = BTreeMap::new();
     for line in log.lines() {
@@ -237,7 +262,10 @@ fn opt_string(v: &Value, key: &str) -> Option<String> {
 fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
     let m = meta(dir);
     let s = status(dir);
-    let status = opt_string(&m, "status").or_else(|| opt_string(&s, "state"));
+    // status.json is the live/final state contract. Prefer it over meta.json
+    // so a failure while persisting the terminal heartbeat cannot be masked by
+    // metadata that was written slightly earlier.
+    let status = opt_string(&s, "state").or_else(|| opt_string(&m, "status"));
     let exit = s.get("exit_code").and_then(Value::as_i64);
     let ok = steps.iter().map(|x| x.ok).sum();
     let failed = steps.iter().map(|x| x.failed).sum();
@@ -326,9 +354,16 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
 }
 
 pub fn show(dir: &Path, as_json: bool) -> i32 {
-    if !dir.join("log.jsonl").exists() {
-        eprintln!("sfh: {} is not an sfh run directory", dir.display());
-        return 2;
+    match contain::read_contained_opt(dir, "log.jsonl") {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            eprintln!("sfh: {} is not an sfh run directory", dir.display());
+            return 2;
+        }
+        Err(e) => {
+            eprintln!("sfh: refusing unsafe run directory {}: {e}", dir.display());
+            return 2;
+        }
     }
     let run = details(dir);
     if as_json {
@@ -396,6 +431,146 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
     0
 }
 
+/// Explain the last durable control-flow facts without re-running anything.
+/// This is intentionally log-backed rather than inferred from filenames: the
+/// log is the resume contract and therefore the authoritative answer to
+/// "where did this run stop and what will happen next?".
+pub fn why(dir: &Path, as_json: bool) -> i32 {
+    let log = match contain::read_contained_opt(dir, "log.jsonl") {
+        Ok(Some(log)) => log,
+        Ok(None) => {
+            eprintln!("sfh: {} is not an sfh run directory", dir.display());
+            return 2;
+        }
+        Err(e) => {
+            eprintln!("sfh: cannot safely read {}/log.jsonl: {e}", dir.display());
+            return 2;
+        }
+    };
+    let mut last = Value::Null;
+    let mut position = Value::Null;
+    let mut unfinished: BTreeMap<String, Value> = BTreeMap::new();
+    let mut fanout: BTreeMap<String, Value> = BTreeMap::new();
+    let mut fallbacks: BTreeMap<String, Value> = BTreeMap::new();
+    let mut postprocessing: BTreeMap<String, Value> = BTreeMap::new();
+    for line in log.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = event.get("event").and_then(Value::as_str).unwrap_or("");
+        let step = event
+            .get("step")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let visit = event.get("visit").and_then(Value::as_u64).unwrap_or(1);
+        let parent = event.get("parent").and_then(Value::as_str).unwrap_or("");
+        let key = format!("{parent}/{step}@{visit}");
+        let stage_key = if parent.is_empty() {
+            format!("{step}@{visit}")
+        } else {
+            format!("{parent}/{step}@{visit}")
+        };
+        match kind {
+            "step_start" => {
+                unfinished.insert(key, event.clone());
+            }
+            "step_end" => {
+                unfinished.remove(&key);
+                if event
+                    .get("next_fallback")
+                    .and_then(Value::as_str)
+                    .is_some_and(|profile| !profile.is_empty())
+                {
+                    fallbacks.insert(stage_key.clone(), event.clone());
+                } else {
+                    fallbacks.remove(&stage_key);
+                }
+                if event.get("postprocess_pending").and_then(Value::as_bool) == Some(true) {
+                    postprocessing.insert(stage_key, event.clone());
+                }
+            }
+            "group_start" | "foreach_start" => {
+                fanout.insert(format!("{step}@{visit}"), event.clone());
+            }
+            "aggregate_end" => {
+                let stage_key = format!("{step}@{visit}");
+                fanout.remove(&stage_key);
+                if event.get("postprocess_pending").and_then(Value::as_bool) == Some(true) {
+                    postprocessing.insert(stage_key, event.clone());
+                }
+            }
+            "postprocess_end" => {
+                postprocessing.remove(&format!("{step}@{visit}"));
+            }
+            "position" => position = event.clone(),
+            _ => {}
+        }
+        last = event;
+    }
+    let status = status(dir);
+    let state = get(&status, "state").to_string();
+    let error = opt_string(&status, "error");
+    let current = opt_string(&status, "current_step");
+    let explanation = if let Some(error) = &error {
+        error.clone()
+    } else if let Some(checkpoint) = fallbacks.values().next_back() {
+        format!(
+            "a failed attempt durably selected fallback profile '{}'; resume will continue that profile in the same visit",
+            checkpoint
+                .get("next_fallback")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+        )
+    } else if !postprocessing.is_empty() {
+        "the step result is durable but compact/notes post-processing has no postprocess_end; resume will finish post-processing without rerunning the step".into()
+    } else if !fanout.is_empty() {
+        "a fan-out started but no aggregate_end was durably recorded; resume will restore successful member step_end records and run only the remainder".into()
+    } else if !unfinished.is_empty() {
+        "one or more leaves started without a durable step_end; resume will run those leaves again"
+            .into()
+    } else if let Some(next) = position.get("next").and_then(Value::as_str) {
+        format!("the last durable routing decision selected '{next}'")
+    } else if state == "done" {
+        "the run completed successfully".into()
+    } else {
+        "the log has no later durable control-flow decision".into()
+    };
+    let report = serde_json::json!({
+        "run_dir": dir.display().to_string(),
+        "state": state,
+        "current_step": current,
+        "error": error,
+        "explanation": explanation,
+        "last_event": last,
+        "last_position": position,
+        "unfinished_leaves": unfinished.into_values().collect::<Vec<_>>(),
+        "unfinished_fanouts": fanout.into_values().collect::<Vec<_>>(),
+        "unfinished_fallbacks": fallbacks.into_values().collect::<Vec<_>>(),
+        "unfinished_postprocessing": postprocessing.into_values().collect::<Vec<_>>(),
+    });
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        println!("run dir : {}", dir.display());
+        println!("state   : {}", report["state"].as_str().unwrap_or("-"));
+        if let Some(step) = report["current_step"].as_str().filter(|s| !s.is_empty()) {
+            println!("current : {step}");
+        }
+        println!(
+            "why     : {}",
+            report["explanation"].as_str().unwrap_or("-")
+        );
+        if let Some(next) = report["last_position"].get("next").and_then(Value::as_str) {
+            println!("next    : {next}");
+        }
+    }
+    0
+}
+
 /// Delete run dirs older than `days`, always keeping the newest `keep`.
 pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
     let dirs = run_dirs(root);
@@ -404,9 +579,30 @@ pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
         return 0;
     }
     let now = std::time::SystemTime::now();
-    let cutoff = std::time::Duration::from_secs(days * 86400);
+    let cutoff = std::time::Duration::from_secs(days.saturating_mul(86_400));
+    let canon_root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("sfh: cannot resolve runs root {}: {e}", root.display());
+            return 2;
+        }
+    };
     let mut removed = 0;
     for d in dirs.iter().take(dirs.len() - keep) {
+        // Re-check immediately before a destructive operation. The runs root
+        // is expected to be private, but a path swapped for a symlink/junction
+        // after enumeration must still be refused.
+        let still_safe = d
+            .symlink_metadata()
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false)
+            && d.canonicalize()
+                .map(|resolved| resolved.starts_with(&canon_root))
+                .unwrap_or(false);
+        if !still_safe {
+            eprintln!("sfh: refusing unsafe run directory {}", d.display());
+            continue;
+        }
         let age_ok = std::fs::metadata(d)
             .and_then(|m| m.modified())
             .ok()

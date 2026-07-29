@@ -43,31 +43,247 @@ pub fn run(opts: RunOpts) -> i32 {
 }
 
 pub fn validate(path: &Path, var_overrides: &[(String, String)]) -> i32 {
-    let inner = || -> Result<(), String> {
+    validate_with_options(path, var_overrides, false, false)
+}
+
+pub fn validate_with_options(
+    path: &Path,
+    var_overrides: &[(String, String)],
+    strict: bool,
+    as_json: bool,
+) -> i32 {
+    let inner = || -> Result<(flow::Flow, Vec<String>), String> {
         let flow = flow::load(path)?;
         let mut vars = flow.vars_string_map()?;
         for (k, v) in var_overrides {
             vars.insert(k.clone(), v.clone());
         }
         precheck(&flow, &vars, &HashSet::new())?;
-        eprintln!("OK: {} ({} steps)", path.display(), flow.steps.len());
-        for s in &flow.steps {
-            eprintln!("  - {} ({})", s.id, describe_kind(&flow, s));
-            if let Some(children) = &s.parallel {
-                for c in children {
-                    eprintln!("      * {} ({})", c.id, describe_kind(&flow, c));
-                }
-            }
+        let warnings = flow::strict_warnings(&flow);
+        if strict && !warnings.is_empty() {
+            return Err(format!(
+                "strict validation found {} issue(s):\n  - {}",
+                warnings.len(),
+                warnings.join("\n  - ")
+            ));
         }
-        Ok(())
+        Ok((flow, warnings))
     };
     match inner() {
-        Ok(()) => 0,
+        Ok((flow, warnings)) => {
+            if as_json {
+                let steps: Vec<_> = flow
+                    .steps
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "id": s.id,
+                            "kind": describe_kind(&flow, s),
+                            "children": s.parallel.as_ref().map(|children| {
+                                children.iter().map(|c| json!({
+                                    "id": c.id,
+                                    "kind": describe_kind(&flow, c),
+                                })).collect::<Vec<_>>()
+                            }).unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": true,
+                        "path": path.display().to_string(),
+                        "strict": strict,
+                        "api_version": flow.api_version.unwrap_or(1),
+                        "warnings": warnings,
+                        "steps": steps,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("OK: {} ({} steps)", path.display(), flow.steps.len());
+                for warning in &warnings {
+                    eprintln!("  warning: {warning}");
+                }
+                for s in &flow.steps {
+                    eprintln!("  - {} ({})", s.id, describe_kind(&flow, s));
+                    if let Some(children) = &s.parallel {
+                        for c in children {
+                            eprintln!("      * {} ({})", c.id, describe_kind(&flow, c));
+                        }
+                    }
+                }
+            }
+            0
+        }
+        Err(e) => {
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "ok": false,
+                        "path": path.display().to_string(),
+                        "strict": strict,
+                        "error": e,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                eprintln!("sfh: {e}");
+            }
+            2
+        }
+    }
+}
+
+pub fn show_config(path: &Path, show_secrets: bool) -> i32 {
+    match flow::load(path).and_then(|flow| flow.effective_config_json_pretty(show_secrets)) {
+        Ok(config) => {
+            println!("{config}");
+            0
+        }
         Err(e) => {
             eprintln!("sfh: {e}");
             2
         }
     }
+}
+
+pub fn graph(path: &Path, mermaid: bool) -> i32 {
+    let flow = match flow::load(path) {
+        Ok(flow) => flow,
+        Err(e) => {
+            eprintln!("sfh: {e}");
+            return 2;
+        }
+    };
+    if mermaid {
+        // Step ids may contain '-' which is valid YAML for sfh but is not a
+        // safe unquoted Mermaid node id. Keep user ids as labels and use a
+        // stable, generated identifier for graph syntax.
+        let nodes: HashMap<&str, String> = flow
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| (step.id.as_str(), format!("n{i}")))
+            .collect();
+        let terminal_node = |terminal: &str| format!("terminal_{terminal}");
+        println!("flowchart TD");
+        println!(
+            "  flow_start([start]) --> {}",
+            nodes[flow.steps[0].id.as_str()]
+        );
+        for (i, step) in flow.steps.iter().enumerate() {
+            let node = &nodes[step.id.as_str()];
+            let shape = if step.is_group() || step.is_foreach() {
+                format!("{node}{{\"{}\"}}", step.id)
+            } else {
+                format!("{node}[\"{}\"]", step.id)
+            };
+            println!("  {shape}");
+            for (rule, route) in step.route.iter().enumerate() {
+                let target = nodes
+                    .get(route.goto.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| terminal_node(&route.goto));
+                let label = if route.is_catch_all() {
+                    "else".to_string()
+                } else {
+                    format!("route {rule}")
+                };
+                println!("  {node} -->|\"{label}\"| {target}");
+            }
+            if !step.route.iter().any(flow::Route::is_catch_all) {
+                let target = flow
+                    .steps
+                    .get(i + 1)
+                    .map(|s| nodes[s.id.as_str()].clone())
+                    .unwrap_or_else(|| terminal_node("end"));
+                println!("  {node} -. \"fallthrough\" .-> {target}");
+            }
+            for (kind, action) in [
+                ("error", step.on_error.as_deref()),
+                ("max visits", step.on_max_visits.as_deref()),
+            ] {
+                if let Some(action) = action {
+                    let target = match action {
+                        "continue" => flow
+                            .steps
+                            .get(i + 1)
+                            .map(|next| nodes[next.id.as_str()].clone())
+                            .unwrap_or_else(|| terminal_node("end")),
+                        "fail" => terminal_node("fail"),
+                        action => {
+                            let target = action.strip_prefix("goto:").unwrap_or(action);
+                            nodes
+                                .get(target)
+                                .cloned()
+                                .unwrap_or_else(|| terminal_node(target))
+                        }
+                    };
+                    println!("  {node} -->|\"{kind}: {action}\"| {target}");
+                }
+            }
+        }
+        if let Some(target) = flow.defaults.budget_goto() {
+            let target = nodes
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| terminal_node(target));
+            println!("  budget_guard{{\"budget threshold (global)\"}}");
+            println!("  budget_guard -->|\"on_budget\"| {target}");
+        }
+        for terminal in flow::TERMINALS {
+            println!("  {}([\"{terminal}\"])", terminal_node(terminal));
+        }
+    } else {
+        println!("flow: {}", path.display());
+        for (i, step) in flow.steps.iter().enumerate() {
+            let mut edges = Vec::new();
+            for (rule, route) in step.route.iter().enumerate() {
+                edges.push(format!(
+                    "{} -> {}",
+                    if route.is_catch_all() {
+                        "else".into()
+                    } else {
+                        format!("route[{rule}]")
+                    },
+                    route.goto
+                ));
+            }
+            let fallthrough = flow
+                .steps
+                .get(i + 1)
+                .map(|s| s.id.as_str())
+                .unwrap_or("end");
+            if !step.route.iter().any(flow::Route::is_catch_all) {
+                edges.push(format!("fallthrough -> {fallthrough}"));
+            }
+            for (kind, action) in [
+                ("on_error", step.on_error.as_deref()),
+                ("on_max_visits", step.on_max_visits.as_deref()),
+            ] {
+                if let Some(action) = action {
+                    edges.push(format!(
+                        "{kind} -> {}",
+                        if action == "continue" {
+                            fallthrough
+                        } else {
+                            action.strip_prefix("goto:").unwrap_or(action)
+                        }
+                    ));
+                }
+            }
+            println!("  {}: {}", step.id, edges.join(", "));
+        }
+        if let Some(target) = flow.defaults.budget_goto() {
+            println!("  on_budget (global) -> {target}");
+        }
+        for warning in flow::strict_warnings(&flow) {
+            println!("  warning: {warning}");
+        }
+    }
+    0
 }
 
 fn describe_kind(flow: &flow::Flow, s: &flow::Step) -> String {
@@ -362,7 +578,11 @@ struct BudgetPlan {
 }
 
 impl BudgetPlan {
-    fn of(defaults: &flow::Defaults, flow_start: Instant) -> Option<Self> {
+    fn of(
+        defaults: &flow::Defaults,
+        flow_start: Instant,
+        elapsed_before_attempt: u64,
+    ) -> Option<Self> {
         let goto = defaults.budget_goto()?.to_string();
         // A reserve larger than its own ceiling clamps to "land at once"
         // rather than wrapping around into a threshold in the past/negative.
@@ -373,9 +593,13 @@ impl BudgetPlan {
         Some(Self {
             goto,
             cost_at: defaults.max_cost_usd.map(|m| (m - reserve_usd).max(0.0)),
-            wall_at: defaults
-                .wall_clock_sec
-                .map(|s| flow_start + Duration::from_secs(s.saturating_sub(reserve_sec))),
+            wall_at: defaults.wall_clock_sec.map(|s| {
+                flow_start
+                    + Duration::from_secs(
+                        s.saturating_sub(reserve_sec)
+                            .saturating_sub(elapsed_before_attempt),
+                    )
+            }),
         })
     }
 
@@ -423,6 +647,22 @@ fn claim_leaf_runs(
     Ok(())
 }
 
+fn accumulate_cost(total: &mut f64, additional: f64) {
+    // Provider reports and resumed logs are accounting input, not trusted
+    // arithmetic. They cannot refund spend, and summing two individually finite
+    // f64::MAX values must saturate instead of producing Infinity (which JSON
+    // cannot represent and which would otherwise panic status serialization).
+    let additional = if additional.is_nan() || additional < 0.0 {
+        0.0
+    } else if additional.is_infinite() {
+        f64::MAX
+    } else {
+        additional
+    };
+    let sum = total.max(0.0) + additional;
+    *total = if sum.is_finite() { sum } else { f64::MAX };
+}
+
 #[derive(Clone)]
 struct PendingRoute {
     step: String,
@@ -441,6 +681,17 @@ struct PendingRoute {
     /// before the snapshot existed - the router tells those two apart from the
     /// flow, and refuses the second rather than guessing (see `Members`).
     members: Option<Vec<MemberVerdict>>,
+    /// The step/aggregate result is durable, but compact/notes post-processing
+    /// has not yet reached its own durable end marker. Resume must finish that
+    /// stage before evaluating this route.
+    postprocess: bool,
+    /// A compact_end/compact_failed event points at a durable compacted (or
+    /// head+tail fallback) chain. Resume skips the paid summarizer when this is
+    /// true and continues with the next post-processing stage.
+    compact_done: bool,
+    /// The visit's notes section has been atomically published and notes_end
+    /// was recorded. Resume must not append it again.
+    notes_done: bool,
 }
 
 /// The per-member snapshot an aggregate_end carries, or None when the event has
@@ -480,11 +731,28 @@ fn restored_members(v: &serde_json::Value) -> Option<Vec<MemberVerdict>> {
     Some(out)
 }
 
+fn restored_visit(v: &serde_json::Value, step: &str) -> Result<u32, String> {
+    let Some(raw) = v.get("visit") else {
+        // Pre-visit logs represented the first pass implicitly.
+        return Ok(1);
+    };
+    let value = raw
+        .as_u64()
+        .ok_or_else(|| format!("resume: event for step '{step}' records a non-integer visit"))?;
+    u32::try_from(value).map_err(|_| {
+        format!("resume: event for step '{step}' records visit {value} outside the supported range")
+    })
+}
+
 #[derive(Clone)]
 struct UnfinishedStep {
     step: String,
+    visit: u32,
     started: String,
     cmd: String,
+    /// A durable step_end selected this fallback, but its own final step_end
+    /// was never recorded. Resume this profile directly in the same visit.
+    profile: Option<String>,
 }
 
 #[derive(Default)]
@@ -495,6 +763,9 @@ struct ResumeState {
     chain_files: HashMap<String, PathBuf>,
     total: u32,
     cost_usd: f64,
+    /// Active run time recorded by the last status heartbeat. A resume carries
+    /// this forward so wall_clock_sec is a run budget, not a per-attempt budget.
+    elapsed_sec: u64,
     start: Option<String>,
     pending_route: Option<PendingRoute>,
     unfinished_step: Option<UnfinishedStep>,
@@ -513,6 +784,15 @@ struct ResumeState {
     /// count plus a full fresh batch past max_total_steps, wedging the resume
     /// (rev_regression: fan-out members re-executed after a mid-group crash).
     completed_members: HashMap<(String, u32), HashSet<String>>,
+    /// A failed fan-out member durably selected this profile but stopped
+    /// before that fallback reached step_end. Keyed separately per member so a
+    /// resumed group can continue the paid attempt chain instead of starting
+    /// that member's primary profile again.
+    member_fallbacks: HashMap<(String, u32, String), String>,
+    /// Ordered foreach input fingerprints recorded when the group opened.
+    /// Completed items are keyed by index, so their meaning is safe to restore
+    /// only while the exact ordered item list is unchanged.
+    foreach_inputs: HashMap<(String, u32), String>,
 }
 
 #[cfg(test)]
@@ -534,6 +814,10 @@ fn load_resume_for_flow(
     let mut st = ResumeState::default();
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
+    // A completed leaf's chain may later be intentionally replaced by its
+    // compact substage. Defer a mismatched step_end hash until the log proves
+    // that transition and verify the pre-compact recovery artifact instead.
+    let mut pending_step_hashes: HashMap<(String, u32), String> = HashMap::new();
     // Groups whose finished members a resume should carry into the next visit,
     // and the visit to carry them FROM. Populated when a fan-out's lap ends in
     // failure, and removed the moment the log shows the run did something else
@@ -566,20 +850,81 @@ fn load_resume_for_flow(
             .unwrap_or("")
             .to_string();
         match ev {
-            // A compacted step's chain file now holds the summary, so `output`
-            // is already right. `outputs` has to be walked back to what was
-            // summarized, or a resumed run sees strictly less than a live one.
+            // A child finished (and may already have been billed), but sfh
+            // could not publish the complete artifact set that would make the
+            // result safe to restore. Treat this run as permanently
+            // non-resumable instead of interpreting the preceding step_start
+            // as permission to execute the uncertain side effect again.
+            "persistence_failure" => {
+                let error = v
+                    .get("error")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("required result artifacts could not be persisted");
+                return Err(format!(
+                    "resume: run is non-resumable after persistence failure in step '{step}': {error}; verify the external side effect before starting a new run"
+                ));
+            }
+            // compact_start is also a recovery record: its precompact artifact
+            // is the last known-good chain. The compacted chain is published
+            // atomically before compact_end, so a kill in that narrow interval
+            // leaves the new bytes on disk but no completion checkpoint. Reset
+            // the in-memory result to the original here and rerun the unfinished
+            // compactor; otherwise it would summarize its own summary and route
+            // a leaf against text the live run never judged.
+            "compact_start" => {
+                let visit = restored_visit(&v, &step)?;
+                if st
+                    .pending_route
+                    .as_ref()
+                    .is_some_and(|pending| pending.step == step && pending.visit == visit)
+                {
+                    // Older log writers did not name the recovery artifact.
+                    // Preserve their previous best-effort behavior, but a new
+                    // checkpoint that names a missing artifact is corruption.
+                    if let Some(path) = v.get("precompact_file").and_then(|x| x.as_str()) {
+                        let original =
+                            contain::read_contained_opt(run_dir, path)?.ok_or_else(|| {
+                                format!(
+                                    "resume: compact start for step '{step}' names missing artifact '{path}'"
+                                )
+                            })?;
+                        if let Some(expected) = pending_step_hashes.remove(&(step.clone(), visit)) {
+                            if !output_fingerprint_matches(&expected, &original) {
+                                return Err(format!(
+                                    "resume: compact recovery artifact for step '{step}' does not match the completed leaf output hash"
+                                ));
+                            }
+                        }
+                        let original = original.trim_end().to_string();
+                        if let Some(output) = st.outputs.get_mut(&step) {
+                            output.output = original.clone();
+                            output.outputs = original.clone();
+                        }
+                        if let Some(pending) = st.pending_route.as_mut() {
+                            if !pending.from_plain {
+                                pending.route_text = original;
+                            }
+                        }
+                    } else {
+                        // Legacy compact_start records did not name a recovery
+                        // artifact, so there is no byte source against which an
+                        // old step hash can be checked.
+                        pending_step_hashes.remove(&(step.clone(), visit));
+                    }
+                }
+            }
+            // A completed compactor is its own durable post-processing stage.
+            // Restore its published chain so a crash before postprocess_end
+            // does not launch and bill the summarizer a second time.
             "compact_end" | "compact_failed" => {
                 // A live run counts the summarizer as one more leaf run and
                 // adds its cost the moment compact starts; a resume that drops
                 // both under-reports steps_done and cost, which can push a
                 // resumed run past max_total_steps / max_cost_usd that the
                 // live run would have honoured.
-                st.total += 1;
-                if ev == "compact_end" {
-                    if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
-                        st.cost_usd += c.max(0.0);
-                    }
+                st.total = st.total.saturating_add(1);
+                if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
+                    accumulate_cost(&mut st.cost_usd, c);
                 }
                 // A path that escapes the run dir fails the resume outright;
                 // only a genuinely absent file reads as None (S1-4).
@@ -587,16 +932,53 @@ fn load_resume_for_flow(
                     Some(p) => contain::read_contained_opt(run_dir, p)?,
                     None => None,
                 };
-                if let (Some(e), Some(p)) = (st.outputs.get_mut(&step), precompact.as_ref()) {
-                    e.outputs = p.trim_end().to_string();
+                let compact_file = v.get("chain_file").and_then(|x| x.as_str());
+                let compacted = match compact_file {
+                    Some(path) => Some(
+                        contain::read_contained_opt(run_dir, path)?.ok_or_else(|| {
+                            format!(
+                                "resume: compact checkpoint for step '{step}' names missing artifact '{path}'"
+                            )
+                        })?,
+                    ),
+                    None => None,
+                };
+                if let (Some(expected), Some(compacted)) = (
+                    v.get("output_hash").and_then(|x| x.as_str()),
+                    compacted.as_deref(),
+                ) {
+                    if !output_fingerprint_matches(expected, compacted) {
+                        return Err(format!(
+                            "resume: compact checkpoint for step '{step}' does not match the recorded output hash"
+                        ));
+                    }
                 }
-                if let (Some(pending), Some(p)) = (st.pending_route.as_mut(), precompact) {
-                    if pending.step == step && !pending.from_plain {
+                if let Some(e) = st.outputs.get_mut(&step) {
+                    if let Some(original) = precompact.as_ref() {
+                        e.outputs = original.trim_end().to_string();
+                    }
+                    if let Some(compacted) = compacted.as_ref() {
+                        e.output = compacted.trim_end().to_string();
+                    }
+                }
+                let visit = restored_visit(&v, &step)?;
+                if let Some(pending) = st.pending_route.as_mut() {
+                    if pending.step == step && pending.visit == visit {
+                        pending.compact_done = compacted.is_some();
+                    }
+                    if pending.step == step && pending.visit == visit && !pending.from_plain {
                         // Live routing uses the pre-compact text, even though
                         // the chain file now contains the summary/head+tail.
                         // A fan-out's route text is its headerless plain
                         // output, which compaction never touches.
-                        pending.route_text = p.trim_end().to_string();
+                        if let Some(original) = precompact {
+                            pending.route_text = original.trim_end().to_string();
+                        }
+                    }
+                }
+                if let Some(path) = compact_file {
+                    if let Some(canon) = contain::contained_opt(run_dir, path)? {
+                        st.chain_files.insert(step.clone(), canon);
                     }
                 }
             }
@@ -607,11 +989,12 @@ fn load_resume_for_flow(
             // the whole fan-out.
             "step_start" if v.get("parent").is_some_and(|p| !p.is_null()) => {}
             "step_start" => {
-                let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                let visit = restored_visit(&v, &step)?;
                 unfinished.insert(
                     (step.clone(), visit),
                     UnfinishedStep {
-                        step,
+                        step: step.clone(),
+                        visit,
                         started: v
                             .get("ts")
                             .and_then(|x| x.as_str())
@@ -622,6 +1005,7 @@ fn load_resume_for_flow(
                             .and_then(|x| x.as_str())
                             .unwrap_or("unknown command")
                             .to_string(),
+                        profile: None,
                     },
                 );
             }
@@ -632,7 +1016,7 @@ fn load_resume_for_flow(
             // resume from at all. Track the group exactly like an unfinished
             // leaf; aggregate_end clears it.
             "group_start" | "foreach_start" => {
-                let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                let visit = restored_visit(&v, &step)?;
                 // A new lap opened, so whatever the previous one left behind is
                 // not something to carry into it.
                 carry_from.remove(&step);
@@ -645,15 +1029,35 @@ fn load_resume_for_flow(
                 unfinished.insert(
                     (step.clone(), visit),
                     UnfinishedStep {
+                        visit,
                         started: v
                             .get("ts")
                             .and_then(|x| x.as_str())
                             .unwrap_or("unknown")
                             .to_string(),
                         cmd: format!("{kind} fan-out ({n} members)"),
-                        step,
+                        step: step.clone(),
+                        profile: None,
                     },
                 );
+                if ev == "foreach_start" {
+                    if let Some(hash) = v
+                        .get("items_hash")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                    {
+                        let key = (step.clone(), visit);
+                        if let Some(previous) = st.foreach_inputs.get(&key) {
+                            if previous != hash {
+                                return Err(format!(
+                                    "resume: foreach step '{step}' visit {visit} has contradictory ordered-input fingerprints in log.jsonl"
+                                ));
+                            }
+                        } else {
+                            st.foreach_inputs.insert(key, hash.to_string());
+                        }
+                    }
+                }
             }
             // A member an earlier resume carried over rather than executed. It
             // has no output, cost or session of its own to restore - those came
@@ -665,7 +1069,7 @@ fn load_resume_for_flow(
                     .and_then(|p| p.as_str())
                     .filter(|p| !p.is_empty())
                 {
-                    let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                    let visit = restored_visit(&v, &step)?;
                     let entry = st
                         .completed_members
                         .entry((parent.to_string(), visit))
@@ -683,17 +1087,48 @@ fn load_resume_for_flow(
             }
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
-                    st.total += 1;
+                    st.total = st.total.saturating_add(1);
                 }
                 // A run dir is untrusted on --resume: a NEGATIVE cost_usd in an
                 // edited log would subtract from the running total and let a
                 // resumed run slip under max_cost_usd. Reported cost can only be
                 // spent, never refunded, so clamp at zero (rev_break #12).
                 if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
-                    st.cost_usd += c.max(0.0);
+                    accumulate_cost(&mut st.cost_usd, c);
                 }
-                let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                let visit = restored_visit(&v, &step)?;
                 let is_child = v.get("parent").is_some_and(|p| !p.is_null());
+                let next_fallback = v
+                    .get("next_fallback")
+                    .and_then(|profile| profile.as_str())
+                    .filter(|profile| !profile.is_empty())
+                    .map(str::to_string);
+                if ev == "step_end" {
+                    if let Some(parent) = v
+                        .get("parent")
+                        .and_then(|parent| parent.as_str())
+                        .filter(|parent| !parent.is_empty())
+                    {
+                        let key = (parent.to_string(), visit, step.clone());
+                        if let Some(profile) = &next_fallback {
+                            st.member_fallbacks.insert(key, profile.clone());
+                        } else {
+                            st.member_fallbacks.remove(&key);
+                        }
+                    }
+                } else {
+                    // aggregate_end closes every recovery stage owned by this
+                    // group visit. Honest logs have already removed them one by
+                    // one; this also keeps malformed stale entries from leaking
+                    // into a later explicit lap.
+                    st.member_fallbacks.retain(|(parent, member_visit, _), _| {
+                        parent != &step || *member_visit != visit
+                    });
+                }
+                let postprocess_pending = v
+                    .get("postprocess_pending")
+                    .and_then(|pending| pending.as_bool())
+                    == Some(true);
                 // step_end clears an unfinished leaf; aggregate_end clears the
                 // fan-out group opened by group_start/foreach_start. A child's
                 // step_end is keyed by the CHILD id, so it cannot clear its
@@ -798,7 +1233,11 @@ fn load_resume_for_flow(
                 // A path pointing elsewhere used to be swallowed into empty
                 // output; it now fails the whole resume instead (S1-4).
                 let chain = match v.get("chain_file").and_then(|x| x.as_str()) {
-                    Some(p) => contain::read_contained_opt(run_dir, p)?.unwrap_or_default(),
+                    Some(p) => contain::read_contained_opt(run_dir, p)?.ok_or_else(|| {
+                        format!(
+                            "resume: {ev} checkpoint for step '{step}' names missing artifact '{p}'"
+                        )
+                    })?,
                     None => String::new(),
                 };
                 // Fan-out steps route against the headerless plain
@@ -807,9 +1246,26 @@ fn load_resume_for_flow(
                 // re-reads the chain would test conditions against "--- id ---"
                 // headers and could pick a different branch.
                 let plain = match v.get("plain_file").and_then(|x| x.as_str()) {
-                    Some(p) => contain::read_contained_opt(run_dir, p)?,
+                    Some(p) => Some(contain::read_contained_opt(run_dir, p)?.ok_or_else(|| {
+                        format!(
+                            "resume: aggregate checkpoint for step '{step}' names missing artifact '{p}'"
+                        )
+                    })?),
                     None => None,
                 };
+                if let Some(expected) = v.get("output_hash").and_then(|x| x.as_str()) {
+                    if ev == "aggregate_end" {
+                        if let Some(restored) = plain.as_deref() {
+                            if !output_fingerprint_matches(expected, restored) {
+                                return Err(format!(
+                                    "resume: {ev} checkpoint for step '{step}' does not match the recorded output hash"
+                                ));
+                            }
+                        }
+                    } else if !output_fingerprint_matches(expected, &chain) {
+                        pending_step_hashes.insert((step.clone(), visit), expected.to_string());
+                    }
+                }
                 let exit = exit_raw.and_then(|c| i32::try_from(c).ok()).unwrap_or(1);
                 let timed_out = v
                     .get("timed_out")
@@ -879,36 +1335,62 @@ fn load_resume_for_flow(
                             .and_then(|f| f.steps.iter().find(|candidate| candidate.id == step))
                             .and_then(|candidate| candidate.on_error.as_deref())
                             .is_some_and(|action| action != "fail");
-                    st.pending_route =
-                        if ev == "step_end" && completed_event && (ok || replay_failed_control) {
-                            Some(PendingRoute {
+                    st.pending_route = if next_fallback.is_some() {
+                        // This step_end closes one failed attempt but also
+                        // atomically checkpoints the fallback that must run
+                        // next. It is not a routable completion yet.
+                        None
+                    } else if ev == "step_end" && completed_event && (ok || replay_failed_control) {
+                        Some(PendingRoute {
+                            step: step.clone(),
+                            visit,
+                            route_text: chain.trim_end().to_string(),
+                            errored: !ok,
+                            from_plain: false,
+                            members: None,
+                            postprocess: postprocess_pending,
+                            compact_done: false,
+                            notes_done: false,
+                        })
+                    } else if ev == "aggregate_end"
+                        && completed_event
+                        && (ok || replay_failed_control)
+                    {
+                        // Runs written before plain_file existed have no
+                        // headerless copy: leave the route unset (as before)
+                        // so the fan-out re-runs rather than routing on
+                        // headered text live never matched against.
+                        let members = restored_members(&v);
+                        plain.map(|p| PendingRoute {
+                            step: step.clone(),
+                            visit,
+                            route_text: p.trim_end().to_string(),
+                            errored: !ok,
+                            from_plain: true,
+                            members,
+                            postprocess: postprocess_pending,
+                            compact_done: false,
+                            notes_done: false,
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(profile) = &next_fallback {
+                        unfinished.insert(
+                            (step.clone(), visit),
+                            UnfinishedStep {
                                 step: step.clone(),
                                 visit,
-                                route_text: chain.trim_end().to_string(),
-                                errored: !ok,
-                                from_plain: false,
-                                members: None,
-                            })
-                        } else if ev == "aggregate_end"
-                            && completed_event
-                            && (ok || replay_failed_control)
-                        {
-                            // Runs written before plain_file existed have no
-                            // headerless copy: leave the route unset (as before)
-                            // so the fan-out re-runs rather than routing on
-                            // headered text live never matched against.
-                            let members = restored_members(&v);
-                            plain.map(|p| PendingRoute {
-                                step: step.clone(),
-                                visit,
-                                route_text: p.trim_end().to_string(),
-                                errored: !ok,
-                                from_plain: true,
-                                members,
-                            })
-                        } else {
-                            None
-                        };
+                                started: v
+                                    .get("ts")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                cmd: format!("fallback profile '{profile}'"),
+                                profile: Some(profile.clone()),
+                            },
+                        );
+                    }
                 }
                 // Trust model for the recorded session (rev_break #11): the
                 // session id/marker/access restored here come from log.jsonl,
@@ -956,6 +1438,42 @@ fn load_resume_for_flow(
                     }
                 }
             }
+            "notes_end" => {
+                let visit = restored_visit(&v, &step)?;
+                if let Some(pending) = st.pending_route.as_mut() {
+                    if pending.step == step && pending.visit == visit {
+                        let marker = v
+                            .get("marker")
+                            .and_then(|x| x.as_str())
+                            .filter(|marker| !marker.is_empty())
+                            .ok_or_else(|| {
+                                format!("resume: notes checkpoint for step '{step}' has no marker")
+                            })?;
+                        let notes = contain::read_contained_opt(run_dir, "notes.md")?
+                            .ok_or_else(|| {
+                                format!(
+                                    "resume: notes checkpoint for step '{step}' names missing artifact 'notes.md'"
+                                )
+                            })?;
+                        if !notes.lines().any(|line| line.trim() == marker) {
+                            return Err(format!(
+                                "resume: notes checkpoint for step '{step}' is missing marker '{marker}'"
+                            ));
+                        }
+                        pending.notes_done = true;
+                    }
+                }
+            }
+            "postprocess_end" => {
+                let visit = restored_visit(&v, &step)?;
+                if let Some(pending) = st.pending_route.as_mut() {
+                    if pending.step == step && pending.visit == visit {
+                        pending.postprocess = false;
+                        pending.compact_done = true;
+                        pending.notes_done = true;
+                    }
+                }
+            }
             "position" => {
                 st.pending_route = None;
                 let next = v.get("next").and_then(|x| x.as_str()).unwrap_or("");
@@ -995,6 +1513,13 @@ fn load_resume_for_flow(
             _ => {}
         }
     }
+    if let Some(((step, _), _)) = pending_step_hashes.into_iter().next() {
+        return Err(format!(
+            "resume: step_end checkpoint for step '{step}' does not match the recorded output hash"
+        ));
+    }
+    st.member_fallbacks
+        .retain(|(parent, visit, _), _| unfinished.contains_key(&(parent.clone(), *visit)));
     st.unfinished_step = unfinished.into_values().next_back();
     if st.pending_route.is_none() && !st.completed {
         if let Some(u) = &st.unfinished_step {
@@ -1033,14 +1558,25 @@ fn load_resume_for_flow(
                 .get(&(resume_at.clone(), visit))
                 .cloned()
             {
+                let next_visit = visit.checked_add(1).ok_or_else(|| {
+                    format!("resume: step '{resume_at}' exhausted the supported visit counter")
+                })?;
                 // extend, not or_insert: a member known complete from either
                 // source is complete, and replacing an existing entry - or
                 // declining to touch it - would drop one side of the union.
                 st.completed_members
-                    .entry((resume_at, visit + 1))
+                    .entry((resume_at, next_visit))
                     .or_default()
                     .extend(set);
             }
+        }
+    }
+    if let Some(text) = contain::read_contained_opt(run_dir, "status.json")? {
+        if let Ok(status) = serde_json::from_str::<serde_json::Value>(&text) {
+            st.elapsed_sec = status
+                .get("elapsed_sec")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
         }
     }
     Ok(st)
@@ -1144,7 +1680,11 @@ fn latest_run_dir(root: &Path, flow_path: &Path) -> Option<PathBuf> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.path())
-        .filter(|p| p.join("log.jsonl").exists())
+        .filter(|p| {
+            contain::read_contained_opt(p, "log.jsonl")
+                .map(|log| log.is_some())
+                .unwrap_or(false)
+        })
         .filter(|p| match p.canonicalize() {
             Ok(c) => c.starts_with(&canon_root),
             Err(_) => false,
@@ -1207,7 +1747,16 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
     let status_path = run_dir.join("status.json");
     // A resumed run dir still holds the previous attempt's terminal status;
     // drop it so a stale "done" cannot be mistaken for this attempt's result.
-    let _ = std::fs::remove_file(&status_path);
+    match std::fs::remove_file(&status_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot remove the previous status {} before detach: {e}",
+                status_path.display()
+            ))
+        }
+    }
 
     let d = execute::spawn_detached(
         &exe,
@@ -1225,12 +1774,17 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
     // the same bytes with its own pid - which is exactly d.pid - so there is no
     // window of disagreement (rev_break #8).
     let child_start = execute::pid_start_time(d.pid);
-    contain::write_nonce(run_dir, d.pid, child_start, nonce)
-        .map_err(|e| format!("cannot write the stop nonce: {e}"))?;
+    if let Err(e) = contain::write_nonce(run_dir, d.pid, child_start, nonce) {
+        let _ = execute::kill_pid_tree(d.pid);
+        return Err(format!(
+            "cannot write the stop nonce; killed detached pid {}: {e}",
+            d.pid
+        ));
+    }
     // Seed status.json only if the child has not already written its own, so
     // `sfh status` has something to report either way and neither clobbers.
     // The create_new guard inside seed_status makes this race-free.
-    seed_status(
+    if let Err(e) = seed_status(
         &status_path,
         &Status {
             state: "running",
@@ -1243,6 +1797,11 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
             last_output: Arc::new(AtomicU64::new(0)),
             steps_done: 0,
             cost_usd: 0.0,
+            elapsed_before_attempt: 0,
+            attempt_started: Instant::now(),
+            active_members: BTreeMap::new(),
+            fanout_total: 0,
+            fanout_completed: 0,
             run_dir: run_dir.display().to_string(),
             flow: abs(&opts.flow_path).display().to_string(),
             pid: d.pid,
@@ -1254,7 +1813,10 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
             nonce: nonce.to_string(),
             pid_start: child_start,
         },
-    );
+    ) {
+        let _ = execute::kill_pid_tree(d.pid);
+        return Err(e);
+    }
     if !opts.quiet {
         eprintln!(
             "sfh: detached (pid {}). poll with: sfh status {}",
@@ -1344,6 +1906,17 @@ fn gitignore_ignores_everything(text: &str) -> bool {
 /// hash, so this is not a way to smuggle an edit past the check.
 fn fingerprint(s: &str) -> String {
     crate::sha256::hex(s.replace("\r\n", "\n").as_bytes())
+}
+
+/// Output checkpoints predate the SHA-256 migration used by current logs.
+/// Verify both encodings rather than making old run directories unresumable;
+/// an unknown or malformed encoding never counts as a match.
+fn output_fingerprint_matches(recorded: &str, text: &str) -> bool {
+    match recorded.len() {
+        16 => legacy_fingerprint_fnv(text) == recorded,
+        64 => fingerprint(text) == recorded,
+        _ => false,
+    }
 }
 
 /// The FNV-1a 64 fingerprint sfh <= 0.9 recorded in meta.json. Kept ONLY so
@@ -1437,6 +2010,43 @@ fn check_flow_fingerprint(
     Ok(())
 }
 
+fn check_effective_config_fingerprint(
+    meta: &serde_json::Value,
+    effective_config: &str,
+    dir: &Path,
+) -> Result<(), String> {
+    let Some(old_fp) = meta
+        .get("effective_config_fingerprint")
+        .and_then(|x| x.as_str())
+    else {
+        // Runs written before 1.1.2 did not pin machine-level profiles. Keep
+        // them resumable, but make the missing guarantee visible.
+        eprintln!(
+            "sfh: warning: {} predates effective-config pinning; global profile changes cannot be verified for this legacy run",
+            dir.display()
+        );
+        return Ok(());
+    };
+    let algo = meta
+        .get("effective_config_fingerprint_algo")
+        .and_then(|x| x.as_str())
+        .unwrap_or(FINGERPRINT_ALGO);
+    if algo != FINGERPRINT_ALGO {
+        return Err(format!(
+            "{} records unknown effective_config_fingerprint_algo '{algo}' (use --force-resume to override)",
+            dir.display()
+        ));
+    }
+    let current = fingerprint(effective_config);
+    if old_fp != current {
+        return Err(format!(
+            "{} resolves to a different effective configuration now (global profiles, tool/model/access/args/env/cwd or defaults changed; restore the original profiles or use --force-resume)",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
 struct Status {
     state: &'static str,
     step: String,
@@ -1452,6 +2062,11 @@ struct Status {
     last_output: Arc<AtomicU64>,
     steps_done: u32,
     cost_usd: f64,
+    elapsed_before_attempt: u64,
+    attempt_started: Instant,
+    active_members: BTreeMap<String, String>,
+    fanout_total: u32,
+    fanout_completed: u32,
     run_dir: String,
     flow: String,
     /// Which process owns this run; `sfh status` checks it is still alive so a
@@ -1472,12 +2087,14 @@ struct Status {
     pid_start: Option<u64>,
 }
 
-fn status_json(s: &Status) -> String {
+fn status_json(s: &Status) -> Result<String, String> {
     let unfinished_step = s.unfinished_step.as_ref().map(|u| {
         json!({
             "step": u.step,
+            "visit": u.visit,
             "started_utc": u.started,
             "cmd": u.cmd,
+            "profile": u.profile,
             "will_rerun": true,
         })
     });
@@ -1485,7 +2102,10 @@ fn status_json(s: &Status) -> String {
         0 => serde_json::Value::Null,
         secs => json!(utc_stamp_at(secs)),
     };
+    let cost = serde_json::Number::from_f64(s.cost_usd)
+        .ok_or_else(|| "cannot serialize status: cost_usd is not finite".to_string())?;
     let v = json!({
+        "schema_version": 1,
         "state": s.state,
         "current_step": s.step,
         "started_utc": s.started,
@@ -1494,7 +2114,11 @@ fn status_json(s: &Status) -> String {
         "visit": s.visit,
         "heartbeat_utc": utc_stamp(),
         "steps_done": s.steps_done,
-        "cost_usd": s.cost_usd,
+        "cost_usd": cost,
+        "elapsed_sec": s.elapsed_before_attempt.saturating_add(s.attempt_started.elapsed().as_secs()),
+        "active_members": s.active_members,
+        "fanout_total": s.fanout_total,
+        "fanout_completed": s.fanout_completed,
         "run_dir": s.run_dir,
         "flow": s.flow,
         "pid": s.pid,
@@ -1507,25 +2131,19 @@ fn status_json(s: &Status) -> String {
         "nonce": s.nonce,
         "pid_start": s.pid_start,
     });
-    serde_json::to_string_pretty(&v).unwrap_or_default()
+    serde_json::to_string_pretty(&v).map_err(|e| format!("cannot serialize status: {e}"))
 }
 
-fn write_status(path: &Path, s: &Status) {
-    let text = status_json(s);
+fn write_status(path: &Path, s: &Status) -> Result<(), String> {
+    let text = status_json(s)?;
     // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
     // seconds, and a plain write lets them read a half-written document. Rename
     // is atomic on both platforms, so a reader sees the old or the new file and
     // never a torn one. The tmp name carries the pid: the detaching parent and
     // its child both write status.json, and a SHARED tmp name let them clobber
     // each other's in-flight write (rev_regression: detach status race).
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(format!(".tmp.{}", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    if contain::write_private(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-        return;
-    }
-    let _ = std::fs::remove_file(&tmp);
-    let _ = contain::write_private(path, &text);
+    contain::write_private_atomic(path, &text)
+        .map_err(|e| format!("cannot persist status {}: {e}", path.display()))
 }
 
 /// Seed status.json for a detached run ONLY if the child has not already written
@@ -1535,16 +2153,24 @@ fn write_status(path: &Path, s: &Status) {
 /// would then clobber the terminal status, leaving a finished run stuck on
 /// `running` forever (rev_regression: detach status race). create_new fails
 /// harmlessly once the file exists.
-fn seed_status(path: &Path, s: &Status) {
+fn seed_status(path: &Path, s: &Status) -> Result<(), String> {
     use std::io::Write as _;
-    let text = status_json(s);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let text = status_json(s)?;
+    match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
     {
-        let _ = f.write_all(text.as_bytes());
-        contain::restrict_file(&f);
+        Ok(mut f) => {
+            f.write_all(text.as_bytes())
+                .map_err(|e| format!("cannot seed status {}: {e}", path.display()))?;
+            f.sync_data()
+                .map_err(|e| format!("cannot sync status {}: {e}", path.display()))?;
+            contain::restrict_file(&f);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(format!("cannot create status {}: {e}", path.display())),
     }
 }
 
@@ -1599,6 +2225,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
         }
     };
+    let effective_config = flow.effective_config_json()?;
+    let effective_config_fp = fingerprint(&effective_config);
     let mut vars = flow.vars_string_map()?;
     let step_ids = flow.step_ids();
     if let Some(e) = &opts.emit {
@@ -1608,7 +2236,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     }
 
     let flow_dir = abs(opts.flow_path.parent().unwrap_or(Path::new(".")));
-    let flow_text = std::fs::read_to_string(&opts.flow_path).unwrap_or_default();
+    let flow_text = std::fs::read_to_string(&opts.flow_path).map_err(|e| {
+        format!(
+            "cannot re-read flow {} for its execution fingerprint: {e}",
+            opts.flow_path.display()
+        )
+    })?;
     let flow_fp = fingerprint(&flow_text);
     // Same rule `sfh validate` enforces through flow::validate: only characters
     // that would affect the run dir PATH are forbidden (R-6).
@@ -1625,6 +2258,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         let meta = resume_meta.as_ref().expect("resume meta read above");
         if !opts.force_resume {
             check_flow_fingerprint(meta, &flow_text, dir, &opts.flow_path)?;
+            check_effective_config_fingerprint(meta, &effective_config, dir)?;
         }
         // A resumed dir must be a real directory, not a symlink/junction sfh
         // would resolve into somewhere the caller did not point at; and on Unix
@@ -1690,11 +2324,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let run_dir: PathBuf;
     let mut is_resume = false;
     if opts.dry_run {
-        protect_runs_root(&runs_root)?;
-        let base = format!("{}-{}-dryrun", utc_stamp(), name);
-        run_dir = abs(&runs_root.join(base));
-        contain::mkdir_private(&run_dir)
-            .map_err(|e| format!("cannot create run dir {}: {e}", run_dir.display()))?;
+        run_dir = std::env::temp_dir().join(format!("sfh-plan-{}", leaf::gen_uuid()));
+        contain::mkdir_private(&run_dir).map_err(|e| {
+            format!(
+                "cannot create temporary plan dir {}: {e}",
+                run_dir.display()
+            )
+        })?;
     } else if let Some(dir) = resume_dir {
         // The resumed dir was protected when it was first created; nothing
         // here writes to the runs root, so its state is not this run's
@@ -1741,10 +2377,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             ));
         }
         if let Some(u) = &resumed.unfinished_step {
-            eprintln!(
-                "sfh: step '{}' started {} and never recorded an end.\n     resuming will run it again: {}",
-                u.step, u.started, u.cmd
-            );
+            if let Some(profile) = &u.profile {
+                eprintln!(
+                    "sfh: step '{}' selected fallback '{}' in visit {} but never recorded its end.\n     resuming that fallback directly: {}",
+                    u.step, profile, u.visit, u.cmd
+                );
+            } else {
+                eprintln!(
+                    "sfh: step '{}' started {} and never recorded an end.\n     resuming will run it again: {}",
+                    u.step, u.started, u.cmd
+                );
+            }
         }
         run_dir = dir;
         is_resume = true;
@@ -1770,7 +2413,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     }
     // Defense-in-depth: even though `name` is charset-validated, confirm the
     // resolved run dir is actually under the runs root (guards symlink tricks).
-    if !is_resume && opts.run_dir.is_none() && !contain::is_under(&runs_root, &run_dir) {
+    if !is_resume
+        && !opts.dry_run
+        && opts.run_dir.is_none()
+        && !contain::is_under(&runs_root, &run_dir)
+    {
         return Err(format!(
             "run dir {} escapes the runs root {}",
             run_dir.display(),
@@ -1794,7 +2441,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         _ => contain::random_nonce(),
     };
     let pid_start = execute::pid_start_time(std::process::id());
-    if !opts.detach {
+    if !opts.detach && !opts.dry_run {
         // The detaching parent writes the file itself, after the spawn, when
         // it knows the child's pid (in detach_run).
         contain::write_nonce(&run_dir, std::process::id(), pid_start, &nonce)
@@ -1803,7 +2450,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let notes_file = run_dir.join("notes.md");
 
     if opts.dry_run {
-        return dry_run(
+        let result = dry_run(
             &flow,
             &vars,
             &tainted_vars,
@@ -1812,6 +2459,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             &notes_file,
             &needed_sessions,
         );
+        if let Err(e) = std::fs::remove_dir_all(&run_dir) {
+            eprintln!(
+                "sfh: warning: could not remove temporary plan dir {}: {e}",
+                run_dir.display()
+            );
+        }
+        return result;
     }
 
     // ---- hand the run off to a detached copy of ourselves ----
@@ -1821,6 +2475,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         return detach_run(opts, &run_dir, is_resume, &nonce);
     }
 
+    let elapsed_before_attempt = resumed.elapsed_sec;
     let mut log = contain::append_private(&run_dir.join("log.jsonl"))
         .map_err(|e| format!("cannot open log: {e}"))?;
 
@@ -1851,30 +2506,35 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     }
     let started = utc_stamp();
     let meta = json!({
+        "schema_version": 1,
         "sfh_version": VERSION,
         "flow": abs(&opts.flow_path).display().to_string(),
         "flow_fingerprint": flow_fp,
         "flow_fingerprint_algo": FINGERPRINT_ALGO,
+        "effective_config_fingerprint": effective_config_fp,
+        "effective_config_fingerprint_algo": FINGERPRINT_ALGO,
         "name": name,
         "started_utc": started,
         "os": std::env::consts::OS,
         "vars": vars,
         "tools": tool_versions,
         "resumed": is_resume,
+        "elapsed_sec": elapsed_before_attempt,
     });
-    let _ = contain::write_private(
-        &run_dir.join("meta.json"),
-        serde_json::to_string_pretty(&meta).unwrap_or_default(),
-    );
+    let meta_text = serde_json::to_string_pretty(&meta)
+        .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
+    contain::write_private_atomic(&run_dir.join("meta.json"), meta_text)
+        .map_err(|e| format!("cannot persist run metadata: {e}"))?;
     log_event(
         &mut log,
-        json!({"ts": utc_stamp(), "event": "run_start", "sfh_version": VERSION, "resumed": is_resume, "flow_fingerprint": flow_fp}),
-    );
+        json!({"ts": utc_stamp(), "event": "run_start", "sfh_version": VERSION, "resumed": is_resume, "flow_fingerprint": flow_fp, "effective_config_fingerprint": effective_config_fp}),
+    )?;
 
     // ---- live status file + heartbeat so a parent agent can poll liveness ----
     // The run-level activity clock: every child's reader thread stores the
     // moment it read anything here, so the heartbeat can publish "nothing has
     // been said for N minutes" without asking any single step.
+    let flow_start = Instant::now();
     let run_clock = Arc::new(AtomicU64::new(0));
     let status_path = run_dir.join("status.json");
     let status = Arc::new(Mutex::new(Status {
@@ -1891,6 +2551,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         last_output: Arc::clone(&run_clock),
         steps_done: resumed.total,
         cost_usd: resumed.cost_usd,
+        elapsed_before_attempt,
+        attempt_started: flow_start,
+        active_members: BTreeMap::new(),
+        fanout_total: 0,
+        fanout_completed: 0,
         run_dir: run_dir.display().to_string(),
         flow: abs(&opts.flow_path).display().to_string(),
         pid: std::process::id(),
@@ -1903,18 +2568,29 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         pid_start,
     }));
     {
+        let g = status.lock().unwrap();
+        write_status(&status_path, &g)?;
+    }
+    let persistence_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
         let s = Arc::clone(&status);
         let p = status_path.clone();
+        let failed = Arc::clone(&persistence_error);
         std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(3));
             {
                 let g = s.lock().unwrap();
                 if g.state != "running" {
-                    write_status(&p, &g);
                     break;
                 }
-                write_status(&p, &g);
+                if let Err(e) = write_status(&p, &g) {
+                    if let Ok(mut slot) = failed.lock() {
+                        *slot = Some(e);
+                    }
+                    execute::request_interrupt();
+                    break;
+                }
             }
-            std::thread::sleep(Duration::from_secs(3));
         });
     }
 
@@ -1924,6 +2600,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .enumerate()
         .map(|(i, s)| (s.id.clone(), i))
         .collect();
+    let mut resume_fallback = resumed
+        .unfinished_step
+        .clone()
+        .filter(|unfinished| unfinished.profile.is_some());
     let mut outputs = resumed.outputs;
     let mut visits = resumed.visits;
     let mut sessions = resumed.sessions;
@@ -1931,12 +2611,23 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut cost_usd: f64 = resumed.cost_usd;
     let mut last_executed = resumed.last_executed;
     let mut last_success = resumed.last_success;
-    let pending_route = resumed.pending_route;
+    let mut resume_postprocess = resumed
+        .pending_route
+        .clone()
+        .filter(|pending| pending.postprocess);
+    let pending_route = resumed.pending_route.filter(|pending| !pending.postprocess);
     let completed_members = resumed.completed_members;
+    let member_fallbacks = resumed.member_fallbacks;
+    let foreach_inputs = resumed.foreach_inputs;
     // step id -> the chain file its LAST visit wrote. A re-visited step writes
     // <id>.v2.chain.txt, so nothing may assume <id>.chain.txt.
     let mut chain_files = resumed.chain_files;
-    let mut cur = match &resumed.start {
+    let resume_id = resumed.start.clone().or_else(|| {
+        resume_postprocess
+            .as_ref()
+            .map(|pending| pending.step.clone())
+    });
+    let mut cur = match &resume_id {
         Some(id) => *index_of
             .get(id)
             .ok_or_else(|| format!("resume: step '{id}' no longer exists in the flow"))?,
@@ -1948,6 +2639,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 "sfh: resuming {} by replaying pending control flow after step '{}' ({} steps already done, ${cost_usd:.4} spent)",
                 run_dir.display(),
                 p.step,
+                total
+            );
+        } else if let Some(p) = &resume_postprocess {
+            eprintln!(
+                "sfh: resuming {} at post-processing for step '{}' visit {} ({} steps already done, ${cost_usd:.4} spent)",
+                run_dir.display(),
+                p.step,
+                p.visit,
                 total
             );
         } else {
@@ -1968,15 +2667,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .map(|(k, v)| (k.clone(), *v))
             .collect(),
     );
-    // One clock for both the ceiling and the landing threshold, so the two can
-    // never disagree about how long this attempt has been running. A resume
-    // starts it again from zero, exactly as wall_clock_sec always has.
-    let flow_start = Instant::now();
+    // One clock for both the ceiling and the landing threshold, carrying the
+    // prior attempt's active time across resume.
     let wall_deadline = flow
         .defaults
         .wall_clock_sec
-        .map(|s| flow_start + Duration::from_secs(s));
-    let budget_plan = BudgetPlan::of(&flow.defaults, flow_start);
+        .map(|s| flow_start + Duration::from_secs(s.saturating_sub(elapsed_before_attempt)));
+    let budget_plan = BudgetPlan::of(&flow.defaults, flow_start, elapsed_before_attempt);
     let mut budget_landed = resumed.budget_landed;
 
     let result: Result<FlowEnd, String> = (|| {
@@ -2026,12 +2723,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // Nothing is executed on this path - it only re-evaluates a
                     // recorded route - so there is no child to time.
                     run_clock: None,
+                    wall_deadline: None,
                     // The restored spend is real; the clock is this attempt's, the
                     // same one wall_clock_sec is judged on.
                     budget: leaf::BudgetVars::new(
                         &flow.defaults,
                         cost_usd,
-                        flow_start.elapsed().as_secs(),
+                        elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs()),
                     ),
                     quiet: opts.quiet,
                     verbose: opts.verbose,
@@ -2084,22 +2782,22 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             next_label(completed_idx + 1, &flow),
                             PositionVia::Fallthrough,
                             None,
-                        );
+                        )?;
                         cur = completed_idx + 1;
                         if cur >= n_steps {
                             return Ok(FlowEnd::Completed);
                         }
                     }
                     Some(("end", hit)) => {
-                        log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
+                        log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit))?;
                         return Ok(FlowEnd::Completed);
                     }
                     Some(("fail", hit)) => {
-                        log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
+                        log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit))?;
                         return Err(format!("step '{}' routed to fail", step.id));
                     }
                     Some(("stuck", hit)) => {
-                        log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit));
+                        log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit))?;
                         return Ok(FlowEnd::Stuck {
                             after: step.id.clone(),
                         });
@@ -2108,13 +2806,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         if !opts.quiet {
                             eprintln!("sfh: [{}] -> goto {id}", step.id);
                         }
-                        log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit));
+                        log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit))?;
                         cur = index_of[id];
                     }
                 }
             }
         }
         loop {
+            if let Some(e) = persistence_error.lock().ok().and_then(|mut e| e.take()) {
+                return Err(e);
+            }
             if execute::interrupted() {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
             }
@@ -2130,7 +2831,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // checks are all that is left - spend the reserve too and the run
             // ends the way it always did.
             if let (Some(plan), false) = (&budget_plan, budget_landed) {
-                let elapsed = flow_start.elapsed();
+                let elapsed_sec =
+                    elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs());
                 if let Some(trigger) = plan.trigger(Instant::now(), cost_usd) {
                     budget_landed = true;
                     // The step the landing PRE-EMPTED: it has not run and will
@@ -2142,13 +2844,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "budget_landing", "trigger": trigger,
-                               "spent_usd": cost_usd, "elapsed_sec": elapsed.as_secs(),
+                               "spent_usd": cost_usd, "elapsed_sec": elapsed_sec,
                                "goto": plan.goto}),
-                    );
+                    )?;
                     if !opts.quiet {
                         eprintln!(
                             "sfh: budget landing ({trigger}): ${cost_usd:.4} spent, {}s elapsed -> goto {}",
-                            elapsed.as_secs(),
+                            elapsed_sec,
                             plan.goto
                         );
                     }
@@ -2160,7 +2862,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "end".into(),
                                 PositionVia::Budget,
                                 None,
-                            );
+                            )?;
                             return Ok(FlowEnd::Completed);
                         }
                         "fail" => {
@@ -2170,10 +2872,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "fail".into(),
                                 PositionVia::Budget,
                                 None,
-                            );
+                            )?;
                             return Err(format!(
                                 "on_budget ({trigger}) routed to fail: ${cost_usd:.4} spent, {}s elapsed",
-                                elapsed.as_secs()
+                                elapsed_sec
                             ));
                         }
                         "stuck" => {
@@ -2183,7 +2885,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "stuck".into(),
                                 PositionVia::Budget,
                                 None,
-                            );
+                            )?;
                             return Ok(FlowEnd::Stuck {
                                 after: pending_step,
                             });
@@ -2195,7 +2897,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 id.to_string(),
                                 PositionVia::Budget,
                                 None,
-                            );
+                            )?;
                             cur = index_of[id];
                             continue;
                         }
@@ -2218,16 +2920,55 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 }
             }
             let step = &flow.steps[cur];
+            let needs_postprocess =
+                step.compact.is_some() || step.notes.as_deref() == Some("append");
             {
                 let mut g = status.lock().unwrap();
                 g.step = step.id.clone();
                 g.steps_done = total;
                 g.cost_usd = cost_usd;
+                g.active_members.clear();
+                g.fanout_total = 0;
+                g.fanout_completed = 0;
             }
 
-            let visit = visits.get(&step.id).copied().unwrap_or(0) + 1;
+            let resumed_fallback = if resume_fallback
+                .as_ref()
+                .is_some_and(|unfinished| unfinished.step == step.id)
+            {
+                resume_fallback.take()
+            } else {
+                None
+            };
+            let resumed_postprocess = if resume_postprocess
+                .as_ref()
+                .is_some_and(|pending| pending.step == step.id)
+            {
+                resume_postprocess.take()
+            } else {
+                None
+            };
+            let visit = if let Some(visit) = resumed_fallback
+                .as_ref()
+                .map(|unfinished| unfinished.visit)
+                .or_else(|| resumed_postprocess.as_ref().map(|pending| pending.visit))
+            {
+                visit
+            } else {
+                visits
+                    .get(&step.id)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        format!("step '{}' exhausted the supported visit counter", step.id)
+                    })?
+            };
             let max_v = step.max_visits.or(flow.defaults.max_visits).unwrap_or(5);
-            if visit > max_v {
+            // A fallback resumed from its durable checkpoint belongs to the
+            // visit that already passed this gate; it neither consumes a new
+            // visit nor trips max_visits on re-entry.
+            if resumed_fallback.is_none() && resumed_postprocess.is_none() && visit > max_v {
                 let action = step.on_max_visits.as_deref().unwrap_or("fail");
                 if !opts.quiet {
                     eprintln!(
@@ -2238,7 +2979,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 log_event(
                     &mut log,
                     json!({"ts": utc_stamp(), "event": "max_visits", "step": step.id, "action": action}),
-                );
+                )?;
                 match action {
                     "continue" => {
                         log_position(
@@ -2247,7 +2988,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             next_label(cur + 1, &flow),
                             PositionVia::MaxVisits,
                             None,
-                        );
+                        )?;
                         cur += 1;
                         if cur >= n_steps {
                             return Ok(FlowEnd::Completed);
@@ -2262,7 +3003,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "end".into(),
                                 PositionVia::MaxVisits,
                                 None,
-                            );
+                            )?;
                             return Ok(FlowEnd::Completed);
                         }
                         "fail" => {
@@ -2272,7 +3013,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "fail".into(),
                                 PositionVia::MaxVisits,
                                 None,
-                            );
+                            )?;
                             return Err(format!("step '{}' exhausted max_visits ({max_v})", step.id));
                         }
                         "stuck" => {
@@ -2282,7 +3023,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "stuck".into(),
                                 PositionVia::MaxVisits,
                                 None,
-                            );
+                            )?;
                             return Ok(FlowEnd::Stuck {
                                 after: step.id.clone(),
                             });
@@ -2294,7 +3035,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 id.to_string(),
                                 PositionVia::MaxVisits,
                                 None,
-                            );
+                            )?;
                             cur = index_of[id];
                             continue;
                         }
@@ -2337,13 +3078,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         needed_sessions: &needed_sessions,
                         tainted_vars: &tainted_vars,
                         run_clock: Some(&run_clock),
+                        wall_deadline,
                         // Read at expansion time, so every step (and every
                         // retry, fallback and compaction inside it) renders
                         // {{budget.*}} from the totals as they stand now.
                         budget: leaf::BudgetVars::new(
                             &flow.defaults,
                             cost_usd,
-                            flow_start.elapsed().as_secs(),
+                            elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs()),
                         ),
                         quiet: opts.quiet,
                         verbose: opts.verbose,
@@ -2357,35 +3099,74 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // failover it declared. Sequential on purpose: the pool has already
             // finished, and a fallback is the expensive, rare path.
             macro_rules! fan_fallback {
-                ($done:expr, $mstep:expr, $label:expr, $mtag:expr, $fbs:expr, $extra:expr) => {{
+                ($done:expr, $mstep:expr, $label:expr, $mtag:expr, $fbs:expr, $start:expr, $extra:expr) => {{
                     if !$done.ok() && !$done.interrupted && !$fbs.is_empty() {
-                        for fb in $fbs {
+                        for (fallback_index, fb) in
+                            $fbs.iter().enumerate().skip($start)
+                        {
                             if execute::interrupted() {
-                                break;
+                                return Err(format!(
+                                    "interrupted after fan-out member '{}' completed an attempt; its selected fallback is checkpointed for resume",
+                                    $label
+                                ));
                             }
-                            cost_usd += $done.usage.reported_cost();
-                            log_step_end(
-                                &mut log,
-                                &$label,
-                                Some(&step.id),
-                                visit,
-                                &$done,
-                            );
                             claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
                             if !opts.quiet {
                                 eprintln!("sfh: [{}] falling back to profile '{fb}'", $label);
                             }
                             let ftag = format!("{}.fb-{fb}", $mtag);
+                            {
+                                let mut g = status.lock().unwrap();
+                                g.active_members
+                                    .insert($label.to_string(), format!("fallback:{fb}"));
+                            }
                             let prep = {
                                 let cx = mk_cx!(&outputs, &sessions);
                                 leaf::prepare_leaf(&cx, $mstep, visit, &ftag, $extra, Some(fb))?
                             };
                             log_event(
                                 &mut log,
-                                json!({"ts": utc_stamp(), "event": "fallback", "step": $label, "profile": fb, "cmd": prep.inv.describe()}),
-                            );
+                                json!({"ts": utc_stamp(), "event": "fallback", "step": $label,
+                                       "parent": step.id, "visit": visit, "profile": fb,
+                                       "resumed": false, "cmd": prep.inv.describe()}),
+                            )?;
                             let alt = leaf::exec_leaf(prep);
+                            accumulate_cost(&mut cost_usd, alt.usage.reported_cost());
+                            {
+                                let mut g = status.lock().unwrap();
+                                g.active_members.remove(&$label.to_string());
+                                g.cost_usd = cost_usd;
+                            }
+                            if let Some(e) = &alt.persistence_error {
+                                log_persistence_failure(
+                                    &mut log,
+                                    &$label,
+                                    Some(&step.id),
+                                    visit,
+                                    &alt,
+                                    e,
+                                )?;
+                                return Err(format!("step '{}': {e}", $label));
+                            }
                             let ok = alt.ok();
+                            let next = if !ok && !alt.interrupted {
+                                $fbs.get(fallback_index + 1).map(String::as_str)
+                            } else {
+                                None
+                            };
+                            log_step_end_with_next(
+                                &mut log,
+                                &$label,
+                                Some(&step.id),
+                                visit,
+                                &alt,
+                                next,
+                                false,
+                            )?;
+                            if next.is_none() && !alt.interrupted {
+                                let mut g = status.lock().unwrap();
+                                g.fanout_completed = g.fanout_completed.saturating_add(1);
+                            }
                             $done = alt;
                             if ok {
                                 break;
@@ -2403,7 +3184,20 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 String,
                 bool,
                 Option<Vec<MemberVerdict>>,
-            ) = if let Some(children) = &step.parallel {
+            ) = if let Some(pending) = &resumed_postprocess {
+                let restored = outputs.get(&step.id).ok_or_else(|| {
+                    format!(
+                        "resume: step '{}' has pending post-processing but no durable output",
+                        step.id
+                    )
+                })?;
+                (
+                    restored.output.clone(),
+                    pending.route_text.clone(),
+                    pending.errored,
+                    pending.members.clone(),
+                )
+            } else if let Some(children) = &step.parallel {
                 // Members the crashed attempt already finished: their step_end
                 // events restored their output, session and cost, so a resume
                 // must NOT prepare or execute them again (rev_regression: the
@@ -2424,6 +3218,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let cx = mk_cx!(&outputs, &sessions);
                 let mut preps = Vec::new();
                 let mut fresh_idx: Vec<usize> = Vec::new();
+                let mut fallback_starts: Vec<usize> = Vec::new();
+                let mut resumed_profiles: Vec<Option<String>> = Vec::new();
                 for (ci, c) in children.iter().enumerate() {
                     if restored.contains(&c.id) {
                         continue;
@@ -2433,8 +3229,38 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     } else {
                         format!("{}.v{visit}", c.id)
                     };
-                    preps.push(leaf::prepare_leaf(&cx, c, visit, &ctag, &[], None)?);
+                    let resumed_profile = member_fallbacks
+                        .get(&(step.id.clone(), visit, c.id.clone()))
+                        .cloned();
+                    let fallback_start = match &resumed_profile {
+                        Some(profile) => c
+                            .fallback
+                            .iter()
+                            .position(|candidate| candidate == profile)
+                            .map(|index| index + 1)
+                            .ok_or_else(|| {
+                                format!(
+                                    "resume: fan-out member '{}' checkpointed fallback profile '{}', but the current flow does not list it",
+                                    c.id, profile
+                                )
+                            })?,
+                        None => 0,
+                    };
+                    let prep_tag = resumed_profile
+                        .as_ref()
+                        .map(|profile| format!("{ctag}.fb-{profile}"))
+                        .unwrap_or(ctag);
+                    preps.push(leaf::prepare_leaf(
+                        &cx,
+                        c,
+                        visit,
+                        &prep_tag,
+                        &[],
+                        resumed_profile.as_deref(),
+                    )?);
                     fresh_idx.push(ci);
+                    fallback_starts.push(fallback_start);
+                    resumed_profiles.push(resumed_profile);
                 }
                 claim_leaf_runs(&mut total, preps.len() as u32, max_total, &step.id)?;
                 let mp = step
@@ -2461,12 +3287,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 // that had not been written yet and run them again. Written
                 // first, a kill anywhere in here leaves no group_start at all,
                 // the old carry still stands, and nothing is lost.
-                log_restored_members(&mut log, &step.id, visit, &restored);
+                log_restored_members(&mut log, &step.id, visit, &restored)?;
                 if !preps.is_empty() {
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
-                    );
+                    )?;
                 }
                 log_member_starts(
                     &mut log,
@@ -2476,8 +3302,93 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         .iter()
                         .zip(fresh_idx.iter())
                         .map(|(p, &ci)| (children[ci].id.clone(), p)),
-                );
-                let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                )?;
+                for ((prep, &ci), profile) in preps
+                    .iter()
+                    .zip(fresh_idx.iter())
+                    .zip(resumed_profiles.iter())
+                {
+                    if let Some(profile) = profile {
+                        log_event(
+                            &mut log,
+                            json!({"ts": utc_stamp(), "event": "fallback",
+                                   "step": children[ci].id, "parent": step.id,
+                                   "visit": visit, "profile": profile,
+                                   "resumed": true, "cmd": prep.inv.describe()}),
+                        )?;
+                    }
+                }
+                let fresh_labels: Vec<String> = fresh_idx
+                    .iter()
+                    .map(|&ci| children[ci].id.clone())
+                    .collect();
+                {
+                    let mut g = status.lock().unwrap();
+                    g.fanout_total = u32::try_from(children.len()).unwrap_or(u32::MAX);
+                    g.fanout_completed = u32::try_from(restored.len()).unwrap_or(u32::MAX);
+                    for label in &fresh_labels {
+                        g.active_members.insert(label.clone(), "queued".into());
+                    }
+                }
+                let start_labels = fresh_labels.clone();
+                let start_status = Arc::clone(&status);
+                let mut dones = leaf::run_pool(
+                    preps,
+                    mp,
+                    Arc::clone(&gate),
+                    move |pos| {
+                        if let Some(label) = start_labels.get(pos) {
+                            let mut g = start_status.lock().unwrap();
+                            g.active_members.insert(label.clone(), "running".into());
+                        }
+                    },
+                    |pos, done| {
+                        let label = fresh_labels.get(pos).ok_or_else(|| {
+                            "internal error: fan-out completion index out of range".to_string()
+                        })?;
+                        let child_index = *fresh_idx.get(pos).ok_or_else(|| {
+                            "internal error: fan-out child index out of range".to_string()
+                        })?;
+                        let next_fallback = if !done.ok() && !done.interrupted {
+                            children[child_index]
+                                .fallback
+                                .get(fallback_starts[pos])
+                                .map(String::as_str)
+                        } else {
+                            None
+                        };
+                        accumulate_cost(&mut cost_usd, done.usage.reported_cost());
+                        let durable = match &done.persistence_error {
+                            Some(e) => log_persistence_failure(
+                                &mut log,
+                                label,
+                                Some(&step.id),
+                                visit,
+                                done,
+                                e,
+                            )
+                            .and_then(|_| Err(format!("step '{label}': {e}"))),
+                            None => log_step_end_with_next(
+                                &mut log,
+                                label,
+                                Some(&step.id),
+                                visit,
+                                done,
+                                next_fallback,
+                                false,
+                            ),
+                        };
+                        {
+                            let mut g = status.lock().unwrap();
+                            g.active_members.remove(label);
+                            g.cost_usd = cost_usd;
+                            if durable.is_ok() && next_fallback.is_none() && !done.interrupted {
+                                g.fanout_completed = g.fanout_completed.saturating_add(1);
+                            }
+                        }
+                        durable
+                    },
+                )?;
                 for (pos, &ci) in fresh_idx.iter().enumerate() {
                     let c = &children[ci];
                     let ctag = if visit == 1 {
@@ -2485,7 +3396,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     } else {
                         format!("{}.v{visit}", c.id)
                     };
-                    fan_fallback!(dones[pos], c, c.id, ctag, &c.fallback, &[]);
+                    fan_fallback!(
+                        dones[pos],
+                        c,
+                        c.id,
+                        ctag,
+                        &c.fallback,
+                        fallback_starts[pos],
+                        &[]
+                    );
                 }
                 let mut agg = String::new();
                 let mut plain = String::new();
@@ -2534,7 +3453,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             hard_fail = true;
                         }
                     }
-                    cost_usd += d.usage.reported_cost();
                     outputs.insert(
                         c.id.clone(),
                         template::StepOutput {
@@ -2560,7 +3478,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             },
                         );
                     }
-                    log_step_end(&mut log, &c.id, Some(&step.id), visit, d);
                     let failed_header = if d.ok() {
                         String::new()
                     } else {
@@ -2592,8 +3509,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 // holds the labeled aggregate, and a resume must route against
                 // exactly what this live run routed against (see load_resume).
                 let plain_name = format!("{gtag}.plain.txt");
-                let _ = contain::write_private(&run_dir.join(&plain_name), &plain);
-                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
+                let plain_path = run_dir.join(&plain_name);
+                contain::write_private_atomic(&plain_path, &plain).map_err(|e| {
+                    format!(
+                        "cannot persist aggregate routing text {}: {e}",
+                        plain_path.display()
+                    )
+                })?;
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail)?;
                 log_aggregate_end(
                     &mut log,
                     AggregateEnd {
@@ -2604,8 +3527,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         plain: &plain,
                         plain_file: &plain_name,
                         members: &verdicts,
+                        postprocess_pending: !hard_fail && needs_postprocess,
                     },
-                );
+                )?;
                 (agg, plain, hard_fail, Some(verdicts))
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
@@ -2631,6 +3555,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 if items.is_empty() {
                     eprintln!("sfh: warning: step '{}': foreach produced 0 items", step.id);
                 }
+                let items_hash = foreach_items_hash(&items);
+                if let Some(expected) = foreach_inputs.get(&(step.id.clone(), visit)) {
+                    if expected != &items_hash {
+                        return Err(format!(
+                            "resume: foreach inputs for step '{}' visit {} changed; refusing to apply completed item indexes to a different ordered list (recorded {}, current {}). Restore the original vars/inputs, or start a new run",
+                            step.id, visit, expected, items_hash
+                        ));
+                    }
+                }
                 // Items the crashed attempt already finished, keyed by the
                 // "id[i]" label they logged under; skipped, not re-run
                 // (rev_regression - see the parallel branch above). Item order
@@ -2648,6 +3581,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     .unwrap_or_default();
                 let mut preps = Vec::new();
                 let mut fresh_idx: Vec<usize> = Vec::new();
+                let mut fallback_starts: Vec<usize> = Vec::new();
+                let mut resumed_profiles: Vec<Option<String>> = Vec::new();
                 for (i, it) in items.iter().enumerate() {
                     let label = format!("{}[{i}]", step.id);
                     if restored.contains(&label) {
@@ -2658,15 +3593,37 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     } else {
                         format!("{}.v{visit}.i{i}", step.id)
                     };
+                    let resumed_profile = member_fallbacks
+                        .get(&(step.id.clone(), visit, label.clone()))
+                        .cloned();
+                    let fallback_start = match &resumed_profile {
+                        Some(profile) => step
+                            .fallback
+                            .iter()
+                            .position(|candidate| candidate == profile)
+                            .map(|index| index + 1)
+                            .ok_or_else(|| {
+                                format!(
+                                    "resume: foreach member '{label}' checkpointed fallback profile '{profile}', but the current flow does not list it"
+                                )
+                            })?,
+                        None => 0,
+                    };
+                    let prep_tag = resumed_profile
+                        .as_ref()
+                        .map(|profile| format!("{tag}.fb-{profile}"))
+                        .unwrap_or(tag);
                     preps.push(leaf::prepare_leaf(
                         &cx,
                         step,
                         visit,
-                        &tag,
+                        &prep_tag,
                         &[("item", it.clone()), ("item_index", i.to_string())],
-                        None,
+                        resumed_profile.as_deref(),
                     )?);
                     fresh_idx.push(i);
+                    fallback_starts.push(fallback_start);
+                    resumed_profiles.push(resumed_profile);
                 }
                 claim_leaf_runs(&mut total, preps.len() as u32, max_total, &step.id)?;
                 let mp = step
@@ -2684,12 +3641,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 // See the parallel branch, including why this goes BEFORE the
                 // foreach_start line: reading that line is what cancels the
                 // previous lap's carry.
-                log_restored_members(&mut log, &step.id, visit, &restored);
+                log_restored_members(&mut log, &step.id, visit, &restored)?;
                 if !preps.is_empty() {
                     log_event(
                         &mut log,
-                        json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": preps.len()}),
-                    );
+                        json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id,
+                               "visit": visit, "items": preps.len(), "items_total": items.len(),
+                               "items_hash": items_hash}),
+                    )?;
                 }
                 log_member_starts(
                     &mut log,
@@ -2699,8 +3658,87 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         .iter()
                         .zip(fresh_idx.iter())
                         .map(|(p, &i)| (format!("{}[{i}]", step.id), p)),
-                );
-                let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
+                )?;
+                for ((prep, &i), profile) in preps
+                    .iter()
+                    .zip(fresh_idx.iter())
+                    .zip(resumed_profiles.iter())
+                {
+                    if let Some(profile) = profile {
+                        log_event(
+                            &mut log,
+                            json!({"ts": utc_stamp(), "event": "fallback",
+                                   "step": format!("{}[{i}]", step.id), "parent": step.id,
+                                   "visit": visit, "profile": profile,
+                                   "resumed": true, "cmd": prep.inv.describe()}),
+                        )?;
+                    }
+                }
+                let fresh_labels: Vec<String> = fresh_idx
+                    .iter()
+                    .map(|&i| format!("{}[{i}]", step.id))
+                    .collect();
+                {
+                    let mut g = status.lock().unwrap();
+                    g.fanout_total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+                    g.fanout_completed = u32::try_from(restored.len()).unwrap_or(u32::MAX);
+                    for label in &fresh_labels {
+                        g.active_members.insert(label.clone(), "queued".into());
+                    }
+                }
+                let start_labels = fresh_labels.clone();
+                let start_status = Arc::clone(&status);
+                let mut dones = leaf::run_pool(
+                    preps,
+                    mp,
+                    Arc::clone(&gate),
+                    move |pos| {
+                        if let Some(label) = start_labels.get(pos) {
+                            let mut g = start_status.lock().unwrap();
+                            g.active_members.insert(label.clone(), "running".into());
+                        }
+                    },
+                    |pos, done| {
+                        let label = fresh_labels.get(pos).ok_or_else(|| {
+                            "internal error: foreach completion index out of range".to_string()
+                        })?;
+                        let next_fallback = if !done.ok() && !done.interrupted {
+                            step.fallback.get(fallback_starts[pos]).map(String::as_str)
+                        } else {
+                            None
+                        };
+                        accumulate_cost(&mut cost_usd, done.usage.reported_cost());
+                        let durable = match &done.persistence_error {
+                            Some(e) => log_persistence_failure(
+                                &mut log,
+                                label,
+                                Some(&step.id),
+                                visit,
+                                done,
+                                e,
+                            )
+                            .and_then(|_| Err(format!("step '{label}': {e}"))),
+                            None => log_step_end_with_next(
+                                &mut log,
+                                label,
+                                Some(&step.id),
+                                visit,
+                                done,
+                                next_fallback,
+                                false,
+                            ),
+                        };
+                        {
+                            let mut g = status.lock().unwrap();
+                            g.active_members.remove(label);
+                            g.cost_usd = cost_usd;
+                            if durable.is_ok() && next_fallback.is_none() && !done.interrupted {
+                                g.fanout_completed = g.fanout_completed.saturating_add(1);
+                            }
+                        }
+                        durable
+                    },
+                )?;
                 for (pos, &i) in fresh_idx.iter().enumerate() {
                     let tag = if visit == 1 {
                         format!("{}.i{i}", step.id)
@@ -2712,7 +3750,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         ("item_index", i.to_string()),
                     ];
                     let label = format!("{}[{i}]", step.id);
-                    fan_fallback!(dones[pos], step, label, tag, &step.fallback, &extra);
+                    fan_fallback!(
+                        dones[pos],
+                        step,
+                        label,
+                        tag,
+                        &step.fallback,
+                        fallback_starts[pos],
+                        &extra
+                    );
                 }
                 let mut agg = String::new();
                 let mut plain = String::new();
@@ -2764,8 +3810,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             eprintln!("sfh: [{}] stderr| {line}", d.tag);
                         }
                     }
-                    cost_usd += d.usage.reported_cost();
-                    log_step_end(&mut log, &label, Some(&step.id), visit, d);
                     let failed_header = if d.ok() {
                         String::new()
                     } else {
@@ -2794,8 +3838,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
                 let plain_name = format!("{gtag}.plain.txt");
-                let _ = contain::write_private(&run_dir.join(&plain_name), &plain);
-                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
+                let plain_path = run_dir.join(&plain_name);
+                contain::write_private_atomic(&plain_path, &plain).map_err(|e| {
+                    format!(
+                        "cannot persist aggregate routing text {}: {e}",
+                        plain_path.display()
+                    )
+                })?;
+                write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail)?;
                 log_aggregate_end(
                     &mut log,
                     AggregateEnd {
@@ -2806,28 +3856,86 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         plain: &plain,
                         plain_file: &plain_name,
                         members: &verdicts,
+                        postprocess_pending: !hard_fail && needs_postprocess,
                     },
-                );
+                )?;
                 (agg, plain, hard_fail, Some(verdicts))
             } else {
-                claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
-                let mut done = {
+                let mut next_fallback_index = 0usize;
+                let mut done = if let Some(unfinished) = &resumed_fallback {
+                    let profile = unfinished.profile.as_deref().ok_or_else(|| {
+                        "internal error: fallback checkpoint has no profile".to_string()
+                    })?;
+                    let index = step
+                        .fallback
+                        .iter()
+                        .position(|candidate| candidate == profile)
+                        .ok_or_else(|| {
+                            format!(
+                                "resume: step '{}' checkpointed fallback profile '{}', but the current flow does not list it",
+                                step.id, profile
+                            )
+                        })?;
+                    next_fallback_index = index + 1;
+                    claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
+                    if !opts.quiet {
+                        eprintln!("sfh: [{}] resuming fallback profile '{profile}'", step.id);
+                    }
+                    let ftag = format!("{gtag}.fb-{profile}");
+                    let cx = mk_cx!(&outputs, &sessions);
+                    let prep = leaf::prepare_leaf(&cx, step, visit, &ftag, &[], Some(profile))?;
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "fallback", "step": step.id,
+                               "visit": visit, "profile": profile, "resumed": true,
+                               "cmd": prep.inv.describe()}),
+                    )?;
+                    leaf::exec_leaf(prep)
+                } else {
+                    claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
                     let cx = mk_cx!(&outputs, &sessions);
                     let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep)}),
-                    );
+                    )?;
                     leaf::exec_leaf(prep)
                 };
+                // Usage belongs to the attempt even when publishing one of its
+                // required artifacts failed. Account it before every possible
+                // durability error so run_end/meta never erase paid work.
+                accumulate_cost(&mut cost_usd, done.usage.reported_cost());
+                if let Some(e) = &done.persistence_error {
+                    log_persistence_failure(&mut log, &step.id, None, visit, &done, e)?;
+                    return Err(format!("step '{}': {e}", step.id));
+                }
                 // fallback: retry the step with a different profile (tool/model).
                 if !done.ok() && !done.interrupted && !step.fallback.is_empty() {
-                    for fb in &step.fallback {
+                    for fb in step.fallback.iter().skip(next_fallback_index) {
+                        log_step_end_with_next(
+                            &mut log,
+                            &step.id,
+                            None,
+                            visit,
+                            &done,
+                            Some(fb),
+                            false,
+                        )?;
+                        // The paid attempt and selected next profile are one
+                        // durable checkpoint. An interrupt that lands after the
+                        // child exits must not turn that completed failure into
+                        // an uncheckpointed primary that resume runs again.
                         if execute::interrupted() {
-                            break;
+                            return Err(
+                                "interrupted after a completed attempt; the selected fallback is checkpointed for resume"
+                                    .into(),
+                            );
                         }
-                        cost_usd += done.usage.reported_cost();
-                        log_step_end(&mut log, &step.id, None, visit, &done);
+                        // The completed attempt above is already paid work and
+                        // its checkpoint must become durable even when the next
+                        // fallback would exceed max_total_steps. Claiming first
+                        // used to return early with only step_start recorded,
+                        // so resume reran and rebilled the completed primary.
                         claim_leaf_runs(&mut total, 1, max_total, &step.id)?;
                         if !opts.quiet {
                             eprintln!("sfh: [{}] falling back to profile '{fb}'", step.id);
@@ -2837,9 +3945,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         let prep = leaf::prepare_leaf(&cx, step, visit, &ftag, &[], Some(fb))?;
                         log_event(
                             &mut log,
-                            json!({"ts": utc_stamp(), "event": "fallback", "step": step.id, "profile": fb, "cmd": prep.inv.describe()}),
-                        );
+                            json!({"ts": utc_stamp(), "event": "fallback", "step": step.id,
+                                   "visit": visit, "profile": fb, "resumed": false,
+                                   "cmd": prep.inv.describe()}),
+                        )?;
                         let alt = leaf::exec_leaf(prep);
+                        accumulate_cost(&mut cost_usd, alt.usage.reported_cost());
+                        if let Some(e) = &alt.persistence_error {
+                            log_persistence_failure(&mut log, &step.id, None, visit, &alt, e)?;
+                            return Err(format!("step '{}': {e}", step.id));
+                        }
                         let ok = alt.ok();
                         done = alt;
                         if ok {
@@ -2857,7 +3972,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         eprintln!("sfh: [{}] stderr| {line}", d.tag);
                     }
                 }
-                cost_usd += d.usage.reported_cost();
                 if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
                     sessions.insert(
                         step.id.clone(),
@@ -2872,7 +3986,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         },
                     );
                 }
-                log_step_end(&mut log, &step.id, None, visit, d);
+                log_step_end_with_next(
+                    &mut log,
+                    &step.id,
+                    None,
+                    visit,
+                    d,
+                    None,
+                    d.ok() && needs_postprocess,
+                )?;
                 let exposed = if d.ok() {
                     d.chain_output.clone()
                 } else {
@@ -2893,11 +4015,45 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 // recorded - see `Members`.
                 (d.chain_output.clone(), rt, !d.ok(), None)
             };
-            let notes_output = chain_output.clone();
+            if let Some(e) = persistence_error.lock().ok().and_then(|mut e| e.take()) {
+                return Err(e);
+            }
+            // Cancellation is stronger than on_error, routing, compact and
+            // notes. The interrupted result above is durable diagnostic state,
+            // but it is deliberately not a completed step and must never route
+            // to `end` (or append/compact partial output) before the loop-top
+            // interrupt check gets another chance to run.
+            if execute::interrupted() {
+                return Err("interrupted (Ctrl+C): child processes were terminated".into());
+            }
+            // A run-level deadline is stronger than a leaf's on_error policy.
+            // Each leaf timeout is capped to this instant, so report the
+            // global budget cause instead of misclassifying that kill as an
+            // ordinary step failure.
+            if wall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(format!(
+                    "exceeded wall_clock_sec ({})",
+                    flow.defaults.wall_clock_sec.unwrap_or(0)
+                ));
+            }
+            let notes_output = resumed_postprocess
+                .as_ref()
+                .and_then(|_| outputs.get(&step.id))
+                .map(|output| output.outputs.clone())
+                .unwrap_or_else(|| chain_output.clone());
+            let compact_already_done = resumed_postprocess
+                .as_ref()
+                .is_some_and(|pending| pending.compact_done);
+            let notes_already_done = resumed_postprocess
+                .as_ref()
+                .is_some_and(|pending| pending.notes_done);
 
             // ---- compact ----
             if let Some(comp) = &step.compact {
-                if !errored && chain_output.chars().count() as u64 > comp.when_over {
+                if !compact_already_done
+                    && !errored
+                    && chain_output.chars().count() as u64 > comp.when_over
+                {
                     if !opts.quiet {
                         eprintln!(
                             "sfh: [{}] compacting output ({} chars > {})",
@@ -2912,11 +4068,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // documented as the pre-compact original - including after
                     // a --resume, which can only read files.
                     let pre_name = format!("{gtag}.precompact.txt");
-                    let _ = contain::write_private(&run_dir.join(&pre_name), &chain_output);
+                    let pre_path = run_dir.join(&pre_name);
+                    contain::write_private_sync(&pre_path, &chain_output).map_err(|e| {
+                        format!(
+                            "cannot persist pre-compact artifact {}: {e}",
+                            pre_path.display()
+                        )
+                    })?;
                     log_event(
                         &mut log,
-                        json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
-                    );
+                        json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id,
+                               "visit": visit, "chars": chain_output.chars().count(),
+                               "precompact_file": &pre_name}),
+                    )?;
                     let cx = mk_cx!(&outputs, &sessions);
                     let compact_prompt_file = run_dir.join(format!("{gtag}.compact.prompt.txt"));
                     let builtins =
@@ -2934,41 +4098,75 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         run_dir: &run_dir,
                         tag: &gtag,
                         run_clock: &run_clock,
+                        wall_deadline,
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     };
-                    match run_compact(comp, compact_run) {
-                        Ok((sum, usage)) => {
-                            cost_usd += usage.reported_cost();
-                            log_event(
-                                &mut log,
-                                json!({"ts": utc_stamp(), "event": "compact_end", "step": step.id, "chars": sum.chars().count(), "cost_usd": usage.cost_usd, "precompact_file": pre_name}),
-                            );
-                            chain_output = sum.clone();
-                            if let Some(e) = outputs.get_mut(&step.id) {
-                                e.output = sum;
-                            }
+                    let compact_outcome =
+                        run_compact(comp, compact_run).unwrap_or_else(|error| CompactOutcome {
+                            summary: Err(error),
+                            usage: preset::Usage::default(),
+                        });
+                    let compact_cost = compact_outcome.usage.reported_cost();
+                    accumulate_cost(&mut cost_usd, compact_cost);
+                    let chain_name = format!("{gtag}.chain.txt");
+                    let compact_event = match compact_outcome.summary {
+                        Ok(sum) => {
+                            chain_output = sum;
+                            json!({
+                                "ts": utc_stamp(),
+                                "event": "compact_end",
+                                "step": step.id,
+                                "visit": visit,
+                                "chars": chain_output.chars().count(),
+                                "cost_usd": compact_cost,
+                                "output_hash": fingerprint(&chain_output),
+                                "precompact_file": pre_name,
+                                "chain_file": chain_name,
+                            })
                         }
                         Err(e) => {
                             eprintln!(
                                 "sfh: warning: step '{}' compact failed ({e}); using head+tail of the original",
                                 step.id
                             );
-                            log_event(
-                                &mut log,
-                                json!({"ts": utc_stamp(), "event": "compact_failed", "step": step.id, "error": e, "precompact_file": pre_name}),
-                            );
                             chain_output = head_tail(&chain_output, comp.when_over as usize);
-                            if let Some(en) = outputs.get_mut(&step.id) {
-                                en.output = chain_output.clone();
-                            }
+                            json!({
+                                "ts": utc_stamp(),
+                                "event": "compact_failed",
+                                "step": step.id,
+                                "visit": visit,
+                                "chars": chain_output.chars().count(),
+                                "error": e,
+                                "cost_usd": compact_cost,
+                                "output_hash": fingerprint(&chain_output),
+                                "precompact_file": pre_name,
+                                "chain_file": chain_name,
+                            })
                         }
+                    };
+                    // The checkpoint may only become visible after the chain
+                    // it names is on stable storage. The old event-first order
+                    // let a crash replay a paid summarizer or restore stale
+                    // text from the leaf's original chain.
+                    let compact_chain = run_dir.join(&chain_name);
+                    contain::write_private_atomic(&compact_chain, &chain_output).map_err(|e| {
+                        format!(
+                            "cannot persist compacted chain artifact {}: {e}",
+                            compact_chain.display()
+                        )
+                    })?;
+                    if let Some(entry) = outputs.get_mut(&step.id) {
+                        entry.output = chain_output.clone();
                     }
-                    let _ = contain::write_private(
-                        &run_dir.join(format!("{gtag}.chain.txt")),
-                        &chain_output,
-                    );
+                    log_event(&mut log, compact_event)?;
                 }
+            }
+            if wall_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(format!(
+                    "exceeded wall_clock_sec ({})",
+                    flow.defaults.wall_clock_sec.unwrap_or(0)
+                ));
             }
 
             // A re-visited step writes <id>.v2.chain.txt, so the emitted file
@@ -2976,15 +4174,33 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             chain_files.insert(step.id.clone(), run_dir.join(format!("{gtag}.chain.txt")));
 
             // ---- notes ----
-            if step.notes.as_deref() == Some("append") && !errored {
-                let mut f = contain::append_private(&notes_file)
-                    .map_err(|e| format!("cannot open notes: {e}"))?;
-                let _ = writeln!(
-                    f,
-                    "## {} (visit {visit})\n{}\n",
-                    step.id,
-                    notes_output.trim_end()
-                );
+            if step.notes.as_deref() == Some("append") && !errored && !notes_already_done {
+                let marker = note_marker(&step.id, visit, &notes_output);
+                write_note_once(
+                    &run_dir,
+                    &notes_file,
+                    &marker,
+                    &step.id,
+                    visit,
+                    &notes_output,
+                )?;
+                log_event(
+                    &mut log,
+                    json!({
+                        "ts": utc_stamp(),
+                        "event": "notes_end",
+                        "step": step.id,
+                        "visit": visit,
+                        "marker": marker,
+                    }),
+                )?;
+            }
+            if !errored && (needs_postprocess || resumed_postprocess.is_some()) {
+                log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "postprocess_end",
+                           "step": step.id, "visit": visit}),
+                )?;
             }
 
             last_executed = Some(step.id.clone());
@@ -3044,22 +4260,22 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         next_label(cur + 1, &flow),
                         PositionVia::Fallthrough,
                         None,
-                    );
+                    )?;
                     cur += 1;
                     if cur >= n_steps {
                         return Ok(FlowEnd::Completed);
                     }
                 }
                 Some(("end", hit)) => {
-                    log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
+                    log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit))?;
                     return Ok(FlowEnd::Completed);
                 }
                 Some(("fail", hit)) => {
-                    log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
+                    log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit))?;
                     return Err(format!("step '{}' routed to fail", step.id));
                 }
                 Some(("stuck", hit)) => {
-                    log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit));
+                    log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit))?;
                     return Ok(FlowEnd::Stuck {
                         after: step.id.clone(),
                     });
@@ -3068,7 +4284,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     if !opts.quiet {
                         eprintln!("sfh: [{}] -> goto {id}", step.id);
                     }
-                    log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit));
+                    log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit))?;
                     cur = index_of[id];
                 }
             }
@@ -3076,20 +4292,24 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     })();
 
     let max_emit = flow.defaults.max_emit_chars.unwrap_or(200_000) as usize;
-    let finish =
-        |state: &'static str, cost: f64, code: i32, emit: Option<&str>, err: Option<&str>| {
-            let mut g = status.lock().unwrap();
-            g.state = state;
-            g.steps_done = total;
-            g.cost_usd = cost;
-            g.exit_code = Some(code);
-            g.emit_step = emit.map(String::from);
-            g.emit_file = emit
-                .and_then(|id| chain_files.get(id))
-                .map(|p| p.display().to_string());
-            g.error = err.map(String::from);
-            write_status(&status_path, &g);
-        };
+    let finish = |state: &'static str,
+                  cost: f64,
+                  code: i32,
+                  emit: Option<&str>,
+                  err: Option<&str>|
+     -> Result<(), String> {
+        let mut g = status.lock().unwrap();
+        g.state = state;
+        g.steps_done = total;
+        g.cost_usd = cost;
+        g.exit_code = Some(code);
+        g.emit_step = emit.map(String::from);
+        g.emit_file = emit
+            .and_then(|id| chain_files.get(id))
+            .map(|p| p.display().to_string());
+        g.error = err.map(String::from);
+        write_status(&status_path, &g)
+    };
     // The output a caller gets when the run did NOT succeed. Computed once,
     // before the match, because `stuck` hands back exactly what a failure hands
     // back: work was done, the caller needs it, and only --no-partial-emit says
@@ -3106,15 +4326,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         };
         opts.emit
             .clone()
-            .filter(&nonempty)
-            .or_else(|| last_success.clone().filter(&nonempty))
-            .or_else(|| last_executed.clone().filter(&nonempty))
+            .filter(nonempty)
+            .or_else(|| last_success.clone().filter(nonempty))
+            .or_else(|| last_executed.clone().filter(nonempty))
     };
     let mut meta_final = meta.clone();
     if let Some(m) = meta_final.as_object_mut() {
         m.insert("finished_utc".into(), json!(utc_stamp()));
         m.insert("leaf_runs".into(), json!(total));
         m.insert("cost_usd".into(), json!(cost_usd));
+        m.insert(
+            "elapsed_sec".into(),
+            json!(elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs())),
+        );
         m.insert(
             "status".into(),
             json!(match &result {
@@ -3124,10 +4348,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }),
         );
     }
-    let _ = contain::write_private(
-        &run_dir.join("meta.json"),
-        serde_json::to_string_pretty(&meta_final).unwrap_or_default(),
-    );
+    let meta_final_text = match serde_json::to_string_pretty(&meta_final) {
+        Ok(text) => text,
+        Err(e) => {
+            let msg = format!("cannot serialize final run metadata: {e}");
+            let _ = finish("failed", cost_usd, 1, None, Some(&msg));
+            return Err(msg);
+        }
+    };
+    if let Err(e) = contain::write_private_atomic(&run_dir.join("meta.json"), meta_final_text) {
+        let msg = format!("cannot persist final run metadata: {e}");
+        let _ = finish("failed", cost_usd, 1, None, Some(&msg));
+        return Err(msg);
+    }
 
     // Shared by the two terminals a caller can pick up again. Paths are quoted
     // (flow names may carry spaces since R-6, and so may the runs dir) and this
@@ -3165,7 +4398,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             log_event(
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
-            );
+            )?;
             let emit_id = opts.emit.clone().or(last_success);
             let emit_id =
                 emit_id.filter(|id| outputs.get(id).is_some_and(|output| output.exit == 0));
@@ -3180,10 +4413,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             } else if last_executed.is_none() {
                 // Rare, but leaving status.json on "running" would make this
                 // look like a run that got killed rather than one that ended.
-                finish("failed", cost_usd, 1, None, Some("no step was executed"));
+                finish("failed", cost_usd, 1, None, Some("no step was executed"))?;
                 return Err("no step was executed".into());
             }
-            finish("done", cost_usd, 0, emit_id.as_deref(), None);
+            finish("done", cost_usd, 0, emit_id.as_deref(), None)?;
             if !opts.quiet {
                 eprintln!(
                     "sfh: done. {} leaf runs, ${cost_usd:.4} reported. run dir: {}",
@@ -3202,13 +4435,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             log_event(
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd}),
-            );
+            )?;
             eprintln!("sfh: FLOW STUCK: {msg}");
             // Emit before the status goes terminal, for the same reason the
             // success path does: `sfh wait` reads a terminal status.json as
             // "the output is ready".
             emit_partial(&partial_pick);
-            finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg));
+            finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg))?;
             eprintln!("sfh: run dir: {}", run_dir.display());
             print_resume_hint();
             Ok(4)
@@ -3217,10 +4450,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             log_event(
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
-            );
+            )?;
             eprintln!("sfh: FLOW FAILED: {msg}");
             emit_partial(&partial_pick);
-            finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg));
+            finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg))?;
             eprintln!("sfh: run dir: {}", run_dir.display());
             print_resume_hint();
             Ok(1)
@@ -3253,8 +4486,15 @@ fn print_emit(out: &str, max: usize, chain: Option<&PathBuf>) {
 
 fn resume_target(opts: &RunOpts, runs_root: &Path) -> Result<Option<PathBuf>, String> {
     if let Some(d) = &opts.resume {
-        if !d.join("log.jsonl").exists() {
-            return Err(format!("{} is not an sfh run directory", d.display()));
+        match contain::read_contained_opt(d, "log.jsonl") {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(format!("{} is not an sfh run directory", d.display())),
+            Err(e) => {
+                return Err(format!(
+                    "{} is not a safe sfh run directory: {e}",
+                    d.display()
+                ))
+            }
         }
         return Ok(Some(d.clone()));
     }
@@ -3286,10 +4526,13 @@ fn write_aggregate(
     outputs: &mut BTreeMap<String, template::StepOutput>,
     step_id: &str,
     failed: bool,
-) {
+) -> Result<(), String> {
     let gfile = run_dir.join(format!("{gtag}.out.txt"));
-    let _ = contain::write_private(&gfile, agg);
-    let _ = contain::write_private(&run_dir.join(format!("{gtag}.chain.txt")), agg);
+    contain::write_private_atomic(&gfile, agg)
+        .map_err(|e| format!("cannot persist aggregate {}: {e}", gfile.display()))?;
+    let chain = run_dir.join(format!("{gtag}.chain.txt"));
+    contain::write_private_atomic(&chain, agg)
+        .map_err(|e| format!("cannot persist aggregate {}: {e}", chain.display()))?;
     outputs.insert(
         step_id.to_string(),
         template::StepOutput {
@@ -3300,6 +4543,44 @@ fn write_aggregate(
             stderr_file: String::new(),
         },
     );
+    Ok(())
+}
+
+fn note_marker(step: &str, visit: u32, output: &str) -> String {
+    // Content-derived instead of attempt-nonce-derived: sfh intentionally
+    // rotates the stop nonce on every --resume, while this marker must remain
+    // stable across attempts. Including the exact note body makes accidental
+    // collisions with model output impractical.
+    let digest = fingerprint(&format!("{step}\0{visit}\0{output}"));
+    format!("<!-- sfh-note:{} -->", &digest[..24])
+}
+
+fn write_note_once(
+    run_dir: &Path,
+    notes_file: &Path,
+    marker: &str,
+    step: &str,
+    visit: u32,
+    output: &str,
+) -> Result<(), String> {
+    let mut notes = contain::read_contained_opt(run_dir, "notes.md")?.unwrap_or_default();
+    if notes.lines().any(|line| line.trim() == marker) {
+        return Ok(());
+    }
+    if !notes.is_empty() && !notes.ends_with('\n') {
+        notes.push('\n');
+    }
+    notes.push_str(marker);
+    notes.push('\n');
+    notes.push_str(&format!("## {step} (visit {visit})\n"));
+    notes.push_str(output.trim_end());
+    notes.push_str("\n\n");
+    contain::write_private_atomic(notes_file, notes).map_err(|e| {
+        format!(
+            "cannot atomically persist notes {}: {e}",
+            notes_file.display()
+        )
+    })
 }
 
 fn head_tail(s: &str, budget: usize) -> String {
@@ -3314,6 +4595,19 @@ fn head_tail(s: &str, budget: usize) -> String {
     format!("{head}\n...[sfh: truncated middle]...\n{tail}")
 }
 
+fn foreach_items_hash(items: &[String]) -> String {
+    // Length-prefix every UTF-8 item, including the count, so neither embedded
+    // delimiters nor ["ab", "c"] versus ["a", "bc"] can collide at the input
+    // encoding layer. `fingerprint` then supplies the public SHA-256 digest.
+    let mut material = format!("{}:", items.len());
+    for item in items {
+        material.push_str(&item.len().to_string());
+        material.push(':');
+        material.push_str(item);
+    }
+    fingerprint(&material)
+}
+
 struct CompactRun<'a, 'ctx> {
     flow: &'a flow::Flow,
     ctx: &'a template::Ctx<'ctx>,
@@ -3323,14 +4617,48 @@ struct CompactRun<'a, 'ctx> {
     /// The summarizer is a child of this run like any other, so its output
     /// counts as the run being alive.
     run_clock: &'a Arc<AtomicU64>,
+    wall_deadline: Option<Instant>,
     quiet: bool,
     verbose: bool,
 }
 
-fn run_compact(
+struct CompactOutcome {
+    summary: Result<String, String>,
+    /// Always returned once an external summarizer was launched, including
+    /// non-zero exit, timeout, empty output, or artifact-persistence failure.
+    /// Dropping failed-attempt usage would let compact work escape the run's
+    /// accounting and max_cost_usd guard.
+    usage: preset::Usage,
+}
+
+fn run_compact(comp: &flow::Compact, run: CompactRun<'_, '_>) -> Result<CompactOutcome, String> {
+    let prep = prepare_compact(comp, &run)?;
+    let d = leaf::exec_leaf(prep);
+    let summary = if let Some(e) = &d.persistence_error {
+        Err(e.clone())
+    } else if !d.ok() {
+        Err(format!(
+            "summarizer exit={} timed_out={}",
+            d.exit_code, d.timed_out
+        ))
+    } else {
+        let s = d.chain_output.trim().to_string();
+        if s.is_empty() {
+            Err("summarizer returned empty output".into())
+        } else {
+            Ok(s)
+        }
+    };
+    Ok(CompactOutcome {
+        summary,
+        usage: d.usage,
+    })
+}
+
+fn prepare_compact(
     comp: &flow::Compact,
-    run: CompactRun<'_, '_>,
-) -> Result<(String, preset::Usage), String> {
+    run: &CompactRun<'_, '_>,
+) -> Result<leaf::Prepared, String> {
     let CompactRun {
         flow,
         ctx,
@@ -3338,6 +4666,7 @@ fn run_compact(
         run_dir,
         tag,
         run_clock,
+        wall_deadline,
         quiet,
         verbose,
     } = run;
@@ -3403,13 +4732,14 @@ fn run_compact(
         }
         preset::Delivery::None => None,
     };
-    let prep = leaf::Prepared {
+    Ok(leaf::Prepared {
         tag: ctag.clone(),
         inv: execute::Invocation::Argv(argv),
         parse: built.parse,
         stdin_payload,
         cwd: None,
         timeout: timeout_sec.map(Duration::from_secs),
+        wall_deadline: *wall_deadline,
         preassigned_session: None,
         expect_session: None,
         expect_marker: None,
@@ -3428,21 +4758,9 @@ fn run_compact(
         allow_empty: false,
         retry: leaf::RetryCfg::default(),
         run_clock: Some(Arc::clone(run_clock)),
-        quiet,
-        verbose,
-    };
-    let d = leaf::exec_leaf(prep);
-    if !d.ok() {
-        return Err(format!(
-            "summarizer exit={} timed_out={}",
-            d.exit_code, d.timed_out
-        ));
-    }
-    let s = d.chain_output.trim().to_string();
-    if s.is_empty() {
-        return Err("summarizer returned empty output".into());
-    }
-    Ok((s, d.usage))
+        quiet: *quiet,
+        verbose: *verbose,
+    })
 }
 
 fn split_items(s: &str, mode: Option<&str>) -> Result<Vec<String>, String> {
@@ -3514,7 +4832,27 @@ fn dry_run(
     needed_sessions: &HashSet<String>,
 ) -> Result<i32, String> {
     let step_ids = flow.step_ids();
-    let outputs: BTreeMap<String, template::StepOutput> = BTreeMap::new();
+    // `plan` has no real upstream results, but rendering them as empty made a
+    // perfectly valid downstream `stdin: prompt` look like an empty prompt and
+    // aborted the plan. Stable, visibly synthetic values let every dominated
+    // dependency resolve without pretending an external command ran.
+    let outputs: BTreeMap<String, template::StepOutput> = step_ids
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                template::StepOutput {
+                    output: format!("[[steps.{id}.output]]"),
+                    outputs: format!("[[steps.{id}.outputs]]"),
+                    output_file: format!("[[steps.{id}.output_file]]"),
+                    exit: 0,
+                    stderr_file: format!("[[steps.{id}.stderr_file]]"),
+                },
+            )
+        })
+        .collect();
+    contain::write_private(notes_file, "[[notes]]")
+        .map_err(|e| format!("cannot prepare the isolated plan notes placeholder: {e}"))?;
     let mut sessions: HashMap<String, leaf::SessionInfo> = HashMap::new();
     // Fake sessions so continue_from/fork_from steps can render their resume
     // command. The target's own access comes along, so a dry run already shows
@@ -3546,8 +4884,15 @@ fn dry_run(
             }
         }
     }
-    println!("dry run: steps in file order (routing not simulated)");
-    println!("run dir (prompts rendered here): {}", run_dir.display());
+    println!("execution plan: commands are resolved but no process is started");
+    println!(
+        "temporary render dir (removed after this command): {}",
+        run_dir.display()
+    );
+    println!("upstream results are shown as [[steps.<id>.*]] placeholders (exit uses 0)");
+    for warning in flow::strict_warnings(flow) {
+        println!("warning: {warning}");
+    }
     // The one goto that never appears in any step's route:, so a reader of the
     // flow cannot see it by following the steps. Print it where the jump is
     // declared - at the top, with the flow, not against any step.
@@ -3581,6 +4926,7 @@ fn dry_run(
         tainted_vars,
         // A dry run renders and prints; it spawns nothing to time.
         run_clock: None,
+        wall_deadline: None,
         // Nothing has been spent and no time has passed, so {{budget.*}} shows
         // the whole declared budget - which is what a prompt reviewer wants to
         // see, and it exercises the `unlimited` spelling for undeclared axes.
@@ -3588,12 +4934,18 @@ fn dry_run(
         quiet: true,
         verbose: false,
     };
+    let plan_clock = Arc::new(AtomicU64::new(0));
     for s in &flow.steps {
         println!("[{}] ({})", s.id, describe_kind(flow, s));
         if let Some(children) = &s.parallel {
             for c in children {
                 let p = leaf::prepare_leaf(&cx, c, 1, &c.id, &[], None)?;
                 println!("  child {}: {}", c.id, p.inv.describe());
+                for fb in &c.fallback {
+                    let p =
+                        leaf::prepare_leaf(&cx, c, 1, &format!("{}.fb-{fb}", c.id), &[], Some(fb))?;
+                    println!("    fallback {fb}: {}", p.inv.describe());
+                }
             }
         } else if let Some(fe) = &s.foreach {
             println!("  foreach.from: {}", one_line(&fe.from, 100));
@@ -3610,6 +4962,20 @@ fn dry_run(
                 None,
             )?;
             println!("  cmd (per item): {}", p.inv.describe());
+            for fb in &s.fallback {
+                let p = leaf::prepare_leaf(
+                    &cx,
+                    s,
+                    1,
+                    &format!("{}.i0.fb-{fb}", s.id),
+                    &[
+                        ("item", "<item>".to_string()),
+                        ("item_index", "0".to_string()),
+                    ],
+                    Some(fb),
+                )?;
+                println!("    fallback {fb} (per item): {}", p.inv.describe());
+            }
         } else {
             let p = leaf::prepare_leaf(&cx, s, 1, &s.id, &[], None)?;
             println!("  cmd: {}", p.inv.describe());
@@ -3617,9 +4983,36 @@ fn dry_run(
                 println!("  (resumes session of '{t}')");
             }
             for fb in &s.fallback {
-                let p = leaf::prepare_leaf(&cx, s, 1, &format!("{}.fb", s.id), &[], Some(fb))?;
+                let p = leaf::prepare_leaf(&cx, s, 1, &format!("{}.fb-{fb}", s.id), &[], Some(fb))?;
                 println!("  fallback {fb}: {}", p.inv.describe());
             }
+        }
+        if let Some(comp) = &s.compact {
+            let prompt_file = run_dir.join(format!("{}.prompt.txt", s.id));
+            let builtins = leaf::make_builtins(&cx, &s.id, 1, &prompt_file, &[]);
+            let compact_ctx = template::Ctx {
+                vars,
+                outputs: &outputs,
+                step_ids: &step_ids,
+                builtins,
+            };
+            let run = CompactRun {
+                flow,
+                ctx: &compact_ctx,
+                original: &format!("[[steps.{}.outputs]]", s.id),
+                run_dir,
+                tag: &s.id,
+                run_clock: &plan_clock,
+                wall_deadline: None,
+                quiet: true,
+                verbose: false,
+            };
+            let p = prepare_compact(comp, &run)?;
+            println!(
+                "  compact when output > {} chars: {}",
+                comp.when_over,
+                p.inv.describe()
+            );
         }
         for r in &s.route {
             let mut cond = Vec::new();
@@ -3664,8 +5057,17 @@ fn dry_run(
     Ok(0)
 }
 
-fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
-    let _ = writeln!(f, "{v}");
+fn log_event(f: &mut std::fs::File, mut v: serde_json::Value) -> Result<(), String> {
+    if let Some(object) = v.as_object_mut() {
+        object
+            .entry("schema_version".to_string())
+            .or_insert_with(|| json!(1));
+    }
+    writeln!(f, "{v}").map_err(|e| format!("cannot append durable run log: {e}"))?;
+    f.flush()
+        .map_err(|e| format!("cannot flush durable run log: {e}"))?;
+    f.sync_data()
+        .map_err(|e| format!("cannot sync durable run log: {e}"))
 }
 
 /// The fan-out members' own step_start lines: one per member about to run, each
@@ -3680,7 +5082,12 @@ fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
 /// load_resume uses step_start to remember "this started and never ended, so
 /// resume here", and a member id is not a place a resume can start. The group's
 /// own group_start / foreach_start already stands for the whole fan-out there.
-fn log_member_starts<'a, I>(f: &mut std::fs::File, group: &str, visit: u32, members: I)
+fn log_member_starts<'a, I>(
+    f: &mut std::fs::File,
+    group: &str,
+    visit: u32,
+    members: I,
+) -> Result<(), String>
 where
     I: Iterator<Item = (String, &'a leaf::Prepared)>,
 {
@@ -3690,8 +5097,9 @@ where
             json!({"ts": utc_stamp(), "event": "step_start", "step": id, "parent": group,
                    "visit": visit, "cmd": prep.inv.describe(),
                    "session_parent": session_parent_json(prep)}),
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// The session a step attached to, for step_start. Null - like `session` in
@@ -3720,16 +5128,16 @@ fn log_restored_members(
     group: &str,
     visit: u32,
     restored: &HashSet<String>,
-) {
+) -> Result<(), String> {
     if restored.is_empty() {
-        return;
+        return Ok(());
     }
     let mut names: Vec<&String> = restored.iter().collect();
     names.sort();
     log_event(
         f,
         json!({"ts": utc_stamp(), "event": "members_restored", "steps": names, "parent": group, "visit": visit}),
-    );
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -4018,15 +5426,7 @@ fn evaluate_route(
             }
         }
         if matched {
-            let via = if r.when_contains.is_none()
-                && r.when_matches.is_none()
-                && r.when_last_line_contains.is_none()
-                && r.when_last_line_is.is_none()
-                && r.when_last_line_matches.is_none()
-                && r.when_exit.is_none()
-                && r.when_stderr_matches.is_none()
-                && r.when_members.is_none()
-            {
+            let via = if r.is_catch_all() {
                 PositionVia::CatchAll
             } else {
                 PositionVia::Rule
@@ -4053,7 +5453,7 @@ fn log_position(
     next: String,
     via: PositionVia,
     hit: Option<&RouteHit>,
-) {
+) -> Result<(), String> {
     let mut ev = json!({
         "ts": utc_stamp(), "event": "position", "after": after,
         "next": next, "via": via.as_str(),
@@ -4068,7 +5468,7 @@ fn log_position(
             o.insert("voters".into(), json!(v));
         }
     }
-    log_event(f, ev);
+    log_event(f, ev)
 }
 
 fn apply_on_error(
@@ -4081,25 +5481,25 @@ fn apply_on_error(
         "continue" => Ok(ErrorDisposition::Continue),
         oe if oe.starts_with("goto:") => match &oe[5..] {
             "end" => {
-                log_position(log, &step.id, "end".into(), PositionVia::OnError, None);
+                log_position(log, &step.id, "end".into(), PositionVia::OnError, None)?;
                 Ok(ErrorDisposition::Completed)
             }
             "fail" => {
-                log_position(log, &step.id, "fail".into(), PositionVia::OnError, None);
+                log_position(log, &step.id, "fail".into(), PositionVia::OnError, None)?;
                 Err(format!(
                     "step '{}' failed and on_error routed to fail",
                     step.id
                 ))
             }
             "stuck" => {
-                log_position(log, &step.id, "stuck".into(), PositionVia::OnError, None);
+                log_position(log, &step.id, "stuck".into(), PositionVia::OnError, None)?;
                 Ok(ErrorDisposition::Stuck)
             }
             id => {
                 let next = index_of.get(id).copied().ok_or_else(|| {
                     format!("step '{}': on_error goto target '{id}' not found", step.id)
                 })?;
-                log_position(log, &step.id, id.to_string(), PositionVia::OnError, None);
+                log_position(log, &step.id, id.to_string(), PositionVia::OnError, None)?;
                 Ok(ErrorDisposition::Goto(next))
             }
         },
@@ -4111,13 +5511,44 @@ fn apply_on_error(
     }
 }
 
-fn log_step_end(
+/// Persist one completed attempt and, when present, the fallback profile whose
+/// execution is now required. Keeping both facts in one synced JSONL record
+/// closes the crash window between "attempt failed" and "fallback started".
+fn log_persistence_failure(
     f: &mut std::fs::File,
     step: &str,
     parent: Option<&str>,
     visit: u32,
     d: &leaf::LeafDone,
-) {
+    error: &str,
+) -> Result<(), String> {
+    log_event(
+        f,
+        json!({
+            "ts": utc_stamp(),
+            "event": "persistence_failure",
+            "step": step,
+            "parent": parent,
+            "visit": visit,
+            "error": error,
+            "attempts": d.attempts,
+            "input_tokens": d.usage.input_tokens,
+            "output_tokens": d.usage.output_tokens,
+            "cost_usd": d.usage.cost_usd,
+            "tool": d.tool,
+        }),
+    )
+}
+
+fn log_step_end_with_next(
+    f: &mut std::fs::File,
+    step: &str,
+    parent: Option<&str>,
+    visit: u32,
+    d: &leaf::LeafDone,
+    next_fallback: Option<&str>,
+    postprocess_pending: bool,
+) -> Result<(), String> {
     let session = match (&d.tool, &d.session_id) {
         (Some(t), Some(id)) => {
             json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker, "access": d.access.map(|a| a.as_str())})
@@ -4128,8 +5559,15 @@ fn log_step_end(
         f,
         json!({
             "ts": utc_stamp(), "event": "step_end", "step": step, "parent": parent,
+            "next_fallback": next_fallback,
+            "postprocess_pending": postprocess_pending,
             "visit": visit, "exit": d.exit_code, "timed_out": d.timed_out,
-            "interrupted": d.interrupted, "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
+            // A signal handler may reap the process group before run_cmd
+            // observes the flag. Snapshot the run-level cancellation at the
+            // durable commit point too, so resume never mistakes that race for
+            // an ordinary completed leaf.
+            "interrupted": d.interrupted || execute::interrupted(),
+            "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
             "idle_ms": d.idle_ms,
             "output_chars": d.chain_output.chars().count(),
             "output_hash": fingerprint(&d.chain_output),
@@ -4143,7 +5581,7 @@ fn log_step_end(
             // mine" is exactly the class of report this answers.
             "os": std::env::consts::OS,
         }),
-    );
+    )
 }
 
 /// How a fan-out lap ended, as the log records it. A struct rather than eight
@@ -4157,9 +5595,10 @@ struct AggregateEnd<'a> {
     plain: &'a str,
     plain_file: &'a str,
     members: &'a [MemberVerdict],
+    postprocess_pending: bool,
 }
 
-fn log_aggregate_end(f: &mut std::fs::File, a: AggregateEnd<'_>) {
+fn log_aggregate_end(f: &mut std::fs::File, a: AggregateEnd<'_>) -> Result<(), String> {
     log_event(
         f,
         json!({
@@ -4168,13 +5607,14 @@ fn log_aggregate_end(f: &mut std::fs::File, a: AggregateEnd<'_>) {
             "output_hash": fingerprint(a.plain),
             "chain_file": format!("{}.chain.txt", a.gtag), "out_file": format!("{}.out.txt", a.gtag),
             "plain_file": a.plain_file,
+            "postprocess_pending": a.postprocess_pending,
             // Who said what, per member. A resume re-decides a `when_members`
             // route from THIS and nothing else: the artifacts on disk hold the
             // members' text but not which of them completed, and the text alone
             // cannot answer that (see MemberVerdict).
             "members": a.members.iter().map(MemberVerdict::to_json).collect::<Vec<_>>(),
         }),
-    );
+    )
 }
 
 fn file_name(p: &Path) -> Option<String> {
@@ -4280,6 +5720,145 @@ mod tests {
         let error = claim_leaf_runs(&mut total, 1, 1, "fallback").unwrap_err();
         assert!(error.contains("max_total_steps (1)"), "{error}");
         assert_eq!(total, 1, "a rejected claim must not mutate the count");
+    }
+
+    #[test]
+    fn run_cost_saturates_and_never_refunds_or_leaves_json_space() {
+        let mut total = 0.25;
+        accumulate_cost(&mut total, -1.0);
+        assert_eq!(total, 0.25);
+        accumulate_cost(&mut total, f64::MAX);
+        accumulate_cost(&mut total, f64::MAX);
+        assert_eq!(total, f64::MAX);
+        assert!(total.is_finite());
+    }
+
+    #[test]
+    fn resume_refuses_a_visit_counter_that_cannot_advance() {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-visit-overflow-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let visit = u32::MAX;
+        let events = [
+            json!({"event":"group_start","step":"fan","visit":visit,"children":1}),
+            json!({
+                "event":"step_end",
+                "step":"member",
+                "parent":"fan",
+                "visit":visit,
+                "exit":0,
+                "timed_out":false,
+                "interrupted":false
+            }),
+            json!({
+                "event":"aggregate_end",
+                "step":"fan",
+                "visit":visit,
+                "exit":1,
+                "failed":true
+            }),
+        ];
+        let log = events
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("log.jsonl"), log).unwrap();
+
+        let error = match load_resume(&dir) {
+            Err(error) => error,
+            Ok(_) => panic!("the visit counter must not wrap back to zero"),
+        };
+        assert!(
+            error.contains("exhausted the supported visit counter"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_refuses_a_named_result_artifact_that_is_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-missing-chain-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        let event = json!({
+            "event":"step_end",
+            "step":"paid",
+            "visit":1,
+            "exit":0,
+            "timed_out":false,
+            "interrupted":false,
+            "chain_file":"paid.chain.txt"
+        });
+        std::fs::write(dir.join("log.jsonl"), event.to_string()).unwrap();
+
+        let error = match load_resume(&dir) {
+            Err(error) => error,
+            Ok(_) => panic!("a durable checkpoint must not silently restore a missing chain"),
+        };
+        assert!(
+            error.contains("names missing artifact 'paid.chain.txt'"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_verifies_the_output_bytes_named_by_a_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("sfh-output-hash-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        std::fs::write(dir.join("paid.chain.txt"), "changed after completion").unwrap();
+        let event = json!({
+            "event":"step_end",
+            "step":"paid",
+            "visit":1,
+            "exit":0,
+            "timed_out":false,
+            "interrupted":false,
+            "chain_file":"paid.chain.txt",
+            "output_hash":fingerprint("the completed output")
+        });
+        std::fs::write(dir.join("log.jsonl"), event.to_string()).unwrap();
+
+        let error = match load_resume(&dir) {
+            Err(error) => error,
+            Ok(_) => panic!("changed output must not be routed as the recorded result"),
+        };
+        assert!(
+            error.contains("does not match the recorded output hash"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_refuses_to_repeat_an_uncertain_paid_persistence_failure() {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-persist-failed-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        let log = [
+            json!({"event":"step_start","step":"paid","visit":1,"cmd":"provider"}),
+            json!({
+                "event":"persistence_failure",
+                "step":"paid",
+                "visit":1,
+                "cost_usd":0.25,
+                "error":"cannot persist required chain artifact"
+            }),
+        ]
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(dir.join("log.jsonl"), log).unwrap();
+
+        let error = match load_resume(&dir) {
+            Err(error) => error,
+            Ok(_) => panic!("the uncertain external side effect must not execute again"),
+        };
+        assert!(error.contains("run is non-resumable"), "{error}");
+        assert!(error.contains("verify the external side effect"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn route(
@@ -4611,6 +6190,246 @@ mod tests {
     }
 
     #[test]
+    fn resume_continues_the_checkpointed_fallback_in_the_same_visit() {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-resume-fallback-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("work.chain.txt"), "primary failed\n").unwrap();
+        std::fs::write(dir.join("work.out.txt"), "").unwrap();
+        std::fs::write(dir.join("work.err.txt"), "failed\n").unwrap();
+        let checkpoint = "{\"event\":\"step_end\",\"step\":\"work\",\"visit\":1,\
+            \"exit\":7,\"timed_out\":false,\"interrupted\":false,\"attempts\":1,\
+            \"dur_ms\":10,\"cost_usd\":0.25,\"chain_file\":\"work.chain.txt\",\
+            \"out_file\":\"work.out.txt\",\"next_fallback\":\"backup\"}\n";
+        std::fs::write(dir.join("log.jsonl"), checkpoint).unwrap();
+
+        let state = load_resume(&dir).expect("fallback checkpoint must be resumable");
+        let unfinished = state
+            .unfinished_step
+            .as_ref()
+            .expect("the selected fallback is unfinished");
+        assert_eq!(state.start.as_deref(), Some("work"));
+        assert_eq!(unfinished.step, "work");
+        assert_eq!(unfinished.visit, 1);
+        assert_eq!(unfinished.profile.as_deref(), Some("backup"));
+        assert_eq!(state.visits.get("work"), Some(&1));
+        assert_eq!(state.total, 1);
+        assert_eq!(state.cost_usd, 0.25);
+        assert!(state.pending_route.is_none());
+
+        std::fs::write(dir.join("work.fb-backup.chain.txt"), "recovered\n").unwrap();
+        std::fs::write(dir.join("work.fb-backup.out.txt"), "recovered\n").unwrap();
+        std::fs::write(dir.join("work.fb-backup.err.txt"), "").unwrap();
+        let completed = "{\"event\":\"step_end\",\"step\":\"work\",\"visit\":1,\
+            \"exit\":0,\"timed_out\":false,\"interrupted\":false,\"attempts\":1,\
+            \"dur_ms\":5,\"cost_usd\":0.10,\"chain_file\":\"work.fb-backup.chain.txt\",\
+            \"out_file\":\"work.fb-backup.out.txt\",\"next_fallback\":null}\n";
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log.jsonl"))
+            .unwrap();
+        write!(log, "{completed}").unwrap();
+        drop(log);
+
+        let state = load_resume(&dir).expect("completed fallback must close the checkpoint");
+        assert!(state.unfinished_step.is_none());
+        assert_eq!(state.last_success.as_deref(), Some("work"));
+        assert_eq!(state.total, 2);
+        assert_eq!(state.cost_usd, 0.35);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_keeps_a_fanout_members_fallback_checkpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-resume-member-fallback-{}",
+            contain::random_nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kid.chain.txt"), "primary failed\n").unwrap();
+        std::fs::write(dir.join("kid.out.txt"), "").unwrap();
+        std::fs::write(dir.join("kid.err.txt"), "failed\n").unwrap();
+        let log = concat!(
+            "{\"event\":\"group_start\",\"step\":\"fan\",\"visit\":2,\"children\":1}\n",
+            "{\"event\":\"step_end\",\"step\":\"kid\",\"parent\":\"fan\",\"visit\":2,",
+            "\"exit\":7,\"timed_out\":false,\"interrupted\":false,\"attempts\":1,",
+            "\"dur_ms\":10,\"cost_usd\":0.25,\"chain_file\":\"kid.chain.txt\",",
+            "\"out_file\":\"kid.out.txt\",\"next_fallback\":\"backup\"}\n",
+        );
+        std::fs::write(dir.join("log.jsonl"), log).unwrap();
+
+        let state = load_resume(&dir).expect("member fallback checkpoint must load");
+        assert_eq!(state.start.as_deref(), Some("fan"));
+        assert_eq!(
+            state
+                .member_fallbacks
+                .get(&("fan".into(), 2, "kid".into()))
+                .map(String::as_str),
+            Some("backup")
+        );
+        assert_eq!(state.total, 1);
+        assert_eq!(state.cost_usd, 0.25);
+
+        std::fs::write(dir.join("kid.fb-backup.chain.txt"), "recovered\n").unwrap();
+        std::fs::write(dir.join("kid.fb-backup.out.txt"), "recovered\n").unwrap();
+        std::fs::write(dir.join("kid.fb-backup.err.txt"), "").unwrap();
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log.jsonl"))
+            .unwrap();
+        writeln!(
+            log,
+            "{{\"event\":\"step_end\",\"step\":\"kid\",\"parent\":\"fan\",\"visit\":2,\
+             \"exit\":0,\"timed_out\":false,\"interrupted\":false,\"attempts\":1,\
+             \"dur_ms\":5,\"cost_usd\":0.10,\"chain_file\":\"kid.fb-backup.chain.txt\",\
+             \"out_file\":\"kid.fb-backup.out.txt\",\"next_fallback\":null}}"
+        )
+        .unwrap();
+        drop(log);
+
+        let state = load_resume(&dir).expect("completed member fallback must load");
+        assert!(state.member_fallbacks.is_empty());
+        assert!(state
+            .completed_members
+            .get(&("fan".into(), 2))
+            .is_some_and(|members| members.contains("kid")));
+        assert_eq!(state.total, 2);
+        assert_eq!(state.cost_usd, 0.35);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_keeps_postprocessing_pending_until_its_end_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-resume-postprocess-{}",
+            contain::random_nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("source.chain.txt"), "large original\n").unwrap();
+        std::fs::write(dir.join("source.out.txt"), "large original\n").unwrap();
+        std::fs::write(dir.join("source.err.txt"), "").unwrap();
+        let completion = "{\"event\":\"step_end\",\"step\":\"source\",\"visit\":1,\
+            \"exit\":0,\"timed_out\":false,\"interrupted\":false,\"attempts\":1,\
+            \"dur_ms\":10,\"chain_file\":\"source.chain.txt\",\
+            \"out_file\":\"source.out.txt\",\"postprocess_pending\":true}\n";
+        std::fs::write(dir.join("log.jsonl"), completion).unwrap();
+
+        let state = load_resume(&dir).expect("post-processing checkpoint must be resumable");
+        let pending = state
+            .pending_route
+            .as_ref()
+            .expect("the completed step still has a route to evaluate");
+        assert!(pending.postprocess);
+        assert!(!pending.compact_done);
+        assert!(!pending.notes_done);
+        assert_eq!(pending.step, "source");
+        assert_eq!(pending.visit, 1);
+        assert_eq!(state.total, 1);
+
+        std::fs::write(dir.join("source.precompact.txt"), "large original\n").unwrap();
+        std::fs::write(dir.join("source.chain.txt"), "small summary\n").unwrap();
+        let marker = note_marker("source", 1, "large original");
+        std::fs::write(
+            dir.join("notes.md"),
+            format!("{marker}\n## source (visit 1)\nlarge original\n\n"),
+        )
+        .unwrap();
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log.jsonl"))
+            .unwrap();
+        writeln!(
+            log,
+            "{}",
+            json!({
+                "event": "compact_end",
+                "step": "source",
+                "visit": 1,
+                "chars": 13,
+                "cost_usd": 0.25,
+                "precompact_file": "source.precompact.txt",
+                "chain_file": "source.chain.txt",
+            })
+        )
+        .unwrap();
+        writeln!(
+            log,
+            "{}",
+            json!({
+                "event": "notes_end",
+                "step": "source",
+                "visit": 1,
+                "marker": marker,
+            })
+        )
+        .unwrap();
+        drop(log);
+
+        let state = load_resume(&dir).expect("post-processing substages must be resumable");
+        let pending = state.pending_route.as_ref().unwrap();
+        assert!(pending.postprocess);
+        assert!(pending.compact_done);
+        assert!(pending.notes_done);
+        assert_eq!(state.total, 2);
+        assert_eq!(state.cost_usd, 0.25);
+        assert_eq!(state.outputs["source"].output, "small summary");
+        assert_eq!(state.outputs["source"].outputs, "large original");
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log.jsonl"))
+            .unwrap();
+        writeln!(
+            log,
+            "{{\"event\":\"postprocess_end\",\"step\":\"source\",\"visit\":1}}"
+        )
+        .unwrap();
+        drop(log);
+
+        let state = load_resume(&dir).expect("postprocess_end must close the checkpoint");
+        assert!(
+            !state.pending_route.as_ref().unwrap().postprocess,
+            "routing may replay only after post-processing is durable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_start_recovers_the_original_across_publish_before_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-resume-compact-start-{}",
+            contain::random_nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("source.out.txt"), "large original\n").unwrap();
+        // Simulate an atomic compacted-chain publish followed by a kill before
+        // compact_end. The earlier step_end now resolves to these newer bytes.
+        std::fs::write(dir.join("source.chain.txt"), "uncheckpointed summary\n").unwrap();
+        std::fs::write(dir.join("source.precompact.txt"), "large original\n").unwrap();
+        std::fs::write(
+            dir.join("log.jsonl"),
+            concat!(
+                "{\"event\":\"step_end\",\"step\":\"source\",\"visit\":1,",
+                "\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"attempts\":1,",
+                "\"dur_ms\":10,\"chain_file\":\"source.chain.txt\",",
+                "\"out_file\":\"source.out.txt\",\"postprocess_pending\":true}\n",
+                "{\"event\":\"compact_start\",\"step\":\"source\",\"visit\":1,",
+                "\"precompact_file\":\"source.precompact.txt\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let state = load_resume(&dir).expect("compact_start must be recoverable");
+        let pending = state.pending_route.as_ref().unwrap();
+        assert!(pending.postprocess);
+        assert!(!pending.compact_done);
+        assert_eq!(pending.route_text, "large original");
+        assert_eq!(state.outputs["source"].output, "large original");
+        assert_eq!(state.outputs["source"].outputs, "large original");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resume_records_completed_fanout_members_under_parent_and_visit() {
         // F-2: a crash mid-fan-out leaves step_end events for the members that
         // already finished. load_resume must hand them back keyed by (parent
@@ -4914,6 +6733,23 @@ mod tests {
     }
 
     #[test]
+    fn foreach_input_fingerprint_binds_values_order_and_boundaries() {
+        let original = vec!["ab".to_string(), "c".to_string()];
+        assert_eq!(
+            foreach_items_hash(&original),
+            foreach_items_hash(&original.clone())
+        );
+        assert_ne!(
+            foreach_items_hash(&original),
+            foreach_items_hash(&["c".into(), "ab".into()])
+        );
+        assert_ne!(
+            foreach_items_hash(&original),
+            foreach_items_hash(&["a".into(), "bc".into()])
+        );
+    }
+
+    #[test]
     fn failed_output_records_process_facts_without_changing_the_text() {
         assert_eq!(
             failed_output("verify[1]", "partial text", 9, false),
@@ -5030,6 +6866,43 @@ mod tests {
             "flow_fingerprint_algo": "md5"
         });
         assert!(check_flow_fingerprint(&meta_unknown, flow_text, dir, flow_path).is_err());
+    }
+
+    #[test]
+    fn effective_config_fingerprint_detects_merged_profile_changes() {
+        let config = r#"{"api_version":1,"profiles":{"review":{"tool":"claude"}}}"#;
+        let meta = serde_json::json!({
+            "effective_config_fingerprint": fingerprint(config),
+            "effective_config_fingerprint_algo": FINGERPRINT_ALGO
+        });
+        assert!(check_effective_config_fingerprint(&meta, config, Path::new("/tmp/run")).is_ok());
+        let changed = r#"{"api_version":1,"profiles":{"review":{"tool":"claude","model":"new"}}}"#;
+        let error =
+            check_effective_config_fingerprint(&meta, changed, Path::new("/tmp/run")).unwrap_err();
+        assert!(
+            error.contains("different effective configuration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn durable_log_events_carry_a_public_schema_version() {
+        let path = std::env::temp_dir().join(format!(
+            "sfh-log-schema-{}-{}.jsonl",
+            std::process::id(),
+            utc_stamp()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        log_event(
+            &mut file,
+            json!({"ts": utc_stamp(), "event": "run_end", "status": "ok"}),
+        )
+        .unwrap();
+        drop(file);
+        let value: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(value["schema_version"], 1);
     }
 
     #[test]

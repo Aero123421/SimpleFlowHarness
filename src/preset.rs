@@ -1493,7 +1493,7 @@ mod tests {
     }
     use std::path::PathBuf;
 
-    fn inp<'a>(access: Access, extra: &'a [String]) -> PresetInput<'a> {
+    fn inp(access: Access, extra: &[String]) -> PresetInput<'_> {
         PresetInput {
             model: None,
             effort: None,

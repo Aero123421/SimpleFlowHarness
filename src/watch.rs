@@ -9,6 +9,7 @@
 
 use crate::contain;
 use crate::execute;
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -38,6 +39,12 @@ pub struct Snapshot {
     /// than printing "0s elapsed" about a run it cannot time.
     pub step_started: Option<String>,
     pub last_output: Option<String>,
+    /// Fan-out member id -> queued/running/fallback state. Keep the values in
+    /// the public JSON view; names alone cannot distinguish queue pressure from
+    /// work that is actually executing.
+    pub active_members: BTreeMap<String, String>,
+    pub fanout_total: u64,
+    pub fanout_completed: u64,
     pub visit: Option<u64>,
     pub nonce: Option<String>,
     /// Start time of the owning process, recorded when the run began. Lets
@@ -84,7 +91,11 @@ fn run_dirs(root: &Path) -> Vec<PathBuf> {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .map(|e| e.path())
-            .filter(|p| p.join("status.json").exists())
+            .filter(|p| {
+                contain::read_contained_opt(p, "status.json")
+                    .map(|status| status.is_some())
+                    .unwrap_or(false)
+            })
             .filter(|p| match p.canonicalize() {
                 Ok(c) => c.starts_with(&canon_root),
                 Err(_) => false,
@@ -218,6 +229,25 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
         started: s("started_utc"),
         step_started: opt("step_started_utc"),
         last_output: opt("last_output_utc"),
+        active_members: v
+            .get("active_members")
+            .and_then(|x| x.as_object())
+            .map(|m| {
+                m.iter()
+                    .map(|(member, state)| {
+                        (
+                            member.clone(),
+                            state.as_str().unwrap_or("unknown").to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        fanout_total: v.get("fanout_total").and_then(|x| x.as_u64()).unwrap_or(0),
+        fanout_completed: v
+            .get("fanout_completed")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
         visit: v.get("visit").and_then(|x| x.as_u64()),
         nonce: opt("nonce"),
         pid_start: v.get("pid_start").and_then(|x| x.as_u64()),
@@ -259,7 +289,30 @@ fn idle_segment(snap: &Snapshot) -> Option<String> {
         // written a byte yet.
         None => "no output yet".to_string(),
     };
-    Some(format!("{}{visit}, {elapsed} elapsed, {quiet}", snap.step))
+    let fanout = if snap.fanout_total > 0 {
+        let active = if snap.active_members.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; active {}",
+                snap.active_members
+                    .iter()
+                    .map(|(member, state)| format!("{member}({state})"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        format!(
+            ", fan-out {}/{}{}",
+            snap.fanout_completed, snap.fanout_total, active
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{}{visit}, {elapsed} elapsed, {quiet}{fanout}",
+        snap.step
+    ))
 }
 
 /// The flow path for a command hint: a placeholder when unknown, otherwise
@@ -321,6 +374,9 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 "current_step": snap.step,
                 "step_started_utc": snap.step_started,
                 "last_output_utc": snap.last_output,
+                "active_members": snap.active_members,
+                "fanout_total": snap.fanout_total,
+                "fanout_completed": snap.fanout_completed,
                 "visit": snap.visit,
                 "steps_done": snap.steps_done,
                 "cost_usd": snap.cost_usd,
@@ -440,18 +496,50 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
     // they are what was actually spent before the kill. The read is contained
     // and no-follow like every other status.json access (rev_break #6).
     let sp = dir.join("status.json");
-    if let Ok(Some(text)) = contain::read_contained_opt(&dir, "status.json") {
-        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(m) = v.as_object_mut() {
-                m.insert("state".into(), serde_json::json!("stopped"));
-                m.insert("exit_code".into(), serde_json::json!(1));
-                m.insert("error".into(), serde_json::json!("cancelled by sfh stop"));
-                let _ = contain::write_private(
-                    &sp,
-                    serde_json::to_string_pretty(&v).unwrap_or_default(),
-                );
-            }
+    let text = match contain::read_contained_opt(&dir, "status.json") {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            eprintln!(
+                "sfh: killed pid {} but cannot record the stop: status.json disappeared",
+                snap.pid
+            );
+            return 1;
         }
+        Err(e) => {
+            eprintln!(
+                "sfh: killed pid {} but cannot safely read status.json to record the stop: {e}",
+                snap.pid
+            );
+            return 1;
+        }
+    };
+    let mut v = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "sfh: killed pid {} but cannot record the stop: unreadable status.json: {e}",
+                snap.pid
+            );
+            return 1;
+        }
+    };
+    let Some(m) = v.as_object_mut() else {
+        eprintln!(
+            "sfh: killed pid {} but cannot record the stop: status.json is not an object",
+            snap.pid
+        );
+        return 1;
+    };
+    m.insert("state".into(), serde_json::json!("stopped"));
+    m.insert("exit_code".into(), serde_json::json!(1));
+    m.insert("error".into(), serde_json::json!("cancelled by sfh stop"));
+    let encoded = serde_json::to_string_pretty(&v).unwrap_or_default();
+    if let Err(e) = contain::write_private_atomic(&sp, encoded) {
+        eprintln!(
+            "sfh: killed pid {} but cannot persist the stopped status: {e}",
+            snap.pid
+        );
+        return 1;
     }
     println!("stopped {}", dir.display());
     eprintln!(

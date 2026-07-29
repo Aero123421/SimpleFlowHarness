@@ -323,7 +323,10 @@ pub fn write_nonce(dir: &Path, pid: u32, start: Option<u64>, nonce: &str) -> std
         Some(s) => format!("{pid} {s} {nonce}"),
         None => format!("{pid} {nonce}"),
     };
-    write_private(&dir.join("sfh-nonce"), body)
+    // The detaching parent and child intentionally publish the same binding.
+    // Replace atomically so a stop/status reader never observes the truncate
+    // window between those concurrent writers.
+    write_private_atomic(&dir.join("sfh-nonce"), body)
 }
 
 /// A parsed sfh-nonce file.
@@ -394,9 +397,14 @@ pub fn is_under(parent: &Path, child: &Path) -> bool {
 
 /// Generate a 128-bit random nonce as a 32-char hex string.
 pub fn random_nonce() -> String {
+    use std::fmt::Write as _;
     let mut buf = [0u8; 16];
     fill_random(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(buf.len() * 2);
+    for byte in buf {
+        write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
 }
 
 // --- owner-only permissions for run artifacts -------------------------------
@@ -467,6 +475,215 @@ pub fn write_private(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result
     {
         std::fs::write(path, contents.as_ref())
     }
+}
+
+/// `write_private`, plus a durability barrier before returning. Used for the
+/// temporary side of write-then-rename state snapshots: the rename must never
+/// publish bytes that are still only in a userspace/kernel write buffer.
+pub fn write_private_sync(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        f.write_all(contents.as_ref())?;
+        let mut p = f.metadata()?.permissions();
+        if p.mode() & 0o777 != 0o600 {
+            p.set_mode(0o600);
+            f.set_permissions(p)?;
+        }
+        f.sync_all()?;
+        sync_parent_directory(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        f.write_all(contents.as_ref())?;
+        f.sync_all()
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let mut f = std::fs::File::create(path)?;
+        use std::io::Write;
+        f.write_all(contents.as_ref())?;
+        f.sync_all()
+    }
+}
+
+/// Persist a newly created file name (or an atomic replacement) as well as its
+/// bytes. Some Unix filesystems do not support fsync on directories; in that
+/// case the file barrier is still the strongest portable guarantee available.
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    match std::fs::File::open(parent)?.sync_all() {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Durably write a private temporary file and atomically replace `path`.
+/// The temporary name includes the process id and a process-local sequence so
+/// neither separate sfh processes nor concurrent writers inside one process
+/// ever share an in-flight file.
+pub fn write_private_atomic(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
+
+    // MoveFileExW may transiently reject two simultaneous replacements of the
+    // same destination even though both source names are unique. sfh's status
+    // writers are cheap and infrequent, so serializing the publish boundary is
+    // both simpler and more deterministic than platform-specific retry loops.
+    let _publish = PUBLISH_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+    let result = write_private_sync(&tmp, contents)
+        .and_then(|_| atomic_replace_file(&tmp, path))
+        .and_then(|_| sync_parent_directory(path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, MoveFileExW, SetFileInformationByHandle, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
+        MOVEFILE_WRITE_THROUGH,
+    };
+
+    // FileRenameInfoEx with POSIX replacement semantics (Windows 10 1709+)
+    // can retire the old directory entry while a reader still has that old
+    // file open. MoveFileExW alone repeatedly returns sharing/access errors in
+    // that case, so a status poller can otherwise starve the heartbeat writer.
+    //
+    // The constants live in a windows-sys feature unrelated to their API; keep
+    // the documented values local instead of enabling a broad module solely
+    // for two integers. If the filesystem/OS does not support the extended
+    // rename class, fall back to MoveFileExW below.
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+    const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+    let destination = if to.is_absolute() {
+        to.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(to)
+    };
+    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let base_size = std::mem::size_of::<FILE_RENAME_INFO>();
+    let extra_chars = destination_wide.len().saturating_sub(1);
+    let buffer_size = base_size
+        .checked_add(extra_chars.saturating_mul(std::mem::size_of::<u16>()))
+        .ok_or_else(|| std::io::Error::other("rename information buffer is too large"))?;
+    if let Ok(source) = std::fs::OpenOptions::new()
+        .access_mode(DELETE_ACCESS | SYNCHRONIZE_ACCESS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(from)
+    {
+        let words = buffer_size.div_ceil(std::mem::size_of::<usize>());
+        let mut storage = vec![0usize; words];
+        let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let rename_ok = unsafe {
+            (*info).Anonymous.Flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+            (*info).RootDirectory = std::ptr::null_mut();
+            (*info).FileNameLength = u32::try_from(
+                destination_wide
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u16>()),
+            )
+            .map_err(|_| std::io::Error::other("destination path is too long"))?;
+            std::ptr::copy_nonoverlapping(
+                destination_wide.as_ptr(),
+                (*info).FileName.as_mut_ptr(),
+                destination_wide.len(),
+            );
+            SetFileInformationByHandle(
+                source.as_raw_handle().cast(),
+                FileRenameInfoEx,
+                info.cast(),
+                u32::try_from(buffer_size)
+                    .map_err(|_| std::io::Error::other("rename buffer is too large"))?,
+            )
+        };
+        if rename_ok != 0 {
+            return Ok(());
+        }
+    }
+
+    let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    for attempt in 0..=20 {
+        let ok = unsafe {
+            MoveFileExW(
+                from_wide.as_ptr(),
+                to_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // A status/nonce reader, the detaching sibling process, or an AV
+        // scanner can briefly hold the destination against replacement.
+        // Retry only Windows' access/share/lock failures; malformed paths and
+        // real filesystem errors still fail immediately.
+        let transient = matches!(error.raw_os_error(), Some(5 | 32 | 33));
+        if !transient || attempt == 20 {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    unreachable!("the bounded replacement loop always returns")
 }
 
 /// Open (creating if needed) an append-only file that must be 0600 on Unix.
@@ -625,6 +842,125 @@ fn fill_random(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_atomic_write_replaces_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("sfh-atomic-status-{}", random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("status.json");
+        write_private_atomic(&path, b"{\"state\":\"running\"}").unwrap();
+        write_private_atomic(&path, b"{\"state\":\"done\"}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"state\":\"done\"}"
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("status.json.tmp.")),
+            "temporary files must be consumed by the atomic replace"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_atomic_writers_do_not_share_a_temporary_file() {
+        use std::sync::{Arc, Barrier};
+
+        let dir =
+            std::env::temp_dir().join(format!("sfh-atomic-status-concurrent-{}", random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Arc::new(dir.join("status.json"));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut writers = Vec::new();
+        for writer in 0..8 {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                let payload = format!(
+                    "{{\"writer\":{writer},\"padding\":\"{}\"}}",
+                    "x".repeat(4096)
+                );
+                barrier.wait();
+                write_private_atomic(&path, payload)
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&*path).unwrap()).unwrap();
+        assert!(value["writer"].as_u64().is_some());
+        assert_eq!(value["padding"].as_str().unwrap().len(), 4096);
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("status.json.tmp.")),
+            "temporary files must not leak after concurrent writes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_atomic_replacement_never_exposes_missing_or_partial_json() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!("sfh-atomic-reader-{}", random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Arc::new(dir.join("status.json"));
+        let payload = |generation: u64| {
+            format!(
+                "{{\"generation\":{generation},\"padding\":\"{}\"}}",
+                "x".repeat(8192)
+            )
+        };
+        write_private_atomic(&path, payload(0)).unwrap();
+
+        let start = Arc::new(Barrier::new(5));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let path = Arc::clone(&path);
+            let start = Arc::clone(&start);
+            let finished = Arc::clone(&finished);
+            readers.push(std::thread::spawn(move || {
+                start.wait();
+                let mut reads = 0usize;
+                loop {
+                    let text = std::fs::read_to_string(&*path)
+                        .expect("an atomic replacement must keep the path readable");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&text).expect("a reader must see one whole payload");
+                    assert!(value["generation"].as_u64().is_some());
+                    assert_eq!(value["padding"].as_str().map(str::len), Some(8192));
+                    reads += 1;
+                    if finished.load(Ordering::Acquire) && reads >= 2 {
+                        break;
+                    }
+                }
+                reads
+            }));
+        }
+
+        start.wait();
+        for generation in 1..=32 {
+            write_private_atomic(&path, payload(generation)).unwrap();
+        }
+        finished.store(true, Ordering::Release);
+        for reader in readers {
+            assert!(reader.join().unwrap() >= 2);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_nonce_current_format() {

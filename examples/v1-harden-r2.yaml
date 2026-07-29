@@ -8,6 +8,7 @@
 #      fmt/clippy/test/behaviour はゲートが既に通している)
 #
 #   sfh run examples/v1-harden-r2.yaml --detach
+api_version: 1
 name: v1-harden-r2
 
 vars:
@@ -62,7 +63,7 @@ steps:
   - id: fix1
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化。**レビューの指摘に対応**します。
+      sfh ({{flow_dir}}) のセキュリティ強化。**レビューの指摘に対応**します。
 
       あなたが先ほど入れた S1〜S3 の修正を、codex 2体が独立にレビューしました。
       結論は両者とも **REVIEW-FAIL** です。指摘の要旨は「鍵が甘い」ではなく
@@ -177,7 +178,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**防御確認**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**防御確認**レビュアーです。
           これは自分たちのオープンソースプロジェクトに入れたセキュリティ修正が、
           意図した保護を本当に達成できているかを確かめる、通常のコードレビューです。
 
@@ -215,7 +216,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**回帰**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**回帰**レビュアーです。
           セキュリティ修正が**正当な利用者を閉め出していないか**を見ます。
 
           ## 環境の制約(重要)
@@ -250,7 +251,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**網羅性**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**網羅性**レビュアーです。
 
           ## 環境の制約(重要)
           読み取り専用です。テストは実行できませんし、する必要もありません。
@@ -294,7 +295,7 @@ steps:
   - id: fix2
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化。**レビュー指摘への対応**です。
+      sfh ({{flow_dir}}) のセキュリティ強化。**レビュー指摘への対応**です。
 
       codex 3体が独立にレビューし、全員一致の合格が出ませんでした。
       以下が3体分の指摘です。**指摘された箇所を全て直してください。**

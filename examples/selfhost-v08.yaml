@@ -7,6 +7,7 @@
 #
 #   sfh run examples/selfhost-v08.yaml --detach
 #   sfh status ; sfh wait
+api_version: 1
 name: selfhost-v08
 
 vars:
@@ -44,7 +45,7 @@ steps:
   - id: a_impl
     use: dev
     prompt: |
-      あなたは sfh (D:\AI\SimpleFlowHarness) というRust製CLIのメンテナです。
+      あなたは sfh ({{flow_dir}}) というRust製CLIのメンテナです。
       独立レビューで確認された欠陥を直します。**指示された範囲だけ**を直してください。
 
       ## sfh の思想(これに反する変更はしないこと)
@@ -138,7 +139,7 @@ steps:
       自分で実行して確認してから終わること。
 
       前回の検証でこう言われている(初回は空):
-      {{steps.a_check.output | tail:120}}
+      {{steps.a_check.output | optional | tail:120}}
 
   - id: a_check
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
@@ -158,7 +159,7 @@ steps:
   - id: b_impl
     use: dev
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の v0.8 実装、2バッチ目です。
+      sfh ({{flow_dir}}) の v0.8 実装、2バッチ目です。
 
       ## sfh の思想
       **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
@@ -230,7 +231,7 @@ steps:
       新しいログフィールドには挙動テストを足すこと。
 
       前回の検証結果(初回は空):
-      {{steps.b_check.output | tail:120}}
+      {{steps.b_check.output | optional | tail:120}}
 
   - id: b_check
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
@@ -249,7 +250,7 @@ steps:
   - id: c_impl
     use: dev
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の v0.8 実装、3バッチ目。ここが一番大きい。
+      sfh ({{flow_dir}}) の v0.8 実装、3バッチ目。ここが一番大きい。
 
       ## sfh の思想
       **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
@@ -325,7 +326,7 @@ steps:
       - **ライブ実行と resume で下流プロンプトがバイト一致する**
 
       前回の検証結果(初回は空):
-      {{steps.c_check.output | tail:120}}
+      {{steps.c_check.output | optional | tail:120}}
 
   - id: c_check
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
@@ -344,7 +345,7 @@ steps:
   - id: d_impl
     use: dev
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の v0.8 実装、最終バッチ。
+      sfh ({{flow_dir}}) の v0.8 実装、最終バッチ。
 
       ## sfh の思想
       **sfh は自分の配管については判断してよいが、仕事の中身については絶対に判断しない。**
@@ -426,7 +427,7 @@ steps:
       動かないイディオムを書くくらいなら書かない方がましです。
 
       前回の検証結果(初回は空):
-      {{steps.d_check.output | tail:120}}
+      {{steps.d_check.output | optional | tail:120}}
 
   - id: d_check
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、

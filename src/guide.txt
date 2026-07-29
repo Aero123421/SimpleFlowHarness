@@ -1,5 +1,6 @@
 DETERMINISTIC GATE — use process exit status for facts, then send diagnostics to AI:
 ```yaml
+api_version: 1
 steps:
   - id: build
     cmd: ["cargo", "test"]     # direct spawn; no shell
@@ -15,9 +16,9 @@ steps:
 ```
 This is the only form with exactly the same behavior on Windows, macOS, and Linux.
 Use `sh -c` only to join multiple commands; on Windows it requires Git Bash.
-
 AI GOAL VERDICT — require exactly one final-line token and fail closed:
 ```yaml
+api_version: 1
 steps:
   - id: judge
     tool: codex
@@ -32,16 +33,16 @@ steps:
   - {id: unmet, cmd: ["sfh", "--version"], route: [{goto: fail}]}
   - {id: unclear, cmd: ["sfh", "--version"], route: [{goto: fail}]}
 ```
-
 BOUNDED REWORK WITH DEGRADATION:
 ```yaml
+api_version: 1
 steps:
   - id: revise
     tool: codex
     access: full
     max_visits: 3
     on_max_visits: goto:degraded
-    prompt: "Revise using: {{steps.review.output}}"
+    prompt: "Revise using: {{steps.review.output | optional}}"
   - id: review
     tool: codex
     access: read
@@ -52,9 +53,9 @@ steps:
   - {id: degraded, cmd: ["sfh", "--version"]}
 ```
 Limits are checked on entry, so the node entered first in a loop reaches its limit first.
-
 PARALLEL MEMBERS / ONE BRANCH PER ITEM — when_members counts verdicts, never text:
 ```yaml
+api_version: 1
 vars: {targets: "--version\n--help"}
 steps:
   - id: review
@@ -68,9 +69,9 @@ steps:
     foreach: {from: "{{vars.targets}}", split: lines}
     cmd: ["sfh", "{{item}}"]
 ```
-
 HUMAN ANSWER — the command waits; timeout_sec is the deadline:
 ```yaml
+api_version: 1
 steps:
   - {id: approval, cmd: ["approval-cli", "wait", "--question", "Ship this build?"], timeout_sec: 3600}
 ```

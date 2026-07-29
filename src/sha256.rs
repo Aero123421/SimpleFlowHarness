@@ -83,7 +83,13 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 pub fn hex(data: &[u8]) -> String {
-    sha256(data).iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let digest = sha256(data);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    out
 }
 
 #[cfg(test)]

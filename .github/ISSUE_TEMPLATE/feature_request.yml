@@ -1,0 +1,21 @@
+name: Feature request
+description: Propose a focused workflow or usability improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    attributes:
+      label: Problem
+      description: What workflow is difficult or unsafe today?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed contract
+      description: Show the CLI/YAML behavior you would like, including failure and resume semantics.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Alternatives and compatibility
+      description: Could this be expressed with existing primitives? Would formats or exit codes change?

@@ -24,10 +24,13 @@ USAGE:
   sfh wait [run-dir] [--timeout SEC]     Block until a run finishes, then print its result
   sfh stop [run-dir]                     Cancel a run and its agents
   sfh doctor [flow.yaml]                 Check the presets still match the installed CLIs
-  sfh validate <flow.yaml> [--var k=v]   Parse and static-check a flow file
+  sfh validate <flow.yaml> [options]      Parse and static-check a flow file
+  sfh plan <flow.yaml> [--var k=v]        Resolve commands without executing
+  sfh graph <flow.yaml> [--mermaid]       Show control-flow edges
+  sfh config show <flow.yaml>             Show merged config (env values redacted)
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
   sfh guide                              Show the compact AI-oriented flow guide
-  sfh runs list|show|clean [...]         Browse or prune past runs
+  sfh runs list|show|why|clean [...]     Browse, explain or prune past runs
 
 RUN OPTIONS:
   --var key=value     Override a flow variable (repeatable)
@@ -64,6 +67,7 @@ DOCTOR OPTIONS:
 RUNS OPTIONS:
   runs list [--runs-dir d] [-n N] [--json]
   runs show <run-dir> [--json]
+  runs why  <run-dir> [--json]
   runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]
 
 EXIT CODES:
@@ -77,7 +81,7 @@ FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the sc
   {{item}} {{item_index}} {{notes}} {{run_dir}} {{flow_dir}} {{step_id}} {{visit}} {{os}}
   {{budget.spent_usd}} {{budget.elapsed_sec}} {{budget.remaining_usd}} {{budget.remaining_sec}}
   (remaining_* is the string `unlimited` when that axis has no ceiling)
-  Filters: | head:N | tail:N | truncate:N | lines:A-B | trim
+  Filters: | head:N | tail:N | truncate:N | lines:A-B | trim | optional | default:text
   Preset tools: codex, claude, opencode, grok, agy, pi, cursor.
   Custom cmd: array form = spawned directly; string form = via cmd /C | sh -c.
 ";
@@ -86,7 +90,11 @@ fn main() {
     execute::install_process_guard();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
+        Some(cmd) if args.get(1).is_some_and(|a| a == "-h" || a == "--help") => cmd_help(cmd),
         Some("run") => cmd_run(&args[1..]),
+        Some("plan") => cmd_plan(&args[1..]),
+        Some("graph") => cmd_graph(&args[1..]),
+        Some("config") => cmd_config(&args[1..]),
         Some("status") => cmd_watch(&args[1..], Watch::Status),
         Some("wait") => cmd_watch(&args[1..], Watch::Wait),
         Some("stop") => cmd_watch(&args[1..], Watch::Stop),
@@ -110,6 +118,29 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+fn cmd_help(command: &str) -> i32 {
+    let usage = match command {
+        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--detach] [--resume dir|--resume-latest] [--force-resume] [--no-partial-emit] [--dry-run] [-v|-q]",
+        "plan" => "sfh plan <flow.yaml> [--var k=v] [-v|-q]\nResolves every command in an isolated temporary directory and executes nothing.",
+        "graph" => "sfh graph <flow.yaml> [--mermaid]",
+        "config" => "sfh config show <flow.yaml> [--show-secrets]",
+        "validate" => "sfh validate <flow.yaml> [--var k=v] [--strict] [--json]",
+        "status" => "sfh status [run-dir] [--runs-dir d] [--json]",
+        "wait" => "sfh wait [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]",
+        "stop" => "sfh stop [run-dir] [--runs-dir d]",
+        "doctor" => "sfh doctor [flow.yaml] [--runs-dir d] [--timeout SEC]",
+        "init" => "sfh init [file] [--force]",
+        "guide" => "sfh guide",
+        "runs" => "sfh runs list|show|why|clean [options]",
+        _ => {
+            print!("{HELP}");
+            return 2;
+        }
+    };
+    println!("{usage}");
+    0
 }
 
 fn usage_err(msg: &str) -> i32 {
@@ -215,12 +246,102 @@ fn cmd_run(rest: &[String]) -> i32 {
         return usage_err("usage: sfh run <flow.yaml> [--var k=v]... [--emit id] [--resume dir] [--dry-run] [-v] [-q]");
     };
     opts.flow_path = fp;
+    if opts.resume.is_some() && opts.resume_latest {
+        return usage_err("--resume and --resume-latest are mutually exclusive");
+    }
+    if opts.force_resume && opts.resume.is_none() && !opts.resume_latest {
+        return usage_err("--force-resume requires --resume or --resume-latest");
+    }
+    if opts.verbose && opts.quiet {
+        return usage_err("--verbose and --quiet are mutually exclusive");
+    }
     if opts.detach && opts.dry_run {
         return usage_err(
             "--detach and --dry-run do nothing together (a dry run has nothing to detach)",
         );
     }
     engine::run(opts)
+}
+
+fn cmd_plan(rest: &[String]) -> i32 {
+    let mut flow_files = 0usize;
+    let mut i = 0usize;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--var" => {
+                if i + 1 >= rest.len() {
+                    return usage_err("--var needs key=value");
+                }
+                i += 1;
+            }
+            "-v" | "--verbose" | "-q" | "--quiet" => {}
+            flag if flag.starts_with('-') => {
+                return usage_err(&format!(
+                    "sfh plan does not accept run-only option '{flag}'"
+                ))
+            }
+            _ => {
+                flow_files += 1;
+                if flow_files > 1 {
+                    return usage_err("more than one flow file given");
+                }
+            }
+        }
+        i += 1;
+    }
+    let mut args = rest.to_vec();
+    args.push("--dry-run".into());
+    cmd_run(&args)
+}
+
+fn cmd_graph(rest: &[String]) -> i32 {
+    let mut path = None;
+    let mut mermaid = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--mermaid" => mermaid = true,
+            flag if flag.starts_with('-') => return usage_err(&format!("unknown flag '{flag}'")),
+            value if path.is_some() => {
+                return usage_err(&format!("more than one flow file given (extra: '{value}')"))
+            }
+            value => path = Some(PathBuf::from(value)),
+        }
+    }
+    match path {
+        Some(path) => engine::graph(&path, mermaid),
+        None => usage_err("usage: sfh graph <flow.yaml> [--mermaid]"),
+    }
+}
+
+fn cmd_config(rest: &[String]) -> i32 {
+    if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("sfh config show <flow.yaml> [--show-secrets]");
+        return 0;
+    }
+    if rest.first().map(String::as_str) != Some("show") {
+        return usage_err("usage: sfh config show <flow.yaml> [--show-secrets]");
+    }
+    let mut path: Option<PathBuf> = None;
+    let mut show_secrets = false;
+    for arg in &rest[1..] {
+        match arg.as_str() {
+            "--show-secrets" => show_secrets = true,
+            flag if flag.starts_with('-') => return usage_err(&format!("unknown flag '{flag}'")),
+            value if path.is_some() => {
+                return usage_err(&format!("more than one flow file given (extra: '{value}')"))
+            }
+            value => path = Some(PathBuf::from(value)),
+        }
+    }
+    let Some(path) = path else {
+        return usage_err("usage: sfh config show <flow.yaml> [--show-secrets]");
+    };
+    if show_secrets {
+        eprintln!(
+            "sfh: warning: --show-secrets prints environment values; treat stdout as sensitive"
+        );
+    }
+    engine::show_config(&path, show_secrets)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -314,6 +435,8 @@ fn cmd_doctor(rest: &[String]) -> i32 {
 fn cmd_validate(rest: &[String]) -> i32 {
     let mut flow_path: Option<PathBuf> = None;
     let mut vars: Vec<(String, String)> = Vec::new();
+    let mut strict = false;
+    let mut as_json = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -322,25 +445,43 @@ fn cmd_validate(rest: &[String]) -> i32 {
                     return usage_err(&e);
                 }
             }
+            "--strict" => strict = true,
+            "--json" => as_json = true,
             s if s.starts_with('-') => return usage_err(&format!("unknown flag '{s}'")),
-            s => flow_path = Some(PathBuf::from(s)),
+            s => {
+                if flow_path.is_some() {
+                    return usage_err("more than one flow file given");
+                }
+                flow_path = Some(PathBuf::from(s));
+            }
         }
         i += 1;
     }
     let Some(fp) = flow_path else {
         return usage_err("usage: sfh validate <flow.yaml> [--var k=v]...");
     };
-    engine::validate(&fp, &vars)
+    if strict || as_json {
+        engine::validate_with_options(&fp, &vars, strict, as_json)
+    } else {
+        engine::validate(&fp, &vars)
+    }
 }
 
 fn cmd_init(rest: &[String]) -> i32 {
     let mut path = PathBuf::from("flow.yaml");
+    let mut path_given = false;
     let mut force = false;
     for a in rest {
         match a.as_str() {
             "--force" => force = true,
             s if s.starts_with('-') => return usage_err(&format!("unknown flag '{s}'")),
-            s => path = PathBuf::from(s),
+            s if path_given => {
+                return usage_err(&format!("more than one output file given (extra: '{s}')"))
+            }
+            s => {
+                path = PathBuf::from(s);
+                path_given = true;
+            }
         }
     }
     if path.exists() && !force {
@@ -379,36 +520,64 @@ fn cmd_runs(rest: &[String]) -> i32 {
     let mut as_json = false;
     let mut target: Option<PathBuf> = None;
     let sub = rest.first().map(String::as_str).unwrap_or("list");
+    if rest
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        let usage = match sub {
+            "list" => "sfh runs list [--runs-dir d] [-n N] [--json]",
+            "show" => "sfh runs show <run-dir> [--json]",
+            "why" => "sfh runs why <run-dir> [--json]",
+            "clean" => "sfh runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]",
+            _ => "sfh runs list|show|why|clean [options]",
+        };
+        println!("{usage}");
+        return if matches!(sub, "list" | "show" | "why" | "clean") {
+            0
+        } else {
+            2
+        };
+    }
     let mut i = 1;
     while i < rest.len() {
         let r: Result<(), String> = match rest[i].as_str() {
-            "--runs-dir" => need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v)),
-            "-n" | "--limit" => need(rest, &mut i, "-n")
+            "--runs-dir" if sub == "list" || sub == "clean" => {
+                need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v))
+            }
+            "-n" | "--limit" if sub == "list" => need(rest, &mut i, "-n")
                 .and_then(|v| v.parse().map_err(|_| "-n needs a number".to_string()))
                 .map(|v| limit = v),
-            "--older-than" => need(rest, &mut i, "--older-than")
+            "--older-than" if sub == "clean" => need(rest, &mut i, "--older-than")
                 .and_then(|v| {
                     v.trim_end_matches('d')
                         .parse()
                         .map_err(|_| "--older-than needs days".to_string())
                 })
                 .map(|v| days = v),
-            "--keep" => need(rest, &mut i, "--keep")
+            "--keep" if sub == "clean" => need(rest, &mut i, "--keep")
                 .and_then(|v| v.parse().map_err(|_| "--keep needs a number".to_string()))
                 .map(|v| keep = v),
-            "--dry-run" => {
+            "--dry-run" if sub == "clean" => {
                 dry = true;
                 Ok(())
             }
-            "--json" if sub == "list" || sub == "show" => {
+            "--json" if sub == "list" || sub == "show" || sub == "why" => {
                 as_json = true;
                 Ok(())
             }
             s if s.starts_with('-') => Err(format!("unknown flag '{s}'")),
-            s => {
-                target = Some(PathBuf::from(s));
-                Ok(())
+            s if sub == "show" || sub == "why" => {
+                if target.is_some() {
+                    Err("more than one run dir given".into())
+                } else {
+                    target = Some(PathBuf::from(s));
+                    Ok(())
+                }
             }
+            s => Err(format!(
+                "runs {sub} does not accept positional argument '{s}'"
+            )),
         };
         if let Err(e) = r {
             return usage_err(&e);
@@ -421,16 +590,20 @@ fn cmd_runs(rest: &[String]) -> i32 {
             Some(d) => runs::show(&d, as_json),
             None => usage_err("usage: sfh runs show <run-dir>"),
         },
+        "why" => match target {
+            Some(d) => runs::why(&d, as_json),
+            None => usage_err("usage: sfh runs why <run-dir> [--json]"),
+        },
         "clean" => runs::clean(&runs_dir, days, keep, dry),
         other => usage_err(&format!(
-            "unknown runs subcommand '{other}' (list/show/clean)"
+            "unknown runs subcommand '{other}' (list/show/why/clean)"
         )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::GUIDE;
+    use super::{cmd_config, cmd_init, cmd_plan, cmd_runs, GUIDE};
 
     #[test]
     fn guide_fits_one_screen() {
@@ -485,5 +658,108 @@ mod tests {
                 index + 1
             );
         }
+    }
+
+    #[test]
+    fn plan_keeps_downstream_prompts_renderable_without_running_upstream_steps() {
+        let path =
+            std::env::temp_dir().join(format!("sfh-plan-dependency-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"api_version: 1
+name: plan-dependency
+steps:
+  - id: gather
+    parallel:
+      - id: left
+        cmd: ["echo", "left"]
+      - id: right
+        cmd: ["echo", "right"]
+  - id: verdict
+    cmd: ["sh", "-c", "cat -"]
+    stdin: prompt
+    prompt: "{{steps.gather.outputs}}"
+"#,
+        )
+        .expect("write plan fixture");
+        let runs_dir =
+            std::env::temp_dir().join(format!("sfh-plan-dependency-{}-runs", std::process::id()));
+        let result = crate::engine::run(crate::engine::RunOpts {
+            flow_path: path.clone(),
+            vars: Vec::new(),
+            emit: None,
+            runs_dir: Some(runs_dir.clone()),
+            dry_run: true,
+            verbose: false,
+            quiet: true,
+            resume: None,
+            resume_latest: false,
+            force_resume: false,
+            no_partial_emit: false,
+            detach: false,
+            run_dir: None,
+        });
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(runs_dir);
+        assert_eq!(
+            result, 0,
+            "plan must use placeholders for results that do not exist yet"
+        );
+    }
+
+    #[test]
+    fn nested_help_works_and_irrelevant_runs_arguments_are_rejected() {
+        assert_eq!(
+            cmd_config(&["show".into(), "--help".into()]),
+            0,
+            "config show has its own help"
+        );
+        for subcommand in ["list", "show", "why", "clean"] {
+            assert_eq!(
+                cmd_runs(&[subcommand.into(), "--help".into()]),
+                0,
+                "runs {subcommand} has its own help"
+            );
+        }
+        assert_eq!(
+            cmd_runs(&["list".into(), "ignored-run-dir".into()]),
+            2,
+            "runs list must not silently ignore a positional argument"
+        );
+        assert_eq!(
+            cmd_runs(&["show".into(), "run".into(), "--keep".into(), "2".into()]),
+            2,
+            "runs show must not silently ignore clean-only options"
+        );
+        assert_eq!(
+            cmd_init(&["one.yaml".into(), "two.yaml".into()]),
+            2,
+            "init must not silently use only the last output path"
+        );
+        assert_eq!(
+            cmd_plan(&["flow.yaml".into(), "--resume-latest".into()]),
+            2,
+            "plan must reject run-only options instead of silently changing semantics"
+        );
+        assert_eq!(
+            super::cmd_run(&[
+                "flow.yaml".into(),
+                "--resume".into(),
+                "one".into(),
+                "--resume-latest".into()
+            ]),
+            2,
+            "two different resume selectors must not be silently prioritized"
+        );
+        assert_eq!(
+            super::cmd_run(&["flow.yaml".into(), "--force-resume".into()]),
+            2,
+            "force-resume without a resume target is a user error"
+        );
+        assert_eq!(
+            super::cmd_run(&["flow.yaml".into(), "-q".into(), "-v".into()]),
+            2,
+            "opposite output modes must not be order-dependent"
+        );
     }
 }

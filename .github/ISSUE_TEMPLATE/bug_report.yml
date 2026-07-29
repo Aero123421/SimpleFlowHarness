@@ -1,0 +1,43 @@
+name: Bug report
+description: Report reproducible incorrect sfh behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: checkboxes
+    attributes:
+      label: Preflight
+      options:
+        - label: I removed credentials and private provider output.
+          required: true
+        - label: I am using the latest release or reproduced this on main.
+          required: true
+  - type: input
+    attributes:
+      label: sfh version
+      placeholder: sfh 1.1.2
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Operating system
+      options: [Windows, Linux, macOS, Other]
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Minimal flow and commands
+      description: Include a sanitized, minimal api_version 1 flow and exact command.
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Actual behavior and diagnostics
+      description: Include exit code and sanitized output from validate/plan/runs why when relevant.
+    validations:
+      required: true

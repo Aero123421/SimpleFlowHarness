@@ -9,6 +9,7 @@
 #   - 不足があっても自動で差し戻さない。所見を出して終わる
 #
 #   sfh run examples/v1-review.yaml --detach
+api_version: 1
 name: v1-review
 
 profiles:
@@ -42,7 +43,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) のレビュアーです。
+          あなたは sfh ({{flow_dir}}) のレビュアーです。
           自分たちのオープンソースプロジェクトの v1.0.0 リリース前レビューです。
 
           ## 環境の制約
@@ -111,7 +112,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**テスト品質**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**テスト品質**レビュアーです。
 
           ## 環境の制約
           読み取り専用です。テストは実行できませんし、する必要もありません。
@@ -161,7 +162,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**移植性**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**移植性**レビュアーです。
 
           ## 環境の制約
           読み取り専用です。テストは実行できません。**コードを読んでください。**
