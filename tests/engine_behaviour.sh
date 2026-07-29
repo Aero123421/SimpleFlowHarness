@@ -2660,6 +2660,160 @@ else
   fail=$((fail + 1))
 fi
 
+# --- F4: a resumed run reads a log that carries the new keys ------------------
+# Written before the enrichment itself: load_resume takes only the keys it knows
+# about, so adding keys must be invisible to it. This cuts a REAL new-format log
+# where a crash would cut it - just after a step_end, before its position - and
+# resumes from there.
+cat > f4res.yaml <<'YAML'
+name: f4res
+steps:
+  - id: one
+    cmd: ["echo", "first"]
+    route:
+      - {when_last_line_is: "first", goto: two}
+      - {goto: fail}
+  - id: two
+    cmd: ["echo", "second:{{steps.one.output | trim}}"]
+YAML
+"$SFH" run f4res.yaml --runs-dir f4res-runs -q > f4res-live.out 2>&1
+check "F4: the flow runs live before being resumed" 0 $?
+F4R_DIR="$(dirname "$(find f4res-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_end"/ && /"step":"one"/ { exit }' \
+  "$F4R_DIR/log.jsonl" > "$F4R_DIR/log.cut"
+mv "$F4R_DIR/log.cut" "$F4R_DIR/log.jsonl"
+"$SFH" run f4res.yaml --resume "$F4R_DIR" -q > f4res.out 2>f4res.err
+check "F4: a log carrying the new keys still resumes" 0 $?
+contains "F4: the resumed run restored the recorded output" "second:first" f4res.out
+
+# --- F4: position records which rule fired, and on what text -----------------
+cat > f4log.yaml <<'YAML'
+name: f4log
+steps:
+  - id: choose
+    cmd: ["printf", "prose that mentions VERDICT-OK in passing\nVERDICT-OK\n"]
+    route:
+      - {when_contains: "no such text anywhere", goto: fail}
+      - {when_last_line_is: "VERDICT-OK", goto: whole}
+  - id: whole
+    cmd: ["printf", "whole-text-judgement"]
+    route:
+      - {when_contains: "whole-text", goto: catchall}
+  - id: catchall
+    cmd: ["echo", "no-predicate-here"]
+    route:
+      - {goto: end}
+YAML
+"$SFH" run f4log.yaml --runs-dir f4log-runs -q > f4log.out 2>f4log.err
+check "F4: the routed flow runs" 0 $?
+F4_LOG="$(find f4log-runs -type f -name 'log.jsonl' -print -quit)"
+contains "F4: position records the 0-based index of the rule that fired" \
+  '"rule":1' "$F4_LOG"
+contains "F4: a last-line rule records the last line it judged" \
+  '"route_line":"VERDICT-OK"' "$F4_LOG"
+contains "F4: a whole-text rule records the head of the routing text" \
+  '"route_line":"whole-text-judgement"' "$F4_LOG"
+if grep -F '"via":"catch_all"' "$F4_LOG" | grep -qF '"route_line":"no-predicate-here"'; then
+  echo "ok   - F4: the catch-all records the last line too"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: the catch-all recorded no route_line"
+  grep -F '"event":"position"' "$F4_LOG"
+  fail=$((fail + 1))
+fi
+# A rule index is a claim about `route:`; the vias that never consulted it must
+# not make one.
+F4_VISITS_LOG="$(find visits-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"via":"max_visits"' "$F4_VISITS_LOG" | grep -qF '"rule":'; then
+  echo "FAIL - F4: a max_visits position claimed a route rule"
+  fail=$((fail + 1))
+else
+  echo "ok   - F4: only rule/catch_all positions carry a rule index"
+  pass=$((pass + 1))
+fi
+
+# --- F4: step_end names the OS that produced it -------------------------------
+if grep -F '"event":"step_end"' "$F4_LOG" | grep -qE '"os":"(windows|linux|macos)"'; then
+  echo "ok   - F4: step_end records the OS it ran on"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: step_end has no os field"
+  grep -F '"event":"step_end"' "$F4_LOG" | head -1
+  fail=$((fail + 1))
+fi
+
+# --- F4: step_start records the session it attached to ------------------------
+# bin: "echo" stands in for claude exactly as the S2-4 block uses it: sfh
+# pre-assigns the session id, so continue_from/fork_from resolve without an AI.
+cat > f4sess.yaml <<'YAML'
+name: f4sess
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: again
+    tool: claude
+    bin: "echo"
+    access: read
+    continue_from: low
+    prompt: "y"
+YAML
+"$SFH" run f4sess.yaml --runs-dir f4sess-runs -q > f4sess.out 2>f4sess.err
+F4SESS_LOG="$(find f4sess-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"event":"step_start"' "$F4SESS_LOG" | grep -F '"step":"again"' |
+  grep -qF '"mode":"continue"'; then
+  echo "ok   - F4: step_start records a continue_from parent"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: step_start recorded no continue_from parent"
+  grep -F '"event":"step_start"' "$F4SESS_LOG"
+  fail=$((fail + 1))
+fi
+if grep -F '"event":"step_start"' "$F4SESS_LOG" | grep -F '"step":"again"' |
+  grep -qF '"session_parent":{"id":'; then
+  echo "ok   - F4: the recorded parent carries the session it attached to"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: the recorded parent has no session id"
+  fail=$((fail + 1))
+fi
+if grep -F '"event":"step_start"' "$F4SESS_LOG" | grep -F '"step":"low"' |
+  grep -qF '"session_parent":null'; then
+  echo "ok   - F4: a step that opened its own context records a null parent"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: a step with no session parent did not record null"
+  fail=$((fail + 1))
+fi
+cat > f4fork.yaml <<'YAML'
+name: f4fork
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: branch
+    tool: claude
+    bin: "echo"
+    access: read
+    fork_from: low
+    prompt: "y"
+YAML
+"$SFH" run f4fork.yaml --runs-dir f4fork-runs -q > f4fork.out 2>f4fork.err
+F4FORK_LOG="$(find f4fork-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"event":"step_start"' "$F4FORK_LOG" | grep -F '"step":"branch"' |
+  grep -qF '"mode":"fork"'; then
+  echo "ok   - F4: a fork_from parent is recorded as a fork"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: step_start did not distinguish a fork from a continue"
+  grep -F '"event":"step_start"' "$F4FORK_LOG"
+  fail=$((fail + 1))
+fi
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

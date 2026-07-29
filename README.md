@@ -685,6 +685,7 @@ sfh runs list --runs-dir evruns --json
 .sfh/runs/<UTC日時>-<フロー名>/
   meta.json        実行時の変数・sfhバージョン・各CLIの実バイナリとバージョン・合計コスト
   log.jsonl        ステップ毎のexit/所要時間/トークン/コスト/セッションID/コマンドライン
+                   分岐の理由(どの規則がどの行で発火してどこへ跳んだか)も残る
   status.json      3秒ごとに更新される生存信号(state/current_step/cost_usd/pid)
                    step_started_utc / last_output_utc / visit で停滞が分かる
                    終了時に exit_code / emit_step / emit_file / error が入る
@@ -704,6 +705,32 @@ sfh runs list --runs-dir evruns --json
 resume を重ねても二重バナーにならない。parallel / foreach は集約済みの一つの
 文字列を `.out.txt` / `.chain.txt` / テンプレート値へ共通して書くため、集約ファイル
 自体がバナー付きであり、バナー無しの集約コピーは存在しない。
+
+### `log.jsonl` から「なぜそこへ跳んだか」を読む
+
+`position` イベントは分岐の**理由**を持つ。`via` が `rule`(述語が一致)/ `catch_all`
+(述語無しの規則)のときは、さらに次の 2 キーが付く:
+
+| キー | 内容 |
+|---|---|
+| `rule` | 一致した規則の `route:` 内での 0 始まり番号 |
+| `route_line` | その規則が実際に照合したテキスト。最終行系述語(`when_last_line_*`)と catch-all は**最終非空行**、全文系(`when_contains` / `when_matches`)は**判定テキストの先頭**。いずれも 200 文字で機械的に切る |
+
+`via` が `fallthrough` / `on_error` / `max_visits` の position は規則を見ていないので、
+この 2 キーは付かない(「どの規則か」を騙らないため)。
+
+`step_end` には `os`(`windows` / `linux` / `macos`)が入る。ログは書いた機械と別の機械で
+読まれるのが普通なので、「こっちでは通る」の一次資料をログ自身に持たせる。
+
+`step_start` には `session_parent` が入る。`continue_from` / `fork_from` が解決できたときは
+`{"mode":"continue"|"fork","step":"<接続先ステップ>","tool":"<CLI>","id":"<親のセッションID>"}`、
+自前の文脈で始まったステップは `null`。フローを編集して `--force-resume` した後は
+フロー側を読んでも実際の親子関係が分からないため、ログ側に残す。
+
+```bash
+# どのステップがどの行でどこへ跳んだか
+grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next,.route_line]|@tsv'
+```
 
 `sfh runs list` で一覧、`sfh runs show <dir>` でステップ別の明細、`sfh runs clean --older-than 30d --keep 5` で掃除。
 
