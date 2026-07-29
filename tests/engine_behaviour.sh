@@ -1457,11 +1457,19 @@ fi
 contains "S3-2: doctor names the resolved program" "echo" s32-doctor.out
 
 # --- S3-3: run artifacts are owner-only and gitignore is verified -------------
+# An AI step, not a cmd: step. The prompt file is the most sensitive artifact
+# a run writes, and only a step with a prompt: produces one - the old fixture
+# asserted 0600 on a file it never created, so `stat` returned nothing and the
+# check could not have failed for the right reason either. bin: "echo" stands
+# in for the CLI.
 cat > s33.yaml <<'YAML'
 name: s33
 steps:
   - id: a
-    cmd: ["echo", "secret-output"]
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "secret-output"
 YAML
 "$SFH" run s33.yaml --runs-dir s33-runs -q > s33.out 2>&1
 check "S3-3: the permissions fixture runs" 0 $?
@@ -2398,6 +2406,14 @@ case "$(uname 2>/dev/null)" in
     pass=$((pass + 1))
     ;;
   *)
+    # Root ignores the write bit, so "cannot be fixed" is not reachable as
+    # root and this would report a failure that says nothing about sfh. CI runs
+    # as an ordinary user; a container or WSL shell often does not.
+    if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+      echo "ok   - S3-3: read-only .gitignore test skipped (running as root)"
+      pass=$((pass + 1))
+      false
+    else
     mkdir -p s33-ro/runs
     printf 'keep\n' > s33-ro/runs/.gitignore
     chmod 0444 s33-ro/runs/.gitignore
@@ -2410,6 +2426,7 @@ case "$(uname 2>/dev/null)" in
     else
       echo "FAIL - S3-3: a read-only .gitignore was silently ignored"
       fail=$((fail + 1))
+    fi
     fi
     ;;
 esac

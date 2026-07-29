@@ -364,6 +364,12 @@ pub fn kill_pid_tree(pid: u32) -> bool {
 pub fn kill_pid_tree(pid: u32) -> bool {
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
+        // ...and wake it, or a run that is STOPPED - suspended laptop, ^Z, a
+        // debugger - never acts on the SIGTERM at all. That is the case most
+        // in need of stopping, and without the SIGCONT the graceful path is
+        // skipped entirely: the process gets SIGKILLed below and its agents,
+        // which live in their own sessions, are left running.
+        libc::kill(pid as i32, libc::SIGCONT);
     }
     for _ in 0..50 {
         if !pid_alive(pid) {
@@ -375,7 +381,18 @@ pub fn kill_pid_tree(pid: u32) -> bool {
         libc::kill(-(pid as i32), libc::SIGKILL);
         libc::kill(pid as i32, libc::SIGKILL);
     }
-    !pid_alive(pid)
+    // Poll rather than asking once. SIGKILL is not synchronous: the process
+    // still has to be scheduled to die, and it stays visible as a zombie until
+    // whoever adopted it reaps it - a detached run's parent is init, which is
+    // prompt but not instant. Checking immediately reported "could not kill"
+    // for a process that was already on its way out.
+    for _ in 0..30 {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 /// Check whether the given pid belongs to a running sfh process.
