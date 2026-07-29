@@ -1,0 +1,143 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.2/schema/log-event.schema.json",
+  "title": "sfh durable log event",
+  "description": "One JSON object from a run directory's append-only log.jsonl. Readers must ignore unknown properties for forward compatibility.",
+  "type": "object",
+  "required": ["schema_version", "ts", "event"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "ts": {
+      "type": "string",
+      "description": "UTC timestamp in sfh's compact YYYYMMDD-HHMMSS form."
+    },
+    "event": {
+      "enum": [
+        "run_start",
+        "step_start",
+        "step_end",
+        "group_start",
+        "foreach_start",
+        "members_restored",
+        "aggregate_end",
+        "position",
+        "fallback",
+        "compact_start",
+        "compact_end",
+        "compact_failed",
+        "notes_end",
+        "postprocess_end",
+        "max_visits",
+        "budget_landing",
+        "persistence_failure",
+        "run_end"
+      ]
+    },
+    "step": { "type": "string" },
+    "parent": { "type": ["string", "null"] },
+    "visit": { "type": "integer", "minimum": 0 },
+    "next_fallback": { "type": ["string", "null"] },
+    "postprocess_pending": { "type": "boolean" },
+    "items_total": { "type": "integer", "minimum": 0 },
+    "items_hash": { "type": "string", "minLength": 1 },
+    "precompact_file": { "type": "string", "minLength": 1 },
+    "chain_file": { "type": ["string", "null"] },
+    "out_file": { "type": ["string", "null"] },
+    "output_hash": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{16}|[0-9a-f]{64})$"
+    },
+    "marker": { "type": "string", "minLength": 1 },
+    "exit": { "type": "integer" },
+    "cost_usd": { "type": ["number", "null"], "minimum": 0 },
+    "error": { "type": ["string", "null"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "event": { "const": "run_start" } } },
+      "then": {
+        "required": [
+          "sfh_version",
+          "resumed",
+          "flow_fingerprint",
+          "effective_config_fingerprint"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "event": { "const": "step_start" } } },
+      "then": { "required": ["step", "visit", "cmd"] }
+    },
+    {
+      "if": { "properties": { "event": { "const": "step_end" } } },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "exit",
+          "attempts",
+          "dur_ms",
+          "chain_file",
+          "out_file"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "event": { "const": "foreach_start" } } },
+      "then": {
+        "required": ["step", "visit", "items_hash", "items_total"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": { "enum": ["group_start", "foreach_start", "aggregate_end"] }
+        }
+      },
+      "then": { "required": ["step", "visit"] }
+    },
+    {
+      "if": { "properties": { "event": { "const": "position" } } },
+      "then": { "required": ["after", "next", "via"] }
+    },
+    {
+      "if": { "properties": { "event": { "const": "compact_start" } } },
+      "then": {
+        "required": ["step", "visit", "precompact_file"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": { "enum": ["compact_end", "compact_failed"] }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "cost_usd",
+          "precompact_file",
+          "chain_file"
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "event": { "const": "notes_end" } } },
+      "then": { "required": ["step", "visit", "marker"] }
+    },
+    {
+      "if": { "properties": { "event": { "const": "persistence_failure" } } },
+      "then": {
+        "required": ["step", "visit", "error", "cost_usd"]
+      }
+    },
+    {
+      "if": { "properties": { "event": { "const": "run_end" } } },
+      "then": { "required": ["status", "leaf_runs", "cost_usd"] }
+    }
+  ]
+}

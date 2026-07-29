@@ -26,6 +26,7 @@
 #
 #   rustup target add x86_64-unknown-linux-gnu    # 2 の前提(一度だけ)
 #   sfh run examples/cross-os-gate.yaml
+api_version: 1
 name: cross-os-gate
 
 profiles:
@@ -73,9 +74,9 @@ steps:
 
       走っていないゲートのファイルパスは空文字列になる。空のものは無視すること。
 
-      windows_tests  (cargo test):            {{steps.windows_tests.stderr_file}}
-      unix_typecheck (clippy --target linux): {{steps.unix_typecheck.stderr_file}}
-      wsl_behaviour  (WSL engine_behaviour):  {{steps.wsl_behaviour.stderr_file}}
+      windows_tests  (cargo test):            {{steps.windows_tests.stderr_file | optional}}
+      unix_typecheck (clippy --target linux): {{steps.unix_typecheck.stderr_file | optional}}
+      wsl_behaviour  (WSL engine_behaviour):  {{steps.wsl_behaviour.stderr_file | optional}}
 
       直したら停止せよ。ゲートは sfh が回し直す。
       3 OS で同じ挙動になる直し方だけを採ること。`cfg!(windows)` で

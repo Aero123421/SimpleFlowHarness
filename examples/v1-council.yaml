@@ -2,6 +2,7 @@
 # 回答は統合せず、8本ぜんぶそのまま回収する。
 #
 #   sfh run examples/v1-council.yaml --detach
+api_version: 1
 name: v1-council
 
 profiles:
@@ -40,7 +41,7 @@ steps:
       - id: codex_security
         use: codex
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness, v0.9.0, Rust単一バイナリ, MIT,
+          あなたは sfh ({{flow_dir}}, v0.9.0, Rust単一バイナリ, MIT,
           github.com/Aero123421/SimpleFlowHarness) のセキュリティレビュアーです。
           リポジトリを実際に読んでから答えてください(src/, README.md, tests/)。
 
@@ -73,7 +74,7 @@ steps:
       - id: codex_robust
         use: codex
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness, v0.9.0, Rust単一バイナリ) の
+          あなたは sfh ({{flow_dir}}, v0.9.0, Rust単一バイナリ) の
           信頼性レビュアーです。リポジトリを実際に読んでから答えてください。
 
           sfh は AI CLI を非対話で多段フロー実行するオーケストレータ。
@@ -102,7 +103,7 @@ steps:
       - id: grok_dx
         use: grok
         prompt: |
-          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          sfh ({{flow_dir}}, v0.9.0) は AI CLI を YAML の多段フローで
           非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください
           (README.md, examples/, src/guide.txt, schema/flow.schema.json)。
 
@@ -125,7 +126,7 @@ steps:
       - id: grok_features
         use: grok
         prompt: |
-          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          sfh ({{flow_dir}}, v0.9.0) は AI CLI を YAML の多段フローで
           非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください。
 
           既にあるもの: route/goto の循環、parallel、foreach、profiles、
@@ -149,7 +150,7 @@ steps:
       - id: grok_ecosystem
         use: grok
         prompt: |
-          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI(codex/claude/opencode/
+          sfh ({{flow_dir}}, v0.9.0) は AI CLI(codex/claude/opencode/
           grok/agy/pi/cursor)を YAML の多段フローで非対話実行する Rust 製 CLI です。
           リポジトリを読んでください(特に src/preset.rs)。
 
@@ -169,7 +170,7 @@ steps:
       - id: grok_v1meaning
         use: grok
         prompt: |
-          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          sfh ({{flow_dir}}, v0.9.0) は AI CLI を YAML の多段フローで
           非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください。
 
           # あなたへの問い
@@ -190,7 +191,7 @@ steps:
       - id: qwen_onboarding
         use: qwen
         prompt: |
-          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          sfh ({{flow_dir}}, v0.9.0) は AI CLI を YAML の多段フローで
           非対話実行する Rust 製単一バイナリの CLI です。
           README.md と src/guide.txt と examples/ を読んでください。
 
@@ -210,7 +211,7 @@ steps:
       - id: qwen_ops
         use: qwen
         prompt: |
-          sfh (D:\AI\SimpleFlowHarness, v0.9.0) は AI CLI を YAML の多段フローで
+          sfh ({{flow_dir}}, v0.9.0) は AI CLI を YAML の多段フローで
           非対話実行する Rust 製単一バイナリの CLI です。リポジトリを読んでください
           (src/runs.rs, src/watch.rs, src/engine.rs の log_event 周辺)。
 

@@ -47,6 +47,16 @@ contains() { # contains <name> <needle> <file>
     fail=$((fail + 1))
   fi
 }
+not_contains() { # not_contains <name> <needle> <file>
+  if grep -qF -e "$2" "$3"; then
+    echo "FAIL - $1 (unexpected '$2' in $3)"
+    sed -n '1,40p' "$3"
+    fail=$((fail + 1))
+  else
+    echo "ok   - $1"
+    pass=$((pass + 1))
+  fi
+}
 # Real (native) symlink support. msys' default ln -s writes a copy or a marker
 # file a native Windows binary does not follow, which would test nothing; force
 # native-or-fail so the symlink attacks are only run where they can exist.
@@ -454,6 +464,107 @@ else
 fi
 contains "notes preserve the pre-compact original" "ORIGINAL-BEFORE-COMPACT-0123456789" "$COMPACT_NOTES"
 
+# Rewind to the durable source result, before compact/notes reached
+# postprocess_end. Resume must run only that post-processing stage: the source
+# command is already complete and must not be billed/executed again.
+COMPACT_DIR="$(dirname "$COMPACT_PROMPT")"
+cp -r "$COMPACT_DIR" compact-checkpoint
+awk '{ print } /"event":"step_end"/ && /"step":"source"/ { exit }' \
+  "$COMPACT_DIR/log.jsonl" > compact-checkpoint/log.jsonl
+cp "$COMPACT_DIR/source.precompact.txt" compact-checkpoint/source.chain.txt
+rm -f compact-checkpoint/source.compact.* compact-checkpoint/source.precompact.txt \
+  compact-checkpoint/notes.md
+"$SFH" run compact.yaml --resume compact-checkpoint -q \
+  > compact-resume.out 2> compact-resume.err
+check "post-processing resumes without rerunning the completed source" 0 $?
+COMPACT_SOURCE_STARTS="$(grep -F '"event":"step_start"' compact-checkpoint/log.jsonl |
+  grep -cF '"step":"source"')"
+check "the completed source has only its original start" 1 "$COMPACT_SOURCE_STARTS"
+contains "the resumed compactor reaches a durable end" \
+  '"event":"compact_end"' compact-checkpoint/log.jsonl
+contains "compact and notes finish before routing resumes" \
+  '"event":"postprocess_end"' compact-checkpoint/log.jsonl
+contains "the flow continues after resumed post-processing" \
+  "compact-finished" compact-resume.out
+contains "resumed notes still use the pre-compact original" \
+  "ORIGINAL-BEFORE-COMPACT-0123456789" compact-checkpoint/notes.md
+
+# Rewind one event later: the paid compactor result and notes file are already
+# durable, but neither notes_end nor postprocess_end is in the log. Resume must
+# trust the compact checkpoint (no second summarizer call), recognize the
+# content-derived note marker (no duplicate section), and only finish the two
+# cheap log checkpoints before routing.
+cp -r "$COMPACT_DIR" compact-substage-checkpoint
+awk '{ print } /"event":"compact_end"/ && /"step":"source"/ { exit }' \
+  "$COMPACT_DIR/log.jsonl" > compact-substage-checkpoint/log.jsonl
+"$SFH" run compact.yaml --resume compact-substage-checkpoint -q \
+  > compact-substage-resume.out 2> compact-substage-resume.err
+check "a completed compact substage resumes without a second summarizer" 0 $?
+COMPACT_SUB_STARTS="$(
+  grep -F '"event":"compact_start"' compact-substage-checkpoint/log.jsonl |
+    grep -cF '"step":"source"'
+)"
+check "the compact substage has only its original start" 1 "$COMPACT_SUB_STARTS"
+COMPACT_SUB_ENDS="$(
+  grep -F '"event":"compact_end"' compact-substage-checkpoint/log.jsonl |
+    grep -cF '"step":"source"'
+)"
+check "the compact substage has only its original end" 1 "$COMPACT_SUB_ENDS"
+COMPACT_NOTE_HEADINGS="$(
+  grep -cF '## source (visit 1)' compact-substage-checkpoint/notes.md
+)"
+check "atomic notes recovery does not duplicate a visit section" 1 "$COMPACT_NOTE_HEADINGS"
+contains "notes recovery records its durable substage end" \
+  '"event":"notes_end"' compact-substage-checkpoint/log.jsonl
+contains "routing continues after exact post-processing recovery" \
+  "compact-finished" compact-substage-resume.out
+
+# A summarizer that exits non-zero is still a paid attempt. Its reported usage
+# must enter the run total before the head+tail fallback continues, otherwise a
+# failed compactor can spend past max_cost_usd and the next step still runs.
+rm -f compact-failed-cost-next.marker
+cat > compact-failed-cost.yaml <<YAML
+name: compact-failed-cost
+defaults:
+  max_cost_usd: 0.15
+steps:
+  - id: source
+    cmd: ["printf", "LONG-OUTPUT-FOR-A-PAID-FAILED-COMPACTOR"]
+    compact:
+      when_over: 1
+      tool: claude
+      bin: "$STUB_BIN"
+  - id: forbidden
+    cmd: ["sh", "-c", "printf 'ran\n' > compact-failed-cost-next.marker"]
+YAML
+SFH_STUB_COST=0.20 SFH_STUB_EXIT=1 \
+  "$SFH" run compact-failed-cost.yaml --runs-dir compact-failed-cost-runs -q \
+  > compact-failed-cost.out 2> compact-failed-cost.err
+check "a paid failed compactor still trips the cost ceiling" 1 $?
+COMPACT_FAILED_COST_LOG="$(
+  find compact-failed-cost-runs -type f -name 'log.jsonl' -print -quit
+)"
+contains "compact_failed records the paid attempt cost" \
+  '"cost_usd":0.2' "$COMPACT_FAILED_COST_LOG"
+if [ -e compact-failed-cost-next.marker ]; then
+  echo "FAIL - failed compactor usage escaped the cost guard"
+  fail=$((fail + 1))
+else
+  echo "ok   - failed compactor usage blocks the following step"
+  pass=$((pass + 1))
+fi
+COMPACT_FAILED_COST_DIR="$(dirname "$COMPACT_FAILED_COST_LOG")"
+"$SFH" run compact-failed-cost.yaml --resume "$COMPACT_FAILED_COST_DIR" -q \
+  > compact-failed-cost-resume.out 2> compact-failed-cost-resume.err
+check "failed compactor cost survives resume" 1 $?
+if [ -e compact-failed-cost-next.marker ]; then
+  echo "FAIL - resume forgot failed compactor usage and ran the next step"
+  fail=$((fail + 1))
+else
+  echo "ok   - resumed cost guard still includes the failed compactor"
+  pass=$((pass + 1))
+fi
+
 # max_total_steps covers every engine-scheduled leaf run, including recovery
 # and summarization paths. Those two paths used to increment the count without
 # checking it, so a limit of one still executed a second external command.
@@ -482,6 +593,17 @@ else
   echo "ok   - no fallback was spawned beyond max_total_steps"
   pass=$((pass + 1))
 fi
+contains "the paid primary is checkpointed before the fallback limit fires" \
+  '"next_fallback":"works"' "$MAX_TOTAL_FB_LOG"
+MAX_TOTAL_FB_DIR="$(dirname "$MAX_TOTAL_FB_LOG")"
+"$SFH" run max-total-fallback.yaml --resume "$MAX_TOTAL_FB_DIR" -q \
+  > max-total-fallback-resume.out 2> max-total-fallback-resume.err
+check "the blocked fallback remains resumable without rerunning primary" 1 $?
+MAX_TOTAL_PRIMARY_STARTS="$(
+  grep -F '"event":"step_start"' "$MAX_TOTAL_FB_LOG" | grep -cF '"step":"primary"'
+)"
+check "the max_total resume does not rebill the checkpointed primary" \
+  1 "$MAX_TOTAL_PRIMARY_STARTS"
 
 cat > max-total-compact.yaml <<'YAML'
 name: max-total-compact
@@ -738,6 +860,7 @@ rc=$?
 elapsed=$(( $(date +%s) - start ))
 check "timed-out step does not hang the flow" 0 $rc
 contains "flow continued after the timeout" "flow-continued" to.out
+not_contains "timeout closes every inherited output pipe" "output drain timed out" to.out
 if [ "$elapsed" -lt 25 ]; then
   echo "ok   - timeout enforced (${elapsed}s)"
   pass=$((pass + 1))
@@ -745,6 +868,95 @@ else
   echo "FAIL - timeout not enforced (${elapsed}s)"
   fail=$((fail + 1))
 fi
+
+# A per-leaf cancellation boundary must not become a per-run one: timing out
+# one parallel member kills that member's descendants, not a healthy sibling.
+cat > timeout-sibling.yaml <<'YAML'
+name: timeout-sibling
+steps:
+  - id: fan
+    on_error: continue
+    parallel:
+      - id: times_out
+        cmd: ["sh", "-c", "sleep 30 & echo started; sleep 30"]
+        timeout_sec: 1
+        on_error: continue
+      - id: survives
+        cmd: ["sh", "-c", "sleep 3; echo sibling-survived"]
+  - id: after
+    cmd: ["echo", "fanout-continued"]
+YAML
+"$SFH" run timeout-sibling.yaml --runs-dir timeout-sibling-runs -q > timeout-sibling.out 2>&1
+check "one member timeout does not fail the whole continued fan-out" 0 $?
+SIBLING_DIR="$(dirname "$(find timeout-sibling-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "one member timeout does not kill a parallel sibling" "sibling-survived" "$SIBLING_DIR/survives.out.txt"
+contains "flow continues after the isolated member timeout" "fanout-continued" timeout-sibling.out
+
+# A command's background descendants belong to that leaf. Even when the root
+# shell exits 0, inherited pipe handles must be reaped instead of stalling the
+# drain or leaking past a normally completed run.
+cat > background-exit.yaml <<'YAML'
+name: background-exit
+steps:
+  - id: starts_background
+    cmd: ["sh", "-c", "sleep 30 & echo root-finished"]
+    timeout_sec: 10
+  - id: after
+    cmd: ["echo", "background-reaped"]
+YAML
+start=$(date +%s)
+"$SFH" run background-exit.yaml -q > background-exit.out 2>&1
+check "a successful root does not leave its background tree alive" 0 $?
+contains "flow continues after reaping a successful leaf tree" "background-reaped" background-exit.out
+not_contains "successful leaf cleanup closes inherited output pipes" "output drain timed out" background-exit.out
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -lt 8 ]; then
+  echo "ok   - successful leaf tree was reaped promptly (${elapsed}s)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - successful leaf tree cleanup stalled (${elapsed}s)"
+  fail=$((fail + 1))
+fi
+
+# Ctrl+C is a run-level cancellation, not an ordinary leaf failure. In
+# particular, on_error: goto:end must not convert an interrupted child into a
+# successful run before the loop-top interrupt check runs again.
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ok   - graceful SIGINT precedence is exercised on Unix CI"
+    pass=$((pass + 1))
+    ;;
+  *)
+    cat > interrupt-on-error.yaml <<'YAML'
+api_version: 1
+name: interrupt-on-error
+steps:
+  - id: slow
+    cmd: ["sh", "-c", "echo ready; sleep 30"]
+    on_error: goto:end
+YAML
+    "$SFH" run interrupt-on-error.yaml --runs-dir interrupt-on-error-runs -q \
+      > interrupt-on-error.out 2> interrupt-on-error.err &
+    INTERRUPT_PID=$!
+    INTERRUPT_LOG=""
+    for _ in $(seq 1 100); do
+      INTERRUPT_LOG="$(find interrupt-on-error-runs -type f -name 'log.jsonl' -print -quit 2>/dev/null)"
+      if [ -n "$INTERRUPT_LOG" ] &&
+          grep -qF '"event":"step_start"' "$INTERRUPT_LOG" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
+    kill -INT "$INTERRUPT_PID" 2>/dev/null
+    wait "$INTERRUPT_PID"
+    INTERRUPT_RC=$?
+    check "Ctrl+C cannot be converted to success by on_error goto:end" 1 "$INTERRUPT_RC"
+    contains "the interrupted leaf remains diagnostic, not completed" \
+      '"interrupted":true' "$INTERRUPT_LOG"
+    contains "the cancelled run records a failed terminal state" \
+      '"status":"failed"' "$INTERRUPT_LOG"
+    ;;
+esac
 
 # --- detach / status / wait ---------------------------------------------------
 # The whole point of --detach is that the run outlives whoever started it, so
@@ -841,6 +1053,85 @@ else
   fail=$((fail + 1))
 fi
 contains "meta leaf_runs agrees with step_end count" "\"leaf_runs\": $FB_STEP_ENDS" "$(dirname "$FB_LOG")/meta.json"
+
+# A crash after the primary failure was made durable but before its selected
+# fallback finished used to replay on_error and skip the fallback altogether.
+# Rewind a completed run to exactly that checkpoint: resume must execute the
+# selected profile in the SAME visit and must not run/pay the broken primary a
+# second time.
+cp -r "$(dirname "$FB_LOG")" fb-checkpoint
+awk '{ print } /"event":"step_end"/ && /"step":"plain"/ { exit }' \
+  "$FB_LOG" > fb-checkpoint/log.jsonl
+"$SFH" run fb.yaml --resume fb-checkpoint -q > fb-resume.out 2> fb-resume.err
+check "a crash at a fallback checkpoint resumes successfully" 0 $?
+contains "resume continues the selected fallback directly" \
+  "resuming that fallback directly" fb-resume.err
+contains "the resumed fallback remains in the original visit" \
+  '"profile":"works","resumed":true' fb-checkpoint/log.jsonl
+FB_PRIMARY_FAILURES="$(grep -F '"event":"step_end"' fb-checkpoint/log.jsonl |
+  grep -F '"step":"plain"' | grep -cF '"exit":1')"
+check "resume does not rerun the already billed broken primary" 1 "$FB_PRIMARY_FAILURES"
+contains "the flow continues after the resumed fallback" "fanout-survived" fb-resume.out
+
+# The same crash boundary exists inside fan-out members. Their primary
+# step_end must identify the selected fallback so resuming the GROUP continues
+# that member's paid chain instead of starting its primary profile over.
+cp -r "$(dirname "$FB_LOG")" fb-fan-checkpoint
+awk '{ print } /"event":"step_end"/ && /"step":"kid"/ && /"next_fallback":"works"/ { exit }' \
+  "$FB_LOG" > fb-fan-checkpoint/log.jsonl
+"$SFH" run fb.yaml --resume fb-fan-checkpoint -q \
+  > fb-fan-resume.out 2> fb-fan-resume.err
+check "a parallel member resumes from its fallback checkpoint" 0 $?
+contains "parallel fallback resume is explicit in the log" \
+  '"parent":"fan","profile":"works","resumed":true' fb-fan-checkpoint/log.jsonl
+FB_KID_PRIMARY_FAILURES="$(
+  grep -F '"event":"step_end"' fb-fan-checkpoint/log.jsonl |
+    grep -F '"step":"kid"' | grep -cF '"exit":1'
+)"
+check "parallel fallback resume does not rebill the member primary" \
+  1 "$FB_KID_PRIMARY_FAILURES"
+contains "parallel fallback resume continues beyond the group" \
+  "fanout-survived" fb-fan-resume.out
+
+cat > fb-foreach.yaml <<'YAML'
+api_version: 1
+name: fb-foreach
+profiles:
+  broken: {tool: codex, bin: "false", access: read}
+  works: {tool: codex, bin: "echo", access: read}
+steps:
+  - id: source
+    cmd: ["echo", "one-item"]
+  - id: fan
+    use: broken
+    fallback: [works]
+    foreach: {from: "{{steps.source.output}}", split: lines}
+    prompt: "{{item}}"
+  - id: after
+    cmd: ["echo", "foreach-survived"]
+YAML
+"$SFH" run fb-foreach.yaml --runs-dir fb-foreach-runs -q \
+  > fb-foreach.out 2> fb-foreach.err
+check "the foreach fallback fixture completes normally" 0 $?
+FB_FOREACH_LOG="$(
+  find fb-foreach-runs -type f -name 'log.jsonl' -print -quit
+)"
+cp -r "$(dirname "$FB_FOREACH_LOG")" fb-foreach-checkpoint
+awk '{ print } index($0, "\"event\":\"step_end\"") && index($0, "\"step\":\"fan[0]\"") && index($0, "\"next_fallback\":\"works\"") { exit }' \
+  "$FB_FOREACH_LOG" > fb-foreach-checkpoint/log.jsonl
+"$SFH" run fb-foreach.yaml --resume fb-foreach-checkpoint -q \
+  > fb-foreach-resume.out 2> fb-foreach-resume.err
+check "a foreach member resumes from its fallback checkpoint" 0 $?
+contains "foreach fallback resume is explicit in the log" \
+  '"parent":"fan","profile":"works","resumed":true' fb-foreach-checkpoint/log.jsonl
+FB_ITEM_PRIMARY_FAILURES="$(
+  grep -F '"event":"step_end"' fb-foreach-checkpoint/log.jsonl |
+    grep -F '"step":"fan[0]"' | grep -cF '"exit":1'
+)"
+check "foreach fallback resume does not rebill the item primary" \
+  1 "$FB_ITEM_PRIMARY_FAILURES"
+contains "foreach fallback resume continues beyond the group" \
+  "foreach-survived" fb-foreach-resume.out
 
 # --- {{raw}} lets a prompt talk about templates -------------------------------
 # Checked through validate/--dry-run rather than a command's output: msys2's
@@ -1003,6 +1294,47 @@ else
   echo "ok   - the cost guard blocked the post-retry step"
   pass=$((pass + 1))
 fi
+
+# A provider can finish and bill successfully while publication of one required
+# result artifact fails (bad filesystem entry, disk error, AV/share failure).
+# The charge must survive in run accounting, and the incomplete checkpoint must
+# make this run non-resumable instead of executing the uncertain side effect a
+# second time.
+cat > persistence-failure-cost.yaml <<YAML
+api_version: 1
+name: persistence-failure-cost
+steps:
+  - id: paid
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    env:
+      SFH_STUB_COST: "0.25"
+      SFH_STUB_MKDIR: "{{run_dir}}/paid.chain.txt"
+    prompt: "finish, then make the chain target unpublishable"
+YAML
+"$SFH" run persistence-failure-cost.yaml --runs-dir persistence-failure-cost-runs -q \
+  > persistence-failure-cost.out 2> persistence-failure-cost.err
+check "a required artifact publication failure fails the run" 1 $?
+PERSISTENCE_FAILURE_LOG="$(
+  find persistence-failure-cost-runs -type f -name 'log.jsonl' -print -quit
+)"
+PERSISTENCE_FAILURE_DIR="$(dirname "$PERSISTENCE_FAILURE_LOG")"
+contains "the paid but unpublishable attempt gets a durable failure marker" \
+  '"event":"persistence_failure"' "$PERSISTENCE_FAILURE_LOG"
+contains "the persistence marker records the provider charge" \
+  '"cost_usd":0.25' "$PERSISTENCE_FAILURE_LOG"
+contains "final metadata does not erase cost after artifact failure" \
+  '"cost_usd": 0.25' "$PERSISTENCE_FAILURE_DIR/meta.json"
+"$SFH" run persistence-failure-cost.yaml --resume "$PERSISTENCE_FAILURE_DIR" -q \
+  > persistence-failure-resume.out 2> persistence-failure-resume.err
+check "an uncertain paid persistence failure is not automatically re-executed" 2 $?
+contains "resume explains why repeating the paid side effect is unsafe" \
+  "run is non-resumable" persistence-failure-resume.err
+PERSISTENCE_FAILURE_STARTS="$(
+  grep -cF '"event":"step_start"' "$PERSISTENCE_FAILURE_LOG"
+)"
+check "refused resume did not start the paid step twice" 1 "$PERSISTENCE_FAILURE_STARTS"
 
 # A provider's negative report is invalid accounting input, not a refund. The
 # old live path added it verbatim even though resume clamped the same record.
@@ -1401,7 +1733,7 @@ SECRET_ABS="$(cd "$(dirname s14-secret.txt)" && pwd)/$(basename s14-secret.txt)"
 cat > s14-run/log.jsonl <<JSON
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"$SECRET_ABS","out_file":"$SECRET_ABS","cmd":"echo hi","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"$SECRET_ABS","out_file":"$SECRET_ABS","cmd":"echo hi","session":null}
 JSON
 cat > s14.yaml <<'YAML'
 name: s14
@@ -1874,7 +2206,7 @@ JSON
 cat > r2b-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo first"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":5,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo first","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":5,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo first","session":null}
 JSON
 echo "first" > r2b-run/one.chain.txt
 echo "first" > r2b-run/one.out.txt
@@ -1905,7 +2237,7 @@ JSON
 cat > rfan-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}
-{"ts":"20250101-000002","event":"step_end","step":"fa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":4,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"fa.chain.txt","out_file":"fa.out.txt","cmd":"echo FA-A","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"fa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":4,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"fa.chain.txt","out_file":"fa.out.txt","cmd":"echo FA-A","session":null}
 JSON
 echo "FA-A" > rfan-run/fa.chain.txt
 echo "FA-A" > rfan-run/fa.out.txt
@@ -1942,7 +2274,7 @@ JSON
 cat > rskip-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}
-{"ts":"20250101-000002","event":"step_end","step":"fa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":4,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"fa.chain.txt","out_file":"fa.out.txt","cmd":"echo FA-A","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"fa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":4,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"fa.chain.txt","out_file":"fa.out.txt","cmd":"echo FA-A","session":null}
 JSON
 echo "FA-A" > rskip-run/fa.chain.txt
 echo "FA-A" > rskip-run/fa.out.txt
@@ -1985,7 +2317,7 @@ JSON
 cat > rfeskip-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"foreach_start","step":"each","visit":1,"items":2}
-{"ts":"20250101-000002","event":"step_end","step":"each[0]","parent":"each","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":10,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"each.i0.chain.txt","out_file":"each.i0.out.txt","cmd":"echo item-alpha","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"each[0]","parent":"each","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":10,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"each.i0.chain.txt","out_file":"each.i0.out.txt","cmd":"echo item-alpha","session":null}
 JSON
 echo "item-alpha" > rfeskip-run/each.i0.chain.txt
 echo "item-alpha" > rfeskip-run/each.i0.out.txt
@@ -2047,6 +2379,71 @@ else
 fi
 contains "F-2: the resumed aggregate still carries the reused member's output" "out1" "$RREAL_DIR/fan.v2.chain.txt"
 contains "F-2: the flow continued past the fan-out" "fan-finished" rreal2.out
+
+# A harder failure mode: kill sfh while one sibling has finished and another
+# is still running. The finished member's step_end must already be durable at
+# that instant; otherwise resume has no evidence and executes it (and bills it)
+# twice. This is intentionally a real detached process tree, not a cut log.
+rm -f rcrash-tally.txt
+cat > rcrash.yaml <<'YAML'
+api_version: 1
+name: rcrash
+steps:
+  - id: fan-out
+    max_parallel: 2
+    parallel:
+      - id: fast-member
+        cmd: ["sh", "-c", "printf 'fast\\n' >> rcrash-tally.txt; echo fast-output"]
+      - id: slow-member
+        cmd: ["sh", "-c", "printf 'slow-start\\n' >> rcrash-tally.txt; sleep 6; printf 'slow-done\\n' >> rcrash-tally.txt; echo slow-output"]
+  - id: after
+    cmd: ["echo", "crash-resume-finished"]
+YAML
+RCRASH_DIR="$("$SFH" run rcrash.yaml --runs-dir rcrash-runs --detach -q 2>rcrash-detach.err)"
+RCRASH_FAST_DURABLE=0
+for _ in $(seq 1 50); do
+  if grep -F '"event":"step_end"' "$RCRASH_DIR/log.jsonl" 2>/dev/null |
+      grep -qF '"step":"fast-member"'; then
+    RCRASH_FAST_DURABLE=1
+    break
+  fi
+  sleep 0.1
+done
+check "fan-out crash: a fast member is durable while its sibling is still active" 1 "$RCRASH_FAST_DURABLE"
+if grep -F '"event":"step_end"' "$RCRASH_DIR/log.jsonl" 2>/dev/null |
+    grep -qF '"step":"slow-member"'; then
+  RCRASH_SLOW_STILL_ACTIVE=0
+else
+  RCRASH_SLOW_STILL_ACTIVE=1
+fi
+check "fan-out crash: the test really interrupts before the slow member ends" 1 "$RCRASH_SLOW_STILL_ACTIVE"
+RCRASH_STATUS_READY=0
+for _ in $(seq 1 45); do
+  "$SFH" status "$RCRASH_DIR" --json > rcrash-status.json 2>/dev/null || :
+  if grep -qF '"fanout_completed": 1' rcrash-status.json &&
+      grep -qF '"fanout_total": 2' rcrash-status.json &&
+      grep -qF '"slow-member": "running"' rcrash-status.json; then
+    RCRASH_STATUS_READY=1
+    break
+  fi
+  sleep 0.1
+done
+check "fan-out status: total, completed and running member are observable" 1 "$RCRASH_STATUS_READY"
+"$SFH" stop "$RCRASH_DIR" > rcrash-stop.out 2> rcrash-stop.err
+check "fan-out crash: stop terminates the detached process tree" 0 $?
+sleep 1
+"$SFH" run rcrash.yaml --resume "$RCRASH_DIR" -q > rcrash-resume.out 2> rcrash-resume.err
+check "fan-out crash: resume completes after the hard interruption" 0 $?
+RCRASH_FAST_CALLS="$(grep -c '^fast$' rcrash-tally.txt)"
+RCRASH_SLOW_STARTS="$(grep -c '^slow-start$' rcrash-tally.txt)"
+RCRASH_SLOW_DONE="$(grep -c '^slow-done$' rcrash-tally.txt)"
+check "fan-out crash: the durable fast member is not executed twice" 1 "$RCRASH_FAST_CALLS"
+check "fan-out crash: only the interrupted member starts again" 2 "$RCRASH_SLOW_STARTS"
+check "fan-out crash: the resumed slow member completes once" 1 "$RCRASH_SLOW_DONE"
+contains "fan-out crash: the aggregate reuses the fast member output" \
+  "fast-output" "$RCRASH_DIR/fan-out.chain.txt"
+contains "fan-out crash: the flow continues after reconstruction" \
+  "crash-resume-finished" rcrash-resume.out
 
 # --- F-2: the same, for foreach, with a real crash and a real resume ---------
 # rfeskip above is the hand-built-log variant and does not exercise the visit
@@ -2113,10 +2510,14 @@ JSON
 cat > rplain-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}
-{"ts":"20250101-000002","event":"step_end","step":"pa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"pa.chain.txt","out_file":"pa.out.txt","cmd":"echo AAA","session":null}
-{"ts":"20250101-000003","event":"step_end","step":"pb","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"pb.chain.txt","out_file":"pb.out.txt","cmd":"echo BBB","session":null}
-{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"failed":false,"exit":0,"output_hash":"x","chain_file":"fan.chain.txt","out_file":"fan.out.txt","plain_file":"fan.plain.txt"}
+{"ts":"20250101-000002","event":"step_end","step":"pa","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"pa.chain.txt","out_file":"pa.out.txt","cmd":"echo AAA","session":null}
+{"ts":"20250101-000003","event":"step_end","step":"pb","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"pb.chain.txt","out_file":"pb.out.txt","cmd":"echo BBB","session":null}
+{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"failed":false,"exit":0,"chain_file":"fan.chain.txt","out_file":"fan.out.txt","plain_file":"fan.plain.txt"}
 JSON
+printf 'AAA' > rplain-run/pa.chain.txt
+cp rplain-run/pa.chain.txt rplain-run/pa.out.txt
+printf 'BBB' > rplain-run/pb.chain.txt
+cp rplain-run/pb.chain.txt rplain-run/pb.out.txt
 printf -- '--- pa ---\nAAA\n\n--- pb ---\nBBB\n' > rplain-run/fan.chain.txt
 cp rplain-run/fan.chain.txt rplain-run/fan.out.txt
 printf 'AAA\n\nBBB\n' > rplain-run/fan.plain.txt
@@ -2152,7 +2553,7 @@ JSON
   cat > "$tag-run/log.jsonl" <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo one"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo one","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo one","session":null}
 JSON
   echo "one" > "$tag-run/one.chain.txt"
   echo "one" > "$tag-run/one.out.txt"
@@ -2198,7 +2599,7 @@ JSON
 cat > ror-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo one"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo one","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":3,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo one","session":null}
 JSON
 echo "one" > ror-run/one.chain.txt
 echo "one" > ror-run/one.out.txt
@@ -2228,7 +2629,7 @@ JSON
 cat > rcomp-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo x"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":11,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo x","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":11,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo x","session":null}
 {"ts":"20250101-000003","event":"compact_end","step":"one","chars":7,"cost_usd":0.5,"precompact_file":"one.precompact.txt"}
 JSON
 echo "the summary" > rcomp-run/one.chain.txt
@@ -2561,7 +2962,7 @@ JSON
 cat > s14b-run/log.jsonl <<JSON
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"$S14B_ABS","cmd":"echo hi","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"$S14B_ABS","cmd":"echo hi","session":null}
 JSON
 echo "chain" > s14b-run/one.chain.txt
 cat > s14b.yaml <<'YAML'
@@ -2592,7 +2993,7 @@ JSON
 cat > s14c-run/log.jsonl <<JSON
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo hi","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo hi","session":null}
 {"ts":"20250101-000003","event":"compact_end","step":"one","chars":5,"cost_usd":0.0,"precompact_file":"$S14C_ABS"}
 JSON
 echo "chain" > s14c-run/one.chain.txt
@@ -2626,7 +3027,7 @@ JSON
   cat > s14d-run/log.jsonl <<'JSON'
 {"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"abc"}
 {"ts":"20250101-000001","event":"step_start","step":"one","visit":1,"cmd":"echo hi"}
-{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"output_hash":"x","input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo hi","session":null}
+{"ts":"20250101-000002","event":"step_end","step":"one","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":10,"output_chars":2,"input_tokens":null,"output_tokens":null,"cost_usd":null,"tool":null,"chain_file":"one.chain.txt","out_file":"one.out.txt","cmd":"echo hi","session":null}
 JSON
   cat > s14d.yaml <<'YAML'
 name: s14d

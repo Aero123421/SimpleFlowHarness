@@ -7,6 +7,7 @@
 #   - on_max_visits はループで先に入場するノードに置く
 #
 #   sfh run examples/v1-harden.yaml --detach
+api_version: 1
 name: v1-harden
 
 vars:
@@ -54,7 +55,7 @@ steps:
   - id: s1_impl
     use: qwen
     prompt: |
-      あなたは sfh (D:\AI\SimpleFlowHarness, v0.9.0, Rust) のメンテナです。
+      あなたは sfh ({{flow_dir}}, v0.9.0, Rust) のメンテナです。
       セキュリティ監査で**実際に再現された脆弱性**を修正します。
 
       ## 最重要の考え方
@@ -125,7 +126,7 @@ steps:
       挙動テストを tests/engine_behaviour.sh に足すこと。
 
       前回の検証結果(初回は空):
-      {{steps.s1_check.output | tail:120}}
+      {{steps.s1_check.output | optional | tail:120}}
 
   - id: s1_check
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
@@ -141,7 +142,7 @@ steps:
   - id: s2_impl
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化、2バッチ目。**権限契約**です。
+      sfh ({{flow_dir}}) のセキュリティ強化、2バッチ目。**権限契約**です。
 
       ## 原則
       **サンドボックスの無い環境でシェルを自動承認したら、それは full と同じ。**
@@ -218,7 +219,7 @@ steps:
       README の権限に関する記述を、実装に合わせて正確に書き直すこと。
 
       前回の検証結果(初回は空):
-      {{steps.s2_check.output | tail:120}}
+      {{steps.s2_check.output | optional | tail:120}}
 
   - id: s2_check
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
@@ -234,7 +235,7 @@ steps:
   - id: s3_impl
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化、3バッチ目。残りを片付けます。
+      sfh ({{flow_dir}}) のセキュリティ強化、3バッチ目。残りを片付けます。
 
       ## S3-1 文字列 cmd: のメタ文字チェックは安全境界にならない
       現在 `\n \r & | < > ^ % ` $ ; "` を拒否していますが、これは**区切り文字の
@@ -302,7 +303,7 @@ steps:
       SHA-256 は既知のテストベクタ(空文字列 / "abc")で単体テストすること。
 
       前回の検証結果(初回は空):
-      {{steps.s3_check.output | tail:120}}
+      {{steps.s3_check.output | optional | tail:120}}
 
   - id: s3_check
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
@@ -323,7 +324,7 @@ steps:
       - id: rev_break
         use: rev
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**攻撃側**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**攻撃側**レビュアーです。
           直前に入ったセキュリティ修正を、**破ろうとしてください**。
 
           修正されたはずの項目:
@@ -355,7 +356,7 @@ steps:
       - id: rev_regression
         use: rev
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**回帰**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**回帰**レビュアーです。
           直前に入ったセキュリティ修正が、**既存の機能を壊していないか**を見ます。
 
           sfh は Windows / macOS / Linux の**完全同一挙動が絶対条件**です。
@@ -380,7 +381,7 @@ steps:
       - id: rev_complete
         use: rev
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**網羅性**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**網羅性**レビュアーです。
           指示された修正が**本当に全部入ったか**、黙って飛ばされたものがないかを見ます。
 
           # 対象の一覧(この全てが入っているはず)
@@ -426,7 +427,7 @@ steps:
   - id: s_fix
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) のセキュリティ強化。**レビューでの指摘に対応**します。
+      sfh ({{flow_dir}}) のセキュリティ強化。**レビューでの指摘に対応**します。
 
       codex 3体が独立にレビューし、全員一致の合格が出ませんでした。
       以下が3体分の指摘です。**指摘された箇所を全て直してください。**

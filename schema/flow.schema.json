@@ -1,12 +1,16 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/main/schema/flow.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.2/schema/flow.schema.json",
   "title": "sfh flow",
   "description": "A SimpleFlowHarness flow: staged AI CLI invocations with routing, parallelism and session continuation.",
   "type": "object",
   "required": ["steps"],
   "additionalProperties": false,
   "properties": {
+    "api_version": {
+      "const": 1,
+      "description": "Public flow-format version. Omitted legacy files are interpreted as version 1; new flows should set this explicitly."
+    },
     "name": {
       "type": "string",
       "description": "Used in the run directory name. Unicode, spaces and dots are allowed; path separators (/ \\), control characters, NUL, and the Windows-reserved characters <>:\"|?* are forbidden, as are the reserved names '.' and '..'.",
@@ -76,11 +80,12 @@
         "tool_max_parallel": {
           "type": "object",
           "description": "Per-tool concurrency ceiling across a fan-out, e.g. {opencode: 1}.",
+          "propertyNames": { "enum": ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"] },
           "additionalProperties": { "type": "integer", "minimum": 1 }
         },
         "max_prompt_chars": { "type": "integer", "minimum": 1 },
         "max_emit_chars": { "type": "integer", "minimum": 1, "default": 200000 },
-        "max_cost_usd": { "type": "number", "minimum": 0, "description": "Abort once reported spend reaches this." },
+        "max_cost_usd": { "type": "number", "minimum": 0, "description": "Abort once provider CLIs have reported this much completed-attempt spend. This is a soft accounting guard, not a provider-side hard billing cap; tools that report no cost cannot be bounded by it." },
         "wall_clock_sec": { "type": "integer", "minimum": 1 },
         "on_budget": { "type": "string", "pattern": "^goto:", "description": "Where to jump ONCE per run when spend or elapsed time reaches ceiling minus budget_reserve, instead of failing at the ceiling. goto:<step-id>, or goto:end / goto:fail / goto:stuck. Needs max_cost_usd and/or wall_clock_sec, and a NON-ZERO budget_reserve on each ceiling declared: with a reserve of 0 the landing fires on the ceiling itself and the ceiling ends the run before the landing chain runs a step (validate refuses it)." },
         "budget_reserve": { "$ref": "#/definitions/budget_reserve" },
@@ -163,6 +168,7 @@
     },
     "foreach": {
       "type": "object",
+      "description": "Derives an ordered fan-out at runtime. One expansion is limited to 100 items; larger inputs fail before any member starts.",
       "required": ["from"],
       "additionalProperties": false,
       "properties": {
@@ -178,8 +184,8 @@
         "id": {
           "type": "string",
           "pattern": "^[A-Za-z0-9_-]+$",
-          "not": { "pattern": "^[Ss][Tt][Uu][Cc][Kk]$" },
-          "description": "Unique ignoring case. 'stuck' is reserved: it is a goto terminal (exit 4), not a step."
+          "not": { "pattern": "^(?:[Ee][Nn][Dd]|[Ff][Aa][Ii][Ll]|[Ss][Tt][Uu][Cc][Kk])$" },
+          "description": "Unique ignoring case. end, fail and stuck are reserved goto terminals, not step names."
         },
         "use": { "type": "string", "description": "Profile name." },
         "tool": { "$ref": "#/definitions/tool" },

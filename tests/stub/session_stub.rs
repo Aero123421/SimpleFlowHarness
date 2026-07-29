@@ -49,6 +49,7 @@
 //! | --stub-cost         | SFH_STUB_COST           | 0          | total_cost_usd                                  |
 //! | --stub-tokens       | SFH_STUB_TOKENS         | 11,7       | usage input,output tokens                       |
 //! | --stub-fail-once    | SFH_STUB_FAIL_ONCE      | -          | marker path; first invocation exits 1           |
+//! | --stub-mkdir        | SFH_STUB_MKDIR           | -          | create a directory before returning              |
 //! | --stub-plain        | SFH_STUB_PLAIN=1        | off        | print the body as plain text, no JSON envelope  |
 //!
 //! `--stub-last-line` and `--stub-quote` decode `\n`, `\r`, `\t` and `\\`, so a
@@ -78,6 +79,7 @@ struct Config {
     cost_usd: f64,
     input_tokens: u64,
     output_tokens: u64,
+    mkdir: Option<String>,
 }
 
 fn die(msg: &str) -> ! {
@@ -158,6 +160,7 @@ fn parse_config(argv: &[String]) -> Config {
     let mut cost: Option<String> = None;
     let mut tokens: Option<String> = None;
     let mut fail_once: Option<String> = None;
+    let mut mkdir: Option<String> = None;
     let mut plain = env_var("SFH_STUB_PLAIN").is_some();
 
     let mut i = 0;
@@ -188,6 +191,7 @@ fn parse_config(argv: &[String]) -> Config {
             "--stub-cost" => cost = Some(value(&mut i)),
             "--stub-tokens" => tokens = Some(value(&mut i)),
             "--stub-fail-once" => fail_once = Some(value(&mut i)),
+            "--stub-mkdir" => mkdir = Some(value(&mut i)),
             "--stub-plain" => plain = true,
             // Everything else belongs to the preset sfh is imitating. Skipping
             // it WITHOUT consuming the next argument is what keeps `--tools
@@ -271,6 +275,7 @@ fn parse_config(argv: &[String]) -> Config {
         },
         None => (11, 7),
     };
+    let mkdir = mkdir.or_else(|| env_var("SFH_STUB_MKDIR"));
 
     Config {
         session,
@@ -283,6 +288,7 @@ fn parse_config(argv: &[String]) -> Config {
         cost_usd,
         input_tokens,
         output_tokens,
+        mkdir,
     }
 }
 
@@ -338,6 +344,10 @@ fn main() {
 
     let start = Instant::now();
     work(&cfg);
+    if let Some(path) = &cfg.mkdir {
+        std::fs::create_dir(path)
+            .unwrap_or_else(|error| die(&format!("--stub-mkdir: cannot create '{path}': {error}")));
+    }
     let body = build_body(&cfg);
 
     let mut out = String::new();

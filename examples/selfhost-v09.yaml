@@ -8,6 +8,7 @@
 #   5. 他の AI がこれを使えないと意味がない
 #
 #   sfh run examples/selfhost-v09.yaml --detach
+api_version: 1
 name: selfhost-v09
 
 vars:
@@ -52,7 +53,7 @@ steps:
   - id: e_impl
     use: dev
     prompt: |
-      あなたは sfh (D:\AI\SimpleFlowHarness) のメンテナです。
+      あなたは sfh ({{flow_dir}}) のメンテナです。
       **指示された範囲だけ**を実装してください。
 
       ## sfh の思想(これに反する変更はしない)
@@ -147,7 +148,7 @@ steps:
       (`&&` だけの行、引用符に囲まれた `;` などが通ること)。
 
       前回の検証結果(初回は空):
-      {{steps.e_check.output | tail:120}}
+      {{steps.e_check.output | optional | tail:120}}
 
   - id: e_check
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
@@ -162,7 +163,7 @@ steps:
   - id: f_impl
     use: dev
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) v0.9 の 2 バッチ目。
+      sfh ({{flow_dir}}) v0.9 の 2 バッチ目。
 
       ## F-1. `sfh guide` を足す
       **読者は人間ではなく AI です。** sfh は単一バイナリで配られるので、
@@ -226,7 +227,7 @@ steps:
       `sfh guide` の出力が 80 行以内であることをテストで固定すること。
 
       前回の検証結果(初回は空):
-      {{steps.f_check.output | tail:120}}
+      {{steps.f_check.output | optional | tail:120}}
 
   - id: f_check
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]

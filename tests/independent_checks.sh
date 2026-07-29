@@ -700,7 +700,7 @@ YAML
 printf '{"sfh_version":"0.9.0","flow":"f.yaml","flow_fingerprint":"x","name":"legacycmd","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' > run/meta.json
 {
   printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"x"}\n'
-  printf '{"ts":"20250101-000001","event":"step_end","step":"a","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":5,"output_hash":"x","chain_file":"a.chain.txt","out_file":"a.out.txt","cmd":"echo HELLO","session":null}\n'
+  printf '{"ts":"20250101-000001","event":"step_end","step":"a","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":5,"chain_file":"a.chain.txt","out_file":"a.out.txt","cmd":"echo HELLO","session":null}\n'
 } > run/log.jsonl
 echo "HELLO" > run/a.chain.txt
 echo "HELLO" > run/a.out.txt
@@ -1012,7 +1012,7 @@ printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":
 {
   printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
   printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}\n'
-  printf '{"ts":"20250101-000002","event":"step_end","step":"h1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"h1.chain.txt","out_file":"h1.out.txt","cmd":"echo o1","session":null}\n'
+  printf '{"ts":"20250101-000002","event":"step_end","step":"h1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"chain_file":"h1.chain.txt","out_file":"h1.out.txt","cmd":"echo o1","session":null}\n'
 } > run/log.jsonl
 echo "o1" > run/h1.chain.txt
 echo "o1" > run/h1.out.txt
@@ -1069,10 +1069,10 @@ printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":
 {
   printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
   printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}\n'
-  printf '{"ts":"20250101-000002","event":"step_end","step":"k1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"k1.chain.txt","out_file":"k1.out.txt","cmd":"echo o1","session":null}\n'
-  printf '{"ts":"20250101-000003","event":"step_end","step":"k2","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"k2.chain.txt","out_file":"k2.out.txt","cmd":"echo o2","session":null}\n'
-  printf '{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"exit":0,"failed":false,"out_file":"fan.out.txt","plain_file":"fan.plain.txt","output_hash":"x"}\n'
-  printf '{"ts":"20250101-000005","event":"step_end","step":"gate","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":5,"output_hash":"x","chain_file":"gate.chain.txt","out_file":"gate.out.txt","cmd":"gate","session":null}\n'
+  printf '{"ts":"20250101-000002","event":"step_end","step":"k1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"chain_file":"k1.chain.txt","out_file":"k1.out.txt","cmd":"echo o1","session":null}\n'
+  printf '{"ts":"20250101-000003","event":"step_end","step":"k2","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"chain_file":"k2.chain.txt","out_file":"k2.out.txt","cmd":"echo o2","session":null}\n'
+  printf '{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"exit":0,"failed":false,"out_file":"fan.out.txt","plain_file":"fan.plain.txt"}\n'
+  printf '{"ts":"20250101-000005","event":"step_end","step":"gate","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":5,"chain_file":"gate.chain.txt","out_file":"gate.out.txt","cmd":"gate","session":null}\n'
   printf '{"ts":"20250101-000006","event":"position","after":"gate","next":"fan","via":"rule"}\n'
 } > run/log.jsonl
 for n in k1 k2 fan gate; do echo "o-$n" > "run/$n.chain.txt"; echo "o-$n" > "run/$n.out.txt"; done
@@ -1125,9 +1125,9 @@ printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":
 {
   printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
   printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":2}\n'
-  printf '{"ts":"20250101-000002","event":"step_end","step":"w1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"w1.chain.txt","out_file":"w1.out.txt","cmd":"echo o1","session":null}\n'
-  printf '{"ts":"20250101-000003","event":"step_end","step":"w2","parent":"fan","visit":1,"exit":7,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":0,"output_hash":"x","chain_file":"w2.chain.txt","out_file":"w2.out.txt","cmd":"exit 7","session":null}\n'
-  printf '{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"exit":1,"failed":true,"out_file":"fan.out.txt","plain_file":"fan.plain.txt","output_hash":"x"}\n'
+  printf '{"ts":"20250101-000002","event":"step_end","step":"w1","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"chain_file":"w1.chain.txt","out_file":"w1.out.txt","cmd":"echo o1","session":null}\n'
+  printf '{"ts":"20250101-000003","event":"step_end","step":"w2","parent":"fan","visit":1,"exit":7,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":0,"chain_file":"w2.chain.txt","out_file":"w2.out.txt","cmd":"exit 7","session":null}\n'
+  printf '{"ts":"20250101-000004","event":"aggregate_end","step":"fan","visit":1,"exit":1,"failed":true,"out_file":"fan.out.txt","plain_file":"fan.plain.txt"}\n'
   printf '{"ts":"20250101-000005","event":"position","after":"fan","next":"fan","via":"rule"}\n'
 } > run/log.jsonl
 for n in w1 w2 fan; do echo "o-$n" > "run/$n.chain.txt"; echo "o-$n" > "run/$n.out.txt"; done
@@ -1285,7 +1285,7 @@ for dir in lf2crlf crlf2lf; do
   printf '{"sfh_version":"0.9.0","flow":"flow.yaml","flow_fingerprint":"%s","flow_fingerprint_algo":"sha256","name":"fp","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' "$FP" > run/meta.json
   {
     printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"%s"}\n' "$FP"
-    printf '{"ts":"20250101-000001","event":"step_end","step":"a","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":3,"output_hash":"x","chain_file":"a.chain.txt","out_file":"a.out.txt","cmd":"echo one","session":null}\n'
+    printf '{"ts":"20250101-000001","event":"step_end","step":"a","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":3,"chain_file":"a.chain.txt","out_file":"a.out.txt","cmd":"echo one","session":null}\n'
   } > run/log.jsonl
   echo "one" > run/a.chain.txt; echo "one" > run/a.out.txt
   "$SFH" run flow.yaml --resume run -q >/dev/null 2>../c21_$dir.err
@@ -1335,10 +1335,10 @@ printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":
   printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
   printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":3}\n'
   for n in t1 t2; do
-    printf '{"ts":"20250101-00000X","event":"step_end","step":"%s","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"%s.chain.txt","out_file":"%s.out.txt","cmd":"echo","session":null}\n' "$n" "$n" "$n"
+    printf '{"ts":"20250101-00000X","event":"step_end","step":"%s","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"chain_file":"%s.chain.txt","out_file":"%s.out.txt","cmd":"echo","session":null}\n' "$n" "$n" "$n"
   done
-  printf '{"ts":"20250101-000004","event":"step_end","step":"t3","parent":"fan","visit":1,"exit":7,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":0,"output_hash":"x","chain_file":"t3.chain.txt","out_file":"t3.out.txt","cmd":"exit 7","session":null}\n'
-  printf '{"ts":"20250101-000005","event":"aggregate_end","step":"fan","visit":1,"exit":1,"failed":true,"out_file":"fan.out.txt","plain_file":"fan.plain.txt","output_hash":"x"}\n'
+  printf '{"ts":"20250101-000004","event":"step_end","step":"t3","parent":"fan","visit":1,"exit":7,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":0,"chain_file":"t3.chain.txt","out_file":"t3.out.txt","cmd":"exit 7","session":null}\n'
+  printf '{"ts":"20250101-000005","event":"aggregate_end","step":"fan","visit":1,"exit":1,"failed":true,"out_file":"fan.out.txt","plain_file":"fan.plain.txt"}\n'
   printf '{"ts":"20250101-000006","event":"members_restored","steps":["t1"'
 } > run/log.jsonl
 for n in t1 t2 t3 fan; do echo "o-$n" > "run/$n.chain.txt"; echo "o-$n" > "run/$n.out.txt"; done

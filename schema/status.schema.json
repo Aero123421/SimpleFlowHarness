@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.2/schema/status.schema.json",
+  "title": "sfh run status",
+  "description": "The atomic status.json snapshot in an sfh run directory. Readers must ignore unknown properties for forward compatibility.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "state",
+    "current_step",
+    "started_utc",
+    "heartbeat_utc",
+    "steps_done",
+    "cost_usd",
+    "elapsed_sec",
+    "active_members",
+    "fanout_total",
+    "fanout_completed",
+    "run_dir",
+    "flow",
+    "pid",
+    "sfh_version",
+    "exit_code",
+    "nonce"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "state": {
+      "enum": ["running", "done", "failed", "stuck", "interrupted", "stopped"]
+    },
+    "current_step": { "type": "string" },
+    "started_utc": { "type": "string" },
+    "step_started_utc": { "type": ["string", "null"] },
+    "last_output_utc": { "type": ["string", "null"] },
+    "visit": { "type": "integer", "minimum": 0 },
+    "heartbeat_utc": { "type": "string" },
+    "steps_done": { "type": "integer", "minimum": 0 },
+    "cost_usd": { "type": "number", "minimum": 0 },
+    "elapsed_sec": { "type": "integer", "minimum": 0 },
+    "active_members": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "fanout_total": { "type": "integer", "minimum": 0 },
+    "fanout_completed": { "type": "integer", "minimum": 0 },
+    "run_dir": { "type": "string" },
+    "flow": { "type": "string" },
+    "pid": { "type": "integer", "minimum": 0 },
+    "sfh_version": { "type": "string" },
+    "exit_code": { "type": ["integer", "null"] },
+    "emit_step": { "type": ["string", "null"] },
+    "emit_file": { "type": ["string", "null"] },
+    "error": { "type": ["string", "null"] },
+    "unfinished_step": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["step", "started_utc", "cmd", "will_rerun"],
+          "additionalProperties": true,
+          "properties": {
+            "step": { "type": "string" },
+            "visit": { "type": "integer", "minimum": 1 },
+            "started_utc": { "type": "string" },
+            "cmd": { "type": "string" },
+            "profile": { "type": ["string", "null"] },
+            "will_rerun": { "const": true }
+          }
+        }
+      ]
+    },
+    "nonce": { "type": "string", "minLength": 1 },
+    "pid_start": { "type": ["integer", "null"], "minimum": 0 }
+  }
+}

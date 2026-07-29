@@ -28,8 +28,10 @@ pub struct Ctx<'a> {
 ///   run_dir, flow_dir, step_id, visit, os, prompt_file, notes, item, item_index
 /// Filters:
 ///   head:N (first N lines) | tail:N (last N lines) | truncate:N (first N chars)
-///   lines:A-B (1-indexed inclusive) | trim
+///   lines:A-B (1-indexed inclusive) | trim | optional | default:text
 /// Referencing a step that exists but has not run yet yields an empty string.
+/// Mark intentional branch-optional references with `optional`; strict
+/// validation can then distinguish them from accidental missing dependencies.
 pub fn render(input: &str, ctx: &Ctx) -> Result<String, String> {
     render_impl(input, ctx, None)
 }
@@ -77,6 +79,58 @@ pub fn check_keys(
         rest = &after[end + 2..];
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRef {
+    pub id: String,
+    /// `optional` and `default:` are explicit acknowledgements that the source
+    /// may not have run on this control-flow path.
+    pub optional: bool,
+}
+
+/// Collect step-output dependencies from a template without rendering it.
+/// Raw blocks are skipped exactly as render/check_keys skip them.
+pub fn step_refs(input: &str) -> Vec<StepRef> {
+    let mut refs = Vec::new();
+    let mut rest = input;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        if let Some(body) = after.strip_prefix("raw}}") {
+            match body.find(RAW_END) {
+                Some(end) => {
+                    rest = &body[end + RAW_END.len()..];
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        let inner = &after[..end];
+        let mut parts = inner.split('|');
+        let key = parts.next().unwrap_or("").trim();
+        if let Some(step) = key.strip_prefix("steps.") {
+            let id = step.split('.').next().unwrap_or("");
+            if !id.is_empty() {
+                let optional = parts.any(|filter| {
+                    let name = filter
+                        .trim()
+                        .split_once(':')
+                        .map(|(name, _)| name)
+                        .unwrap_or_else(|| filter.trim());
+                    name == "optional" || name == "default"
+                });
+                refs.push(StepRef {
+                    id: id.to_string(),
+                    optional,
+                });
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    refs
 }
 
 /// True when rendering `input` would substitute at least one value. Raw blocks
@@ -187,6 +241,21 @@ fn apply_filter(val: String, f: &str) -> Result<String, String> {
     };
     match name {
         "trim" => Ok(val.trim().to_string()),
+        "optional" => {
+            if arg.is_some() {
+                Err("filter 'optional' takes no argument".into())
+            } else {
+                Ok(val)
+            }
+        }
+        "default" => {
+            let fallback = arg.ok_or("filter 'default' needs text")?;
+            if val.is_empty() {
+                Ok(fallback.to_string())
+            } else {
+                Ok(val)
+            }
+        }
         "head" => {
             let n = num(arg)?;
             Ok(val.lines().take(n).collect::<Vec<_>>().join("\n"))
@@ -231,7 +300,7 @@ fn apply_filter(val: String, f: &str) -> Result<String, String> {
                 .join("\n"))
         }
         other => Err(format!(
-            "unknown filter '{other}' (head/tail/truncate/lines/trim)"
+            "unknown filter '{other}' (head/tail/truncate/lines/trim/optional/default)"
         )),
     }
 }
@@ -363,6 +432,35 @@ mod tests {
             render_with("{{steps.gen.output | head:1 | trim}}", o).unwrap(),
             "l1"
         );
+    }
+
+    #[test]
+    fn optional_and_default_filters_make_branch_intent_explicit() {
+        assert_eq!(
+            render_with("[{{steps.gen.output | optional}}]", BTreeMap::new()).unwrap(),
+            "[]"
+        );
+        assert_eq!(
+            render_with("{{steps.gen.output | default:not-run}}", BTreeMap::new()).unwrap(),
+            "not-run"
+        );
+        let present = BTreeMap::from([("gen".to_string(), out("value"))]);
+        assert_eq!(
+            render_with("{{steps.gen.output | default:not-run}}", present).unwrap(),
+            "value"
+        );
+
+        let refs = step_refs(
+            "{{steps.a.output}} {{steps.b.output | optional}} \
+             {{steps.c.output | default:no}} {{raw}}{{steps.d.output}}{{endraw}}",
+        );
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0].id, "a");
+        assert!(!refs[0].optional);
+        assert_eq!(refs[1].id, "b");
+        assert!(refs[1].optional);
+        assert_eq!(refs[2].id, "c");
+        assert!(refs[2].optional);
     }
 
     #[test]

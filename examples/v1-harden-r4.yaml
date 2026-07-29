@@ -19,6 +19,7 @@
 # 新たに見つけた問題は「追加所見」として記録してよいが、FAIL の理由にしない。
 #
 #   sfh run examples/v1-harden-r4.yaml --detach
+api_version: 1
 name: v1-harden-r4
 
 profiles:
@@ -65,7 +66,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:fix_f3
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この1項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この1項目だけ**やってください。
 
       ## F-2【高】parallel / foreach の途中で落ちると完了済みメンバーまで再実行される
       load_resume は完了済みの子の訪問回数とコストを復元し、親グループを再開位置にします。
@@ -96,7 +97,7 @@ steps:
       旧実装でも通ってしまいます。修正前のコードで落ちるテストにしてください。
 
       前回の検証結果(初回は空):
-      {{steps.gate_f2.output | tail:60}}
+      {{steps.gate_f2.output | optional | tail:60}}
 
   - id: gate_f2
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -113,7 +114,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:fix_f4
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この1項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この1項目だけ**やってください。
 
       ## F-3【高】旧 run の continue_from / fork_from が write/full で再開できない
       旧ログには `session.access` が無いので load_resume が `None` を復元し、
@@ -147,7 +148,7 @@ steps:
       **F-3 の挙動テストを足すこと。修正前のコードで落ちるテストにすること。**
 
       前回の検証結果(初回は空):
-      {{steps.gate_f3.output | tail:60}}
+      {{steps.gate_f3.output | optional | tail:60}}
 
   - id: gate_f3
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -164,7 +165,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:fix_f5
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この1項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この1項目だけ**やってください。
 
       ## F-4【中】旧 run 互換ローダーが新しい文字列 cmd: 制限を緩和していない
       `load_lenient` も通常の検証を呼ぶため、テンプレート入り文字列 cmd の拒否が
@@ -192,7 +193,7 @@ steps:
       **新規実行では従来どおり拒否されること**の両方を確認するテストにすること。
 
       前回の検証結果(初回は空):
-      {{steps.gate_f4.output | tail:60}}
+      {{steps.gate_f4.output | optional | tail:60}}
 
   - id: gate_f4
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -209,7 +210,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:checkA
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この1項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この1項目だけ**やってください。
 
       ## F-5【中】bin: / cwd: のテンプレートが validate を通るのに実行時に必ず拒否される
       prepare_leaf が `steps.*` を全面禁止していますが、同じ静的検査が validator に
@@ -238,7 +239,7 @@ steps:
       **F-5 の挙動テストを足すこと。修正前のコードで落ちるテストにすること。**
 
       前回の検証結果(初回は空):
-      {{steps.gate_f5.output | tail:60}}
+      {{steps.gate_f5.output | optional | tail:60}}
 
   - id: gate_f5
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -266,7 +267,7 @@ steps:
   - id: repairA
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**壊れたゲートを直すだけ**です。
+      sfh ({{flow_dir}}) の修正。**壊れたゲートを直すだけ**です。
 
       F-2〜F-5 の修正を入れた結果、バッチ全体のゲートが落ちています。
       個別の cargo test は通っているので、落ちているのは
@@ -280,7 +281,7 @@ steps:
       範囲外のリファクタはしないこと。テストを消したり緩めたりしないこと。
       質問しないこと。解釈を出力に明記して進めてください。
 
-      {{steps.checkA.output | tail:120}}
+      {{steps.checkA.output | optional | tail:120}}
     route: [{ goto: checkA }]
 
   # ======================================================== バッチB: fail-open
@@ -294,7 +295,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:fix_f6
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この2項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この2項目だけ**やってください。
       2つは同じ場所(セッションの access 判定)なので一緒に直します。
 
       原則: **run ディレクトリは信頼できない入力。判定に必要な情報が
@@ -341,7 +342,7 @@ steps:
       偽の `"access":"full"` が採用されないことを確認するテストを含めること。
 
       前回の検証結果(初回は空):
-      {{steps.gate_f1_f7.output | tail:60}}
+      {{steps.gate_f1_f7.output | optional | tail:60}}
 
   - id: gate_f1_f7
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -358,7 +359,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:fix_f8_f9
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この1項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この1項目だけ**やってください。
 
       ## F-6 status / wait の成功判定に fail-open が残っている
       - `status` は nonce を一切検査せず、偽の `state:"done"` で exit 0 を返す
@@ -388,7 +389,7 @@ steps:
       判定に使う出力先に注意すること(stderr に出るメッセージを stdout で探さないこと)。
 
       前回の検証結果(初回は空):
-      {{steps.gate_f6.output | tail:60}}
+      {{steps.gate_f6.output | optional | tail:60}}
 
   - id: gate_f6
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -406,7 +407,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:fix_f10_f11
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この2項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この2項目だけ**やってください。
       2つとも「特権フィールドに未信頼の値が届く」という同じ穴です。
 
       ## F-8 run 由来値の汚染が特権テンプレートまで届いていない
@@ -445,7 +446,7 @@ steps:
       (`cmd.exe`)の両方が検査対象になることを確認すること。
 
       前回の検証結果(初回は空):
-      {{steps.gate_f8_f9.output | tail:60}}
+      {{steps.gate_f8_f9.output | optional | tail:60}}
 
   - id: gate_f8_f9
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -463,7 +464,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:checkB
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**この2項目だけ**やってください。
+      sfh ({{flow_dir}}) の修正。**この2項目だけ**やってください。
       2つとも「報告が欠けているのに成功として扱う」という同じ穴です。
 
       ## F-10 resume ログの成功フィールドが欠落時に false 扱いになる
@@ -500,7 +501,7 @@ steps:
       確認すること(単に resume が失敗するだけでは不十分)。
 
       前回の検証結果(初回は空):
-      {{steps.gate_f10_f11.output | tail:60}}
+      {{steps.gate_f10_f11.output | optional | tail:60}}
 
   - id: gate_f10_f11
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
@@ -527,7 +528,7 @@ steps:
   - id: repairB
     use: qwen
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**壊れたゲートを直すだけ**です。
+      sfh ({{flow_dir}}) の修正。**壊れたゲートを直すだけ**です。
 
       F-1 と F-6〜F-11 の修正を入れた結果、バッチ全体のゲートが落ちています。
       個別の cargo test は通っているので、落ちているのは
@@ -539,7 +540,7 @@ steps:
       範囲外のリファクタはしないこと。テストを消したり緩めたりしないこと。
       質問しないこと。解釈を出力に明記して進めてください。
 
-      {{steps.checkB.output | tail:120}}
+      {{steps.checkB.output | optional | tail:120}}
     route: [{ goto: checkB }]
 
   - id: stage
@@ -558,7 +559,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) のレビュアーです。
+          あなたは sfh ({{flow_dir}}) のレビュアーです。
           自分たちのオープンソースプロジェクトに入れた修正のレビューです。
 
           ## 環境の制約
@@ -600,7 +601,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**テスト品質**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**テスト品質**レビュアーです。
 
           ## 環境の制約
           読み取り専用です。テストは実行できませんし、する必要もありません。
@@ -644,7 +645,7 @@ steps:
         use: rev
         on_error: continue
         prompt: |
-          あなたは sfh (D:\AI\SimpleFlowHarness) の**移植性**レビュアーです。
+          あなたは sfh ({{flow_dir}}) の**移植性**レビュアーです。
 
           ## 環境の制約
           読み取り専用です。テストは実行できません。**コードを読んでください。**
@@ -702,7 +703,7 @@ steps:
     use: qwen
     timeout_sec: 3600
     prompt: |
-      sfh (D:\AI\SimpleFlowHarness) の修正。**レビュー指摘への対応**。
+      sfh ({{flow_dir}}) の修正。**レビュー指摘への対応**。
 
       codex 3体が F-1〜F-11 の11項目を、実装 / テスト品質 / 移植性 の3観点で
       独立に判定しました。全員一致の合格が出ていません。

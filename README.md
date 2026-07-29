@@ -4,7 +4,7 @@
 [![release](https://img.shields.io/github/v/release/Aero123421/SimpleFlowHarness)](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**EN**: `sfh` chains AI coding CLIs — **Codex, Claude Code, opencode, Grok, Antigravity (`agy`), Pi, Cursor**, or any command — into YAML-defined multi-stage flows: review/retry loops, parallel fan-out, per-step model/effort/permission control, tool **session resume**, cost accounting with spend caps, and **crash-resume** of a whole run. It keeps your main agent's context window clean: stdout carries only the final step's output, everything else lands in a run directory. Long flows can be **detached** (`--detach`) so they outlive the caller that started them, then polled with `sfh status` and collected with `sfh wait`. Single static binary for Windows / macOS / Linux. The docs below are in Japanese, but the YAML reference tables are language-neutral — and your favorite AI can translate the rest. A JSON Schema for flow files lives in [schema/flow.schema.json](schema/flow.schema.json).
+[English documentation](README.en.md) | 日本語
 
 ---
 
@@ -17,7 +17,7 @@ AI CLI(codex / claude / opencode / grok / agy / pi / cursor / 任意コマンド
 - 差し戻しループ(`route:`)、**並列実行(`parallel:` / `foreach:`)**、**セッション再開(`continue_from:`)**、**自動要約(`compact:`)** を宣言的に書ける
 - ステップごとにツール・モデル・reasoning effort・権限を自由に組み替え、`profiles:` で名前付きプリセット化
 - **投げっぱなし実行(`--detach`)**: 呼び出し元エージェントが落ちても実行は生き残る。`sfh status` で生死確認、`sfh wait` で結果回収
-- 無人運転前提の安全弁: **中断した実行の再開(`--resume`)**、**金額上限(`max_cost_usd`)**、リトライ/フォールバック、Ctrl+Cや強制終了でも**子AIプロセスを道連れに終了**
+- 無人運転前提の安全弁: **中断した実行の再開(`--resume`)**、**金額上限(`max_cost_usd`)**、リトライ/フォールバック、Ctrl+C/stop時の**子AIプロセスツリー停止**（hard-kill時の保証範囲は下記）
 
 ## インストール / Install
 
@@ -81,10 +81,14 @@ sfh status [run-dir] [--json]          実行がまだ生きているか確認(�
 sfh wait [run-dir] [--timeout SEC]     終了まで待って結果をstdoutへ
 sfh stop [run-dir]                     実行を中止(子AIごと殺す)
 sfh doctor [flow.yaml]                 プリセットが実CLIとまだ噛み合っているか検査
-sfh validate <flow.yaml> [--var k=v]   実行せずに検査
+sfh validate <flow.yaml> [--strict] [--json]  実行せずに構文・CFG・依存を検査
+sfh plan <flow.yaml> [--var k=v]       隔離した一時dirで実行計画だけを解決
+sfh graph <flow.yaml> [--mermaid]      制御フローの辺を表示
+sfh config show <flow.yaml>            global profile込みの実効設定（env値は伏字）
+sfh config show <flow.yaml> --show-secrets  env値も明示表示（機密出力）
 sfh init [file] [--force]              例のフローファイルを生成
 sfh guide                              AI向けの短いフロー記法ガイド
-sfh runs list|show|clean [...]         過去の実行を一覧/詳細/掃除
+sfh runs list|show|why|clean [...]     過去の実行を一覧/詳細/因果説明/掃除
 
 run options:
   --var key=value     フロー変数の上書き(複数可)
@@ -96,7 +100,7 @@ run options:
   --resume-latest     同上。そのフローの最新runを自動で選ぶ
   --force-resume      フローファイルが変わっていても再開する
   --no-partial-emit   失敗時に部分結果をstdoutへ出さない
-  --dry-run           コマンドとプロンプトをrun dirに展開して表示するだけ(実行しない)
+  --dry-run           隔離した一時dirに展開して計画を表示(実行せず、runs dirも作らない)
   -v, --verbose       実行コマンドラインを表示
   -q, --quiet         進捗表示を抑制
 
@@ -119,6 +123,7 @@ doctor options:
 runs options:
   runs list [--runs-dir d] [-n N] [--json]              終了・訪問・反復・コスト付き一覧
   runs show <run-dir> [--json]                          ステップ別の終了・訪問・反復・コスト
+  runs why <run-dir> [--json]                           最終位置・未完了leaf・再開挙動を説明
   runs clean [--older-than 30d] [--keep 5] [--dry-run]  古いrun dirを削除
 
 exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー / 4=stuck(人間待ち)
@@ -129,6 +134,7 @@ exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー / 4=stuc
 ## フローファイル全体像
 
 ```yaml
+api_version: 1             # 公開flow形式。省略した旧ファイルもv1として読める
 name: research
 vars:
   topic: "既定値。--var で上書き"
@@ -147,8 +153,8 @@ defaults:                    # 全ステップの既定値(すべて任意)
     opencode: 2
   max_prompt_chars: 80000    # レンダリング後プロンプトがこれを超えたら実行前に失敗
   max_emit_chars: 200000     # stdoutに出す最大文字数(既定20万。超過分は切って保存先を案内)
-  max_cost_usd: 5.0          # finiteかつ0以上。報告コスト累計が超えたら中断
-  wall_clock_sec: 7200       # フロー全体の実時間上限
+  max_cost_usd: 5.0          # finiteかつ0以上。CLIが報告した確定コストのsoft guard
+  wall_clock_sec: 7200       # フロー全体の実時間上限(resume前の経過も引き継ぐ)
   on_budget: goto:wrap       # 上限−reserve に達したら中断せずここへ着地(1 run 1回)
   budget_reserve:            # 着地連鎖のために各上限から取り置く分(宣言した上限には必須)
     cost_usd: 0.5
@@ -160,7 +166,7 @@ defaults:                    # 全ステップの既定値(すべて任意)
   env: { MY_VAR: value }     # 全子プロセスに渡す環境変数
 
 steps:
-  - id: plan                 # 必須・一意 [A-Za-z0-9_-]
+  - id: plan                 # 必須・一意 [A-Za-z0-9_-]。end/fail/stuckは予約語
     use: smart               # プロファイル参照(ステップ直書きが優先)
     tool: codex              # codex | claude | opencode | grok | agy | pi | cursor
     # bin: /path/to/tool     # 実行ファイル差し替え(PATHが古い時など)
@@ -226,6 +232,10 @@ steps:
 `parallel:` の親は集約と分岐だけを担当するため、leaf 専用の `retry` / `retry_on` /
 `hang_after_sec` / `fallback` は子ごとに置く。親に置いた設定を黙って無視することはなく、
 `sfh validate` が `carries only` エラーで拒否する。
+
+各メンバーの成果物と `step_end` は、グループ全体の終了を待たず**そのメンバーの完了時点で
+同期保存**される。したがって遅い兄弟の実行中にOS停止や `sfh stop` が入っても、resume は
+保存済みメンバーを再実行せず、未完了メンバーだけを起動する。
 
 ### 動的並列: `foreach:`(前段の出力の件数だけワーカー起動)
 
@@ -385,7 +395,16 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 - `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)。中断ではなく畳ませたいなら [`on_budget`](#予算の崖を着地パスに-on_budget) で着地パスへ回す
 - 同じ leaf を retry した場合、`step_end` のトークン数・コストは**全 attempt の累計**。最後の成功 attempt だけで失敗分の課金を上書きしない
 - 外部ツールが負数または NaN のコストを返しても支出は減らさず 0 として記録し、正の無限大は有限上限を確実に止める最大値として扱う。不正値は stderr と `<id>.err.txt` に警告する
-- コスト報告があるのは claude / grok / opencode。codex と agy はトークン数のみ
+- コスト報告があるのは claude / grok / opencode / pi。codex / agy / cursor はプロバイダーコストを報告しない
+
+> `max_cost_usd` はプロバイダCLIが attempt 終了後に報告した確定値に対する
+> **soft accounting guard**。実行中の未報告支出を予約する仕組みでも、プロバイダ側の
+> hard billing capでもない。検査はtop-level step間で行うため、同じleaf内のretry、
+> fallback、および既に走っているfan-outの兄弟が報告する分は上限を越えて計上され得る。
+> コストを報告しないCLIにはこの上限を適用できない。
+
+`foreach` 1回の展開上限は100 item。101件以上ならmemberを1体も開始する前に停止するため、
+大きい入力は明示的にbatchへ分割すること。
 
 ### 失敗からの回復
 
@@ -394,7 +413,17 @@ sfh run research.yaml --resume-latest        # 落ちた所から再開(完了�
 sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 ```
 
-`log.jsonl` から完了済みステップの出力・訪問回数・セッションID・累計コストを復元し、失敗したステップから再開する。フローファイルが変更されていると指紋(SHA-256)不一致で拒否する(`--force-resume`で強行)。
+`log.jsonl` から完了済みステップの出力・訪問回数・セッションID・累計コスト・経過時間を復元し、
+失敗したステップから再開する。フローファイルのSHA-256に加え、
+`~/.sfh/profiles.yaml` をマージした**実行で参照される実効設定**のSHA-256も照合するため、
+tool/model/access/args/env/cwd/defaults の変化は既定で拒否する(`--force-resume`で強行)。
+このフローが参照しない別プロファイルの変更だけではresumeを妨げない。
+
+resumeは、完了イベントが指すchain/plain/precompact成果物の存在と、記録済み
+`output_hash`も照合する。欠損・改竄されたcheckpointを空出力として続行しない。
+有料attemptの終了後に成果物の永続化だけが失敗した場合は、token/costを失わず
+`persistence_failure`を記録するが、そのrunは自動resumeしない。外部副作用が完了したかを
+確認してから、新しいrunとして開始すること（sfhからは安全な再実行か判定できない）。
 
 成功した `step_end` の直後、次の `position` を記録する前に sfh が停止していた場合は、
 そのステップを再実行せず、保存済み chain 出力に対して route 規則だけを再評価し、
@@ -488,7 +517,7 @@ steps:
 #### 既知の限界(全部読んでから reserve を決めること)
 
 1. **コストは報告値のみ。** USD を報告しないツール構成(codex / agy はトークン数だけ)ではコスト軸は永久に発火しない。**信頼できるのは wall-clock 軸**。コスト軸だけを頼りにした無人運転は、報告が無ければ崖に戻る
-2. **検査はステップとステップの間だけ。** 走行中のステップが上限を突き破るのは止められない(F12 が入るまで sfh は時計でプロセスを殺さない)。したがって reserve は最低でも**「最長ステップ 1 本 + 着地連鎖が使う分」**を見込む必要がある
+2. **着地閾値の検査はtop-level step間。** `wall_clock_sec` 本体は実行中のleafにもdeadlineとして適用され、fan-outの待ち行列時間を含めて子プロセスを停止する。一方、reserveの閾値を走行中のstepへ割り込ませることはないため、着地用reserveは最低でも**「最長step 1 本 + 着地連鎖が使う分」**を見込む必要がある。コスト軸では同じleaf内のretry、fallback、既に走っているfan-out兄弟の報告額も越境分になり得る
    - 見積もり指針: `reserve.wall_clock_sec ≥ 最長ステップの timeout_sec + 着地連鎖の全ステップの timeout_sec 合計`
    - `reserve.cost_usd ≥ 最も高いステップ 1 回分の実測コスト + 着地連鎖の実測コスト`。実測は `sfh runs show <dir>` の COST_USD 列から取る
    - 迷ったら多めに。reserve が大きすぎても損は「早めに畳む」だけだが、小さすぎると着地連鎖の途中でエラー終了して着地の意味が消える
@@ -529,9 +558,10 @@ pidの生存確認と**ハートビートの鮮度**の両方を見る(pidは再
 run dir の `status.json` が3秒ごとに更新される。`sfh status` を使わず直接読んでもいい:
 
 ```json
-{ "state": "running", "current_step": "execute", "heartbeat_utc": "20260727-135338",
+{ "schema_version": 1, "state": "running", "current_step": "execute", "heartbeat_utc": "20260727-135338",
   "step_started_utc": "20260727-131240", "last_output_utc": "20260727-131512", "visit": 2,
-  "steps_done": 5, "cost_usd": 0.0974, "pid": 64012 }
+  "steps_done": 5, "cost_usd": 0.0974, "fanout_completed": 2, "fanout_total": 4,
+  "active_members": {"review[2]": "running", "review[3]": "queued"}, "pid": 64012 }
 ```
 
 終了時には `exit_code` / `emit_step` / `emit_file` / `error` が追記される(`sfh wait` はこれを見て結果を返す)。
@@ -560,14 +590,14 @@ running  3 steps, $0.3100 - fix (visit 2), 41m elapsed, 38m since last output, 2
 
 退化した側でも、ゼロ出力で死んだ試行を1回だけ再試行する損失はゼロなので、この退化は許容している。区別が本当に要るステップは、進捗を吐く `cmd:` で包むか `hang_after_sec` をタイムアウトより長くして分類自体を切ること。
 
-Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済みのAI CLIプロセスは道連れで終了する**(Windowsはjob object、Linuxは`PR_SET_PDEATHSIG`+プロセスグループkill)。放置されたエージェントが課金し続ける事故を防ぐ。`--detach` で起動した実行だけがこの規則の例外で、これは明示的に要求された場合に限られる。
+Ctrl+C、`sfh stop`、timeout、捕捉可能な終了signalでは、**起動済みのAI CLIプロセスツリーを停止する**。background子孫もそのleafの所有物であり、root commandが終了した時点で回収する（stepより長生きさせる仕事には別のdetached sfh runを使う）。Windowsはleafごとのnested jobも持つため、timeoutしたmemberの子孫だけを即時停止し、実行中のparallel siblingは停止しない。さらにWindowsのprocess全体kill-on-close job object、Linuxの`PR_SET_PDEATHSIG`で、sfh自体がhard-killされた場合も直接の子をOS側で終了させる。macOSには同等のparent-death primitiveがないため、捕捉不能な`SIGKILL`やhost crash後まで子孫停止を保証するものではない。放置課金を避けるには通常のstop/終了signalを使う。`--detach` で起動した実行だけが意図的な例外である。
 
 ### テンプレート変数
 
 | 変数 | 内容 |
 |---|---|
 | `{{vars.NAME}}` | フロー変数(未定義はエラー) |
-| `{{steps.ID.output}}` | 最新出力(compact後)。未実行なら空 |
+| `{{steps.ID.output}}` | 最新出力(compact後)。未実行なら空。必須参照はCFG上でsourceがconsumerをdominateする必要がある |
 | `{{steps.ID.outputs}}` | 集約/原文(parallel・foreach・compact原文) |
 | `{{steps.ID.output_file}}` | 出力ファイルパス |
 | `{{steps.ID.exit}}` | sfhが正規化した終了コード。プロセス終了コードそのものではなく、出力解析・空出力・セッション検証等の結果も反映する。同じ値で分岐するには `route:` の [`when_exit`](#正しい理由で落ちたゲート-when_exit--when_stderr_matches) を使う |
@@ -575,9 +605,14 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | `{{item}}` `{{item_index}}` | foreach内のみ |
 | `{{notes}}` | 共有ノートの現在内容 |
 | `{{run_dir}}` `{{flow_dir}}` `{{step_id}}` `{{visit}}` `{{os}}` `{{prompt_file}}` | 実行環境 |
-| `{{budget.spent_usd}}` `{{budget.elapsed_sec}}` | 報告済みコスト(小数4桁)と経過秒。常に使える。resume 後の経過秒は**その試行の開始から** |
+| `{{budget.spent_usd}}` `{{budget.elapsed_sec}}` | 報告済みコスト(小数4桁)とrun累積経過秒。resume前の経過も含む |
 | `{{budget.remaining_usd}}` `{{budget.remaining_sec}}` | 上限(`max_cost_usd` / `wall_clock_sec`)までの残り。**上限未設定の軸は文字列 `unlimited`**(0 でも空でもない)。reserve ではなく上限までの残りを出す |
 | `{{raw}}...{{endraw}}` | 中身をそのまま出す。**テンプレートの話をするプロンプト**(「このHandlebarsを直して: `{{user.name}}`」)はこれで囲む。囲まないと未定義キーとして実行前にエラーになる |
+
+分岐によって未実行でも正しい参照は、意図を明示して
+`{{steps.ID.output | optional}}`(空のまま)または
+`{{steps.ID.output | default:not-run}}`(空なら既定文字列)と書く。無注釈の未来参照・
+兄弟参照・branch joinの片側だけで生成される参照は `sfh validate` が実行前に拒否する。
 
 ## プリセット → 実コマンド対応(2026-07-27 実機検証)
 
@@ -608,6 +643,11 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 ## マシンローカルプロファイル
 
 `~/.sfh/profiles.yaml`(名前→プロファイルの素朴なマップ)が自動でマージされる(フロー側が優先)。`bin:`のパスやプロバイダー選択などマシン依存の設定をフロー定義から追い出せるので、**フローYAMLはそのまま他マシンに持っていける**。
+ファイルが存在するのに読めない／YAMLが壊れている場合は無視せずエラーになる。
+`sfh config show flow.yaml` でマージ後の設定を確認でき、この実効設定の指紋がresume時にも照合される。
+環境変数値は既定で `<redacted>` に伏せる。ローカル診断で実値が必要な場合だけ
+`--show-secrets` を明示し、その出力はcredentialを含み得る機密情報として扱って
+公開Issueなどへ貼り付けないこと。
 
 ```yaml
 # ~/.sfh/profiles.yaml
@@ -663,10 +703,10 @@ steps:
         goto: accepted
       - goto: implement                 # 読めない出力も差し戻す
   - id: accepted
-    cmd: ["echo", "accepted"]
+    cmd: "echo accepted"
     route: [{goto: end}]
   - id: manual_review
-    cmd: ["echo", "visit limit reached"]
+    cmd: "echo visit limit reached"
 ```
 
 `max_visits` は実行後ではなく**ステップ入場時**に検査する。`implement → review → implement` で両者の上限が同じなら、毎周先に入る `implement` が先に上限を超えるため、`on_max_visits` もそこへ置く。
@@ -926,10 +966,10 @@ sfh runs list --runs-dir evruns --json
         goto: accepted
       - goto: attempt
   - id: accepted
-    cmd: ["echo", "accepted"]
+    cmd: "echo accepted"
     route: [{goto: end}]
   - id: manual_review
-    cmd: ["echo", "visit limit reached"]
+    cmd: "echo visit limit reached"
 ```
 
 `continue_from: attempt` で周回すると却下済み試行が1セッションへ蓄積し続ける。`fork_from: baseline` なら各visitが同じ修正前の会話から独立分岐する。対応ツールはclaude / opencode / grok / pi。ファイル変更は共有ワークツリーに残るので、毎周ファイルまで戻したい場合はユーザー所有の `cmd:` を別途置く。
@@ -951,10 +991,11 @@ sfh runs list --runs-dir evruns --json
 ```
 .sfh/runs/<UTC日時>-<フロー名>/
   meta.json        実行時の変数・sfhバージョン・各CLIの実バイナリとバージョン・合計コスト
-  log.jsonl        ステップ毎のexit/所要時間/トークン/コスト/セッションID/コマンドライン
+  log.jsonl        schema_version=1。ステップ毎のexit/所要時間/トークン/コスト/セッションID/コマンドライン
                    分岐の理由(どの規則がどの行で発火してどこへ跳んだか)も残る
-  status.json      3秒ごとに更新される生存信号(state/current_step/cost_usd/pid)
+  status.json      schema_version=1。3秒ごとの生存信号(state/current_step/cost_usd/pid)
                    step_started_utc / last_output_utc / visit で停滞が分かる
+                   active_members / fanout_completed / fanout_total で並列進捗が分かる
                    終了時に exit_code / emit_step / emit_file / error が入る
                    resume時の再実行リスクは unfinished_step に入る
   detached.*.txt   --detach 実行のstdout/stderr(sfh wait はここを返す)
@@ -1028,7 +1069,9 @@ run の世代によって分岐が静かに変わるくらいなら止まるほ�
 grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next,.route_line]|@tsv'
 ```
 
-`sfh runs list` で一覧、`sfh runs show <dir>` でステップ別の明細、`sfh runs clean --older-than 30d --keep 5` で掃除。
+`sfh runs list` で一覧、`sfh runs show <dir>` でステップ別の明細、
+`sfh runs why <dir>` で「最後に何が確定し、resumeで何を再実行するか」を説明し、
+`sfh runs clean --older-than 30d --keep 5` で掃除。
 
 **長いステップの様子を見たいときは `<id>.out.txt` を tail すればいい。** 子プロセスの出力は終了を待たずに逐次書き込まれるので、30分かかるステップが「進んでいる」のか「固まっている」のかが分かる。
 
@@ -1056,13 +1099,19 @@ grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。
 - **AIステップが空の最終メッセージを返したら失敗扱い**(既定)。空文字が下流のプロンプトに流れ込む事故を防ぐため。意図的なら `allow_empty: true`。
 - **エディタ補完**: フロー先頭に次の1行を足すとVS Code等でスキーマ補完が効く。
-  `# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/main/schema/flow.schema.json`
+  `# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.2/schema/flow.schema.json`
+
+公開形式: [flow](schema/flow.schema.json) /
+[log event](schema/log-event.schema.json) /
+[status](schema/status.schema.json)。読み手は未知キーを無視し、`api_version` /
+`schema_version` で意味論を判定する。
 
 ## 開発
 
 ```bash
-cargo test                              # Windows 151本 / Unix 152本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト: Windows 545本 / Unix 551本
+cargo test --release
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト
+bash tests/independent_checks.sh ./target/release/sfh
 ```
 
 挙動テストは冒頭で `tests/stub/session_stub.rs` を `rustc` で1回ビルドする。
@@ -1073,3 +1122,6 @@ sfhをビルドしたのと同じRustツールチェーンが要る。スタブ�
 (`tests/` 直下に置くと統合テストとして拾われてしまうのでサブディレクトリに置いてある)。
 
 CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。**トリガーは全ブランチへの push**(main だけにしていた頃、作業ブランチが最後まで push されず、Linux と macOS でコンパイルの通らない v1.0.0 が出た。誰も到達しない 3 OS ランナーはゲートではない)。手元で先回りしたいときは [examples/cross-os-gate.yaml](examples/cross-os-gate.yaml) を使う。
+
+貢献方法は [CONTRIBUTING.md](CONTRIBUTING.md)、脆弱性報告は
+[SECURITY.md](SECURITY.md)、利用上の問い合わせ範囲は [SUPPORT.md](SUPPORT.md)。

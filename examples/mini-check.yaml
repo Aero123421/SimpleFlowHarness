@@ -2,6 +2,7 @@
 #   sfh run examples/mini-check.yaml
 # ※ codexのPATHが古いマシンでは ~/.sfh/profiles.yaml に codex-local を定義して
 #   tool: codex を use: codex-local に変えること。
+api_version: 1
 name: mini-check
 
 defaults:
@@ -56,4 +57,5 @@ steps:
       「pi ok」とだけ出力してください。
 
   - id: done
-    cmd: ["echo", "all-presets-ok [{{steps.c_opencode.output | head:1}}] [{{steps.d_grok.output | head:1}}] [{{steps.e_agy.output | head:1}}] [{{steps.f_pi.output | head:1}}]"]
+    # `echo`はWindowsではshell builtinなので、固定文字列のstring形式にする。
+    cmd: "echo all-presets-ok"

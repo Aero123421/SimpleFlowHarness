@@ -1,7 +1,7 @@
 use crate::{contain, execute, flow, preset, template};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Session recorded for an executed step (continue_from source).
@@ -85,6 +85,9 @@ pub struct Prepared {
     pub stdin_payload: Option<Vec<u8>>,
     pub cwd: Option<PathBuf>,
     pub timeout: Option<Duration>,
+    /// Absolute run-level deadline. Unlike a relative step timeout this also
+    /// expires while a leaf waits in a bounded fan-out queue.
+    pub wall_deadline: Option<std::time::Instant>,
     pub preassigned_session: Option<String>,
     pub expect_session: Option<String>,
     /// On resume: the session marker the tool must report back (see SessionInfo).
@@ -139,6 +142,10 @@ pub struct LeafDone {
     pub access: Option<preset::Access>,
     pub usage: preset::Usage,
     pub cmd: String,
+    /// A required run artifact could not be persisted. This is not an ordinary
+    /// tool failure that on_error/fallback may ignore: without the artifact a
+    /// later resume cannot reconstruct what happened.
+    pub persistence_error: Option<String>,
 }
 
 impl LeafDone {
@@ -341,6 +348,8 @@ pub struct PrepCtx<'a> {
     pub tainted_vars: &'a HashSet<String>,
     /// Run-level activity clock handed to every leaf this context prepares.
     pub run_clock: Option<&'a Arc<std::sync::atomic::AtomicU64>>,
+    /// Hard run deadline applied to every prepared leaf.
+    pub wall_deadline: Option<std::time::Instant>,
     /// Spend and time as of now, exposed to templates as `{{budget.*}}`.
     pub budget: BudgetVars,
     pub quiet: bool,
@@ -382,9 +391,9 @@ pub fn exec_path_key_check(key: &str, tainted_vars: &HashSet<String>) -> Result<
     Ok(())
 }
 
-pub fn exec_template_check<'a>(
-    tainted_vars: &'a HashSet<String>,
-) -> impl Fn(&str, &str) -> Result<(), String> + 'a {
+pub fn exec_template_check(
+    tainted_vars: &HashSet<String>,
+) -> impl Fn(&str, &str) -> Result<(), String> + '_ {
     move |key: &str, _: &str| -> Result<(), String> { exec_path_key_check(key, tainted_vars) }
 }
 
@@ -1054,6 +1063,7 @@ pub fn prepare_leaf(
         stdin_payload,
         cwd,
         timeout: timeout_sec.map(Duration::from_secs),
+        wall_deadline: cx.wall_deadline,
         preassigned_session: preassigned,
         expect_session,
         expect_marker,
@@ -1328,8 +1338,9 @@ fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
                 }
                 if let Some(u) = m.get("usage") {
                     saw_usage = true;
-                    inp += u.get("input").and_then(|x| x.as_u64()).unwrap_or(0);
-                    outp += u.get("output").and_then(|x| x.as_u64()).unwrap_or(0);
+                    inp = inp.saturating_add(u.get("input").and_then(|x| x.as_u64()).unwrap_or(0));
+                    outp =
+                        outp.saturating_add(u.get("output").and_then(|x| x.as_u64()).unwrap_or(0));
                     if let Some(cost) = u
                         .get("cost")
                         .and_then(|c| c.get("total"))
@@ -1378,7 +1389,7 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
         cumulative_usage.accumulate(&done.usage);
         done.usage = cumulative_usage.clone();
         done.attempts = attempt + 1;
-        if done.ok() || done.interrupted || attempt >= cfg.max {
+        if done.ok() || done.interrupted || done.persistence_error.is_some() || attempt >= cfg.max {
             return done;
         }
         let retryable = match cfg.mode {
@@ -1412,7 +1423,11 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
                 cfg.max
             );
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        let deadline = prep
+            .wall_deadline
+            .map(|wall| wall.min(retry_deadline))
+            .unwrap_or(retry_deadline);
         while std::time::Instant::now() < deadline {
             if execute::interrupted() {
                 return done;
@@ -1482,7 +1497,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
         {
-            let _ = contain::write_private(&p.err_file, &why);
+            let _ = contain::write_private_atomic(&p.err_file, &why);
         }
         if !p.quiet {
             eprintln!("sfh: [{}] {why}", p.tag);
@@ -1496,7 +1511,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             idle_ms: 0,
             attempts: 1,
             chain_output: String::new(),
-            stderr_clean: why,
+            stderr_clean: why.clone(),
             out_file: p.out_file,
             session_id: None,
             session_marker: None,
@@ -1505,13 +1520,59 @@ fn exec_once(p: Prepared) -> LeafDone {
             access: p.access,
             usage: preset::Usage::default(),
             cmd: cmd_desc,
+            // No `step_end` may certify completion when an artifact path is
+            // unsafe. The engine treats this like any other durability error
+            // and aborts the run without recording a reusable completion.
+            persistence_error: Some(why.clone()),
+        };
+    }
+    // Compute the remaining wall budget at the last possible point before
+    // spawning. Artifact validation and no-follow pre-creation can perform
+    // filesystem I/O; measuring before them let a scheduling/filesystem delay
+    // leak past the absolute run deadline.
+    let mut deadline_expired = false;
+    let timeout = match p.wall_deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                deadline_expired = true;
+                None
+            } else {
+                Some(p.timeout.map_or(remaining, |step| step.min(remaining)))
+            }
+        }
+        None => p.timeout,
+    };
+    if deadline_expired {
+        let why = "run wall_clock_sec expired before this queued leaf could start";
+        let persistence_error =
+            persist_prestart_failure(&p.out_file, &p.err_file, &p.chain_file, why);
+        return LeafDone {
+            tag: p.tag,
+            exit_code: -1,
+            timed_out: true,
+            interrupted: false,
+            dur_ms: 0,
+            idle_ms: 0,
+            attempts: 1,
+            chain_output: String::new(),
+            stderr_clean: why.into(),
+            out_file: p.out_file,
+            session_id: None,
+            session_marker: None,
+            tool: p.tool,
+            cwd: cwd_str,
+            access: p.access,
+            usage: preset::Usage::default(),
+            cmd: cmd_desc,
+            persistence_error,
         };
     }
     let outcome = match execute::run_cmd(
         &p.inv,
         p.stdin_payload,
         p.cwd.as_deref(),
-        p.timeout,
+        timeout,
         &p.env_remove,
         &p.env_set,
         execute::Observe {
@@ -1523,7 +1584,11 @@ fn exec_once(p: Prepared) -> LeafDone {
     ) {
         Ok(o) => o,
         Err(e) => {
-            let _ = contain::write_private(&p.err_file, &e);
+            // A failed spawn is still a completed, routable leaf result. Give
+            // resume the same three-artifact set as a started process; if any
+            // write fails, do not record a reusable step_end.
+            let persistence_error =
+                persist_prestart_failure(&p.out_file, &p.err_file, &p.chain_file, &e);
             if !p.quiet {
                 eprintln!("sfh: [{}] spawn failed: {e}", p.tag);
             }
@@ -1545,13 +1610,27 @@ fn exec_once(p: Prepared) -> LeafDone {
                 access: p.access,
                 usage: preset::Usage::default(),
                 cmd: cmd_desc,
+                persistence_error,
             };
         }
     };
     let stdout_clean = clean_text(&outcome.stdout);
     let mut stderr_clean = clean_text(&outcome.stderr);
-    let _ = contain::write_private(&p.out_file, &stdout_clean);
-    let _ = contain::write_private(&p.err_file, &stderr_clean);
+    let mut persistence_error = None;
+    if let Err(e) = contain::write_private_atomic(&p.out_file, &stdout_clean) {
+        persistence_error = Some(format!(
+            "cannot persist required output artifact {}: {e}",
+            p.out_file.display()
+        ));
+    }
+    if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+        persistence_error.get_or_insert_with(|| {
+            format!(
+                "cannot persist required stderr artifact {}: {e}",
+                p.err_file.display()
+            )
+        });
+    }
 
     let mut parsed = match parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)) {
         Ok(o) => o,
@@ -1559,7 +1638,14 @@ fn exec_once(p: Prepared) -> LeafDone {
             // A containment violation reading the tool's artifact is a failure
             // of this step, not empty output (rev_break #4).
             stderr_clean.push_str(&format!("\nsfh: {e}\n"));
-            let _ = contain::write_private(&p.err_file, &stderr_clean);
+            if let Err(write_err) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+                persistence_error.get_or_insert_with(|| {
+                    format!(
+                        "cannot persist required stderr artifact {}: {write_err}",
+                        p.err_file.display()
+                    )
+                });
+            }
             ParsedOut {
                 failed: true,
                 ..Default::default()
@@ -1570,7 +1656,14 @@ fn exec_once(p: Prepared) -> LeafDone {
         let warning = "provider reported an invalid cost_usd; the value was normalized without refunding prior spend";
         eprintln!("sfh: warning: [{}] {warning}", p.tag);
         stderr_clean.push_str(&format!("\nsfh: {warning}\n"));
-        let _ = contain::write_private(&p.err_file, &stderr_clean);
+        if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+            persistence_error.get_or_insert_with(|| {
+                format!(
+                    "cannot persist required stderr artifact {}: {e}",
+                    p.err_file.display()
+                )
+            });
+        }
     }
     let mut exit_code = outcome.exit_code;
     // Several tools report success/failure in-band and get the exit code wrong.
@@ -1616,10 +1709,28 @@ fn exec_once(p: Prepared) -> LeafDone {
                 session_id = None;
             }
             stderr_clean.push_str(&why);
-            let _ = contain::write_private(&p.err_file, &stderr_clean);
+            if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+                persistence_error.get_or_insert_with(|| {
+                    format!(
+                        "cannot persist required stderr artifact {}: {e}",
+                        p.err_file.display()
+                    )
+                });
+            }
         }
     }
-    let _ = contain::write_private(&p.chain_file, &chain_output);
+    if let Err(e) = contain::write_private_atomic(&p.chain_file, &chain_output) {
+        persistence_error.get_or_insert_with(|| {
+            format!(
+                "cannot persist required chain artifact {}: {e}",
+                p.chain_file.display()
+            )
+        });
+    }
+    if let Some(e) = &persistence_error {
+        exit_code = -1;
+        stderr_clean.push_str(&format!("\nsfh: {e}\n"));
+    }
 
     if !p.quiet {
         let cost = parsed
@@ -1655,7 +1766,32 @@ fn exec_once(p: Prepared) -> LeafDone {
         access: p.access,
         usage: parsed.usage,
         cmd: cmd_desc,
+        persistence_error,
     }
+}
+
+fn persist_prestart_failure(
+    out_file: &Path,
+    err_file: &Path,
+    chain_file: &Path,
+    why: &str,
+) -> Option<String> {
+    let mut error = None;
+    for (path, text, kind) in [
+        (out_file, "", "output"),
+        (err_file, why, "stderr"),
+        (chain_file, "", "chain"),
+    ] {
+        if let Err(e) = contain::write_private_atomic(path, text) {
+            error.get_or_insert_with(|| {
+                format!(
+                    "cannot persist required {kind} artifact {}: {e}",
+                    path.display()
+                )
+            });
+        }
+    }
+    error
 }
 
 fn codex_session_from_stderr(stderr: &str) -> Option<String> {
@@ -2000,67 +2136,114 @@ impl Warmup {
     }
 }
 
-/// Run prepared leaves on a bounded worker pool. The result Vec ALWAYS has the
-/// same length and order as the input: a slot whose worker died is filled with
-/// a synthetic failure instead of being dropped (positional consumers zip these
-/// against child/item lists).
-pub fn run_pool(preps: Vec<Prepared>, max_parallel: usize, gate: Arc<ToolGate>) -> Vec<LeafDone> {
+/// Run prepared leaves on a bounded worker pool. `on_done` runs in the caller
+/// thread as soon as each member completes, before the remaining workers are
+/// joined. The engine uses that boundary to durably record the member so a
+/// crash while a slower sibling is still running cannot bill it twice.
+///
+/// The result Vec ALWAYS has the same length and order as the input: a slot
+/// whose worker died is filled with a synthetic failure instead of being
+/// dropped (positional consumers zip these against child/item lists).
+pub fn run_pool<S, F>(
+    preps: Vec<Prepared>,
+    max_parallel: usize,
+    gate: Arc<ToolGate>,
+    on_start: S,
+    mut on_done: F,
+) -> Result<Vec<LeafDone>, String>
+where
+    S: Fn(usize) + Send + Sync + 'static,
+    F: FnMut(usize, &LeafDone) -> Result<(), String>,
+{
     let n = preps.len();
     if n == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let warmup = Arc::new(Warmup::from(
         &preps,
         preps.first().map(|p| p.quiet).unwrap_or(true),
     ));
     if n == 1 || max_parallel <= 1 {
-        return preps
-            .into_iter()
-            .map(|p| {
-                let held = gate.acquire(&p.tool);
-                let d = exec_leaf(p);
-                gate.release(held);
-                d
-            })
-            .collect();
+        let mut out = Vec::with_capacity(n);
+        for (idx, p) in preps.into_iter().enumerate() {
+            let held = gate.acquire(&p.tool);
+            on_start(idx);
+            let d = exec_leaf(p);
+            gate.release(held);
+            on_done(idx, &d)?;
+            out.push(d);
+        }
+        return Ok(out);
     }
     let queue: Arc<Mutex<VecDeque<(usize, Prepared)>>> =
         Arc::new(Mutex::new(preps.into_iter().enumerate().collect()));
-    let results: Arc<Mutex<Vec<Option<LeafDone>>>> =
-        Arc::new(Mutex::new((0..n).map(|_| None).collect()));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let starter = Arc::new(on_start);
+    let (tx, rx) = mpsc::channel::<(usize, LeafDone)>();
     let workers = max_parallel.min(n);
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let q = Arc::clone(&queue);
-        let r = Arc::clone(&results);
         let g = Arc::clone(&gate);
         let w = Arc::clone(&warmup);
+        let c = Arc::clone(&cancelled);
+        let start = Arc::clone(&starter);
+        let sender = tx.clone();
         handles.push(std::thread::spawn(move || loop {
-            let job = q.lock().unwrap().pop_front();
+            if c.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let job = match q.lock() {
+                Ok(mut guard) => guard.pop_front(),
+                Err(mut poisoned) => poisoned.get_mut().pop_front(),
+            };
             let Some((idx, p)) = job else { break };
             let role = w.enter(&p);
             let held = g.acquire(&p.tool);
-            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec_leaf(p)))
-                .unwrap_or_else(|_| synthetic_failure(idx));
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                start(idx);
+                exec_leaf(p)
+            }))
+            .unwrap_or_else(|_| synthetic_failure(idx));
             g.release(held);
             w.leave(role);
-            match r.lock() {
-                Ok(mut guard) => guard[idx] = Some(done),
-                Err(mut poisoned) => poisoned.get_mut()[idx] = Some(done),
+            if sender.send((idx, done)).is_err() {
+                break;
             }
         }));
+    }
+    drop(tx);
+    let mut slots: Vec<Option<LeafDone>> = (0..n).map(|_| None).collect();
+    let mut callback_error = None;
+    for (idx, done) in rx {
+        if callback_error.is_none() {
+            if let Err(e) = on_done(idx, &done) {
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut q) = queue.lock() {
+                    q.clear();
+                }
+                // A completion that cannot be durably recorded is a run-level
+                // integrity failure. Stop paid siblings that are already in
+                // flight as well as clearing the queue; otherwise they could
+                // keep spending while the run has already become unsafe to
+                // resume.
+                execute::request_interrupt();
+                callback_error = Some(e);
+            }
+        }
+        slots[idx] = Some(done);
     }
     for h in handles {
         let _ = h.join();
     }
-    let slots = Arc::try_unwrap(results)
-        .map(|m| m.into_inner().unwrap_or_else(|p| p.into_inner()))
-        .unwrap_or_else(|_| (0..n).map(|_| None).collect());
-    slots
+    if let Some(e) = callback_error {
+        return Err(e);
+    }
+    Ok(slots
         .into_iter()
         .enumerate()
         .map(|(i, o)| o.unwrap_or_else(|| synthetic_failure(i)))
-        .collect()
+        .collect())
 }
 
 fn synthetic_failure(idx: usize) -> LeafDone {
@@ -2082,11 +2265,13 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         access: None,
         usage: preset::Usage::default(),
         cmd: String::new(),
+        persistence_error: None,
     }
 }
 
 /// Format-valid UUIDv4 from OS-seeded hasher entropy (no external crates).
 pub fn gen_uuid() -> String {
+    use std::fmt::Write as _;
     use std::hash::{BuildHasher, Hasher};
     let mut bytes = [0u8; 16];
     for chunk in bytes.chunks_mut(8) {
@@ -2103,7 +2288,11 @@ pub fn gen_uuid() -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let h = |r: std::ops::Range<usize>| -> String {
-        bytes[r].iter().map(|b| format!("{b:02x}")).collect()
+        let mut out = String::with_capacity(r.len() * 2);
+        for byte in &bytes[r] {
+            write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        out
     };
     format!(
         "{}-{}-{}-{}-{}",
@@ -2164,6 +2353,27 @@ mod tests {
         let held = gate.acquire(&Some("claude".to_string()));
         assert_eq!(held.as_deref(), Some("claude"));
         gate.release(held);
+    }
+
+    #[test]
+    fn prestart_failures_leave_a_complete_resumable_artifact_set() {
+        let dir = std::env::temp_dir().join(format!("sfh-prestart-{}", gen_uuid()));
+        contain::mkdir_private(&dir).unwrap();
+        let out = dir.join("leaf.out.txt");
+        let err = dir.join("leaf.err.txt");
+        let chain = dir.join("leaf.chain.txt");
+
+        let persistence_error =
+            persist_prestart_failure(&out, &err, &chain, "deadline exhausted before spawn");
+        assert_eq!(persistence_error, None);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "");
+        assert_eq!(
+            std::fs::read_to_string(&err).unwrap(),
+            "deadline exhausted before spawn"
+        );
+        assert_eq!(std::fs::read_to_string(&chain).unwrap(), "");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2287,6 +2497,15 @@ mod tests {
         assert_eq!(o.usage.output_tokens, Some(30));
         assert_eq!(o.usage.cost_usd, Some(0.03));
         assert!(!o.failed);
+
+        let oversized = concat!(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[],"usage":{"input":18446744073709551615,"output":18446744073709551615}}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"done"}],"usage":{"input":1,"output":1}}}"#
+        );
+        let oversized = parse_pi_jsonl(oversized);
+        assert_eq!(oversized.usage.input_tokens, Some(u64::MAX));
+        assert_eq!(oversized.usage.output_tokens, Some(u64::MAX));
     }
 
     #[test]
@@ -2516,6 +2735,7 @@ mod tests {
             needed_sessions: needed,
             tainted_vars: no_tainted_vars(),
             run_clock: None,
+            wall_deadline: None,
             budget: BudgetVars::default(),
             quiet: true,
             verbose: false,
@@ -3172,6 +3392,7 @@ mod tests {
             needed_sessions: &needed,
             tainted_vars: &tainted,
             run_clock: None,
+            wall_deadline: None,
             budget: BudgetVars::default(),
             quiet: true,
             verbose: false,
