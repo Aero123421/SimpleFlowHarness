@@ -380,16 +380,28 @@ pub fn shell_script_span(argv: &[String]) -> Option<std::ops::Range<usize>> {
             if bare.is_empty() {
                 continue;
             }
-            // -EncodedCommand takes exactly one base64 argument; -Command takes
-            // everything left. Check the longer name first: "c" is a prefix of
-            // "command" only, so the order matters just for the "e..." spellings.
+            // -CommandWithArgs (pwsh 7.4+) and its documented short form -cwa
+            // take ONE command string; everything after it is handed to the
+            // script as $args and is never re-parsed - the same shape as the
+            // arguments after `sh -c SCRIPT`. Swallowing the tail here refused
+            //   ["pwsh","-CommandWithArgs","Write-Output $args[0]","{{x}}"]
+            // which is the safe way to write it.
+            //
+            // Matched by exact name only. PowerShell resolves -c to -Command,
+            // not to -CommandWithArgs, so accepting prefixes of the longer name
+            // would take spellings the shell itself reads the other way.
+            if bare == "cwa" || bare == "commandwithargs" {
+                return Some(i + 1..(i + 2).min(argv.len()));
+            }
+            // -EncodedCommand also takes exactly one argument, a base64 blob.
+            // Checked before -Command because "e" is a prefix of neither name's
+            // continuation but "c" is a prefix of "command" alone.
             if "encodedcommand".starts_with(bare) && bare.starts_with('e') {
                 return Some(i + 1..(i + 2).min(argv.len()));
             }
-            // -CommandWithArgs (pwsh 7.4+) and its documented short form -cwa
-            // also take a command string. -cwa is not a prefix of the full
-            // name, so prefix matching alone missed both.
-            if "command".starts_with(bare) || "commandwithargs".starts_with(bare) || bare == "cwa" {
+            // -Command really does re-join everything that follows into one
+            // command line, so there the whole tail is shell text.
+            if "command".starts_with(bare) {
                 return Some(i + 1..argv.len());
             }
         }
@@ -2691,6 +2703,17 @@ mod tests {
         assert_eq!(s(&["pwsh", "-NoProfile", "-Command", "x"]), Some(3..4));
         // -EncodedCommand takes exactly one base64 argument.
         assert_eq!(s(&["pwsh", "-EncodedCommand", "eABiAA==", "x"]), Some(2..3));
+        // -CommandWithArgs takes one command string; the rest become $args
+        // inside it, exactly like the arguments after `sh -c SCRIPT`.
+        assert_eq!(
+            s(&["pwsh", "-CommandWithArgs", "Write-Output $args[0]", "data"]),
+            Some(2..3)
+        );
+        assert_eq!(s(&["pwsh", "-cwa", "x", "a", "b"]), Some(2..3));
+        // PowerShell resolves -c and -com to -Command, never to
+        // -CommandWithArgs, so those must still take the whole tail.
+        assert_eq!(s(&["pwsh", "-c", "echo", "a"]), Some(2..4));
+        assert_eq!(s(&["pwsh", "-com", "echo", "a"]), Some(2..4));
         // Either introducer, and a path- or extension-qualified name, on every
         // OS: this is parsed by hand rather than with Path so that a Windows
         // path is still recognised when the check runs on Linux.

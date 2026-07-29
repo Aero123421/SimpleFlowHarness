@@ -1148,6 +1148,83 @@ else
   bad "F-2: after a failed lap plus an explicit route-back, members ran w1=$w1c w2=$w2c, expected both to run"
 fi
 
+# -------------------------------------------------------- 20. sixth round
+sec "20. cases the sixth review round found missing"
+
+# (a) F-9: -CommandWithArgs takes ONE command string and hands the rest to the
+# script as $args - the same shape as the arguments after `sh -c SCRIPT`.
+# Treating the whole tail as shell text refused the safe form. Same mistake as
+# the sh -c one, made again in a different shell.
+cat > f20a.yaml <<'YAML'
+name: cwa-cmd
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "-CommandWithArgs", "Write-Output {{steps.a.output}}"]
+YAML
+if "$SFH" validate f20a.yaml >/dev/null 2>&1
+  then bad "validate accepted a template in the COMMAND part of -CommandWithArgs"
+  else ok  "validate rejected a template in the command part of -CommandWithArgs"; fi
+
+cat > f20b.yaml <<'YAML'
+name: cwa-args
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "-CommandWithArgs", "Write-Output $args[0]", "{{steps.a.output}}"]
+YAML
+if "$SFH" validate f20b.yaml >/dev/null 2>&1
+  then ok  "LEGIT: a template in the \$args part of -CommandWithArgs is allowed"
+  else bad "LEGIT: -CommandWithArgs refuses its \$args - the safe form is locked out"; fi
+
+# -c and -com mean -Command, which really does re-join its tail, so those must
+# still refuse a template anywhere after the flag.
+cat > f20c.yaml <<'YAML'
+name: c-tail
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "-c", "Write-Output", "{{steps.a.output}}"]
+YAML
+if "$SFH" validate f20c.yaml >/dev/null 2>&1
+  then bad "validate accepted a template in the tail of pwsh -c (which joins it)"
+  else ok  "validate still treats the whole tail of pwsh -c as shell text"; fi
+
+# (b) F-10: the honesty fields must fail closed when MISTYPED, not only when
+# missing. Only `failed` had a mistyped case.
+for field in timed_out interrupted; do
+  rm -rf "r20_$field" "t20_$field"
+  sed -e "s/^name: f10-resume/name: f20-$field/" -e "s/t10r/t20_$field/" f10.yaml > "f20_$field.yaml"
+  "$SFH" run "f20_$field.yaml" --runs-dir "r20_$field" -q >/dev/null 2>&1
+  rdf="$(newest "r20_$field")"
+  if [ -z "$rdf" ]; then bad "F-10($field mistyped): could not set up the run"; continue; fi
+  sed -e "s/\"$field\":false/\"$field\":\"false\"/g" \
+      "$rdf/log.jsonl" > "$rdf/l.new" && mv "$rdf/l.new" "$rdf/log.jsonl"
+  outf="$("$SFH" run "f20_$field.yaml" --resume "$rdf" --runs-dir "r20_$field" -q 2>/dev/null)"
+  case "$outf" in
+    *"did not complete"*) ok  "F-10: a mistyped '$field' is not a success" ;;
+    *CLEANTEXT*)          bad "F-10: FAIL-OPEN - a mistyped '$field' passed as a clean success" ;;
+    *)                    ok  "F-10: a mistyped '$field' produced no restored output" ;;
+  esac
+done
+
+# (c) F-6: the derived-dead path must be refused by name and by exit code, not
+# merely be silent about the emit file.
+out="$("$SFH" wait f_derived_dead --timeout 5 2>&1)"
+rc=$?
+case "$out" in
+  *"refusing to report"*|*"refusing to treat"*)
+    ok "wait: refused a run that resolved to dead by name" ;;
+  *)
+    bad "wait: reported a run that resolved to dead without refusing it" ;;
+esac
+if [ "$rc" -ne 0 ]
+  then ok  "wait: a run resolved to dead is not reported as success"
+  else bad "wait: FAIL-OPEN - a run resolved to dead returned 0"; fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"
