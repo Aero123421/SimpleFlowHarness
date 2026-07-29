@@ -507,8 +507,17 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 s.id
             ));
         }
-        if !seen.insert(s.id.clone()) {
-            return Err(format!("duplicate step id '{}'", s.id));
+        // Case-INSENSITIVELY unique. Step ids become artifact file names, and
+        // `A` and `a` are the same file on Windows and on a stock macOS while
+        // being two files on Linux - so the same flow restores different
+        // outputs per platform, and two parallel members ids apart only by case
+        // race for one file. Rejecting the pair makes the failure the same
+        // everywhere, which is the only answer that keeps a flow portable.
+        if !seen.insert(s.id.to_lowercase()) {
+            return Err(format!(
+                "duplicate step id '{}' (ids are compared ignoring case: they become file names, and two ids differing only in case are one file on Windows and macOS)",
+                s.id
+            ));
         }
         if let Some(children) = &s.parallel {
             for c in children {
@@ -518,8 +527,11 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                         c.id
                     ));
                 }
-                if !seen.insert(c.id.clone()) {
-                    return Err(format!("duplicate step id '{}'", c.id));
+                if !seen.insert(c.id.to_lowercase()) {
+                    return Err(format!(
+                        "duplicate step id '{}' (ids are compared ignoring case: they become file names, and two ids differing only in case are one file on Windows and macOS)",
+                        c.id
+                    ));
                 }
             }
         }
