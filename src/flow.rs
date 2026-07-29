@@ -219,6 +219,11 @@ pub enum Cmd {
     Argv(Vec<String>),
 }
 
+/// One `route:` rule. Every `when_*` present in a rule must hold (AND); a rule
+/// with none is the catch-all. Adding one here means adding it to three other
+/// places: schema/flow.schema.json, the catch-all test in `evaluate_route`
+/// (a rule with a condition must not log as `via: catch_all`), and any
+/// exclusivity check that enumerates predicates.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -230,6 +235,18 @@ pub struct Route {
     /// Exact match against the trimmed last non-empty line.
     pub when_last_line_is: Option<String>,
     pub when_last_line_matches: Option<String>,
+    /// Equality against the step's OWN normalized exit code - the same number
+    /// `{{steps.<id>.exit}}` exposes, after sfh has folded in-band failure
+    /// reports and session validation into it. A fan-out group has no exit of
+    /// its own and compares against the composite sfh records (1 when the group
+    /// hard-failed, 0 otherwise). Mainly for `on_error: continue` probes that
+    /// have to prove a step failed for THE reason under test.
+    pub when_exit: Option<i32>,
+    /// Rust regex over the step's cleaned stderr (`<id>.err.txt`). Read from the
+    /// file in both live and resumed runs, so the two cannot disagree; a stderr
+    /// file that is missing (or a step that has none, like a fan-out group)
+    /// never matches.
+    pub when_stderr_matches: Option<String>,
     /// Step id, or one of the three terminals: "end" (finish, success),
     /// "fail" (finish, failure) or "stuck" (finish, needs a human - exit 4).
     pub goto: String,
@@ -707,9 +724,13 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         }
         for (i, r) in s.route.iter().enumerate() {
             check_goto(&format!("step '{}' route[{i}]", s.id), &r.goto)?;
-            for rx in [&r.when_matches, &r.when_last_line_matches]
-                .into_iter()
-                .flatten()
+            for rx in [
+                &r.when_matches,
+                &r.when_last_line_matches,
+                &r.when_stderr_matches,
+            ]
+            .into_iter()
+            .flatten()
             {
                 if !rx.contains("{{") {
                     regex::Regex::new(rx)

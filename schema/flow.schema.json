@@ -116,6 +116,8 @@
         "when_last_line_contains": { "type": "string", "description": "Deterministic verdict trailer check." },
         "when_last_line_is": { "type": "string", "description": "Exact match against the trimmed last non-empty line." },
         "when_last_line_matches": { "type": "string" },
+        "when_exit": { "type": "integer", "description": "Equality against this step's own normalized exit code ({{steps.<id>.exit}}). A fan-out group compares against the composite: 1 when the group hard-failed, else 0." },
+        "when_stderr_matches": { "type": "string", "description": "Rust regex over this step's cleaned stderr (<id>.err.txt), read from the file in live and resumed runs alike. A missing stderr file never matches." },
         "goto": { "type": "string", "description": "step id | end (exit 0) | fail (exit 1) | stuck (exit 4: work saved, needs a human)" }
       }
     },

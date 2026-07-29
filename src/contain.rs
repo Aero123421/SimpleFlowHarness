@@ -175,22 +175,17 @@ fn deverbatim(p: PathBuf) -> PathBuf {
 /// the check and the open. Used for every read of a run-dir artifact, so a
 /// symlink at a fixed name (log.jsonl, status.json, sfh-nonce, a chain file)
 /// reads as an error instead of following out of the run dir (rev_break #6).
-fn read_nofollow(path: &Path) -> std::io::Result<String> {
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
-        use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        let mut s = String::new();
-        f.read_to_string(&mut s)?;
-        Ok(s)
+            .open(path)
     }
     #[cfg(windows)]
     {
-        use std::io::Read;
         use std::os::windows::fs::OpenOptionsExt;
         if path
             .symlink_metadata()
@@ -199,18 +194,35 @@ fn read_nofollow(path: &Path) -> std::io::Result<String> {
         {
             return Err(std::io::Error::other("refusing to read through a symlink"));
         }
-        let mut f = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        let mut s = String::new();
-        f.read_to_string(&mut s)?;
-        Ok(s)
+            .open(path)
     }
     #[cfg(all(not(unix), not(windows)))]
     {
-        std::fs::read_to_string(path)
+        std::fs::File::open(path)
     }
+}
+
+fn read_nofollow(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = open_nofollow(path)?;
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+/// `read_nofollow` that stops after `max_bytes`. Used where the file is judged
+/// rather than handed on (route predicates): the cap bounds a runaway stderr,
+/// and the truncation can land mid-character, so the bytes are decoded lossily
+/// instead of failing the whole read the way `read_to_string` would.
+fn read_nofollow_capped(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let f = open_nofollow(path)?;
+    let mut buf = Vec::new();
+    f.take(max_bytes).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Read a file that must be contained within `base`; a missing file reads as
@@ -243,6 +255,25 @@ pub fn read_contained_opt(base: &Path, candidate: &str) -> Result<Option<String>
 /// on the final component, or any resolution outside `base`, is a hard error;
 /// a genuinely missing file reads as `Ok(None)` (rev_break #5/#6).
 pub fn read_contained_abs(base: &Path, abs: &Path) -> Result<Option<String>, String> {
+    read_contained_abs_inner(base, abs, None)
+}
+
+/// `read_contained_abs` that reads at most `max_bytes`. For artifacts a route
+/// predicate only inspects (`<id>.err.txt`), where an unbounded read would let
+/// a chatty child decide how much memory routing costs.
+pub fn read_contained_abs_capped(
+    base: &Path,
+    abs: &Path,
+    max_bytes: u64,
+) -> Result<Option<String>, String> {
+    read_contained_abs_inner(base, abs, Some(max_bytes))
+}
+
+fn read_contained_abs_inner(
+    base: &Path,
+    abs: &Path,
+    max_bytes: Option<u64>,
+) -> Result<Option<String>, String> {
     let canon_base = base
         .canonicalize()
         .map_err(|e| format!("cannot resolve run dir {}: {e}", base.display()))?;
@@ -268,9 +299,12 @@ pub fn read_contained_abs(base: &Path, abs: &Path) -> Result<Option<String>, Str
             canon_base.display()
         ));
     }
-    read_nofollow(&canon)
-        .map(Some)
-        .map_err(|e| format!("cannot read {}: {e}", canon.display()))
+    match max_bytes {
+        Some(n) => read_nofollow_capped(&canon, n),
+        None => read_nofollow(&canon),
+    }
+    .map(Some)
+    .map_err(|e| format!("cannot read {}: {e}", canon.display()))
 }
 
 /// Write the stop nonce for a run dir, binding the random token to the pid AND
@@ -775,5 +809,44 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         assert!(contained_opt(&base, "not-there.txt").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn capped_read_stops_at_the_cap_and_keeps_absence_absent() {
+        // F6: when_stderr_matches judges <id>.err.txt, so the read is bounded -
+        // a child that writes an enormous stderr must not decide how much memory
+        // a routing decision costs. A missing file is still Ok(None) (the
+        // fail-closed "no evidence" case), not an error.
+        let base = std::env::temp_dir().join(format!("sfh-contain-cap-{}", random_nonce()));
+        std::fs::create_dir_all(&base).unwrap();
+        let f = base.join("big.err.txt");
+        std::fs::write(&f, "x".repeat(100)).unwrap();
+        let got = read_contained_abs_capped(&base, &f, 10).unwrap().unwrap();
+        assert_eq!(got, "x".repeat(10));
+        let whole = read_contained_abs_capped(&base, &f, 4 * 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(whole.len(), 100);
+        assert!(
+            read_contained_abs_capped(&base, &base.join("gone.err.txt"), 16)
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn capped_read_does_not_fail_on_a_cut_multibyte_character() {
+        // The cap counts bytes, so it can land inside a UTF-8 sequence. That has
+        // to degrade to a replacement character rather than failing the read and
+        // taking the whole run down with it.
+        let base = std::env::temp_dir().join(format!("sfh-contain-cut-{}", random_nonce()));
+        std::fs::create_dir_all(&base).unwrap();
+        let f = base.join("wide.err.txt");
+        std::fs::write(&f, "日本語").unwrap();
+        let got = read_contained_abs_capped(&base, &f, 4).unwrap().unwrap();
+        assert!(got.starts_with('日'), "{got:?}");
+        assert_eq!(got.chars().count(), 2, "{got:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

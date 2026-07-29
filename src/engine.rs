@@ -1822,7 +1822,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 step_ids: &step_ids,
                 builtins,
             };
-            let target = evaluate_route(step, &pending.route_text, &ctx)?;
+            let target = evaluate_route(step, &pending.route_text, &ctx, &run_dir)?;
             match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                 None => {
                     log_position(
@@ -2692,7 +2692,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     step_ids: &step_ids,
                     builtins,
                 };
-                evaluate_route(step, &route_text, &ctx)?
+                evaluate_route(step, &route_text, &ctx, &run_dir)?
             };
             match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                 None => {
@@ -3383,12 +3383,43 @@ struct RouteHit {
     voters: Option<Vec<String>>,
 }
 
+/// How much of a step's stderr `when_stderr_matches` will read. A step is free
+/// to produce gigabytes of it; routing is not the place to hold them.
+const STDERR_MATCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The stderr text `when_stderr_matches` judges, or None when there is none to
+/// judge. BOTH live and resumed runs come through here - the path is the one
+/// `{{steps.<id>.stderr_file}}` exposes, which live sets from the file just
+/// written and a resume restores (already containment-checked) from step_end -
+/// so the two paths read the same bytes rather than one reading memory and the
+/// other a file.
+///
+/// None means "no evidence": the step never recorded a stderr file (a fan-out
+/// group has none), or the file is gone from the run dir. A path that resolves
+/// OUTSIDE the run dir is not absence, it is tampering, and stays an error.
+fn stderr_text_for(
+    step_id: &str,
+    ctx: &template::Ctx<'_>,
+    run_dir: &Path,
+) -> Result<Option<String>, String> {
+    let Some(o) = ctx.outputs.get(step_id) else {
+        return Ok(None);
+    };
+    if o.stderr_file.is_empty() {
+        return Ok(None);
+    }
+    contain::read_contained_abs_capped(run_dir, Path::new(&o.stderr_file), STDERR_MATCH_MAX_BYTES)
+}
+
 fn evaluate_route(
     step: &flow::Step,
     route_text: &str,
     ctx: &template::Ctx<'_>,
+    run_dir: &Path,
 ) -> Result<Option<RouteHit>, String> {
     let last = leaf::last_line(route_text).to_string();
+    // Read at most once per routing decision, and only when a rule asks.
+    let mut stderr_seen: Option<Option<String>> = None;
     for (idx, r) in step.route.iter().enumerate() {
         let mut matched = true;
         let mut check = |needle: &Option<String>, hay: &str, is_rx: bool| -> Result<(), String> {
@@ -3421,11 +3452,40 @@ fn evaluate_route(
             }
         }
         if matched {
+            if let Some(want) = r.when_exit {
+                // The step's own normalized exit, read back out of `outputs`:
+                // live inserts it just before routing, and a resume restores it
+                // from step_end, so there is nothing extra to persist. A step
+                // with no recorded output has no exit to compare - fail closed.
+                if ctx.outputs.get(&step.id).map(|o| o.exit) != Some(want) {
+                    matched = false;
+                }
+            }
+        }
+        if matched {
+            if let Some(t) = &r.when_stderr_matches {
+                let t = template::render(t, ctx)?;
+                let rx = regex::Regex::new(&t)
+                    .map_err(|e| format!("step '{}' route regex: {e}", step.id))?;
+                if stderr_seen.is_none() {
+                    stderr_seen = Some(stderr_text_for(&step.id, ctx, run_dir)?);
+                }
+                // The outer Option is the read cache, the inner one is whether
+                // there was any stderr to judge. No stderr = no match.
+                matched = match stderr_seen.as_ref().and_then(|t| t.as_deref()) {
+                    Some(s) => rx.is_match(s),
+                    None => false,
+                };
+            }
+        }
+        if matched {
             let via = if r.when_contains.is_none()
                 && r.when_matches.is_none()
                 && r.when_last_line_contains.is_none()
                 && r.when_last_line_is.is_none()
                 && r.when_last_line_matches.is_none()
+                && r.when_exit.is_none()
+                && r.when_stderr_matches.is_none()
             {
                 PositionVia::CatchAll
             } else {
@@ -3634,6 +3694,8 @@ mod tests {
             when_last_line_contains: None,
             when_last_line_is: when_last_line_is.map(String::from),
             when_last_line_matches: None,
+            when_exit: None,
+            when_stderr_matches: None,
             goto: "end".to_string(),
         }
     }
@@ -3671,6 +3733,139 @@ mod tests {
             ),
             text
         );
+    }
+
+    /// A one-step flow plus the outputs entry the engine would have inserted
+    /// for it just before routing, so `evaluate_route` can be exercised without
+    /// running anything.
+    fn route_probe(
+        route_yaml: &str,
+        out: template::StepOutput,
+    ) -> (
+        flow::Flow,
+        BTreeMap<String, template::StepOutput>,
+        HashSet<String>,
+    ) {
+        let flow: flow::Flow = serde_yaml_ng::from_str(&format!(
+            "name: t\nsteps:\n  - id: probe\n    cmd: [\"echo\", \"x\"]\n    route:\n{route_yaml}"
+        ))
+        .expect("test flow parses");
+        let mut outputs = BTreeMap::new();
+        outputs.insert("probe".to_string(), out);
+        let ids: HashSet<String> = flow.steps.iter().map(|s| s.id.clone()).collect();
+        (flow, outputs, ids)
+    }
+
+    fn probe_output(exit: i32, stderr_file: &str) -> template::StepOutput {
+        template::StepOutput {
+            output: "PROBE-DONE".into(),
+            outputs: "PROBE-DONE".into(),
+            output_file: String::new(),
+            exit,
+            stderr_file: stderr_file.to_string(),
+        }
+    }
+
+    #[test]
+    fn when_exit_compares_the_steps_own_normalized_exit() {
+        // F6: the gate an `on_error: continue` probe needs. `when_exit: 0` on a
+        // probe that was SUPPOSED to be refused is how "the guard is gone" gets
+        // caught, so the equality has to be exact - not "non-zero".
+        let rules = "      - {when_exit: 0, goto: leaked}\n      - {when_exit: 3, goto: expected}\n      - {goto: other}\n";
+        let vars = BTreeMap::new();
+        for (exit, want, rule) in [(3, "expected", 1), (0, "leaked", 0), (9, "other", 2)] {
+            let (flow, outputs, ids) = route_probe(rules, probe_output(exit, ""));
+            let ctx = template::Ctx {
+                vars: &vars,
+                outputs: &outputs,
+                step_ids: &ids,
+                builtins: BTreeMap::new(),
+            };
+            let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."))
+                .unwrap()
+                .expect("some rule always matches here");
+            assert_eq!(hit.goto, want, "exit {exit}");
+            assert_eq!(hit.rule, rule, "exit {exit}");
+        }
+        // A when_exit rule is a RULE, not a catch-all: the position event has to
+        // say the flow branched on a condition.
+        let (flow, outputs, ids) = route_probe(rules, probe_output(3, ""));
+        let ctx = template::Ctx {
+            vars: &vars,
+            outputs: &outputs,
+            step_ids: &ids,
+            builtins: BTreeMap::new(),
+        };
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(hit.via, PositionVia::Rule));
+    }
+
+    #[test]
+    fn when_exit_fails_closed_without_a_recorded_output() {
+        // No outputs entry = no exit to compare. That is missing evidence, so
+        // the rule must not fire (the catch-all below it does).
+        let (flow, _outputs, ids) = route_probe(
+            "      - {when_exit: 0, goto: matched}\n      - {goto: other}\n",
+            probe_output(0, ""),
+        );
+        let vars = BTreeMap::new();
+        let empty = BTreeMap::new();
+        let ctx = template::Ctx {
+            vars: &vars,
+            outputs: &empty,
+            step_ids: &ids,
+            builtins: BTreeMap::new(),
+        };
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.goto, "other");
+    }
+
+    #[test]
+    fn when_stderr_matches_reads_the_file_and_fails_closed_when_it_is_gone() {
+        // F6: the predicate judges <id>.err.txt, in live runs as well as
+        // resumed ones, so a deleted artifact is "no evidence" - never a pass.
+        let dir = std::env::temp_dir().join(format!("sfh-f6-stderr-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = dir.join("probe.err.txt");
+        std::fs::write(&err, "sfh: refusing to resume: no recorded access level\n").unwrap();
+        let rules = "      - {when_stderr_matches: \"refusing to resume\", goto: guard_fired}\n      - {goto: broken}\n";
+        let vars = BTreeMap::new();
+        let (flow, outputs, ids) = route_probe(rules, probe_output(3, &err.display().to_string()));
+        let ctx = template::Ctx {
+            vars: &vars,
+            outputs: &outputs,
+            step_ids: &ids,
+            builtins: BTreeMap::new(),
+        };
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.goto, "guard_fired");
+
+        std::fs::remove_file(&err).unwrap();
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.goto, "broken", "a missing stderr file must not match");
+
+        // A step that never recorded a stderr file at all (a fan-out group)
+        // has nothing to judge either.
+        let (flow, outputs, ids) = route_probe(rules, probe_output(3, ""));
+        let ctx = template::Ctx {
+            vars: &vars,
+            outputs: &outputs,
+            step_ids: &ids,
+            builtins: BTreeMap::new(),
+        };
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.goto, "broken");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
