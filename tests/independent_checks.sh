@@ -1301,6 +1301,65 @@ for dir in lf2crlf crlf2lf; do
   fi
 done
 
+# ------------------------------------------------------- 22. eighth round
+sec "22. cases the eighth review round found missing"
+
+# A kill part-way through recording the carried-over members used to leave a
+# PARTIAL set against the new visit, which the carry-forward then would not
+# replace - so the members whose line had not been written yet ran again.
+# Written as one event, a torn line fails to parse and is skipped, leaving the
+# previous visit's carry standing. Built by hand: the window is one write.
+mkdir -p c22 && (
+cd c22 || exit
+cat > flow.yaml <<'YAML'
+name: tornlog
+steps:
+  - id: fan
+    max_parallel: 3
+    max_visits: 4
+    parallel:
+      - id: t1
+        cmd: ["sh", "-c", "echo t1 >> ../tally22.txt; echo o1"]
+      - id: t2
+        cmd: ["sh", "-c", "echo t2 >> ../tally22.txt; echo o2"]
+      - id: t3
+        cmd: ["sh", "-c", "echo t3 >> ../tally22.txt; echo o3"]
+  - id: after
+    cmd: ["echo", "torn-done"]
+YAML
+mkdir -p run
+printf '{"sfh_version":"1.0.0","flow":"flow.yaml","flow_fingerprint":"x","name":"tornlog","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' > run/meta.json
+# visit 1: t1 and t2 finished, t3 failed, the group closed as failed. The
+# resume then died while recording the carry - the line is truncated.
+{
+  printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"1.0.0","resumed":false,"flow_fingerprint":"x"}\n'
+  printf '{"ts":"20250101-000001","event":"group_start","step":"fan","visit":1,"children":3}\n'
+  for n in t1 t2; do
+    printf '{"ts":"20250101-00000X","event":"step_end","step":"%s","parent":"fan","visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":2,"output_hash":"x","chain_file":"%s.chain.txt","out_file":"%s.out.txt","cmd":"echo","session":null}\n' "$n" "$n" "$n"
+  done
+  printf '{"ts":"20250101-000004","event":"step_end","step":"t3","parent":"fan","visit":1,"exit":7,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":0,"output_hash":"x","chain_file":"t3.chain.txt","out_file":"t3.out.txt","cmd":"exit 7","session":null}\n'
+  printf '{"ts":"20250101-000005","event":"aggregate_end","step":"fan","visit":1,"exit":1,"failed":true,"out_file":"fan.out.txt","plain_file":"fan.plain.txt","output_hash":"x"}\n'
+  printf '{"ts":"20250101-000006","event":"members_restored","steps":["t1"'
+} > run/log.jsonl
+for n in t1 t2 t3 fan; do echo "o-$n" > "run/$n.chain.txt"; echo "o-$n" > "run/$n.out.txt"; done
+echo "o-fan" > run/fan.plain.txt
+"$SFH" run flow.yaml --resume run --force-resume -q > ../c22.out 2> ../c22.err
+printf '%s %s %s\n' \
+  "$(if [ -f ../tally22.txt ]; then grep -c '^t1$' ../tally22.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally22.txt ]; then grep -c '^t2$' ../tally22.txt | head -1; else echo 0; fi)" \
+  "$(if [ -f ../tally22.txt ]; then grep -c '^t3$' ../tally22.txt | head -1; else echo 0; fi)" \
+  > ../c22.verdict
+)
+u1=""; u2=""; u3=""
+[ -f c22.verdict ] && read -r u1 u2 u3 < c22.verdict
+# t1 and t2 finished before the crash and must not be paid for again; only the
+# member that failed runs.
+if [ "${u1:-0}" = "0" ] && [ "${u2:-0}" = "0" ] && [ "${u3:-0}" = "1" ]; then
+  ok "F-2: a torn carry-over record does not cost the finished members a second run"
+else
+  bad "F-2: after a torn members_restored line, members ran t1=$u1 t2=$u2 t3=$u3, expected 0 0 1"
+fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"

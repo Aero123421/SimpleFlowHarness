@@ -485,17 +485,26 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             // has no output, cost or session of its own to restore - those came
             // back with the ORIGINAL step_end, which is still in this same log -
             // so all this records is "do not run it again".
-            "member_restored" => {
+            "members_restored" => {
                 if let Some(parent) = v
                     .get("parent")
                     .and_then(|p| p.as_str())
                     .filter(|p| !p.is_empty())
                 {
                     let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
-                    st.completed_members
+                    let entry = st
+                        .completed_members
                         .entry((parent.to_string(), visit))
-                        .or_default()
-                        .insert(step.clone());
+                        .or_default();
+                    for name in v
+                        .get("steps")
+                        .and_then(|s| s.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s.as_str())
+                    {
+                        entry.insert(name.to_string());
+                    }
                 }
             }
             "step_end" | "aggregate_end" => {
@@ -793,7 +802,7 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
     //     members" test saw visit 1 and skipped the whole of visit 2, which the
     //     flow had deliberately asked for.
     //   two crashes running -> the second lap logs its own failed aggregate_end
-    //     and its carried members are in the log as member_restored, so the
+    //     and its carried members are in the log as members_restored, so the
     //     third attempt carries from visit 2, not visit 1.
     if let Some(resume_at) = st.start.clone() {
         if let Some(&visit) = carry_from.get(&resume_at) {
@@ -802,9 +811,13 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 .get(&(resume_at.clone(), visit))
                 .cloned()
             {
+                // extend, not or_insert: a member known complete from either
+                // source is complete, and replacing an existing entry - or
+                // declining to touch it - would drop one side of the union.
                 st.completed_members
                     .entry((resume_at, visit + 1))
-                    .or_insert(set);
+                    .or_default()
+                    .extend(set);
             }
         }
     }
@@ -3108,20 +3121,28 @@ fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
 /// skipped members write no step_end, so a second crash in the same fan-out
 /// leaves the next resume with no record of them and they run - and bill - a
 /// second time. Sorted so the log is reproducible.
+///
+/// ONE event carrying the whole set, not one line per member. Written a line
+/// at a time, a kill part-way through left a PARTIAL set recorded against the
+/// new visit, and the carry-forward would not replace it - the members whose
+/// line had not been written yet ran again. A single line is either read whole
+/// or, torn, fails to parse and is skipped like any other torn line, which
+/// leaves the previous visit's carry standing and nothing lost.
 fn log_restored_members(
     f: &mut std::fs::File,
     group: &str,
     visit: u32,
     restored: &HashSet<String>,
 ) {
+    if restored.is_empty() {
+        return;
+    }
     let mut names: Vec<&String> = restored.iter().collect();
     names.sort();
-    for name in names {
-        log_event(
-            f,
-            json!({"ts": utc_stamp(), "event": "member_restored", "step": name, "parent": group, "visit": visit}),
-        );
-    }
+    log_event(
+        f,
+        json!({"ts": utc_stamp(), "event": "members_restored", "steps": names, "parent": group, "visit": visit}),
+    );
 }
 
 #[derive(Clone, Copy)]
