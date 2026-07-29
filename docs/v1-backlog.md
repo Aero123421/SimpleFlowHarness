@@ -247,3 +247,46 @@ access を記録する**必要がある。
 **なぜ v1.0.0 に入れないか** — ログ形式の変更を伴い、旧 run の扱いを
 もう一段増やすことになる。実害は「フロー作者が自分で宣言した範囲」に
 留まるため、急ぐ理由が無い。```
+
+---
+
+## 検証環境そのものの穴(v1.0.0 リリース時に判明)
+
+**2026-07-29** — 11ラウンドのレビューと 279 件の挙動テストを通した後で、
+CI が `sfh` は **Linux と macOS でコンパイルすら通らない**と報告した。
+`custom_flags` に必要な Unix 側の `OpenOptionsExt` の import が
+1 箇所だけ抜けていた([contain.rs](../src/contain.rs) の `read_nofollow`)。
+
+原因は単純で、**この作業の検証がすべて Windows 上だった**こと。
+
+- レビュアー(codex)は読み取り専用でコードを読むだけで、コンパイルはしない
+- 挙動テストの Unix 専用パス(パーミッション、SIGSTOP)は Windows でスキップされる
+  ため、**一度も実行されたことがなかった**
+- CI は main への push でしか走らない。作業ブランチは最後まで push していなかった
+
+続けて、実際に Linux で走らせたところ挙動テストが 3 件落ちた。いずれも
+Windows では原理的に観測できないもの:
+
+1. `sfh stop` が SIGKILL 直後に 1 回だけ生存確認しており、
+   まだ回収されていないゾンビを「殺せなかった」と誤報していた
+2. STOPPED なプロセスに SIGCONT を送らないため、SIGTERM が処理されず、
+   **一番停止させたい状態でエージェントが生き残っていた**
+3. 0600 の検査が、fixture が作らないファイルを見ていた(`cmd:` ステップには
+   プロンプトファイルが無い)
+
+**恒久対策**
+
+```bash
+# 型検査だけならリンカ不要。Unix の #[cfg(unix)] 分岐を Windows から検査できる
+rustup target add x86_64-unknown-linux-gnu
+cargo check  --target x86_64-unknown-linux-gnu --all-targets
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+
+# 挙動まで見るなら WSL で実際に走らせる(Unix 専用パスはこれでしか通らない)
+wsl -d Ubuntu-24.04 -- bash -lc 'cd ~/sfh && cargo build --release \
+  && bash tests/engine_behaviour.sh ./target/release/sfh'
+```
+
+**教訓** — 「3 OS 対応」を要件に掲げているなら、**3 OS で走らせない検証は
+検証ではない**。レビューを 11 周回しても、レビュアーがコンパイルしないなら
+コンパイルエラーは出てこない。決定論的ゲートは実行環境の分だけ必要になる。
