@@ -375,6 +375,30 @@ pub fn shell_script_span(argv: &[String]) -> Option<std::ops::Range<usize>> {
         // same way instead of listing spellings - a list would miss -Comm and
         // let it through. The other switches do not collide: "executionpolicy"
         // and "configurationname" are not prefixes of either name.
+        //
+        // A reviewer later argued that pwsh 7.4 accepts only the exact
+        // -CommandWithArgs and -cwa, and that the prefixes should therefore be
+        // dropped. Kept, because the two errors are not symmetric: if pwsh does
+        // take -CommandW, failing to recognise it lets the script text through
+        // unchecked; if it does not, the flow was never going to run, so
+        // refusing it costs a broken flow a clear error instead of a confusing
+        // one. Over-detection here has no legitimate use to block.
+        if powershell {
+            // Everything after -File is arguments TO the script, and so is
+            // everything after the first bare word, which pwsh also reads as a
+            // file. A -Command sitting there is data, not a switch, and
+            // scanning past it refused
+            //   ["pwsh","-File","s.ps1","-Command","{{x}}"]
+            // where nothing is ever re-parsed as code.
+            let is_switch = low.starts_with('-') || low.starts_with('/');
+            if !is_switch {
+                return None;
+            }
+            let bare_f = low.trim_start_matches(['-', '/']);
+            if !bare_f.is_empty() && "file".starts_with(bare_f) {
+                return None;
+            }
+        }
         if powershell && (low.starts_with('-') || low.starts_with('/')) {
             let bare = low.trim_start_matches(['-', '/']);
             if bare.is_empty() {
@@ -2743,6 +2767,16 @@ mod tests {
         assert_eq!(s(&["pwsh", "-ExecutionPolicy", "Bypass"]), None);
         assert_eq!(s(&["pwsh", "-ConfigurationName", "n"]), None);
         assert_eq!(s(&["pwsh", "-NoProfile", "-File", "s.ps1"]), None);
+        // -File hands everything after it to the script, so a -Command sitting
+        // there is one of its arguments and is never re-parsed as code.
+        assert_eq!(s(&["pwsh", "-File", "s.ps1", "-Command", "x"]), None);
+        assert_eq!(s(&["pwsh", "-f", "s.ps1", "-c", "x"]), None);
+        // The first bare word is a file too, with the same consequence.
+        assert_eq!(s(&["pwsh", "s.ps1", "-Command", "x"]), None);
+        // ...but -Command first wins, and everything after it - including
+        // something that looks like -File - is part of the command line it
+        // re-joins.
+        assert_eq!(s(&["pwsh", "-Command", "x", "-File", "s.ps1"]), Some(2..5));
 
         // Not a shell, or no run-string flag: no shell text.
         assert_eq!(s(&["echo", "hi"]), None);

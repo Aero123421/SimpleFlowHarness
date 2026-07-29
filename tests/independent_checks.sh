@@ -1360,6 +1360,49 @@ else
   bad "F-2: after a torn members_restored line, members ran t1=$u1 t2=$u2 t3=$u3, expected 0 0 1"
 fi
 
+# -------------------------------------------------------- 23. ninth round
+sec "23. cases the ninth review round found missing"
+
+# After -File, everything is an argument TO the script. A -Command sitting
+# there is data, and scanning past it refused a form where nothing is ever
+# re-parsed as code.
+cat > f23a.yaml <<'YAML'
+name: ps-file
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "-File", "s.ps1", "-Command", "{{steps.a.output}}"]
+YAML
+if "$SFH" validate f23a.yaml >/dev/null 2>&1
+  then ok  "LEGIT: -Command after -File is a script argument, not shell text"
+  else bad "LEGIT: a -Command after -File is still treated as a shell switch"; fi
+
+cat > f23b.yaml <<'YAML'
+name: ps-bare
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "s.ps1", "-Command", "{{steps.a.output}}"]
+YAML
+if "$SFH" validate f23b.yaml >/dev/null 2>&1
+  then ok  "LEGIT: the first bare word is a script file, so what follows is its args"
+  else bad "LEGIT: a bare script path does not stop the switch scan"; fi
+
+# ...and -Command BEFORE any file still takes its whole tail.
+cat > f23c.yaml <<'YAML'
+name: ps-cmd-first
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "-Command", "Write-Output", "{{steps.a.output}}", "-File", "s.ps1"]
+YAML
+if "$SFH" validate f23c.yaml >/dev/null 2>&1
+  then bad "-Command came first, so its tail is command text - the template must be refused"
+  else ok  "-Command first still claims the whole tail, -File in it and all"; fi
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"
