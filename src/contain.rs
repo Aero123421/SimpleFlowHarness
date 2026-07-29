@@ -179,6 +179,7 @@ fn read_nofollow(path: &Path) -> std::io::Result<String> {
     #[cfg(unix)]
     {
         use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
