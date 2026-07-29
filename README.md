@@ -711,4 +711,11 @@ cargo test                              # 86本の単体テスト
 bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト191本
 ```
 
+挙動テストは冒頭で `tests/stub/session_stub.rs` を `rustc` で1回ビルドする。
+これは `claude -p --output-format json` の形(`.result` / `.session_id` / `.usage`)で
+答えるだけのスタブCLIで、`bin: "echo"` ではセッションIDを報告できず
+「再開できたこと」を証明できない(旧B-15)ため。したがって挙動テストの実行には
+sfhをビルドしたのと同じRustツールチェーンが要る。スタブはcargoのターゲットではない
+(`tests/` 直下に置くと統合テストとして拾われてしまうのでサブディレクトリに置いてある)。
+
 CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。

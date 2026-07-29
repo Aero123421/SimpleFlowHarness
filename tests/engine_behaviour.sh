@@ -5,6 +5,9 @@ set -uo pipefail
 
 SFH="${1:-./target/release/sfh}"
 SFH="$(cd "$(dirname "$SFH")" && pwd)/$(basename "$SFH")"
+# Resolved before the cd below, because the session stub's source lives next to
+# this script and everything after the cd is relative to a temp dir.
+SUITE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d)"
 # Windows holds a directory busy while any process still has a handle inside
 # it, and this suite deliberately starts DETACHED runs that outlive it - that
@@ -69,6 +72,108 @@ fnv1a64() {
   done
   printf '%016x' "$h"
 }
+
+# --- session-reporting stub CLI (T-0 / B-15) ---------------------------------
+# `bin: "echo"` cannot report a session id, so every test that stands echo in
+# for claude fails F-11's "resume unverified" check and can only prove that a
+# guard did NOT fire. tests/stub/session_stub.rs speaks the shape sfh parses
+# (`claude -p --output-format json`: one envelope with .result/.session_id/
+# .usage), so a session can be opened and continued for real without calling an
+# AI. Built once here, into this suite's own temp dir, with the rustc that built
+# sfh - a missing toolchain is a loud failure, not a silent skip.
+STUB_NAME="sfh-session-stub"
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) STUB_NAME="sfh-session-stub.exe" ;;
+esac
+STUB="$WORK/$STUB_NAME"
+if rustc -O --edition 2021 -o "$STUB" "$SUITE_DIR/stub/session_stub.rs" > stub-build.log 2>&1; then
+  echo "ok   - the session stub builds"
+  pass=$((pass + 1))
+else
+  echo "FAIL - the session stub did not build (needs rustc on PATH)"
+  sed -n '1,40p' stub-build.log
+  fail=$((fail + 1))
+fi
+# What a flow's bin: gets. sfh is a native binary, so under msys it cannot
+# resolve the /tmp/... path bash sees; hand it the drive-letter form. Absolute
+# either way, so a step with its own cwd: still finds it.
+if command -v cygpath > /dev/null 2>&1; then
+  STUB_BIN="$(cygpath -m "$STUB")"
+else
+  STUB_BIN="$STUB"
+fi
+
+# Smoke test: the stub answers in the one shape sfh parses, echoes the session
+# id sfh assigned, and keeps its knobs independent of each other.
+"$STUB" -p --output-format json --permission-mode dontAsk --tools "Read,Grep" \
+  --session-id stub-smoke-1 --stub-last-line VERDICT-OK --stub-quote VERDICT-OK \
+  < /dev/null > stub-smoke.json 2> stub-smoke.err
+check "the stub exits 0 and ignores the preset's own flags" 0 $?
+STUB_SMOKE_LINES="$(awk 'END { print NR }' stub-smoke.json)"
+check "the stub answers on exactly one line" 1 "$STUB_SMOKE_LINES"
+contains "the stub echoes the session id sfh assigned" '"session_id":"stub-smoke-1"' stub-smoke.json
+contains "the stub reports usage" '"usage":{"input_tokens":11,"output_tokens":7}' stub-smoke.json
+contains "the stub can quote a needle inside the body" 'VERDICT-OK\nsfh-stub: the line above was quoted' stub-smoke.json
+contains "the quoted needle is not the last line" '\nVERDICT-OK","session_id"' stub-smoke.json
+# A fork gets -r <parent> AND --session-id <child>; sfh fails the step when the
+# child id comes back as the parent, so the child has to win.
+"$STUB" -p --output-format json -r stub-parent --fork-session --session-id stub-child \
+  < /dev/null > stub-fork.json 2>&1
+contains "a fork reports the child session, not the parent" '"session_id":"stub-child"' stub-fork.json
+# Exit code and verdict text are independent: "said the right thing, still
+# failed" is the case a member-vote count has to refuse to count.
+SFH_STUB_LAST_LINE=VERDICT-OK "$STUB" --stub-exit 1 < /dev/null > stub-exit.json 2>&1
+check "the stub takes its exit code and last line from the environment" 1 $?
+contains "a failing stub still reports the requested last line" '\nVERDICT-OK","session_id"' stub-exit.json
+"$STUB" --stub-plain --stub-stderr-every 20 --stub-sleep 0.2 --stub-last-line PLAIN-OK \
+  < /dev/null > stub-plain.out 2> stub-plain.err
+check "the stub runs as a plain cmd: leaf" 0 $?
+contains "plain mode prints the body, not JSON" "PLAIN-OK" stub-plain.out
+contains "progress goes to stderr only" "sfh-stub: progress 1" stub-plain.err
+if grep -q "progress" stub-plain.out; then
+  echo "FAIL - stderr progress leaked into stdout"
+  fail=$((fail + 1))
+else
+  echo "ok   - stderr progress stays out of stdout"
+  pass=$((pass + 1))
+fi
+
+# The payoff (B-15): a session opened by the stub can actually be continued, and
+# sfh verifies the continuation instead of merely failing to object.
+cat > stub-session.yaml <<YAML
+name: stub-session
+steps:
+  - id: first
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    prompt: "open a session"
+  - id: second
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    continue_from: first
+    prompt: "continue it"
+YAML
+"$SFH" run stub-session.yaml --runs-dir stub-runs -q > stub-session.out 2> stub-session.err
+check "a stub session can be opened and continued" 0 $?
+STUB_LOG="$(find stub-runs -type f -name 'log.jsonl' -print -quit)"
+STUB_SESSIONS="$(grep -cF '"session":{"access":"read"' "$STUB_LOG")"
+check "both steps record the session they ran under" 2 "$STUB_SESSIONS"
+if grep -q "resume unverified" stub-session.err; then
+  echo "FAIL - the continuation was not verifiable against a reported session id"
+  fail=$((fail + 1))
+else
+  echo "ok   - the continuation was verified against the reported session id"
+  pass=$((pass + 1))
+fi
+# Negative control. The same flow with the old stand-in must still fail, or the
+# check above proves nothing about the stub: echo reports no session id, so
+# F-11 cannot tell a resume from a fresh session and refuses.
+sed "s#$STUB_BIN#echo#g" stub-session.yaml > stub-session-echo.yaml
+"$SFH" run stub-session-echo.yaml -q > stub-session-echo.out 2> stub-session-echo.err
+check "the same flow with bin: echo still cannot verify the resume" 1 $?
+contains "echo fails for the session reason, not another one" "resume unverified" stub-session-echo.err
 
 # --- built-in AI guide -------------------------------------------------------
 "$SFH" guide > guide.out 2> guide.err
