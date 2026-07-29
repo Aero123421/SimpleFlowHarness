@@ -67,6 +67,7 @@ RUNS OPTIONS:
 
 EXIT CODES:
   0 = flow succeeded    1 = flow failed    2 = config/usage error
+  4 = flow stuck (a step routed to `goto: stuck`: work saved, needs a human)
 
 FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the schema):
   Steps run top-to-bottom unless a route: rule redirects. Templates:

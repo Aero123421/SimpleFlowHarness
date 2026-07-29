@@ -224,9 +224,19 @@ pub struct Route {
     /// Exact match against the trimmed last non-empty line.
     pub when_last_line_is: Option<String>,
     pub when_last_line_matches: Option<String>,
-    /// Step id, or "end" (finish flow, success) or "fail" (finish flow, failure).
+    /// Step id, or one of the three terminals: "end" (finish, success),
+    /// "fail" (finish, failure) or "stuck" (finish, needs a human - exit 4).
     pub goto: String,
 }
+
+/// Goto targets that end the flow instead of naming a step.
+///
+/// Only `stuck` is ALSO refused as a step id (see validate). `end` and `fail`
+/// have shadowed a same-named step since v0.1 - a flow that has one is already
+/// written around it, and turning that into a hard error now would break
+/// working flows for no gain. `stuck` is new, so it is reserved before anyone
+/// can write a flow that depends on the ambiguity.
+pub const TERMINALS: [&str; 3] = ["end", "fail", "stuck"];
 
 pub const TOOLS: [&str; 7] = ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"];
 
@@ -500,6 +510,17 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         validate_name(n)?;
     }
     let mut seen = HashSet::new();
+    // Compared ignoring case for the same reason ids are: `Stuck` and `stuck`
+    // are one name on Windows and macOS, so a rule that only caught the exact
+    // spelling would let the ambiguity back in on two of the three OSes.
+    let reserved_id = |id: &str| -> Result<(), String> {
+        if id.eq_ignore_ascii_case("stuck") {
+            return Err(format!(
+                "step id '{id}' is reserved: 'stuck' is a goto target that ends the run for a human to look at (exit 4), so it cannot also name a step (compared ignoring case). Rename the step"
+            ));
+        }
+        Ok(())
+    };
     for s in &flow.steps {
         if !valid_id(&s.id) {
             return Err(format!(
@@ -507,6 +528,7 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 s.id
             ));
         }
+        reserved_id(&s.id)?;
         // Case-INSENSITIVELY unique. Step ids become artifact file names, and
         // `A` and `a` are the same file on Windows and on a stock macOS while
         // being two files on Linux - so the same flow restores different
@@ -527,6 +549,7 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                         c.id
                     ));
                 }
+                reserved_id(&c.id)?;
                 if !seen.insert(c.id.to_lowercase()) {
                     return Err(format!(
                         "duplicate step id '{}' (ids are compared ignoring case: they become file names, and two ids differing only in case are one file on Windows and macOS)",
@@ -538,11 +561,11 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     }
     let top_ids = flow.top_ids();
     let check_goto = |ctx: &str, g: &str| -> Result<(), String> {
-        if g == "end" || g == "fail" || top_ids.contains(g) {
+        if TERMINALS.contains(&g) || top_ids.contains(g) {
             Ok(())
         } else {
             Err(format!(
-                "{ctx}: goto target '{g}' is not a top-level step id (or end/fail)"
+                "{ctx}: goto target '{g}' is not a top-level step id (or end/fail/stuck)"
             ))
         }
     };
@@ -572,7 +595,7 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     let action = |what: &str, s: &Step, v: &Option<String>, is_child: bool| -> Result<(), String> {
         let Some(oe) = v else { return Ok(()) };
         if let Some(g) = oe.strip_prefix("goto:") {
-            if g == "end" || g == "fail" {
+            if TERMINALS.contains(&g) {
                 return Ok(());
             }
             if is_child {
