@@ -2814,6 +2814,183 @@ else
   fail=$((fail + 1))
 fi
 
+# --- F3: stuck, the third terminal (exit 4) -----------------------------------
+# The resume tests come FIRST because resume is where this feature is decided.
+# A stuck run is not finished: the work is saved and a human has to look at it,
+# so the run stays resumable. A route-borne stuck therefore RE-RUNS the step
+# that made the decision instead of replaying its recorded verdict - replaying
+# would route to stuck again on the same text, forever.
+
+cat > f3-route-resume.yaml <<'YAML'
+name: f3-route-resume
+vars:
+  verdict: NEEDS-HUMAN
+steps:
+  - id: judge
+    cmd: ["echo", "{{vars.verdict}}"]
+    route:
+      - when_last_line_is: "OK"
+        goto: wrap
+      - goto: stuck
+  - id: wrap
+    cmd: ["echo", "WRAPPED"]
+YAML
+"$SFH" run f3-route-resume.yaml --runs-dir f3rr-runs -q > f3rr1.out 2> f3rr1.err
+check "F3: a route to stuck ends the run with exit 4" 4 $?
+F3RR_DIR="$(dirname "$(find f3rr-runs -type f -name 'log.jsonl' -print -quit)")"
+"$SFH" run f3-route-resume.yaml --runs-dir f3rr-runs --resume "$F3RR_DIR" --var verdict=OK -q \
+  > f3rr2.out 2> f3rr2.err
+if ! check "F3: a stuck run is resumable and can go on to succeed" 0 $?; then sed -n '1,20p' f3rr2.err; fi
+contains "F3: the resumed run reached the step past the stuck decision" "WRAPPED" f3rr2.out
+if [ "$(grep -F '"event":"step_end"' "$F3RR_DIR/log.jsonl" | grep -cF '"step":"judge"')" = "2" ]; then
+  echo "ok   - F3: resume re-ran the deciding step instead of replaying its verdict"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F3: the deciding step did not re-run exactly once on resume"
+  grep -F '"step":"judge"' "$F3RR_DIR/log.jsonl" | sed -n '1,10p'
+  fail=$((fail + 1))
+fi
+
+# A stuck reached through on_max_visits is different: resuming re-enters the
+# same exhausted node, so it sticks again immediately. That is the honest
+# answer - silently resetting the visit counter would be a lie - and the way
+# out is to fix max_visits in the flow and use --force-resume.
+cat > f3-maxvisits.yaml <<'YAML'
+name: f3-maxvisits
+steps:
+  - id: spin
+    max_visits: 2
+    on_max_visits: goto:stuck
+    cmd: ["echo", "SPIN"]
+    route:
+      - goto: spin
+YAML
+"$SFH" run f3-maxvisits.yaml --runs-dir f3mv-runs -q > f3mv1.out 2> f3mv1.err
+check "F3: on_max_visits goto:stuck ends the run with exit 4" 4 $?
+F3MV_DIR="$(dirname "$(find f3mv-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F3: the max_visits stuck is recorded as such" '"via":"max_visits"' "$F3MV_DIR/log.jsonl"
+"$SFH" run f3-maxvisits.yaml --runs-dir f3mv-runs --resume "$F3MV_DIR" -q > f3mv2.out 2> f3mv2.err
+check "F3: resuming a max_visits stuck lands on stuck again" 4 $?
+if [ "$(grep -F '"event":"step_end"' "$F3MV_DIR/log.jsonl" | grep -cF '"step":"spin"')" = "2" ]; then
+  echo "ok   - F3: the resumed max_visits run did not run the exhausted step again"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F3: the resumed max_visits run re-entered the exhausted step"
+  fail=$((fail + 1))
+fi
+
+cat > f3-basic.yaml <<'YAML'
+name: f3-basic
+steps:
+  - id: work
+    cmd: ["echo", "SAVED-WORK"]
+  - id: judge
+    cmd: ["echo", "NEEDS-HUMAN"]
+    route:
+      - when_last_line_is: "OK"
+        goto: ship
+      - goto: stuck
+  - id: ship
+    cmd: ["echo", "SHIPPED"]
+YAML
+"$SFH" run f3-basic.yaml --runs-dir f3b-runs -q > f3b.out 2> f3b.err
+check "F3: a flow that routes to stuck exits 4" 4 $?
+F3B_DIR="$(dirname "$(find f3b-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F3: status.json records the stuck state" '"state": "stuck"' "$F3B_DIR/status.json"
+contains "F3: status.json records exit code 4" '"exit_code": 4' "$F3B_DIR/status.json"
+contains "F3: the error names the step that routed to stuck" "routed to stuck after 'judge'" "$F3B_DIR/status.json"
+contains "F3: the position event records the stuck terminal" '"next":"stuck"' "$F3B_DIR/log.jsonl"
+contains "F3: the step after the stuck decision did not run" "NEEDS-HUMAN" f3b.out
+if grep -qF "SHIPPED" f3b.out; then
+  echo "FAIL - F3: the run continued past the stuck terminal"
+  fail=$((fail + 1))
+else
+  echo "ok   - F3: stuck is terminal, not a jump to the next step"
+  pass=$((pass + 1))
+fi
+"$SFH" status "$F3B_DIR" > f3b-status.out 2> f3b-status.err
+check "F3: sfh status exits 4 for a stuck run" 4 $?
+contains "F3: sfh status prints the stuck state" "stuck" f3b-status.out
+"$SFH" wait "$F3B_DIR" --timeout 5 > f3b-wait.out 2> f3b-wait.err
+check "F3: sfh wait exits 4 for a stuck run" 4 $?
+"$SFH" runs show "$F3B_DIR" > f3b-show.out 2>&1
+contains "F3: runs show reports the run as stuck" "stuck" f3b-show.out
+
+# The partial emit is the failure path's, not the success path's: a stuck run
+# has produced real work and the caller needs it.
+"$SFH" run f3-basic.yaml --runs-dir f3np-runs --no-partial-emit -q > f3np.out 2> f3np.err
+check "F3: --no-partial-emit still exits 4" 4 $?
+if [ -s f3np.out ]; then
+  echo "FAIL - F3: --no-partial-emit still printed a partial result"
+  sed -n '1,10p' f3np.out
+  fail=$((fail + 1))
+else
+  echo "ok   - F3: --no-partial-emit suppresses the stuck partial emit"
+  pass=$((pass + 1))
+fi
+
+cat > f3-onerror.yaml <<'YAML'
+name: f3-onerror
+steps:
+  - id: attempt
+    cmd: ["sh", "-c", "printf 'HALF-DONE\n'; exit 3"]
+    on_error: goto:stuck
+YAML
+"$SFH" run f3-onerror.yaml --runs-dir f3oe-runs -q > f3oe.out 2> f3oe.err
+check "F3: on_error goto:stuck ends the run with exit 4" 4 $?
+F3OE_DIR="$(dirname "$(find f3oe-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F3: the on_error stuck is recorded as such" '"via":"on_error"' "$F3OE_DIR/log.jsonl"
+
+# `stuck` is a reserved goto target, so it cannot also be a step id - the same
+# case-insensitive rule the duplicate-id check uses.
+cat > f3-reserved.yaml <<'YAML'
+name: f3-reserved
+steps:
+  - id: stuck
+    cmd: ["echo", "x"]
+YAML
+"$SFH" validate f3-reserved.yaml > f3res.out 2> f3res.err
+check "F3: a step id 'stuck' is refused" 2 $?
+contains "F3: the refusal says the id is reserved" "reserved" f3res.err
+cat > f3-reserved-upper.yaml <<'YAML'
+name: f3-reserved-upper
+steps:
+  - id: STUCK
+    cmd: ["echo", "x"]
+YAML
+"$SFH" validate f3-reserved-upper.yaml > f3resu.out 2> f3resu.err
+check "F3: a step id 'STUCK' is refused too (ids compare ignoring case)" 2 $?
+
+# A run dir is attacker-writable on a forged report, so a bare `state: stuck`
+# gets exactly the authentication `failed` gets - no more trust for being new.
+mkdir -p f3-forged
+cat > f3-forged/status.json <<'JSON'
+{
+  "state": "stuck",
+  "current_step": "judge",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 1,
+  "cost_usd": 0.0,
+  "run_dir": "f3-forged",
+  "flow": "x.yaml",
+  "pid": 99999,
+  "sfh_version": "1.0.0",
+  "exit_code": 0,
+  "emit_step": null,
+  "emit_file": null,
+  "error": null,
+  "unfinished_step": null,
+  "nonce": "forged-nonce"
+}
+JSON
+"$SFH" status f3-forged > f3f-status.out 2> f3f-status.err
+check "F3: sfh status does not report a forged stuck as fact" 1 $?
+contains "F3: the status refusal names the nonce problem" "nonce" f3f-status.err
+"$SFH" wait f3-forged --timeout 5 > f3f-wait.out 2> f3f-wait.err
+check "F3: sfh wait does not report a forged stuck as fact" 1 $?
+contains "F3: the wait refusal names the nonce problem" "nonce" f3f-wait.err
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

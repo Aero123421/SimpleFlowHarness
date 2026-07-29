@@ -104,8 +104,8 @@ status / wait / stop options:
   status [run-dir] [--runs-dir d] [--json]
   wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
   stop   [run-dir] [--runs-dir d]
-  status exit code: 0=完了 / 1=失敗・死亡・中止 / 2=判定不能 / 3=実行中
-  wait はフロー自身の終了コードを返す(--timeout 到達時のみ 3)。
+  status exit code: 0=完了 / 1=失敗・死亡・中止 / 2=判定不能 / 3=実行中 / 4=stuck
+  wait はフロー自身の終了コードを返す(0/1/4。--timeout 到達時のみ 3)。
   **wait のタイムアウトは実行をキャンセルしない**(止めたいなら sfh stop)
 
 doctor options:
@@ -121,10 +121,10 @@ runs options:
   runs show <run-dir> [--json]                          ステップ別の終了・訪問・反復・コスト
   runs clean [--older-than 30d] [--keep 5] [--dry-run]  古いrun dirを削除
 
-exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー
+exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー / 4=stuck(人間待ち)
 ```
 
-失敗しても**その時点で最後に成功したステップの出力はstdoutに出る**(`--no-partial-emit`で抑制可)。呼び出し元エージェントが「何が取れて何が残っているか」を判断できるようにするため。
+失敗しても**その時点で最後に成功したステップの出力はstdoutに出る**(`--no-partial-emit`で抑制可)。呼び出し元エージェントが「何が取れて何が残っているか」を判断できるようにするため。exit 4(stuck)でも同じ部分出力が出る。
 
 ## フローファイル全体像
 
@@ -190,7 +190,7 @@ steps:
         goto: plan
       - when_matches: "(?i)verdict:\\s*ok"           # 全文を正規表現
         goto: exec
-      - goto: end            # end=成功終了 / fail=失敗終了 / <step-id>
+      - goto: end            # end=成功終了(0) / fail=失敗終了(1) / stuck=人間待ち(4) / <step-id>
 ```
 
 判定に使うテキストは**compact前**かつ**集約ヘッダ(`--- id ---`)を含まない**ので、要約やsfhのラベルで誤爆しない。`when_last_line_contains` はレビュアーが本文中で「VERDICT: REVISEと書くべきか迷った」と述べても反応しないので、差し戻し判定はこちらを推奨。
@@ -343,6 +343,44 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 - **フォールバック**: `fallback: [profile_a, profile_b]` — リトライ後も落ちたら別プロファイル(別プロバイダ・別モデルでも可)で再挑戦
 - **差し戻しループの降格**: `on_max_visits: goto:summarize` — 3回REVISEされたら諦めて要約に進む、が書ける(既定はフロー失敗)
 
+### 第3の終端: `goto: stuck`(exit 4 = 作業は残っているが人間待ち)
+
+「**作業は保存されているが、人間の判断なしに先へ進んではいけない**」を機械可読にする終端。`end`(exit 0)/`fail`(exit 1)と同格の予約 goto 先で、`route[].goto` / `on_error: goto:stuck` / `on_max_visits: goto:stuck` のどこでも書ける。
+
+```yaml
+  - id: verdict
+    prompt: "…最終行に RESOLVED か UNRESOLVED だけを書け"
+    route:
+      - when_last_line_is: "RESOLVED"
+        goto: wrap
+      - goto: stuck          # 収束しなかった。作業は run dir に残っている
+  - id: fixer
+    max_visits: 3
+    on_max_visits: goto:stuck    # 3周しても直らないなら人間に返す
+```
+
+これまでこの状況は `goto: end`(=成功と同じ顔)か、「最終行 UNRESOLVED を呼び出し元が grep する」という文字列規約で書くしかなかった。前者は非収束を成功と誤報し、後者は sfh が v1 で潰してきた fail-open と同型なので、終端そのものを増やしてある。
+
+**sfh の判断は一切増えない。** ユーザーが `goto: stuck` と宣言した所に到達したときだけ起きる。
+
+| 見え方 | 値 |
+|---|---|
+| `sfh run` の exit code | **4** |
+| `status.json` | `"state": "stuck"`, `"exit_code": 4`, `"error": "routed to stuck after '<step>'"` |
+| `sfh status` / `sfh wait` の exit code | **4**(`sfh wait` は部分出力も stdout に出す) |
+| `runs list` / `runs show` の STATUS | `stuck` |
+| stdout | 失敗時と同じ部分出力(`--no-partial-emit` で抑制可) |
+| `log.jsonl` | 通常の `position` イベント(`"next":"stuck"`、`via` は rule / catch_all / on_error / max_visits) |
+
+偽装された `status.json` の `state: "stuck"` は `failed` と同じ nonce 検査を通らないと報告されない(新しい状態名だからといって信用度は上がらない)。
+
+**再開できる。** stuck した run は `completed` 扱いにしないので、そのまま `--resume` できる:
+
+- **route 経由**: 再開開始点は stuck へ分岐した**そのステップ**で、**再実行**される(visit +1、通常どおり `max_visits` 検査に服す)。記録済みの判定テキストを再生する道は取らない — 同じテキストを再評価すれば必ず同じ stuck に戻るだけだから。人間が「何に詰まっていたか」を直してから再開すれば、今度は別の枝へ進む。
+- **on_max_visits 経由**: 再開すると入場時の visit 検査に再び引っかかり、**即座にまた stuck になる**。これは仕様。visit カウンタを黙ってリセットするほうが嘘になる。正しい道はフローの `max_visits` を直して `--force-resume` すること。
+
+> **破壊的変更**: ステップ id `stuck`(**大文字小文字を無視**して比較。id の重複検査と同じ規則)は予約語になり、`sfh validate` が明示エラーで拒否する。既存フローに `stuck` という id があれば改名が必要 — ただし黙って挙動が変わるのではなく、validate が大声で落ちる。
+
 ### 投げっぱなし実行: `--detach`(親の寿命から切り離す)
 
 呼び出し元のAIエージェントは、シェルツールのタイムアウトやセッション終了で数十分後には落ちる。フォアグラウンドで待たせているとそこで巻き添えになるので、`--detach` で**親のジョブオブジェクト(Windows)/セッション(Unix)の外**へ実行を追い出せる:
@@ -355,7 +393,7 @@ RUN=$(sfh run research.yaml --var topic="..." --detach)
 以降は好きなタイミングで問い合わせる:
 
 ```bash
-sfh status "$RUN"          # running / done / failed / dead / stopped
+sfh status "$RUN"          # running / done / failed / stuck / dead / stopped
 sfh status "$RUN" --json   # 同じ内容を機械可読で(親エージェント向け)
 sfh wait   "$RUN"          # 終了まで待ち、フォアグラウンド実行と同じ結果をstdoutへ
 sfh stop   "$RUN"          # 中止。起動済みの子AIごと殺す
@@ -596,6 +634,8 @@ sfhは子プロセスのstdinを端末へ直結しない。次はrun固有の回
 ```
 
 表示内容は `stdin: prompt` でコマンドへ渡り、`<run-dir>/approve.err.txt` に残る。人間は確認後に `<run-dir>/approval.txt` を作る。期限は `timeout_sec`、期限切れの方針は `on_error`、回答ファイルの内容は `approve` のchain outputとして後段へ渡る。GUI・チケット・チャット承認を使う場合も、同じstdin/stdout契約のコマンドへ差し替えればよい。
+
+期限切れ側を `on_error: goto:stuck` にすると、「承認されないまま終わった」を exit 4 で呼び出し元に申告できる(成功でも失敗でもない、という事実そのものを返す)。
 
 ### ケース行列
 

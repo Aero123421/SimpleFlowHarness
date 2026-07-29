@@ -19,7 +19,7 @@ const STALE_SEC: u64 = 60;
 
 pub struct Snapshot {
     pub dir: PathBuf,
-    /// Resolved state: running | done | failed | dead | unknown.
+    /// Resolved state: running | done | failed | stuck | dead | unknown.
     pub state: &'static str,
     pub reason: Option<String>,
     pub step: String,
@@ -46,16 +46,23 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// "stuck" belongs here: the run is over and will not move on its own. It
+    /// is listed with the other terminals rather than beside "running" so that
+    /// every check guarding a terminal report (above all the nonce
+    /// authentication) covers it too. A forged `state: "stuck"` gets no more
+    /// trust for being the newest state name.
     pub fn terminal(&self) -> bool {
-        matches!(self.state, "done" | "failed" | "dead" | "stopped")
+        matches!(self.state, "done" | "failed" | "stuck" | "dead" | "stopped")
     }
 
-    /// 0 = done, 1 = failed / dead / stopped, 3 = still running, 2 = cannot tell.
+    /// 0 = done, 1 = failed / dead / stopped, 3 = still running, 2 = cannot
+    /// tell, 4 = stuck (the flow reached a `goto: stuck` and wants a human).
     pub fn exit(&self) -> i32 {
         match self.state {
             "done" => 0,
             "failed" | "dead" | "stopped" => 1,
             "running" => 3,
+            "stuck" => 4,
             _ => 2,
         }
     }
@@ -170,6 +177,7 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
     let state = match raw.as_str() {
         "done" => "done",
         "failed" => "failed",
+        "stuck" => "stuck",
         "stopped" => "stopped",
         "running" => {
             if !pid_valid {
@@ -338,7 +346,7 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 snap.step, snap.heartbeat_age_sec
             ),
         },
-        "failed" => snap.error.clone().unwrap_or_default(),
+        "failed" | "stuck" => snap.error.clone().unwrap_or_default(),
         _ => snap.reason.clone().unwrap_or_default(),
     };
     println!(
@@ -357,6 +365,13 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         ),
         "done" => eprintln!(
             "sfh: result: sfh wait {}",
+            execute::shell_quote(&snap.dir.display().to_string())
+        ),
+        // A stuck run is finished but not done with: the work is saved and
+        // waiting on a human, so say how to pick it up again.
+        "stuck" => eprintln!(
+            "sfh: this run stopped for a human decision. after fixing what it is stuck on: sfh run {} --resume {}",
+            flow_arg(&snap.flow),
             execute::shell_quote(&snap.dir.display().to_string())
         ),
         "stopped" | "dead" => eprintln!(
@@ -713,6 +728,23 @@ pub fn wait(
                     }
                     eprintln!("sfh: run dir: {}", snap.dir.display());
                 }
+                // Same shape as "failed": the caller gets the partial result,
+                // because a stuck run has produced real work and the point of
+                // the exit code is to say who has to look at it next.
+                "stuck" => {
+                    eprintln!(
+                        "sfh: FLOW STUCK: {}",
+                        snap.error.as_deref().unwrap_or("(no reason recorded)")
+                    );
+                    if let Err(e) = print_result(&snap) {
+                        eprintln!("sfh: {e}");
+                        return 1;
+                    }
+                    eprintln!(
+                        "sfh: run dir: {} - resume it once a human has decided",
+                        snap.dir.display()
+                    );
+                }
                 _ => {
                     eprintln!(
                         "sfh: run did not finish ({}). resume with: sfh run {} --resume {}",
@@ -726,11 +758,15 @@ pub fn wait(
                 }
             }
             // The recorded exit code is honoured ONLY for a nonce-authenticated
-            // "done". failed/dead/stopped always exit 1, whatever status.json
-            // claims: exit_code:0 next to a non-done state used to return 0,
-            // laundering a forged "stopped" into success (rev_break #10). For
-            // "done", anything that does not fit an i32 is treated as a failure
-            // (an unchecked `as i32` wrapped 4294967296 to 0 - rev_break #7).
+            // "done". failed/dead/stopped always exit 1 and stuck always exits
+            // 4, whatever status.json claims: exit_code:0 next to a non-done
+            // state used to return 0, laundering a forged "stopped" into
+            // success (rev_break #10), and a forged "stuck" must not be able to
+            // launder itself the same way. The state IS the exit code for those
+            // - a real stuck run records 4 - so nothing is lost by deriving it.
+            // For "done", anything that does not fit an i32 is treated as a
+            // failure (an unchecked `as i32` wrapped 4294967296 to 0 -
+            // rev_break #7).
             return match snap.state {
                 "done" => snap
                     .exit_code

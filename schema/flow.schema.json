@@ -48,8 +48,8 @@
     },
     "action": {
       "type": "string",
-      "pattern": "^(fail|continue|goto:[A-Za-z0-9_-]+|goto:end|goto:fail)$",
-      "description": "fail | continue | goto:<step-id> | goto:end | goto:fail"
+      "pattern": "^(fail|continue|goto:[A-Za-z0-9_-]+|goto:end|goto:fail|goto:stuck)$",
+      "description": "fail | continue | goto:<step-id> | goto:end | goto:fail | goto:stuck"
     },
     "retry": {
       "type": "object",
@@ -116,7 +116,7 @@
         "when_last_line_contains": { "type": "string", "description": "Deterministic verdict trailer check." },
         "when_last_line_is": { "type": "string", "description": "Exact match against the trimmed last non-empty line." },
         "when_last_line_matches": { "type": "string" },
-        "goto": { "type": "string", "description": "step id | end | fail" }
+        "goto": { "type": "string", "description": "step id | end (exit 0) | fail (exit 1) | stuck (exit 4: work saved, needs a human)" }
       }
     },
     "compact": {
@@ -150,7 +150,12 @@
       "required": ["id"],
       "additionalProperties": false,
       "properties": {
-        "id": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "not": { "pattern": "^[Ss][Tt][Uu][Cc][Kk]$" },
+          "description": "Unique ignoring case. 'stuck' is reserved: it is a goto terminal (exit 4), not a step."
+        },
         "use": { "type": "string", "description": "Profile name." },
         "tool": { "$ref": "#/definitions/tool" },
         "bin": { "type": "string" },

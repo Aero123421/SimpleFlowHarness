@@ -304,6 +304,21 @@ fn effort_vocab_warning(tool: &str, e: &str) -> Option<String> {
     }
 }
 
+/// How a flow body finished when it did not error out.
+///
+/// `Stuck` is the third terminal: the run did the work it could and a step the
+/// user marked `goto: stuck` was reached, so the result is neither a success
+/// (exit 0 would tell a parent agent to move on) nor a failure (exit 1 would
+/// say the plumbing broke). It exits 4, keeps the partial output a failure
+/// would emit, and stays resumable.
+enum FlowEnd {
+    Completed,
+    /// The step whose routing decision landed on `stuck`.
+    Stuck {
+        after: String,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Run state that survives a crash: everything needed by --resume.
 // ---------------------------------------------------------------------------
@@ -761,6 +776,22 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 if next == "end" || next == "fail" {
                     st.completed = true;
                     st.start = None;
+                } else if next == "stuck" {
+                    // A stuck run is NOT completed - the whole point is that a
+                    // human looks at it and resumes. It resumes by re-running
+                    // the step that made the decision, which is why the pending
+                    // route is left cleared above: replaying the recorded
+                    // verdict would evaluate the same text and route straight
+                    // back to stuck, for ever. Re-running gives the step a new
+                    // visit under the usual max_visits check.
+                    //
+                    // Reached through on_max_visits instead, that same restart
+                    // walks back into the exhausted node and sticks again on
+                    // entry. That is the honest answer: resetting the visit
+                    // counter here would quietly undo the limit the flow set.
+                    // The way out is to fix max_visits and --force-resume.
+                    st.completed = false;
+                    st.start = v.get("after").and_then(|x| x.as_str()).map(String::from);
                 } else {
                     st.completed = false;
                     // Routing INTO a fan-out is the flow asking for a fresh lap
@@ -1752,7 +1783,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .wall_clock_sec
         .map(|s| Instant::now() + Duration::from_secs(s));
 
-    let result: Result<(), String> = (|| {
+    let result: Result<FlowEnd, String> = (|| {
         if let Some(pending) = pending_route {
             let completed_idx = *index_of.get(&pending.step).ok_or_else(|| {
                 format!(
@@ -1803,16 +1834,22 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     );
                     cur = completed_idx + 1;
                     if cur >= n_steps {
-                        return Ok(());
+                        return Ok(FlowEnd::Completed);
                     }
                 }
                 Some(("end", hit)) => {
                     log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
-                    return Ok(());
+                    return Ok(FlowEnd::Completed);
                 }
                 Some(("fail", hit)) => {
                     log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
                     return Err(format!("step '{}' routed to fail", step.id));
+                }
+                Some(("stuck", hit)) => {
+                    log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit));
+                    return Ok(FlowEnd::Stuck {
+                        after: step.id.clone(),
+                    });
                 }
                 Some((id, hit)) => {
                     if !opts.quiet {
@@ -1875,7 +1912,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         );
                         cur += 1;
                         if cur >= n_steps {
-                            return Ok(());
+                            return Ok(FlowEnd::Completed);
                         }
                         continue;
                     }
@@ -1888,7 +1925,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 PositionVia::MaxVisits,
                                 None,
                             );
-                            return Ok(());
+                            return Ok(FlowEnd::Completed);
                         }
                         "fail" => {
                             log_position(
@@ -1899,6 +1936,18 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 None,
                             );
                             return Err(format!("step '{}' exhausted max_visits ({max_v})", step.id));
+                        }
+                        "stuck" => {
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "stuck".into(),
+                                PositionVia::MaxVisits,
+                                None,
+                            );
+                            return Ok(FlowEnd::Stuck {
+                                after: step.id.clone(),
+                            });
                         }
                         id => {
                             log_position(
@@ -2575,7 +2624,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 PositionVia::OnError,
                                 None,
                             );
-                            return Ok(());
+                            return Ok(FlowEnd::Completed);
                         }
                         "fail" => {
                             log_position(
@@ -2589,6 +2638,18 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 "step '{}' failed and on_error routed to fail",
                                 step.id
                             ));
+                        }
+                        "stuck" => {
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "stuck".into(),
+                                PositionVia::OnError,
+                                None,
+                            );
+                            return Ok(FlowEnd::Stuck {
+                                after: step.id.clone(),
+                            });
                         }
                         id => match index_of.get(id) {
                             Some(i) => {
@@ -2644,16 +2705,22 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     );
                     cur += 1;
                     if cur >= n_steps {
-                        return Ok(());
+                        return Ok(FlowEnd::Completed);
                     }
                 }
                 Some(("end", hit)) => {
                     log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
-                    return Ok(());
+                    return Ok(FlowEnd::Completed);
                 }
                 Some(("fail", hit)) => {
                     log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
                     return Err(format!("step '{}' routed to fail", step.id));
+                }
+                Some(("stuck", hit)) => {
+                    log_position(&mut log, &step.id, "stuck".into(), hit.via, Some(hit));
+                    return Ok(FlowEnd::Stuck {
+                        after: step.id.clone(),
+                    });
                 }
                 Some((id, hit)) => {
                     if !opts.quiet {
@@ -2681,6 +2748,26 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             g.error = err.map(String::from);
             write_status(&status_path, &g);
         };
+    // The output a caller gets when the run did NOT succeed. Computed once,
+    // before the match, because `stuck` hands back exactly what a failure hands
+    // back: work was done, the caller needs it, and only --no-partial-emit says
+    // otherwise. Cloned rather than moved so the success arm can still consume
+    // `last_success` for its own (stricter) emit choice.
+    let partial_pick: Option<String> = if opts.no_partial_emit {
+        None
+    } else {
+        let nonempty = |id: &String| {
+            outputs
+                .get(id)
+                .map(|o| !o.output.trim().is_empty())
+                .unwrap_or(false)
+        };
+        opts.emit
+            .clone()
+            .filter(&nonempty)
+            .or_else(|| last_success.clone().filter(&nonempty))
+            .or_else(|| last_executed.clone().filter(&nonempty))
+    };
     let mut meta_final = meta.clone();
     if let Some(m) = meta_final.as_object_mut() {
         m.insert("finished_utc".into(), json!(utc_stamp()));
@@ -2688,7 +2775,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         m.insert("cost_usd".into(), json!(cost_usd));
         m.insert(
             "status".into(),
-            json!(if result.is_ok() { "ok" } else { "failed" }),
+            json!(match &result {
+                Ok(FlowEnd::Completed) => "ok",
+                Ok(FlowEnd::Stuck { .. }) => "stuck",
+                Err(_) => "failed",
+            }),
         );
     }
     let _ = contain::write_private(
@@ -2696,8 +2787,39 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         serde_json::to_string_pretty(&meta_final).unwrap_or_default(),
     );
 
+    // Shared by the two terminals a caller can pick up again. Paths are quoted
+    // (flow names may carry spaces since R-6, and so may the runs dir) and this
+    // attempt's --var overrides are repeated, so the printed command works when
+    // pasted back even on a resume that predates meta.json var restoration.
+    let print_resume_hint = || {
+        let mut var_args = String::new();
+        for (k, v) in &opts.vars {
+            var_args.push_str(&format!(
+                " --var {}",
+                execute::shell_quote(&format!("{k}={v}"))
+            ));
+        }
+        eprintln!(
+            "sfh: resume with: sfh run {}{var_args} --resume {}",
+            execute::shell_quote(&opts.flow_path.display().to_string()),
+            execute::shell_quote(&run_dir.display().to_string())
+        );
+    };
+    // Whatever finished work exists, handed back the way a failure hands it
+    // back - a run the caller has to act on is exactly when it is needed.
+    let emit_partial = |pick: &Option<String>| {
+        if let Some(id) = pick {
+            if let Some(o) = outputs.get(id) {
+                if !o.output.trim().is_empty() {
+                    eprintln!("sfh: emitting partial result from step '{id}'");
+                    print_emit(&o.output, max_emit, chain_files.get(id));
+                }
+            }
+        }
+    };
+
     match result {
-        Ok(()) => {
+        Ok(FlowEnd::Completed) => {
             log_event(
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
@@ -2729,55 +2851,36 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
             Ok(0)
         }
+        // The third terminal. Not a failure - nothing broke, and the run dir is
+        // a coherent stopping point - but not a success either: something the
+        // flow declared as needing a human was reached, and a parent agent that
+        // read exit 0 would carry on as if the work were finished.
+        Ok(FlowEnd::Stuck { after }) => {
+            let msg = format!("routed to stuck after '{after}'");
+            log_event(
+                &mut log,
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd}),
+            );
+            eprintln!("sfh: FLOW STUCK: {msg}");
+            // Emit before the status goes terminal, for the same reason the
+            // success path does: `sfh wait` reads a terminal status.json as
+            // "the output is ready".
+            emit_partial(&partial_pick);
+            finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg));
+            eprintln!("sfh: run dir: {}", run_dir.display());
+            print_resume_hint();
+            Ok(4)
+        }
         Err(msg) => {
             log_event(
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
             );
             eprintln!("sfh: FLOW FAILED: {msg}");
-            // Hand the caller whatever finished work exists - a failed run is
-            // exactly when the parent agent most needs something to act on.
-            let pick = if opts.no_partial_emit {
-                None
-            } else {
-                let nonempty = |id: &String| {
-                    outputs
-                        .get(id)
-                        .map(|o| !o.output.trim().is_empty())
-                        .unwrap_or(false)
-                };
-                opts.emit
-                    .clone()
-                    .filter(&nonempty)
-                    .or_else(|| last_success.filter(&nonempty))
-                    .or_else(|| last_executed.filter(&nonempty))
-            };
-            if let Some(id) = &pick {
-                if let Some(o) = outputs.get(id) {
-                    if !o.output.trim().is_empty() {
-                        eprintln!("sfh: emitting partial result from step '{id}'");
-                        print_emit(&o.output, max_emit, chain_files.get(id));
-                    }
-                }
-            }
-            finish("failed", cost_usd, 1, pick.as_deref(), Some(&msg));
+            emit_partial(&partial_pick);
+            finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg));
             eprintln!("sfh: run dir: {}", run_dir.display());
-            // Paths are quoted (flow names may carry spaces since R-6, and so
-            // may the runs dir) and this attempt's --var overrides are
-            // repeated, so the printed command works when pasted back even on
-            // a resume that predates meta.json var restoration.
-            let mut var_args = String::new();
-            for (k, v) in &opts.vars {
-                var_args.push_str(&format!(
-                    " --var {}",
-                    execute::shell_quote(&format!("{k}={v}"))
-                ));
-            }
-            eprintln!(
-                "sfh: resume with: sfh run {}{var_args} --resume {}",
-                execute::shell_quote(&opts.flow_path.display().to_string()),
-                execute::shell_quote(&run_dir.display().to_string())
-            );
+            print_resume_hint();
             Ok(1)
         }
     }
