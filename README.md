@@ -190,6 +190,9 @@ steps:
         goto: plan
       - when_matches: "(?i)verdict:\\s*ok"           # 全文を正規表現
         goto: exec
+      - when_exit: 3                                # このステップ自身の正規化exitと等値比較
+        when_stderr_matches: "refusing to"          # <id>.err.txt への正規表現(欠落なら不成立)
+        goto: guard_fired                           # 同じ規則内の条件はANDで結合
       - goto: end            # end=成功終了(0) / fail=失敗終了(1) / stuck=人間待ち(4) / <step-id>
 ```
 
@@ -588,6 +591,49 @@ steps:
 
 `EXIT=$?` を最終行へ出す手法は、`stderr_file` が無かった時代の回避策としてのみ残る。
 
+### 「正しい理由で落ちた」ゲート: `when_exit` / `when_stderr_matches`
+
+`on_error: continue` の `cmd:` ステップは「落ちた」ところまでしか教えてくれない。
+**ガードが効いたのか、別の理由で落ちたのか**を区別するのが `when_exit` である。
+
+```yaml
+  - id: probe
+    cmd: ["sfh", "run", "attack-fixture.yaml", "-q"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: broken}          # 攻撃が通った = ガードが消えている
+      - {when_stderr_matches: "refusing to resume|no recorded access level", goto: guard_fired}
+      - {goto: broken}                        # 別の理由で落ちた = 検証不成立
+```
+
+- `when_exit` は**そのステップ自身の正規化 exit**(`{{steps.<id>.exit}}` と同じ数)との等値比較。
+  「非ゼロならOK」ではないので、fixture が構文エラーやパス間違いで落ちた回を合格に数えない。
+  攻撃 fixture の検証で「別の理由の非ゼロ」を合格として通してしまった実害が 3 件あり、この述語はその対処である。
+- `when_stderr_matches` は `<id>.err.txt`(クリーン済み stderr)への正規表現。
+  live でも resume でも**ファイルを読む**ので両者が食い違わない。読み取りは先頭 4 MB まで。
+  **ファイルが無い場合は不成立**(手で消した run ディレクトリを resume した等)。証拠の欠落は合格にしない。
+- どちらも既存述語と AND で併用できる(1 つの規則に書いた条件は全て満たす必要がある)。
+- resume での再評価は live と一致する。`exit` も `stderr_file` も `step_end` から復元済みなので、
+  この 2 述語のために追加で永続化するものは無い。
+
+**fan-out グループ(`parallel:` / `foreach:`)には自前の exit が無い。** `when_exit` が見るのは
+sfh が記録する合成値で、**グループが hard-fail したら 1、それ以外は 0** である(子の 9 や 127 は見えない)。
+hard-fail の判定は両者で違うので注意する:
+
+| 形 | 合成 exit が 1 になる条件 |
+|---|---|
+| `parallel:` | `on_error: continue` を**持たない子**が 1 つでも落ちた |
+| `foreach:` | 1 件でも落ちた。ただしグループ側に `on_error: continue` があれば常に 0 |
+
+`foreach:` に `on_error: continue` を書くと合成 exit は永久に 0 になるので、そこでは `when_exit` ではなく
+出力本文(`when_contains` 等)で判定すること。グループには stderr ファイルが無いため、
+`when_stderr_matches` はグループステップでは常に不成立になる。
+
+**AI ステップの exit は意味が濁る。** sfh は in-band の失敗申告(agy の `status` 等)、
+空の最終メッセージ、セッションの実在検証といったものを exit へ畳み込む。
+`when_exit` は書けるし validate も警告しないが、`when_exit: 1` は「モデルが失敗と言った」の意味にはならない。
+AI ステップの判定は最終行の判定文字列(`when_last_line_is`)で行うこと。
+
 ### 改竄トリップワイヤ
 
 追跡済みファイルはGitのindexを基準に、宣言したパスだけを比較する。
@@ -754,7 +800,7 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 | キー | 内容 |
 |---|---|
 | `rule` | 一致した規則の `route:` 内での 0 始まり番号 |
-| `route_line` | その規則が実際に照合したテキスト。最終行系述語(`when_last_line_*`)と catch-all は**最終非空行**、全文系(`when_contains` / `when_matches`)は**判定テキストの先頭**。いずれも 200 文字で機械的に切る |
+| `route_line` | その規則が実際に照合したテキスト。最終行系述語(`when_last_line_*`)と catch-all は**最終非空行**、全文系(`when_contains` / `when_matches`)は**判定テキストの先頭**。いずれも 200 文字で機械的に切る。`when_exit` / `when_stderr_matches` は判定テキストを見ないので、catch-all と同じく最終非空行が入る(判定した値そのものではない — exit は `step_end` の `exit`、stderr は `<id>.err.txt` を見ること) |
 
 `via` が `fallthrough` / `on_error` / `max_visits` の position は規則を見ていないので、
 この 2 キーは付かない(「どの規則か」を騙らないため)。
@@ -805,8 +851,8 @@ grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next
 ## 開発
 
 ```bash
-cargo test                              # 126本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト352本
+cargo test                              # 131本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト375本
 ```
 
 挙動テストは冒頭で `tests/stub/session_stub.rs` を `rustc` で1回ビルドする。

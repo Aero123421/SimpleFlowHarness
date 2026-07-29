@@ -2991,6 +2991,222 @@ contains "F3: the status refusal names the nonce problem" "nonce" f3f-status.err
 check "F3: sfh wait does not report a forged stuck as fact" 1 $?
 contains "F3: the wait refusal names the nonce problem" "nonce" f3f-wait.err
 
+# --- F6: when_exit routes on the step's own normalized exit code -------------
+# The gate an `on_error: continue` probe needs: "it failed, and it failed for
+# THE reason I am testing for". Written before the implementation because the
+# resume half re-evaluates a recorded route (see the f6res blocks below).
+cat > f6exit.yaml <<'YAML'
+name: f6exit
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'HALF-DONE\n'; exit 3"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: leaked}
+      - {when_exit: 3, goto: expected}
+      - {goto: other}
+  - id: leaked
+    cmd: ["echo", "F6-LEAKED"]
+    route:
+      - {goto: fail}
+  - id: expected
+    cmd: ["echo", "F6-EXPECTED"]
+    route:
+      - {goto: end}
+  - id: other
+    cmd: ["echo", "F6-OTHER"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6exit.yaml --runs-dir f6exit-runs -q > f6exit.out 2> f6exit.err
+check "F6: a step that exits 3 takes the when_exit: 3 branch" 0 $?
+contains "F6: the when_exit branch actually ran" "F6-EXPECTED" f6exit.out
+F6EXIT_LOG="$(find f6exit-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"event":"position"' "$F6EXIT_LOG" | grep -F '"after":"probe"' |
+  grep -qF '"via":"rule"'; then
+  echo "ok   - F6: a when_exit-only rule logs as a rule, not a catch-all"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F6: a when_exit-only rule was not recorded as a rule"
+  grep -F '"event":"position"' "$F6EXIT_LOG"
+  fail=$((fail + 1))
+fi
+contains "F6: the position names the when_exit rule that fired" '"rule":1' "$F6EXIT_LOG"
+
+# The probe idiom from the spec: exit 0 means the attack fixture ran to
+# completion, i.e. the guard under test is GONE. A plain "did it fail" check
+# passes here; when_exit: 0 is what catches it.
+cat > f6probe.yaml <<'YAML'
+name: f6probe
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'attack fixture completed\n'"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: broken}
+      - {when_stderr_matches: "refusing to resume|no recorded access level", goto: guard_fired}
+      - {goto: broken}
+  - id: guard_fired
+    cmd: ["echo", "F6-GUARD-HELD"]
+    route:
+      - {goto: end}
+  - id: broken
+    cmd: ["echo", "F6-GUARD-GONE"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6probe.yaml --runs-dir f6probe-runs -q > f6probe.out 2> f6probe.err
+check "F6: a probe that exits 0 is caught as 'the guard is gone'" 1 $?
+contains "F6: the probe routed to the broken branch" "F6-GUARD-GONE" f6probe.out
+
+# The same probe, this time refused by the guard: the exit is non-zero AND the
+# refusal message is on stderr, so the verification is the one that counts.
+cat > f6err.yaml <<'YAML'
+name: f6err
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'sfh: refusing to resume: no recorded access level\n' >&2; exit 3"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: broken}
+      - {when_exit: 3, when_stderr_matches: "refusing to resume|no recorded access level", goto: guard_fired}
+      - {goto: broken}
+  - id: guard_fired
+    cmd: ["echo", "F6-GUARD-HELD"]
+    route:
+      - {goto: end}
+  - id: broken
+    cmd: ["echo", "F6-GUARD-GONE"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6err.yaml --runs-dir f6err-runs -q > f6err.out 2> f6err.err
+check "F6: when_exit AND when_stderr_matches accept the right failure" 0 $?
+contains "F6: the stderr-verified branch ran" "F6-GUARD-HELD" f6err.out
+
+# Same refusal text, different exit: the AND must refuse it. This is the case
+# the "count any non-zero as proof" habit gets wrong.
+cat > f6and.yaml <<'YAML'
+name: f6and
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'sfh: refusing to resume: no recorded access level\n' >&2; exit 9"]
+    on_error: continue
+    route:
+      - {when_exit: 3, when_stderr_matches: "refusing to resume", goto: guard_fired}
+      - {goto: broken}
+  - id: guard_fired
+    cmd: ["echo", "F6-GUARD-HELD"]
+    route:
+      - {goto: end}
+  - id: broken
+    cmd: ["echo", "F6-WRONG-REASON"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6and.yaml --runs-dir f6and-runs -q > f6and.out 2> f6and.err
+check "F6: a matching stderr with the wrong exit does not satisfy the AND" 1 $?
+contains "F6: the wrong-reason failure was not counted as proof" "F6-WRONG-REASON" f6and.out
+
+# A group has no exit code of its own, so when_exit sees the composite sfh
+# records: 1 when the group hard-failed, 0 otherwise - never a child's 9.
+cat > f6group.yaml <<'YAML'
+name: f6group
+steps:
+  - id: fan
+    on_error: continue
+    parallel:
+      - {id: g_ok, cmd: ["echo", "OK"]}
+      - {id: g_bad, cmd: ["sh", "-c", "printf BAD; exit 9"]}
+    route:
+      - {when_exit: 9, goto: raw}
+      - {when_exit: 1, goto: dirty}
+      - {goto: clean}
+  - id: raw
+    cmd: ["echo", "F6-GROUP-RAW"]
+    route:
+      - {goto: fail}
+  - id: dirty
+    cmd: ["echo", "F6-GROUP-DIRTY"]
+    route:
+      - {goto: end}
+  - id: clean
+    cmd: ["echo", "F6-GROUP-CLEAN"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6group.yaml --runs-dir f6group-runs -q > f6group.out 2> f6group.err
+check "F6: a fan-out group routes on its composite exit" 0 $?
+contains "F6: the group's when_exit saw 1, not the child's 9" "F6-GROUP-DIRTY" f6group.out
+
+# --- F6: resume re-evaluates when_exit / when_stderr_matches the same way ----
+# Both predicates read state that step_end already restores (the normalized exit
+# and the contained stderr path), so nothing new is persisted and a resume that
+# re-runs the recorded route has to pick the same branch.
+cat > f6res.yaml <<'YAML'
+name: f6res
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'sfh: refusing to resume: no recorded access level\n' >&2; printf 'PROBE-DONE\n'"]
+    route:
+      - {when_exit: 0, when_stderr_matches: "refusing to resume", goto: verified}
+      - {goto: inconclusive}
+  - id: verified
+    cmd: ["echo", "F6-VERIFIED"]
+    route:
+      - {goto: end}
+  - id: inconclusive
+    cmd: ["echo", "F6-INCONCLUSIVE"]
+    route:
+      - {goto: end}
+YAML
+"$SFH" run f6res.yaml --runs-dir f6res-runs -q > f6res-live.out 2> f6res-live.err
+check "F6: the stderr-gated flow runs live" 0 $?
+contains "F6: the live run took the verified branch" "F6-VERIFIED" f6res-live.out
+F6RES_DIR="$(dirname "$(find f6res-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_end"/ && /"step":"probe"/ { exit }' \
+  "$F6RES_DIR/log.jsonl" > "$F6RES_DIR/log.cut"
+mv "$F6RES_DIR/log.cut" "$F6RES_DIR/log.jsonl"
+"$SFH" run f6res.yaml --resume "$F6RES_DIR" -q > f6res-resume.out 2> f6res-resume.err
+check "F6: the resumed run re-evaluates the route" 0 $?
+contains "F6: resume picked the same branch as live" "F6-VERIFIED" f6res-resume.out
+# The point of the test is the RE-EVALUATION: if the resume had simply re-run
+# the probe, the branch would agree for the wrong reason.
+F6RES_STARTS="$(grep -cF '"event":"step_start"' "$F6RES_DIR/log.jsonl" | tr -d '[:space:]')"
+F6RES_PROBE="$(grep -F '"event":"step_start"' "$F6RES_DIR/log.jsonl" | grep -cF '"step":"probe"' | tr -d '[:space:]')"
+check "F6: the resume routed from the record instead of re-running the probe" 1 "$F6RES_PROBE"
+[ "$F6RES_STARTS" -ge 2 ] || echo "note: only $F6RES_STARTS step_start events after resume"
+
+# ... and the fail-closed half: the stderr file is what the predicate reads, so
+# a run dir whose <id>.err.txt was deleted must NOT match. A deleted artifact is
+# missing evidence, never a pass.
+"$SFH" run f6res.yaml --runs-dir f6gone-runs -q > f6gone-live.out 2> f6gone-live.err
+check "F6: the flow runs live before its stderr file is removed" 0 $?
+F6GONE_DIR="$(dirname "$(find f6gone-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_end"/ && /"step":"probe"/ { exit }' \
+  "$F6GONE_DIR/log.jsonl" > "$F6GONE_DIR/log.cut"
+mv "$F6GONE_DIR/log.cut" "$F6GONE_DIR/log.jsonl"
+rm -f "$F6GONE_DIR/probe.err.txt"
+"$SFH" run f6res.yaml --resume "$F6GONE_DIR" -q > f6gone.out 2> f6gone.err
+check "F6: a resume whose stderr file is gone still finishes" 0 $?
+contains "F6: a missing stderr file makes when_stderr_matches fail closed" \
+  "F6-INCONCLUSIVE" f6gone.out
+F6GONE_PROBE="$(grep -F '"event":"step_start"' "$F6GONE_DIR/log.jsonl" | grep -cF '"step":"probe"' | tr -d '[:space:]')"
+check "F6: the fail-closed resume did not re-run the probe either" 1 "$F6GONE_PROBE"
+
+# --- F6: validate checks the new regex like the other two --------------------
+cat > f6badrx.yaml <<'YAML'
+name: f6badrx
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+    route:
+      - {when_stderr_matches: "([unclosed", goto: end}
+YAML
+"$SFH" validate f6badrx.yaml > f6badrx.out 2> f6badrx.err
+check "F6: a bad when_stderr_matches regex is refused" 2 $?
+contains "F6: the refusal names the regex" "bad regex" f6badrx.err
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
