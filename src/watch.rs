@@ -33,6 +33,12 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub flow: String,
     pub started: String,
+    /// The idle clocks (F2). All three are absent from a status.json written by
+    /// sfh <= 1.0, and the display drops the whole segment when they are, rather
+    /// than printing "0s elapsed" about a run it cannot time.
+    pub step_started: Option<String>,
+    pub last_output: Option<String>,
+    pub visit: Option<u64>,
     pub nonce: Option<String>,
     /// Start time of the owning process, recorded when the run began. Lets
     /// `sfh stop` tell a reused pid apart from the original (rev_break #8).
@@ -202,9 +208,50 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
         error: opt("error"),
         flow: s("flow"),
         started: s("started_utc"),
+        step_started: opt("step_started_utc"),
+        last_output: opt("last_output_utc"),
+        visit: v.get("visit").and_then(|x| x.as_u64()),
         nonce: opt("nonce"),
         pid_start: v.get("pid_start").and_then(|x| x.as_u64()),
     })
+}
+
+/// Round a duration to one human-sized unit. Precision past this is noise for
+/// the question being asked ("is this thing moving?").
+fn human_dur(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// "<n> since <stamp>", or None when the stamp is missing or unparseable. A
+/// stamp in the future (clock skew between the writer and this process) reports
+/// 0s rather than a wrapped number.
+fn since(stamp: Option<&String>) -> Option<String> {
+    let secs = crate::engine::parse_utc_stamp(stamp?.as_str())?;
+    Some(human_dur(crate::execute::epoch_secs().saturating_sub(secs)))
+}
+
+/// The second half of the running line: how long the current step has been in
+/// there and how long since anything it started said a word. This is the pair
+/// that tells a 40-minute step that is working from one that died quietly
+/// (B-12); every signal the caller had before this - pid alive, heartbeat
+/// fresh, state "running" - said the wedged run was healthy.
+fn idle_segment(snap: &Snapshot) -> Option<String> {
+    let elapsed = since(snap.step_started.as_ref())?;
+    let visit = match snap.visit {
+        Some(v) if v > 0 => format!(" (visit {v})"),
+        _ => String::new(),
+    };
+    let quiet = match since(snap.last_output.as_ref()) {
+        Some(q) => format!("{q} since last output"),
+        // Null last_output_utc is a fact, not a gap: no child of this run has
+        // written a byte yet.
+        None => "no output yet".to_string(),
+    };
+    Some(format!("{}{visit}, {elapsed} elapsed, {quiet}", snap.step))
 }
 
 /// The flow path for a command hint: a placeholder when unknown, otherwise
@@ -264,6 +311,9 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 "flow": snap.flow,
                 "started_utc": snap.started,
                 "current_step": snap.step,
+                "step_started_utc": snap.step_started,
+                "last_output_utc": snap.last_output,
+                "visit": snap.visit,
                 "steps_done": snap.steps_done,
                 "cost_usd": snap.cost_usd,
                 "pid": snap.pid,
@@ -279,10 +329,15 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     }
 
     let extra = match snap.state {
-        "running" => format!(
-            "step '{}', {}s since heartbeat",
-            snap.step, snap.heartbeat_age_sec
-        ),
+        // The idle clocks replace the bare step name when the run dir carries
+        // them; a status.json from an older sfh keeps the original line.
+        "running" => match idle_segment(&snap) {
+            Some(seg) => format!("{seg}, {}s since heartbeat", snap.heartbeat_age_sec),
+            None => format!(
+                "step '{}', {}s since heartbeat",
+                snap.step, snap.heartbeat_age_sec
+            ),
+        },
         "failed" => snap.error.clone().unwrap_or_default(),
         _ => snap.reason.clone().unwrap_or_default(),
     };

@@ -2156,8 +2156,13 @@ r3c_rc=1
 # so strip both records and stop at once; retry if a heartbeat lands between.
 for _ in 1 2 3; do
   rm -f "$R3C_DIR/sfh-nonce"
+  # Dropping a line can leave a dangling comma on the new last key, and which
+  # key that is depends on the (alphabetical) field order - naming one of them
+  # here broke the moment status.json grew a field later in the alphabet.
+  # Strip the comma from whatever line now sits above the closing brace.
   grep -v '"nonce":' "$R3C_DIR/status.json" |
-    sed 's/\("unfinished_step": null\),/\1/' > "$R3C_DIR/status.json.tmp"
+    awk '{l[NR] = $0} END {for (i = 1; i <= NR; i++) {if (i == NR - 1) sub(/,[ \t]*$/, "", l[i]); print l[i]}}' \
+      > "$R3C_DIR/status.json.tmp"
   mv "$R3C_DIR/status.json.tmp" "$R3C_DIR/status.json"
   "$SFH" stop "$R3C_DIR" > r3c.out 2>r3c.err
   r3c_rc=$?
@@ -2535,6 +2540,125 @@ case "$(uname 2>/dev/null)" in
     fi
     ;;
 esac
+
+# --- F2: the idle clock -------------------------------------------------------
+# B-12 was 112 minutes of silence in which every external signal - pid alive,
+# heartbeat fresh, state "running" - reported a healthy run. sfh reads the
+# child's chunks as they arrive and used to throw the arrival times away. These
+# tests are about the second clock: not "how long has this taken" but "how long
+# since anything was said".
+
+# 1. Speaks once, then goes quiet for good. A timeout at the end of that is a
+#    hang, and a hang is transient - a retry costs nothing and often works.
+cat > f2-hang.yaml <<'YAML'
+name: f2-hang
+defaults:
+  hang_after_sec: 1
+steps:
+  - id: wedge
+    cmd: ["sh", "-c", "echo FIRST-AND-LAST; sleep 30"]
+    timeout_sec: 4
+    retry: { max: 1, backoff_sec: 1 }
+    retry_on: transient
+    on_error: continue
+YAML
+"$SFH" run f2-hang.yaml --runs-dir f2-hang-runs -q > /dev/null 2>f2-hang.err
+F2_HANG_DIR="$(dirname "$(find f2-hang-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$F2_HANG_DIR/wedge.a2.out.txt" ]; then
+  echo "ok   - a timeout after long silence is retried as a hang"
+  pass=$((pass + 1))
+else
+  echo "FAIL - a hung step was not retried (no wedge.a2.out.txt in $F2_HANG_DIR)"
+  ls "$F2_HANG_DIR"
+  fail=$((fail + 1))
+fi
+contains "step_end records idle_ms" '"idle_ms":' "$F2_HANG_DIR/log.jsonl"
+F2_HANG_IDLE="$(sed -n 's/.*"event":"step_end".*"idle_ms":\([0-9]*\).*/\1/p' "$F2_HANG_DIR/log.jsonl" | head -1)"
+if [ -n "$F2_HANG_IDLE" ] && [ "$F2_HANG_IDLE" -ge 2000 ]; then
+  echo "ok   - the recorded idle_ms covers the silent stretch (${F2_HANG_IDLE}ms)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - idle_ms was '$F2_HANG_IDLE'ms after ~4s of silence"
+  fail=$((fail + 1))
+fi
+
+# 2. Talks the whole way through and still runs out of clock. That is overrun,
+#    not a hang: retrying it would just burn the same budget again.
+cat > f2-chatty.yaml <<'YAML'
+name: f2-chatty
+defaults:
+  hang_after_sec: 30
+steps:
+  - id: chatty
+    cmd: ["sh", "-c", "i=0; while [ $i -lt 60 ]; do echo tick; sleep 1; i=$((i+1)); done"]
+    timeout_sec: 4
+    retry: { max: 1, backoff_sec: 1 }
+    retry_on: transient
+    on_error: continue
+YAML
+"$SFH" run f2-chatty.yaml --runs-dir f2-chatty-runs -q > /dev/null 2>f2-chatty.err
+F2_CHATTY_DIR="$(dirname "$(find f2-chatty-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$F2_CHATTY_DIR/chatty.a2.out.txt" ]; then
+  echo "FAIL - a step that never stopped talking was retried as a hang"
+  fail=$((fail + 1))
+else
+  echo "ok   - a timeout with steady output is overrun, not a hang, and is not retried"
+  pass=$((pass + 1))
+fi
+
+# 3. The decisive one: progress on stderr ONLY. Several CLIs report progress
+#    there and nowhere else, so a clock fed by stdout alone would file every one
+#    of their timeouts as a hang.
+cat > f2-stderr.yaml <<'YAML'
+name: f2-stderr
+defaults:
+  hang_after_sec: 2
+steps:
+  - id: noisy
+    cmd: ["sh", "-c", "i=0; while [ $i -lt 60 ]; do echo tick >&2; sleep 1; i=$((i+1)); done"]
+    timeout_sec: 5
+    retry: { max: 1, backoff_sec: 1 }
+    retry_on: transient
+    on_error: continue
+YAML
+"$SFH" run f2-stderr.yaml --runs-dir f2-stderr-runs -q > /dev/null 2>f2-stderr.err
+F2_ERR_DIR="$(dirname "$(find f2-stderr-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$F2_ERR_DIR/noisy.a2.out.txt" ]; then
+  echo "FAIL - a step that reported progress on stderr was treated as hung"
+  fail=$((fail + 1))
+else
+  echo "ok   - stderr output keeps the idle clock alive (no hang retry)"
+  pass=$((pass + 1))
+fi
+F2_ERR_IDLE="$(sed -n 's/.*"event":"step_end".*"idle_ms":\([0-9]*\).*/\1/p' "$F2_ERR_DIR/log.jsonl" | head -1)"
+if [ -n "$F2_ERR_IDLE" ] && [ "$F2_ERR_IDLE" -lt 2000 ]; then
+  echo "ok   - idle_ms follows stderr chunks too (${F2_ERR_IDLE}ms after a 5s step)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - idle_ms was '$F2_ERR_IDLE'ms although stderr spoke every second"
+  fail=$((fail + 1))
+fi
+
+# 4. The same two clocks, live, for whoever is polling from outside.
+cat > f2-status.yaml <<'YAML'
+name: f2-status
+steps:
+  - id: slow
+    cmd: ["sh", "-c", "echo HELLO; sleep 8"]
+YAML
+F2_RUN="$("$SFH" run f2-status.yaml --runs-dir f2-status-runs --detach -q 2>/dev/null)"
+if [ -n "$F2_RUN" ]; then
+  sleep 3
+  contains "status.json dates the current step" '"step_started_utc": "2' "$F2_RUN/status.json"
+  contains "status.json records when a child last spoke" '"last_output_utc": "2' "$F2_RUN/status.json"
+  contains "status.json carries the visit number" '"visit": 1' "$F2_RUN/status.json"
+  "$SFH" status "$F2_RUN" > f2-status.out 2>/dev/null
+  contains "sfh status prints both clocks" "since last output" f2-status.out
+  "$SFH" wait "$F2_RUN" > /dev/null 2>&1
+else
+  echo "FAIL - could not detach the idle-clock status run"
+  fail=$((fail + 1))
+fi
 
 echo
 echo "engine behaviour: $pass passed, $fail failed"
