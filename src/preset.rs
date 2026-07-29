@@ -106,6 +106,77 @@ pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
+    pub(crate) invalid_cost: bool,
+}
+
+impl Usage {
+    fn normalize_cost(cost: f64) -> f64 {
+        if cost.is_nan() || cost < 0.0 || cost == f64::NEG_INFINITY {
+            0.0
+        } else if cost == f64::INFINITY {
+            f64::MAX
+        } else {
+            cost
+        }
+    }
+
+    /// Cost reported by an external tool is untrusted accounting input.
+    /// Negative/NaN values cannot refund earlier work, while positive infinity
+    /// is treated as the largest representable spend so it fails a finite
+    /// budget closed instead of silently becoming free.
+    pub fn reported_cost(&self) -> f64 {
+        match self.cost_usd {
+            Some(c) => Self::normalize_cost(c),
+            None => 0.0,
+        }
+    }
+
+    /// Add one provider report while preserving the fact that any component
+    /// was invalid. Normalizing only after summing would let a negative entry
+    /// refund a positive entry within one streamed response.
+    pub fn add_reported_cost(&mut self, cost: f64) {
+        let normalized = Self::normalize_cost(cost);
+        self.invalid_cost |= cost.to_bits() != normalized.to_bits();
+        let sum = self.reported_cost() + normalized;
+        self.cost_usd = Some(if sum.is_finite() { sum } else { f64::MAX });
+    }
+
+    /// Normalize an external report before it is printed, logged, or returned
+    /// to the engine. Returns true when the provider supplied an invalid value.
+    pub fn sanitize_reported(&mut self) -> bool {
+        let Some(original) = self.cost_usd else {
+            return false;
+        };
+        let normalized = self.reported_cost();
+        let changed = self.invalid_cost || original.to_bits() != normalized.to_bits();
+        if changed {
+            self.cost_usd = Some(normalized);
+        }
+        self.invalid_cost = false;
+        changed
+    }
+
+    /// Add another attempt without losing either attempt's token or cost
+    /// accounting. Integer totals saturate, and a floating-point overflow
+    /// saturates to f64::MAX so the budget guard remains effective.
+    pub fn accumulate(&mut self, other: &Usage) {
+        fn add_tokens(total: &mut Option<u64>, value: Option<u64>) {
+            if let Some(value) = value {
+                *total = Some(total.unwrap_or(0).saturating_add(value));
+            }
+        }
+
+        add_tokens(&mut self.input_tokens, other.input_tokens);
+        add_tokens(&mut self.output_tokens, other.output_tokens);
+        self.invalid_cost |= other.invalid_cost
+            || other
+                .cost_usd
+                .is_some_and(|cost| cost.to_bits() != Self::normalize_cost(cost).to_bits());
+        if self.cost_usd.is_some() || other.cost_usd.is_some() {
+            let sum = self.reported_cost() + other.reported_cost();
+            self.cost_usd = Some(if sum.is_finite() { sum } else { f64::MAX });
+        }
+    }
 }
 
 pub struct Built {
@@ -1365,6 +1436,61 @@ pub fn build_fork(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_accumulates_attempts_and_rejects_refunds() {
+        let mut total = Usage {
+            input_tokens: Some(u64::MAX),
+            output_tokens: Some(2),
+            cost_usd: Some(0.10),
+            invalid_cost: false,
+        };
+        total.accumulate(&Usage {
+            input_tokens: Some(1),
+            output_tokens: Some(3),
+            cost_usd: Some(0.20),
+            invalid_cost: false,
+        });
+        assert_eq!(total.input_tokens, Some(u64::MAX));
+        assert_eq!(total.output_tokens, Some(5));
+        assert!((total.reported_cost() - 0.30).abs() < f64::EPSILON);
+
+        total.accumulate(&Usage {
+            input_tokens: None,
+            output_tokens: None,
+            cost_usd: Some(-99.0),
+            invalid_cost: false,
+        });
+        assert!((total.reported_cost() - 0.30).abs() < f64::EPSILON);
+        assert!(
+            total.sanitize_reported(),
+            "the invalid component is retained"
+        );
+
+        let mut streamed = Usage::default();
+        streamed.add_reported_cost(0.10);
+        streamed.add_reported_cost(-0.10);
+        assert_eq!(streamed.reported_cost(), 0.10);
+        assert!(streamed.sanitize_reported());
+    }
+
+    #[test]
+    fn usage_normalizes_non_finite_costs_fail_closed() {
+        for invalid in [-1.0, f64::NEG_INFINITY, f64::NAN] {
+            let mut usage = Usage {
+                cost_usd: Some(invalid),
+                ..Default::default()
+            };
+            assert!(usage.sanitize_reported());
+            assert_eq!(usage.cost_usd, Some(0.0));
+        }
+        let mut infinite = Usage {
+            cost_usd: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        assert!(infinite.sanitize_reported());
+        assert_eq!(infinite.cost_usd, Some(f64::MAX));
+    }
     use std::path::PathBuf;
 
     fn inp<'a>(access: Access, extra: &'a [String]) -> PresetInput<'a> {

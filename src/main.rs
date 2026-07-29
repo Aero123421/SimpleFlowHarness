@@ -48,8 +48,9 @@ STATUS / WAIT / STOP OPTIONS:
   status [run-dir] [--runs-dir d] [--json]
   wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
   stop   [run-dir] [--runs-dir d]
-  status exit codes: 0 = done, 1 = failed/dead/stopped, 2 = cannot tell, 3 = running
-  wait exits with the flow's own code, or 3 if --timeout elapsed first
+  status exit codes: 0 = done, 1 = failed/dead/stopped, 2 = cannot tell,
+                     3 = running, 4 = stuck (a step routed to `goto: stuck`)
+  wait exits with the flow's own code (0/1/4), or 3 if --timeout elapsed first
   (a wait timeout does NOT cancel the run - use `sfh stop` for that)
 
 DOCTOR OPTIONS:
@@ -67,12 +68,15 @@ RUNS OPTIONS:
 
 EXIT CODES:
   0 = flow succeeded    1 = flow failed    2 = config/usage error
+  4 = flow stuck (a step routed to `goto: stuck`: work saved, needs a human)
 
 FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the schema):
   Steps run top-to-bottom unless a route: rule redirects. Templates:
   {{vars.name}} {{steps.<id>.output}} {{steps.<id>.outputs}} {{steps.<id>.output_file}}
   {{steps.<id>.exit}} {{steps.<id>.stderr_file}}
   {{item}} {{item_index}} {{notes}} {{run_dir}} {{flow_dir}} {{step_id}} {{visit}} {{os}}
+  {{budget.spent_usd}} {{budget.elapsed_sec}} {{budget.remaining_usd}} {{budget.remaining_sec}}
+  (remaining_* is the string `unlimited` when that axis has no ceiling)
   Filters: | head:N | tail:N | truncate:N | lines:A-B | trim
   Preset tools: codex, claude, opencode, grok, agy, pi, cursor.
   Custom cmd: array form = spawned directly; string form = via cmd /C | sh -c.

@@ -104,8 +104,8 @@ status / wait / stop options:
   status [run-dir] [--runs-dir d] [--json]
   wait   [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]
   stop   [run-dir] [--runs-dir d]
-  status exit code: 0=完了 / 1=失敗・死亡・中止 / 2=判定不能 / 3=実行中
-  wait はフロー自身の終了コードを返す(--timeout 到達時のみ 3)。
+  status exit code: 0=完了 / 1=失敗・死亡・中止 / 2=判定不能 / 3=実行中 / 4=stuck
+  wait はフロー自身の終了コードを返す(0/1/4。--timeout 到達時のみ 3)。
   **wait のタイムアウトは実行をキャンセルしない**(止めたいなら sfh stop)
 
 doctor options:
@@ -121,10 +121,10 @@ runs options:
   runs show <run-dir> [--json]                          ステップ別の終了・訪問・反復・コスト
   runs clean [--older-than 30d] [--keep 5] [--dry-run]  古いrun dirを削除
 
-exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー
+exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー / 4=stuck(人間待ち)
 ```
 
-失敗しても**その時点で最後に成功したステップの出力はstdoutに出る**(`--no-partial-emit`で抑制可)。呼び出し元エージェントが「何が取れて何が残っているか」を判断できるようにするため。
+失敗しても**その時点で最後に成功したステップの出力はstdoutに出る**(`--no-partial-emit`で抑制可)。呼び出し元エージェントが「何が取れて何が残っているか」を判断できるようにするため。exit 4(stuck)でも同じ部分出力が出る。
 
 ## フローファイル全体像
 
@@ -141,16 +141,21 @@ profiles:                    # 名前付きツール設定。ステップから 
 defaults:                    # 全ステップの既定値(すべて任意)
   timeout_sec: 3600
   max_visits: 3              # 同一ステップの最大実行回数(既定5)
-  max_total_steps: 100       # 実行するリーフ総数の上限(fan-out前に判定)
+  max_total_steps: 100       # engineが予定するleaf runの上限(fan-out/fallback/compactを含む)
   max_parallel: 4            # parallel/foreach の同時実行数の既定
-  tool_max_parallel:         # ツール別の同時実行上限(レート制限対策)
+  tool_max_parallel:         # ツール別の同時実行上限(レート制限対策。各値は1以上)
     opencode: 2
   max_prompt_chars: 80000    # レンダリング後プロンプトがこれを超えたら実行前に失敗
   max_emit_chars: 200000     # stdoutに出す最大文字数(既定20万。超過分は切って保存先を案内)
-  max_cost_usd: 5.0          # 報告されたコストの累計がこれを超えたら中断
+  max_cost_usd: 5.0          # finiteかつ0以上。報告コスト累計が超えたら中断
   wall_clock_sec: 7200       # フロー全体の実時間上限
+  on_budget: goto:wrap       # 上限−reserve に達したら中断せずここへ着地(1 run 1回)
+  budget_reserve:            # 着地連鎖のために各上限から取り置く分(宣言した上限には必須)
+    cost_usd: 0.5
+    wall_clock_sec: 600
   retry: { max: 2, backoff_sec: 5 }   # 失敗時のリトライ(指数バックオフ)
   retry_on: transient        # transient(既定,429/5xx/切断など) | any | never
+  hang_after_sec: 300        # この秒数以上無出力のままタイムアウトしたら「ハング」=一過性と分類(既定300)
   fork_warmup: auto          # fork_from時のウォームアップ auto(既定) | always | never
   env: { MY_VAR: value }     # 全子プロセスに渡す環境変数
 
@@ -170,9 +175,11 @@ steps:
     timeout_sec: 1800        # 超過でプロセスツリーをkill
     max_prompt_chars: 50000
     notes: append            # このステップの出力を {{notes}} (run_dir/notes.md) に蓄積
-    on_error: fail           # fail(既定) | continue | goto:<id> | goto:end | goto:fail
+    on_error: fail           # fail(既定) | continue | goto:<id> | goto:end | goto:fail | goto:stuck
+                             #   ※parallel:の子はfail/continueのみ(goto:は全部validateエラー)
     on_max_visits: goto:end  # 差し戻し回数を使い切った時の降格先(既定fail=フロー終了)
     retry: { max: 2 }        # このステップだけのリトライ
+    hang_after_sec: 600      # このステップだけのハング判定しきい値(既定はdefaults、無指定なら300)
     fallback: [cheap2]       # リトライ後も落ちたら、このプロファイルで再挑戦(別ツールでも可)
     allow_empty: false       # 空の最終メッセージを失敗扱いにする(AIステップの既定)
     env: { FOO: bar }        # このステップの子プロセスにだけ渡す
@@ -188,7 +195,10 @@ steps:
         goto: plan
       - when_matches: "(?i)verdict:\\s*ok"           # 全文を正規表現
         goto: exec
-      - goto: end            # end=成功終了 / fail=失敗終了 / <step-id>
+      - when_exit: 3                                # このステップ自身の正規化exitと等値比較
+        when_stderr_matches: "refusing to"          # <id>.err.txt への正規表現(欠落なら不成立)
+        goto: guard_fired                           # 同じ規則内の条件はANDで結合
+      - goto: end            # end=成功終了(0) / fail=失敗終了(1) / stuck=人間待ち(4) / <step-id>
 ```
 
 判定に使うテキストは**compact前**かつ**集約ヘッダ(`--- id ---`)を含まない**ので、要約やsfhのラベルで誤爆しない。`when_last_line_contains` はレビュアーが本文中で「VERDICT: REVISEと書くべきか迷った」と述べても反応しないので、差し戻し判定はこちらを推奨。
@@ -213,6 +223,10 @@ steps:
       {{steps.idea_tech.output}}     # 子は個別にも参照できる
 ```
 
+`parallel:` の親は集約と分岐だけを担当するため、leaf 専用の `retry` / `retry_on` /
+`hang_after_sec` / `fallback` は子ごとに置く。親に置いた設定を黙って無視することはなく、
+`sfh validate` が `carries only` エラーで拒否する。
+
 ### 動的並列: `foreach:`(前段の出力の件数だけワーカー起動)
 
 ```yaml
@@ -235,6 +249,56 @@ steps:
 sfh が起動したプロセスが完了しなかったという配管上の事実である。parallel /
 foreach の集約では失敗した要素のヘッダと本文だけが標識され、成功した要素は
 そのまま残る。バナーもレンダリング後の文字列なので `max_prompt_chars` に算入される。
+
+### 合議: `when_members`(N体の票を数えて分岐する)
+
+fan-out の**メンバーごとの成否と最終行**を数える route 述語。`parallel:` /
+`foreach:` を持つステップの route でだけ使える。
+
+```yaml
+  - id: review
+    max_parallel: 3
+    parallel:
+      - { id: rev_a, use: rev, on_error: continue, prompt: "…最後の行に REVIEW-PASS か REVIEW-FAIL…" }
+      - { id: rev_b, use: rev, on_error: continue, prompt: "…" }
+      - { id: rev_c, use: rev, on_error: continue, prompt: "…" }
+    route:
+      - when_members: { last_line_is: "REVIEW-PASS", at_least: 3 }   # or all: true
+        goto: wrap
+      - goto: fix        # 数えられない出力・失敗・タイムアウトは全部こちら
+```
+
+1票と数える条件は**次の両方**:
+
+1. そのメンバーが正常終了している(`exit == 0` かつ timeout でも中断でもない)。
+2. そのメンバー**自身の**出力の最終非空行が `last_line_is` と**完全一致**する
+   (前後の空白と CR は落とす)。
+
+**なぜ文字列で数えてはいけないか。** グループの判定テキストは各メンバーの生出力を
+連結したものだが、そこには**失敗の印が付かない**(`[sfh: FAILED]` バナーが付くのは
+ラベル付き集約 `{{steps.ID.outputs}}` の側だけ)。つまり「REVIEW-PASS と言った」と
+「REVIEW-PASS と言った上で exit 1 した」がテキスト上は同一である。`sh -c "grep -c …"`
+での集計はこれを区別できず、さらに本文中に引用された単独行まで票に数え、そもそも
+グループの route は連結全体の最終行しか見ない。`when_members` は sfh 自身が持つ
+メンバー別の記録から数えるので、この3つとも起こらない。
+
+- 量化子は `at_least: <n>`(n ≥ 1)か `all: true` の**どちらか一方が必須**。
+- **母数が0なら常に不成立**。`all: true` の空集合真(foreach が0件生成した場合)は
+  「全員一致」ではなく「誰も何も決めていない」であり、fail-closed 側に倒す。
+- 同一規則内で他の述語(`when_contains` 等)と併用できない(validate エラー)。
+  「AND で繋ぐ」意味論は作らない — 別々の規則に分けること。
+- 合議イディオムではメンバーに `on_error: continue` を付けるのが正。付けないと
+  1体の失敗がグループ自体の失敗になり、route が**評価されない**(on_error 経路に入る)。
+- `position` イベントに `votes` / `voters` が残るので、何票入って誰が入れたのかは
+  ログから読める(下記)。
+
+**既知の限界**:
+
+| 事柄 | 挙動 |
+|---|---|
+| `parallel` で `at_least` がメンバー数を超える | validate がエラーにする(構成が静的に分かるため) |
+| `foreach` で `at_least` が生成件数を超える | 件数は実行時にしか分からないので validate は通る。実行時は永遠に不成立(catch-all へ) |
+| 判定行が200文字を超える | 記録される最終行は200文字で切られ、比較もその形で行う(live と resume の判定を一致させるため)。リテラルの `last_line_is` が200文字超なら validate がエラーにする |
 
 ### セッション再開: `continue_from:`(コンテキスト最強の節約)
 
@@ -309,7 +373,7 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 
 > Summarize the text below in at most {target} characters, in the same language as the text. It will be passed to another AI agent as context, so keep every conclusion, number, file path and open question. Output only the summary.
 
-要約器が失敗した場合はsfhが**先頭+末尾を機械的に残す**(head+tail)。原文は `<id>.precompact.txt` に保存され、`--resume` してもそれが `{{steps.x.outputs}}` に復元される。
+要約器が失敗した場合はsfhが**先頭+末尾を機械的に残す**(head+tail)。原文は `<id>.precompact.txt` に保存され、`--resume` してもそれが `{{steps.x.outputs}}` に復元される。fallback と compact の呼び出しも `max_total_steps` に含まれ、上限を超える呼び出しは準備・spawn 前に拒否される。`retry.max` が作る同一 leaf 内の追加 attempt はこの論理 leaf 数とは別枠なので、外部呼び出し回数を厳密に絞る場合は `retry.max` も合わせて制限する。
 
 ### コストとトークンの会計
 
@@ -318,7 +382,9 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 - 進捗表示に `$0.0661` のように出る / `log.jsonl` の各 `step_end` に `input_tokens` `output_tokens` `cost_usd`
 - `sfh runs list --json` / `sfh runs show <dir> --json` で後から機械集計できる。`visit` は最大訪問番号、`repeat` は同じステップで同一 `output_hash` が連続した時の初回を除く最大反復回数
 - `runs list` の末尾(`--json` では `total_cost_usd`)は、`-n` 適用後に選ばれたrun群の報告済みコスト合計
-- `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)
+- `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)。中断ではなく畳ませたいなら [`on_budget`](#予算の崖を着地パスに-on_budget) で着地パスへ回す
+- 同じ leaf を retry した場合、`step_end` のトークン数・コストは**全 attempt の累計**。最後の成功 attempt だけで失敗分の課金を上書きしない
+- 外部ツールが負数または NaN のコストを返しても支出は減らさず 0 として記録し、正の無限大は有限上限を確実に止める最大値として扱う。不正値は stderr と `<id>.err.txt` に警告する
 - コスト報告があるのは claude / grok / opencode。codex と agy はトークン数のみ
 
 ### 失敗からの回復
@@ -332,13 +398,102 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 
 成功した `step_end` の直後、次の `position` を記録する前に sfh が停止していた場合は、
 そのステップを再実行せず、保存済み chain 出力に対して route 規則だけを再評価し、
-決定を `position` イベントとして追記する。一方、`step_start` はあるが対応する
+決定を `position` イベントとして追記する。失敗した `step_end` / `aggregate_end` も、
+`on_error: continue` または `on_error: goto:*` が宣言されていれば、保存済み exit・stderr・
+出力から未記録の on_error と route だけを再生する。外部 probe や fan-out メンバーは
+二重実行しない。既定の `on_error: fail` は従来どおり、その失敗ステップを再試行できる。
+一方、`step_start` はあるが対応する
 `step_end` が無いコマンドは完了したか判定できないため再実行する。resume 前に
 コマンドライン付きで警告し、同じ情報を `status.json.unfinished_step` にも残す。
 
 - **リトライ**: `retry: {max: 2, backoff_sec: 5}` — 既定では 429 / 5xx / 接続断など**一過性と判定できる失敗のみ**再試行(指数バックオフ)。`retry_on: any` で何でも、`never` で無効
+- **ハングは一過性に数える**: タイムアウトは従来まとめて非一過性だった。`hang_after_sec`(既定300)以上**何も出力しないまま**タイムアウトした試行だけは「時間切れ」ではなく「パイプが死んだ」と分類し、`retry_on: transient` の再試行対象にする。出力を出し続けたまま時間切れになった試行は従来どおり再試行しない(同じ予算を二度焼くだけだから)
 - **フォールバック**: `fallback: [profile_a, profile_b]` — リトライ後も落ちたら別プロファイル(別プロバイダ・別モデルでも可)で再挑戦
 - **差し戻しループの降格**: `on_max_visits: goto:summarize` — 3回REVISEされたら諦めて要約に進む、が書ける(既定はフロー失敗)
+
+### 第3の終端: `goto: stuck`(exit 4 = 作業は残っているが人間待ち)
+
+「**作業は保存されているが、人間の判断なしに先へ進んではいけない**」を機械可読にする終端。`end`(exit 0)/`fail`(exit 1)と同格の予約 goto 先で、`route[].goto` / `on_error: goto:stuck` / `on_max_visits: goto:stuck` のどこでも書ける。ただし **`parallel:` の子には書けない**(validate エラー)。メンバーの `on_error` は `fail` か `continue` しか意味を持たず、跳び先はグループ自身の `on_error` / `route:` が決めるため — 受理して黙って無視すれば exit 4 を頼んだ人に exit 1 が返る。
+
+```yaml
+  - id: verdict
+    prompt: "…最終行に RESOLVED か UNRESOLVED だけを書け"
+    route:
+      - when_last_line_is: "RESOLVED"
+        goto: wrap
+      - goto: stuck          # 収束しなかった。作業は run dir に残っている
+  - id: fixer
+    max_visits: 3
+    on_max_visits: goto:stuck    # 3周しても直らないなら人間に返す
+```
+
+これまでこの状況は `goto: end`(=成功と同じ顔)か、「最終行 UNRESOLVED を呼び出し元が grep する」という文字列規約で書くしかなかった。前者は非収束を成功と誤報し、後者は sfh が v1 で潰してきた fail-open と同型なので、終端そのものを増やしてある。
+
+**sfh の判断は一切増えない。** ユーザーが `goto: stuck` と宣言した所に到達したときだけ起きる。
+
+| 見え方 | 値 |
+|---|---|
+| `sfh run` の exit code | **4** |
+| `status.json` | `"state": "stuck"`, `"exit_code": 4`, `"error": "routed to stuck after '<step>'"` |
+| `sfh status` / `sfh wait` の exit code | **4**(`sfh wait` は部分出力も stdout に出す) |
+| `runs list` / `runs show` の STATUS | `stuck` |
+| stdout | 失敗時と同じ部分出力(`--no-partial-emit` で抑制可) |
+| `log.jsonl` | 通常の `position` イベント(`"next":"stuck"`、`via` は rule / catch_all / on_error / max_visits / budget) |
+
+偽装された `status.json` の `state: "stuck"` は `failed` と同じ nonce 検査を通らないと報告されない(新しい状態名だからといって信用度は上がらない)。
+
+**再開できる。** stuck した run は `completed` 扱いにしないので、そのまま `--resume` できる:
+
+- **route 経由**: 再開開始点は stuck へ分岐した**そのステップ**で、**再実行**される(visit +1、通常どおり `max_visits` 検査に服す)。記録済みの判定テキストを再生する道は取らない — 同じテキストを再評価すれば必ず同じ stuck に戻るだけだから。人間が「何に詰まっていたか」を直してから再開すれば、今度は別の枝へ進む。
+- **on_max_visits 経由**: 再開すると入場時の visit 検査に再び引っかかり、**即座にまた stuck になる**。これは仕様。visit カウンタを黙ってリセットするほうが嘘になる。正しい道はフローの `max_visits` を直して `--force-resume` すること。
+
+> **破壊的変更**: ステップ id `stuck`(**大文字小文字を無視**して比較。id の重複検査と同じ規則)は予約語になり、`sfh validate` が明示エラーで拒否する。既存フローに `stuck` という id があれば改名が必要 — ただし黙って挙動が変わるのではなく、validate が大声で落ちる。
+
+### 予算の崖を着地パスに: `on_budget`
+
+`max_cost_usd` / `wall_clock_sec` は**崖**だった。超えた瞬間にエラーで終わり、呼び出し元には何も渡らない。`on_budget` は予算の最後の一切れを**着地滑走路**に変える:
+
+```yaml
+defaults:
+  max_cost_usd: 60.0
+  wall_clock_sec: 43200
+  on_budget: goto:wrap                                       # 未指定なら従来どおり即エラー
+  budget_reserve: { cost_usd: 2.0, wall_clock_sec: 900 }     # 宣言した上限ごとに必須(0 不可)
+steps:
+  # …本題のループ…
+  - id: wrap
+    prompt: |
+      予算上限に達した。ここまでの結果を引き継ぎ用にまとめろ。
+      使用済み: ${{budget.spent_usd}} / {{budget.elapsed_sec}}秒経過(残り ${{budget.remaining_usd}} / {{budget.remaining_sec}}秒)
+    route:
+      - goto: stuck        # 「未完了だが整理済み」を exit 4 で申告する(推奨)
+```
+
+- **閾値 = 上限 − reserve**。コスト軸と時間軸は**独立**で、互いに融通しない。どちらか一方が閾値を超えた時点で着地する
+- 発火点は**既存の予算検査と同じループ先頭**(ステップとステップの間)。跳び先は `route[].goto` と同じ書式で、`end` / `fail` / `stuck` も指定できる
+- **1 run に 1 回だけ。** `--resume` を挟んでも `log.jsonl` の `budget_landing` イベントから「着地済み」を復元するので、2 度目は起きない
+- 着地後は**上限本体の検査がそのまま生きる**。reserve まで食い潰したら従来どおりエラーで終わる(fail-closed は温存。reserve は延長ではなく余白)
+
+| 見え方 | 値 |
+|---|---|
+| `log.jsonl` | `{"event":"budget_landing","trigger":"cost"\|"wall_clock","spent_usd":…,"elapsed_sec":…,"goto":…}` に続けて `position`(`"via":"budget"`) |
+| `position` の `after` | **着地に先を越されたステップ**の id(唯一「まだ走っていないステップ」を指す via)。`goto: stuck` で着地した run を `--resume` すると、ここから再開する |
+| `sfh runs show` | `budget  : landed on cost after $58.0312 / 1204s -> goto wrap` |
+| `--dry-run` | `budget landing: goto wrap (cost reserve $2.00, wall reserve 900s)` — `route:` に現れない唯一の goto なので、ここで可視化する |
+
+**validate が拒否するもの**: `max_cost_usd` が負数・NaN・無限大 / 跳び先が実在しない / `goto:` を付けていない / `budget_reserve` だけで `on_budget` が無い(reserve は「どれだけ早く着地するか」を決めるだけなので、単体では何もしない) / `on_budget` があるのに `max_cost_usd` も `wall_clock_sec` も無い(上限が無ければ閾値も無い)/ **宣言した上限のどれかに reserve が無い(または 0)**。
+
+最後のものが一番効く。reserve が 0 だと閾値は上限そのものになり、着地はするが**その次のループ先頭で上限検査が同じ値で発火して**、着地連鎖が 1 ステップも走らないまま従来のエラーで終わる — `budget_landing` イベントと `-> goto wrap` の表示だけが増えて、結果は何も変わらない。軸ごとに独立なので、コスト側に reserve を書いても時間側の着地は買えない。
+
+#### 既知の限界(全部読んでから reserve を決めること)
+
+1. **コストは報告値のみ。** USD を報告しないツール構成(codex / agy はトークン数だけ)ではコスト軸は永久に発火しない。**信頼できるのは wall-clock 軸**。コスト軸だけを頼りにした無人運転は、報告が無ければ崖に戻る
+2. **検査はステップとステップの間だけ。** 走行中のステップが上限を突き破るのは止められない(F12 が入るまで sfh は時計でプロセスを殺さない)。したがって reserve は最低でも**「最長ステップ 1 本 + 着地連鎖が使う分」**を見込む必要がある
+   - 見積もり指針: `reserve.wall_clock_sec ≥ 最長ステップの timeout_sec + 着地連鎖の全ステップの timeout_sec 合計`
+   - `reserve.cost_usd ≥ 最も高いステップ 1 回分の実測コスト + 着地連鎖の実測コスト`。実測は `sfh runs show <dir>` の COST_USD 列から取る
+   - 迷ったら多めに。reserve が大きすぎても損は「早めに畳む」だけだが、小さすぎると着地連鎖の途中でエラー終了して着地の意味が消える
+   - reserve が上限以上なら閾値は 0 に丸められ、**最初のステップの前に着地する**。「10 分の予算から 20 分を取り置く」は最初から仕事の余地が無かった、という素直な読み方
+3. **推奨イディオム**: 着地連鎖の終端は `goto: stuck` にする。予算切れは成功ではないので `goto: end`(exit 0)は嘘になり、かといって配管は壊れていないので `fail`(exit 1)も違う。「整理は済んだが未完了、人間が見ろ」= exit 4 が正しい申告
 
 ### 投げっぱなし実行: `--detach`(親の寿命から切り離す)
 
@@ -352,7 +507,7 @@ RUN=$(sfh run research.yaml --var topic="..." --detach)
 以降は好きなタイミングで問い合わせる:
 
 ```bash
-sfh status "$RUN"          # running / done / failed / dead / stopped
+sfh status "$RUN"          # running / done / failed / stuck / dead / stopped
 sfh status "$RUN" --json   # 同じ内容を機械可読で(親エージェント向け)
 sfh wait   "$RUN"          # 終了まで待ち、フォアグラウンド実行と同じ結果をstdoutへ
 sfh stop   "$RUN"          # 中止。起動済みの子AIごと殺す
@@ -375,10 +530,35 @@ run dir の `status.json` が3秒ごとに更新される。`sfh status` を使�
 
 ```json
 { "state": "running", "current_step": "execute", "heartbeat_utc": "20260727-135338",
+  "step_started_utc": "20260727-131240", "last_output_utc": "20260727-131512", "visit": 2,
   "steps_done": 5, "cost_usd": 0.0974, "pid": 64012 }
 ```
 
 終了時には `exit_code` / `emit_step` / `emit_file` / `error` が追記される(`sfh wait` はこれを見て結果を返す)。
+
+### 二つの時計 — 「経過時間」と「最終出力からの時間」
+
+`state: running` と生きているpidとハートビートは、**112分間一言も出力しないまま固まっていた実行**を全部「正常稼働中」と報告した。経過時間だけでは、40分かかるステップが働いているのか、38分前に黙って死んだのかが区別できない。そこで観測している側の事実、つまり**子プロセスの出力が最後に届いた時刻**を記録して出す:
+
+```
+running  3 steps, $0.3100 - fix (visit 2), 41m elapsed, 38m since last output, 2s since heartbeat
+```
+
+- `status.json`: `step_started_utc`(現ステップの開始)/ `last_output_utc`(全子プロセス横断の最終出力。まだ誰も何も出していなければ `null`)/ `visit`(現ステップの周回数)。`sfh status --json` にも同じ3キーが出る
+- `log.jsonl` の `step_end`: `idle_ms` — 終了(またはkill)時点で何ミリ秒黙っていたか。一度も出力しなければ実行時間そのもの
+- 計測は **stdout と stderr の両方**。進捗をstderrにしか出さないCLIがあるため、片方だけを見るとその全タイムアウトがハング扱いになる
+- 打ち切りはしない。sfhはこの時計で**プロセスを殺さない**(分類と露出だけ)。停滞で止めたい場合は、この値をポーリングして呼び出し元が `sfh stop` を打つ
+
+**既知の退化**: sfhが観測できるのはパイプの活動であって、モデルの活動ではない。最後にJSONを一塊で吐くプリセットでは idle ≒ 経過時間になり、ハング分類は「タイムアウトなら常に1回リトライ」へ退化する。
+
+| プリセット | stdoutの出方(sfhの解析形式) | idle時計 |
+|---|---|---|
+| codex / opencode / pi | イベントを逐次(JSONL / NDJSON) | 実効。無言ハングと純粋な時間超過を区別できる |
+| claude / grok / agy | 最後にJSONを一塊 | **退化**。idle ≒ 経過時間 → タイムアウトは常に1回リトライ |
+| cursor | 最後にJSONを一塊(experimental) | 同上 |
+| `cmd:` | コマンド次第 | コマンド次第。逐次出力するコマンドなら実効 |
+
+退化した側でも、ゼロ出力で死んだ試行を1回だけ再試行する損失はゼロなので、この退化は許容している。区別が本当に要るステップは、進捗を吐く `cmd:` で包むか `hang_after_sec` をタイムアウトより長くして分類自体を切ること。
 
 Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済みのAI CLIプロセスは道連れで終了する**(Windowsはjob object、Linuxは`PR_SET_PDEATHSIG`+プロセスグループkill)。放置されたエージェントが課金し続ける事故を防ぐ。`--detach` で起動した実行だけがこの規則の例外で、これは明示的に要求された場合に限られる。
 
@@ -390,11 +570,13 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | `{{steps.ID.output}}` | 最新出力(compact後)。未実行なら空 |
 | `{{steps.ID.outputs}}` | 集約/原文(parallel・foreach・compact原文) |
 | `{{steps.ID.output_file}}` | 出力ファイルパス |
-| `{{steps.ID.exit}}` | sfhが正規化した終了コード。プロセス終了コードそのものではなく、出力解析・空出力・セッション検証等の結果も反映する。診断用テンプレート値であり `route:` の述語ではない |
+| `{{steps.ID.exit}}` | sfhが正規化した終了コード。プロセス終了コードそのものではなく、出力解析・空出力・セッション検証等の結果も反映する。同じ値で分岐するには `route:` の [`when_exit`](#正しい理由で落ちたゲート-when_exit--when_stderr_matches) を使う |
 | `{{steps.ID.stderr_file}}` | 標準エラー出力ファイルのパス |
 | `{{item}}` `{{item_index}}` | foreach内のみ |
 | `{{notes}}` | 共有ノートの現在内容 |
 | `{{run_dir}}` `{{flow_dir}}` `{{step_id}}` `{{visit}}` `{{os}}` `{{prompt_file}}` | 実行環境 |
+| `{{budget.spent_usd}}` `{{budget.elapsed_sec}}` | 報告済みコスト(小数4桁)と経過秒。常に使える。resume 後の経過秒は**その試行の開始から** |
+| `{{budget.remaining_usd}}` `{{budget.remaining_sec}}` | 上限(`max_cost_usd` / `wall_clock_sec`)までの残り。**上限未設定の軸は文字列 `unlimited`**(0 でも空でもない)。reserve ではなく上限までの残りを出す |
 | `{{raw}}...{{endraw}}` | 中身をそのまま出す。**テンプレートの話をするプロンプト**(「このHandlebarsを直して: `{{user.name}}`」)はこれで囲む。囲まないと未定義キーとして実行前にエラーになる |
 
 ## プリセット → 実コマンド対応(2026-07-27 実機検証)
@@ -438,7 +620,7 @@ codex-local:
 
 > **sfh は自分の配管については判断する。仕事については絶対に判断しない。**
 
-「能力を足さず、順番と分岐だけ」という説明はもう正確ではない。`compact:` はsfhが選んだモデルと指示で下流の文脈を書き換え、`retry_on: transient` は既知の一過性エラー表現を照合して再試行を決める。どちらも配管を維持するための判断である。一方、成果物が正しいか、レビューに合格したか、作業が停滞したかはsfhには決めさせない。その判定はユーザーが `cmd:` と `route:` で明示し、sfhは終了コード・出力・訪問・コストという観測事実だけを記録する。
+「能力を足さず、順番と分岐だけ」という説明はもう正確ではない。`compact:` はsfhが選んだモデルと指示で下流の文脈を書き換え、`retry_on: transient` は既知の一過性エラー表現を照合して再試行を決める。`hang_after_sec` の無出力判定も同種で、パイプが黙った時間を見て再試行の可否を決める。いずれも配管を維持するための判断である。一方、成果物が正しいか、レビューに合格したか、作業が停滞したかはsfhには決めさせない。その判定はユーザーが `cmd:` と `route:` で明示し、sfhは終了コード・出力・訪問・コストという観測事実だけを記録する。
 
 ## カスタムコマンド(エスケープハッチ)
 
@@ -489,6 +671,68 @@ steps:
 
 `max_visits` は実行後ではなく**ステップ入場時**に検査する。`implement → review → implement` で両者の上限が同じなら、毎周先に入る `implement` が先に上限を超えるため、`on_max_visits` もそこへ置く。
 
+### 収束する差し戻しループの書き方
+
+差し戻しループが止まらない原因は、たいてい実装役ではなく**レビュアーに与えた問いの形**にある。
+
+> **終端条件の無い問いを循環に入れてはいけない。**
+
+「まだ穴はあるか」「他に改善点は」は、サンドボックスを持たず外部CLIを起動するプログラムに対しては常に yes になる。周回するたびに新しい指摘が生まれ、`max_visits` を使い切るまで走り続けて、最後は何も終わっていない。判定対象は**閉じた列挙**にすること。
+
+**実測**(sfh 自身の v1.0 強化ラウンド、`examples/v1-harden-r3.yaml` の冒頭コメントに記録):
+
+| レビュアーに与えた問い | 周回ごとの指摘件数 |
+|---|---|
+| 「まだ回避経路はあるか」(終端条件なし) | 13 → 16 と**発散**した |
+| 閉じた11項目の判定表だけ | 3 → 4 → 0 と**収束**した |
+
+閉じたリスト側で 3 → 4 と一度増えているのは、直した項目が別項目の未達を露出させたためで、**列挙が閉じているので必ず 0 に向かう**。発散した側にはその保証が無い。
+
+```yaml
+vars:
+  checklist: |
+    F-1 セッション access の欠落・不正判定
+    F-2 parallel / foreach resume の完了済みメンバー再利用
+    F-3 旧 run の access 記録なしの扱い
+steps:
+  - id: fix
+    tool: codex
+    access: full
+    max_visits: 4
+    on_max_visits: goto:stuck        # 収束しなかったことを exit 4 で申告する
+    notes: append                    # 試行台帳。毎周ここへ全文が積まれる
+    prompt: |
+      次の項目のうち、**未達と判定されたものだけ**を直せ。完了した項目は触るな。
+      {{vars.checklist}}
+
+      これまでの試行:
+      {{notes | tail:120}}
+
+      前回のレビュー:
+      {{steps.review.output | tail:200}}
+  - id: review
+    tool: codex
+    access: read
+    prompt: |
+      次の**閉じたリスト**だけを判定せよ。
+      {{vars.checklist}}
+
+      リスト外で気づいたことは末尾に「## 追加所見」として書け。
+      **それを FAIL の理由にしてはならない**(次のラウンドの入力になる)。
+
+      最終行に、未達項目の**残数だけ**を `FINDINGS: <n>` の形式で書け。
+    route:
+      - when_last_line_is: "FINDINGS: 0"
+        goto: end
+      - goto: fix                    # 数えられない出力も差し戻す(fail-closed)
+```
+
+- **残数を最終行で数えさせる**。`FINDINGS: 0` は「合格だと思う」ではなく「閉じたリストに未達が残っていない」であり、レビュアーの気分ではなく列挙に紐付く。`when_last_line_is` は完全一致なので、本文中で「FINDINGS: 0 を目指す」と書かれても発火しない
+- **`max_visits` と `on_max_visits` は必ず併記する。** 収束の保証は「必ず収束する」ではなく「収束しなければ**止まる**」で作る。降格先は `goto: stuck`(exit 4)が正しい — 未収束は成功でも配管の失敗でもない
+- **新発見は FAIL の理由にさせない。** 「追加所見」として記録だけさせ、次のラウンドの `checklist` に入れるかは人間が決める。これをしないと、リストを閉じた意味が周回ごとに溶ける
+- **修正役には `notes: append` で試行台帳を持たせる。** 参照は `{{notes | tail:120}}` のように末尾だけにする。裸の `{{notes}}` は周回ごとに膨らみ、下流の `max_prompt_chars` に達したステップで初めて失敗する(そこまでの呼び出しは課金済み)
+- レビュアーを複数体にするなら、票を数えるのは `sh -c "grep -c ..."` ではなく [`when_members`](#合議-when_membersn体の票を数えて分岐する)。文字列で数えると「合格と書いた上で落ちたメンバー」を1票に数える
+
 ### 終了コードでルーティングする決定論的検証器
 
 検証器は配列形式の `cmd:` で直接起動し、失敗時だけ `on_error:` で修正役へ送る。修正役は保存済みstderrを `{{steps.test.stderr_file}}` から読むため、シェルを挟まずWindows / macOS / Linuxで同じになる。
@@ -506,6 +750,10 @@ steps:
     route: [{goto: test}]
 ```
 
+**PASS はそれを出した環境にスコープされる。** `cargo test` が Windows で通ったという事実は、Linux で通るという事実ではない。**サポートを主張する環境ごとに1ゲート置くこと。** sfh 自身が v1.0.0 で、11ラウンドのレビューと279件の挙動テストを Windows だけで通した末に、Linux と macOS では**コンパイルすら通らない**バイナリを出した(レビュアーはコードを読むだけでコンパイルせず、Unix 専用の挙動テストは Windows では丸ごとスキップされる)。
+
+実例は [examples/cross-os-gate.yaml](examples/cross-os-gate.yaml) — Windows のテスト / Linux ターゲットへの型検査(リンカ不要なので Windows から打てる)/ WSL での挙動テスト、の3ゲート。ただしあれは**WSL のディストリ名とパスを直書きしたマシンローカルなフロー**で、他マシンへそのまま持っていける類のものではない。環境ごとのゲートは環境に固有になる — 逃げ道は無い。
+
 `sh -c` は複数コマンドをどうしても連結するときだけ使い、Windowsでは別途Git Bashが必要になる。
 
 **`sh -c` の中にテンプレートを書いてはいけない。** スクリプト文字列はシェルに再解釈されるので、`{{...}}` を直接埋め込むと拒否される。値は**スクリプトの後ろの引数**として渡すこと。`$1`, `$2` … として届き、シェルに再パースされない。
@@ -521,6 +769,51 @@ steps:
 `cmd /c` と `powershell -Command` は後続引数を1本のコマンド行に連結し直すため、この手は使えない。そちらは配列形式(`["program", "--flag", "{{...}}"]`)にする。
 
 `EXIT=$?` を最終行へ出す手法は、`stderr_file` が無かった時代の回避策としてのみ残る。
+
+### 「正しい理由で落ちた」ゲート: `when_exit` / `when_stderr_matches`
+
+`on_error: continue` の `cmd:` ステップは「落ちた」ところまでしか教えてくれない。
+**ガードが効いたのか、別の理由で落ちたのか**を区別するのが `when_exit` である。
+
+```yaml
+  - id: probe
+    cmd: ["sfh", "run", "attack-fixture.yaml", "-q"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: broken}          # 攻撃が通った = ガードが消えている
+      - {when_stderr_matches: "refusing to resume|no recorded access level", goto: guard_fired}
+      - {goto: broken}                        # 別の理由で落ちた = 検証不成立
+```
+
+- `when_exit` は**そのステップ自身の正規化 exit**(`{{steps.<id>.exit}}` と同じ数)との等値比較。
+  「非ゼロならOK」ではないので、fixture が構文エラーやパス間違いで落ちた回を合格に数えない。
+  攻撃 fixture の検証で「別の理由の非ゼロ」を合格として通してしまった実害が 3 件あり、この述語はその対処である。
+- `when_stderr_matches` は `<id>.err.txt`(クリーン済み stderr)への正規表現。
+  live でも resume でも**ファイルを読む**ので両者が食い違わない。読み取りは先頭 4 MB まで。
+  **ファイルが無い場合は不成立**(手で消した run ディレクトリを resume した等)。証拠の欠落は合格にしない。
+- どちらも既存述語と AND で併用できる(1 つの規則に書いた条件は全て満たす必要がある)。
+  ただし [`when_members`](#合議-when_membersn体の票を数えて分岐する) とだけは同居できない(validate エラー) —
+  あちらはメンバーを数え、こちらはグループ全体を判定するので、AND で混ぜると意味が壊れる。
+- resume での再評価は live と一致する。`exit` も `stderr_file` も `step_end` から復元済みなので、
+  この 2 述語のために追加で永続化するものは無い。
+
+**fan-out グループ(`parallel:` / `foreach:`)には自前の exit が無い。** `when_exit` が見るのは
+sfh が記録する合成値で、**グループが hard-fail したら 1、それ以外は 0** である(子の 9 や 127 は見えない)。
+hard-fail の判定は両者で違うので注意する:
+
+| 形 | 合成 exit が 1 になる条件 |
+|---|---|
+| `parallel:` | `on_error: continue` を**持たない子**が 1 つでも落ちた |
+| `foreach:` | 1 件でも落ちた。ただしグループ側に `on_error: continue` があれば常に 0 |
+
+`foreach:` に `on_error: continue` を書くと合成 exit は永久に 0 になるので、そこでは `when_exit` ではなく
+出力本文(`when_contains` 等)で判定すること。グループには stderr ファイルが無いため、
+`when_stderr_matches` はグループステップでは常に不成立になる。
+
+**AI ステップの exit は意味が濁る。** sfh は in-band の失敗申告(agy の `status` 等)、
+空の最終メッセージ、セッションの実在検証といったものを exit へ畳み込む。
+`when_exit` は書けるし validate も警告しないが、`when_exit: 1` は「モデルが失敗と言った」の意味にはならない。
+AI ステップの判定は最終行の判定文字列(`when_last_line_is`)で行うこと。
 
 ### 改竄トリップワイヤ
 
@@ -569,6 +862,8 @@ sfhは子プロセスのstdinを端末へ直結しない。次はrun固有の回
 
 表示内容は `stdin: prompt` でコマンドへ渡り、`<run-dir>/approve.err.txt` に残る。人間は確認後に `<run-dir>/approval.txt` を作る。期限は `timeout_sec`、期限切れの方針は `on_error`、回答ファイルの内容は `approve` のchain outputとして後段へ渡る。GUI・チケット・チャット承認を使う場合も、同じstdin/stdout契約のコマンドへ差し替えればよい。
 
+期限切れ側を `on_error: goto:stuck` にすると、「承認されないまま終わった」を exit 4 で呼び出し元に申告できる(成功でも失敗でもない、という事実そのものを返す)。
+
 ### ケース行列
 
 ケースごとに独立したrun dirを固定し、失敗ケースがあっても全件を回す。
@@ -606,6 +901,8 @@ sfh runs list --runs-dir evruns --json
 ```
 
 どの差分を進捗と呼ぶかは、後段のユーザー所有コマンドで決める。sfhが `output_hash` の反復だけを見て自動停止してはいけない。chain outputはエージェントの最終メッセージであって成果物ではなく、同じ「完了しました」が続いてもワークツリーは進んでいる場合があるからである。
+
+`status.json` の `last_output_utc`(上の「二つの時計」)はこれとは別の話で、**パイプが黙っている**ことしか意味しない。喋り続けながら何も作っていないエージェントは、そちらでは検知できない。
 
 ### 差し戻しループ内の `fork_from`
 
@@ -655,7 +952,9 @@ sfh runs list --runs-dir evruns --json
 .sfh/runs/<UTC日時>-<フロー名>/
   meta.json        実行時の変数・sfhバージョン・各CLIの実バイナリとバージョン・合計コスト
   log.jsonl        ステップ毎のexit/所要時間/トークン/コスト/セッションID/コマンドライン
+                   分岐の理由(どの規則がどの行で発火してどこへ跳んだか)も残る
   status.json      3秒ごとに更新される生存信号(state/current_step/cost_usd/pid)
+                   step_started_utc / last_output_utc / visit で停滞が分かる
                    終了時に exit_code / emit_step / emit_file / error が入る
                    resume時の再実行リスクは unfinished_step に入る
   detached.*.txt   --detach 実行のstdout/stderr(sfh wait はここを返す)
@@ -673,6 +972,61 @@ sfh runs list --runs-dir evruns --json
 resume を重ねても二重バナーにならない。parallel / foreach は集約済みの一つの
 文字列を `.out.txt` / `.chain.txt` / テンプレート値へ共通して書くため、集約ファイル
 自体がバナー付きであり、バナー無しの集約コピーは存在しない。
+
+### `log.jsonl` から「なぜそこへ跳んだか」を読む
+
+`position` イベントは分岐の**理由**を持つ。`via` が `rule`(述語が一致)/ `catch_all`
+(述語無しの規則)のときは、さらに次の 2 キーが付く:
+
+| キー | 内容 |
+|---|---|
+| `rule` | 一致した規則の `route:` 内での 0 始まり番号 |
+| `route_line` | その規則が実際に照合したテキスト。最終行系述語(`when_last_line_*`)と catch-all は**最終非空行**、全文系(`when_contains` / `when_matches`)は**判定テキストの先頭**。いずれも 200 文字で機械的に切る。`when_exit` / `when_stderr_matches` は判定テキストを見ないので、catch-all と同じく最終非空行が入る(判定した値そのものではない — exit は `step_end` の `exit`、stderr は `<id>.err.txt` を見ること) |
+
+`via` が `fallthrough` / `on_error` / `max_visits` / `budget` の position は規則を見ていないので、
+この 2 キーは付かない(「どの規則か」を騙らないため)。
+
+`via` が `budget` の position だけは、`after` が**まだ走っていないステップ**を指す。
+`on_budget` の着地はステップの後ではなくステップに入る手前で起きるからで、
+直前の `budget_landing` イベントがその判断の材料(どの軸が、いくら使った時点で)を持つ。
+
+`when_members` の規則が一致した position には、さらに `votes`(票数)と
+`voters`(投票したメンバーの id 配列)が付く。
+
+`aggregate_end`(parallel / foreach 共通)には `members` が入る:
+
+```json
+"members": [{"id": "rev_a", "ok": true, "exit": 0, "last_line": "REVIEW-PASS", "clipped": false}, …]
+```
+
+`last_line` は 200 文字で切る。切ったかどうかを `clipped` が持ち、**`clipped: true` のメンバーは絶対に票に数えない** — 切った後の値は前方一致でしかなく、判定文字列がちょうど 200 文字だったとき「判定文字列を言ってからさらに喋ったメンバー」を 1 票に数えてしまうため。切った先は残っていないので「同じことを言ったか分からない」が正直な答えであり、分からないものは不成立側に倒す。
+
+**この記録が resume 時の唯一の情報源である。** 集約テキストは run ディレクトリに
+残るが、どのメンバーが完走したかはテキストからは分からない(前述のとおり失敗の印が
+付かない)。したがって、v1.1 より前に作られた run にフローを編集して `when_members` を
+足し `--force-resume` した場合、sfh は**黙って catch-all に落とさずエラーで止まる**
+(`this run predates per-member route records; re-run the group step or remove when_members`)。
+run の世代によって分岐が静かに変わるくらいなら止まるほうがよい、という判断。
+
+`step_end` には `os`(`windows` / `linux` / `macos`)が入る。ログは書いた機械と別の機械で
+読まれるのが普通なので、「こっちでは通る」の一次資料をログ自身に持たせる。
+
+`step_start` には `session_parent` が入る。`continue_from` / `fork_from` が解決できたときは
+`{"mode":"continue"|"fork","step":"<接続先ステップ>","tool":"<CLI>","id":"<親のセッションID>"}`、
+自前の文脈で始まったステップは `null`。フローを編集して `--force-resume` した後は
+フロー側を読んでも実際の親子関係が分からないため、ログ側に残す。
+
+**fan-out のメンバーも自分の `step_start` を書く。** `parallel:` の子が全員 `fork_from` で
+同じ親に付く形は `fork_from` の主用途そのものなので、ここが記録されないと肝心の系統が読めない。
+メンバーの行には `parent`(所属グループの id)が付き、これが目印になる:
+`sfh` 自身は `parent` 付きの `step_start` を**再開地点として数えない**(子の id は再開できる場所ではなく、
+グループ全体は `group_start` / `foreach_start` が代表しているため)。`foreach:` のメンバーは
+`step_end` と同じく `<id>[<i>]` の名前で並ぶ。
+
+```bash
+# どのステップがどの行でどこへ跳んだか
+grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next,.route_line]|@tsv'
+```
 
 `sfh runs list` で一覧、`sfh runs show <dir>` でステップ別の明細、`sfh runs clean --older-than 30d --keep 5` で掃除。
 
@@ -707,8 +1061,15 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 ## 開発
 
 ```bash
-cargo test                              # 86本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト191本
+cargo test                              # Windows 151本 / Unix 152本の単体テスト
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト: Windows 545本 / Unix 551本
 ```
 
-CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。
+挙動テストは冒頭で `tests/stub/session_stub.rs` を `rustc` で1回ビルドする。
+これは `claude -p --output-format json` の形(`.result` / `.session_id` / `.usage`)で
+答えるだけのスタブCLIで、`bin: "echo"` ではセッションIDを報告できず
+「再開できたこと」を証明できない(旧B-15)ため。したがって挙動テストの実行には
+sfhをビルドしたのと同じRustツールチェーンが要る。スタブはcargoのターゲットではない
+(`tests/` 直下に置くと統合テストとして拾われてしまうのでサブディレクトリに置いてある)。
+
+CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。**トリガーは全ブランチへの push**(main だけにしていた頃、作業ブランチが最後まで push されず、Linux と macOS でコンパイルの通らない v1.0.0 が出た。誰も到達しない 3 OS ランナーはゲートではない)。手元で先回りしたいときは [examples/cross-os-gate.yaml](examples/cross-os-gate.yaml) を使う。

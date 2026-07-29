@@ -1,7 +1,8 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -39,6 +40,57 @@ pub struct ExecOutcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub dur_ms: u128,
+    /// How long the child was silent before it exited or was killed: the
+    /// elapsed time at that moment minus the last chunk seen on EITHER stream.
+    /// A child that never wrote anything has idle_ms == its whole runtime.
+    ///
+    /// This is the second clock B-12 needed. Elapsed time alone cannot tell a
+    /// 40-minute step that is working from one that stopped talking 38 minutes
+    /// ago, and every external signal (pid alive, heartbeat fresh) said the
+    /// wedged run was healthy.
+    pub idle_ms: u64,
+}
+
+/// Where a child's output goes besides the capture buffer, and which run-level
+/// clock its arrival touches. Bundled so `run_cmd` keeps one "observation"
+/// parameter instead of growing one per watcher.
+#[derive(Default, Clone)]
+pub struct Observe {
+    /// Mirror stdout to this file as it arrives.
+    pub tee: Option<std::path::PathBuf>,
+    /// Run-level activity clock in unix-epoch seconds, shared by every child of
+    /// the run so `status.json` can report when ANY of them last said anything.
+    /// 0 means nothing has been read yet.
+    pub run_clock: Option<Arc<AtomicU64>>,
+}
+
+pub fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The two activity clocks a reader thread touches on every chunk. Both streams
+/// share one instance: a tool that reports progress only on stderr (several do)
+/// would otherwise look silent, and every one of its timeouts would be filed as
+/// a hang.
+#[derive(Clone)]
+struct Activity {
+    start: Instant,
+    /// ms since `start` of the most recent chunk on either stream; 0 = none yet.
+    last_ms: Arc<AtomicU64>,
+    run_clock: Option<Arc<AtomicU64>>,
+}
+
+impl Activity {
+    fn touch(&self) {
+        let ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(ms, Ordering::Relaxed);
+        if let Some(c) = &self.run_clock {
+            c.store(epoch_secs(), Ordering::Relaxed);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +780,7 @@ pub fn run_cmd(
     timeout: Option<Duration>,
     env_remove: &[String],
     env_set: &[(String, String)],
-    tee_stdout: Option<std::path::PathBuf>,
+    obs: Observe,
 ) -> Result<ExecOutcome, String> {
     if interrupted() {
         return Err("interrupted before start".into());
@@ -792,8 +844,21 @@ pub fn run_cmd(
             // handle dropped here -> child sees EOF
         })
     });
-    let rx_out = spawn_reader(child.stdout.take().expect("stdout piped"), tee_stdout);
-    let rx_err = spawn_reader(child.stderr.take().expect("stderr piped"), None);
+    let activity = Activity {
+        start,
+        last_ms: Arc::new(AtomicU64::new(0)),
+        run_clock: obs.run_clock.clone(),
+    };
+    let rx_out = spawn_reader(
+        child.stdout.take().expect("stdout piped"),
+        obs.tee,
+        activity.clone(),
+    );
+    let rx_err = spawn_reader(
+        child.stderr.take().expect("stderr piped"),
+        None,
+        activity.clone(),
+    );
 
     let mut timed_out = false;
     let mut was_interrupted = false;
@@ -816,6 +881,10 @@ pub fn run_cmd(
         std::thread::sleep(Duration::from_millis(100));
     };
     untrack(pid);
+    // Keep the time of death fixed. Reader threads may still be holding a
+    // final buffered chunk at this instant; their activity snapshot is taken
+    // after the drain below, then clamped back to this point.
+    let death_elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Drain the pipes with a deadline: a grandchild that inherited the write
     // ends can otherwise hold them open forever after the child exited.
@@ -854,6 +923,12 @@ pub fn run_cmd(
     if let Some(t) = stdin_thread {
         let _ = t.join();
     }
+    // A final stdout/stderr chunk can be read just after try_wait observed the
+    // process exit. Sampling before the pipe drain made that healthy final
+    // output invisible and exaggerated idle_ms into a false hang. Activity
+    // observed during the drain cannot be later than the child's death for
+    // this calculation, so clamp it to that fixed instant.
+    let idle_ms = idle_at(death_elapsed_ms, activity.last_ms.load(Ordering::Relaxed));
     Ok(ExecOutcome {
         exit_code: status.code().unwrap_or(-1),
         timed_out,
@@ -861,7 +936,12 @@ pub fn run_cmd(
         stdout,
         stderr,
         dur_ms: start.elapsed().as_millis(),
+        idle_ms,
     })
+}
+
+fn idle_at(death_elapsed_ms: u64, last_activity_ms: u64) -> u64 {
+    death_elapsed_ms.saturating_sub(last_activity_ms.min(death_elapsed_ms))
 }
 
 /// Per-stream capture cap; the reader keeps draining past it (discarding) so
@@ -875,6 +955,7 @@ const MAX_CAPTURE: usize = 32 * 1024 * 1024;
 fn spawn_reader<R: Read + Send + 'static>(
     mut r: R,
     tee: Option<std::path::PathBuf>,
+    activity: Activity,
 ) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -897,6 +978,10 @@ fn spawn_reader<R: Read + Send + 'static>(
             match r.read(&mut tmp) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    // Before the capture cap is consulted: a tool that has run
+                    // past 32 MB is noisy, not hung, and dropping the bytes
+                    // must not make it look silent.
+                    activity.touch();
                     if buf.len() < MAX_CAPTURE {
                         let take = n.min(MAX_CAPTURE - buf.len());
                         if let Some(f) = sink.as_mut() {
@@ -932,7 +1017,7 @@ pub fn probe_version(program: &str) -> Option<String> {
         Some(Duration::from_secs(15)),
         &[],
         &[],
-        None,
+        Observe::default(),
     )
     .ok()?;
     if out.timed_out {
@@ -1052,6 +1137,16 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_clock_includes_final_pipe_activity_without_counting_drain_time() {
+        assert_eq!(idle_at(1_000, 250), 750);
+        assert_eq!(idle_at(1_000, 1_000), 0);
+        // A reader can timestamp a buffered final chunk just after the process
+        // death snapshot. Clamp it to death instead of underflowing or treating
+        // the drain itself as runtime.
+        assert_eq!(idle_at(1_000, 1_025), 0);
+    }
 
     #[test]
     fn exe_match_is_exact_stem_not_substring() {

@@ -49,9 +49,19 @@ pub struct Defaults {
     pub max_cost_usd: Option<f64>,
     /// Abort the flow after this many wall-clock seconds.
     pub wall_clock_sec: Option<u64>,
+    /// Where to jump when the run comes within `budget_reserve` of a ceiling,
+    /// as `goto:<id>` (end/fail/stuck allowed). Unset keeps the old behaviour:
+    /// the ceiling itself ends the run with an error and no wrap-up.
+    pub on_budget: Option<String>,
+    /// Headroom held back from each ceiling for the landing chain to spend.
+    /// Omitted axes reserve nothing, so the landing fires at the ceiling.
+    pub budget_reserve: Option<BudgetReserve>,
     pub retry: Option<Retry>,
     /// transient (default) | any | never
     pub retry_on: Option<String>,
+    /// How long a step may be silent before a timeout counts as a hang rather
+    /// than as honest overrun (default 300). Only `retry_on: transient` uses it.
+    pub hang_after_sec: Option<u64>,
     /// Env applied to every child process.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -59,6 +69,40 @@ pub struct Defaults {
     /// first one alone so the provider's prompt cache is warm before the rest
     /// start. auto (default: only where it measurably pays) | always | never.
     pub fork_warmup: Option<String>,
+}
+
+/// How much of each ceiling `on_budget` keeps back for the landing chain. The
+/// landing threshold is `ceiling - reserve` on each axis INDEPENDENTLY: cost
+/// and wall-clock never borrow from one another.
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetReserve {
+    pub cost_usd: Option<f64>,
+    pub wall_clock_sec: Option<u64>,
+}
+
+impl Defaults {
+    /// The step (or terminal) `on_budget` lands on, with the `goto:` prefix
+    /// removed. None when the flow declared no landing - validate has already
+    /// refused any other spelling, so an unprefixed value cannot reach here.
+    pub fn budget_goto(&self) -> Option<&str> {
+        self.on_budget.as_deref()?.strip_prefix("goto:")
+    }
+
+    /// USD the landing chain may still spend after it fires (0 when unset).
+    pub fn budget_reserve_usd(&self) -> f64 {
+        self.budget_reserve
+            .and_then(|r| r.cost_usd)
+            .unwrap_or(0.0)
+            .max(0.0)
+    }
+
+    /// Seconds the landing chain may still take after it fires (0 when unset).
+    pub fn budget_reserve_sec(&self) -> u64 {
+        self.budget_reserve
+            .and_then(|r| r.wall_clock_sec)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -164,6 +208,9 @@ pub struct Step {
     pub fork_from: Option<String>,
     pub retry: Option<Retry>,
     pub retry_on: Option<String>,
+    /// Silence (seconds) after which this step's timeout is classified as a
+    /// hang, which `retry_on: transient` does retry. Overrides defaults.
+    pub hang_after_sec: Option<u64>,
     /// Profiles to try (in order) if the step still fails after its retries.
     #[serde(default)]
     pub fallback: Vec<String>,
@@ -213,6 +260,15 @@ pub enum Cmd {
     Argv(Vec<String>),
 }
 
+/// One `route:` rule. Every `when_*` present in a rule must hold (AND); a rule
+/// with none is the catch-all. Adding one here means adding it to four other
+/// places: schema/flow.schema.json, the catch-all test in `evaluate_route`
+/// (a rule with a condition must not log as `via: catch_all`), any exclusivity
+/// check that enumerates predicates, and - if its text is templated -
+/// `engine::precheck`'s route-condition list. The precheck one is the easiest
+/// to miss and the most expensive: without it a template typo survives validate
+/// and dry-run and only kills the run after the guarded step has been billed
+/// (that is exactly what happened to `when_stderr_matches`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -224,9 +280,66 @@ pub struct Route {
     /// Exact match against the trimmed last non-empty line.
     pub when_last_line_is: Option<String>,
     pub when_last_line_matches: Option<String>,
-    /// Step id, or "end" (finish flow, success) or "fail" (finish flow, failure).
+    /// Equality against the step's OWN normalized exit code - the same number
+    /// `{{steps.<id>.exit}}` exposes, after sfh has folded in-band failure
+    /// reports and session validation into it. A fan-out group has no exit of
+    /// its own and compares against the composite sfh records (1 when the group
+    /// hard-failed, 0 otherwise). Mainly for `on_error: continue` probes that
+    /// have to prove a step failed for THE reason under test.
+    pub when_exit: Option<i32>,
+    /// Rust regex over the step's cleaned stderr (`<id>.err.txt`). Read from the
+    /// file in both live and resumed runs, so the two cannot disagree; a stderr
+    /// file that is missing (or a step that has none, like a fan-out group)
+    /// never matches.
+    pub when_stderr_matches: Option<String>,
+    /// Count the members of THIS step's fan-out that reported a given verdict.
+    /// Only on a `parallel:`/`foreach:` step, and only alone in its rule (see
+    /// validate). See `WhenMembers`.
+    pub when_members: Option<WhenMembers>,
+    /// Step id, or one of the three terminals: "end" (finish, success),
+    /// "fail" (finish, failure) or "stuck" (finish, needs a human - exit 4).
     pub goto: String,
 }
+
+/// "How many of the fan-out's members ended cleanly AND signed off with exactly
+/// this line" - the deterministic way to hold a vote among N independent
+/// judges.
+///
+/// It exists because counting the verdicts out of the group's aggregated text
+/// cannot be made correct. That text is the members' output concatenated with
+/// no per-member marking of success: a member that printed the winning line and
+/// then exited 1 is, in the text, indistinguishable from one that passed. The
+/// count therefore comes from sfh's own per-member record, never from a string
+/// search - and the member's OWN last line is what counts, so a needle quoted
+/// mid-answer is not a vote.
+///
+/// Exactly one quantifier: `at_least: <n>` (n >= 1) or `all: true`. There is no
+/// `contains`/regex variant on purpose - a vote is an exact word or it is not a
+/// vote.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct WhenMembers {
+    /// The exact line a member must end on to be counted. Templated like the
+    /// other route conditions, then compared for equality against the member's
+    /// trimmed last non-empty line.
+    pub last_line_is: String,
+    /// Match when at least this many members voted. Mutually exclusive with
+    /// `all`.
+    pub at_least: Option<u32>,
+    /// Match when EVERY member voted. A fan-out with no members never matches:
+    /// "all of nothing" is true in logic and would turn a foreach that produced
+    /// zero workers into unanimous agreement.
+    pub all: Option<bool>,
+}
+
+/// Goto targets that end the flow instead of naming a step.
+///
+/// Only `stuck` is ALSO refused as a step id (see validate). `end` and `fail`
+/// have shadowed a same-named step since v0.1 - a flow that has one is already
+/// written around it, and turning that into a hard error now would break
+/// working flows for no gain. `stuck` is new, so it is reserved before anyone
+/// can write a flow that depends on the ambiguity.
+pub const TERMINALS: [&str; 3] = ["end", "fail", "stuck"];
 
 pub const TOOLS: [&str; 7] = ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"];
 
@@ -500,6 +613,17 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         validate_name(n)?;
     }
     let mut seen = HashSet::new();
+    // Compared ignoring case for the same reason ids are: `Stuck` and `stuck`
+    // are one name on Windows and macOS, so a rule that only caught the exact
+    // spelling would let the ambiguity back in on two of the three OSes.
+    let reserved_id = |id: &str| -> Result<(), String> {
+        if id.eq_ignore_ascii_case("stuck") {
+            return Err(format!(
+                "step id '{id}' is reserved: 'stuck' is a goto target that ends the run for a human to look at (exit 4), so it cannot also name a step (compared ignoring case). Rename the step"
+            ));
+        }
+        Ok(())
+    };
     for s in &flow.steps {
         if !valid_id(&s.id) {
             return Err(format!(
@@ -507,6 +631,7 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 s.id
             ));
         }
+        reserved_id(&s.id)?;
         // Case-INSENSITIVELY unique. Step ids become artifact file names, and
         // `A` and `a` are the same file on Windows and on a stock macOS while
         // being two files on Linux - so the same flow restores different
@@ -527,6 +652,7 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                         c.id
                     ));
                 }
+                reserved_id(&c.id)?;
                 if !seen.insert(c.id.to_lowercase()) {
                     return Err(format!(
                         "duplicate step id '{}' (ids are compared ignoring case: they become file names, and two ids differing only in case are one file on Windows and macOS)",
@@ -538,11 +664,11 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     }
     let top_ids = flow.top_ids();
     let check_goto = |ctx: &str, g: &str| -> Result<(), String> {
-        if g == "end" || g == "fail" || top_ids.contains(g) {
+        if TERMINALS.contains(&g) || top_ids.contains(g) {
             Ok(())
         } else {
             Err(format!(
-                "{ctx}: goto target '{g}' is not a top-level step id (or end/fail)"
+                "{ctx}: goto target '{g}' is not a top-level step id (or end/fail/stuck)"
             ))
         }
     };
@@ -561,6 +687,20 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             }
         }
     }
+    if let Some(cost) = flow.defaults.max_cost_usd {
+        if !(cost.is_finite() && cost >= 0.0) {
+            return Err(format!(
+                "defaults.max_cost_usd must be a finite number >= 0 (got {cost})"
+            ));
+        }
+    }
+    for (tool, limit) in &flow.defaults.tool_max_parallel {
+        if *limit == 0 {
+            return Err(format!(
+                "defaults.tool_max_parallel.{tool} must be >= 1 (0 would block that tool forever)"
+            ));
+        }
+    }
     if let Some(r) = &flow.defaults.retry_on {
         check_retry_on("defaults", r)?;
     }
@@ -569,17 +709,89 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             return Err("defaults.fork_warmup must be auto/always/never".into());
         }
     }
+    // on_budget and budget_reserve are two halves of one mechanism and are
+    // useless apart, so neither is accepted alone: a reserve with nowhere to
+    // land is a number that does nothing, and a landing with no ceiling above
+    // it can never fire. Both would be silent, which is exactly the failure
+    // mode a budget guard must not have.
+    if flow.defaults.on_budget.is_none() && flow.defaults.budget_reserve.is_some() {
+        return Err(
+            "defaults.budget_reserve is set but defaults.on_budget is not: the reserve only decides how EARLY the landing fires, so on its own it changes nothing. Add on_budget: goto:<id>"
+                .into(),
+        );
+    }
+    if let Some(action) = &flow.defaults.on_budget {
+        if flow.defaults.max_cost_usd.is_none() && flow.defaults.wall_clock_sec.is_none() {
+            return Err(
+                "defaults.on_budget is set but neither defaults.max_cost_usd nor defaults.wall_clock_sec is: the landing threshold is ceiling minus reserve, and with no ceiling there is nothing to land before"
+                    .into(),
+            );
+        }
+        let target = action.strip_prefix("goto:").ok_or_else(|| {
+            format!("defaults.on_budget must be written as goto:<id> (got '{action}'); end, fail and stuck are allowed targets")
+        })?;
+        check_goto("defaults.on_budget", target)?;
+    }
+    if let Some(r) = &flow.defaults.budget_reserve {
+        // A negative or NaN reserve would push the landing threshold ABOVE the
+        // ceiling, so the landing could never fire and the flow would quietly
+        // get the old hard error it was written to avoid.
+        if let Some(c) = r.cost_usd {
+            if !(c.is_finite() && c >= 0.0) {
+                return Err(format!(
+                    "defaults.budget_reserve.cost_usd must be a finite number >= 0 (got {c})"
+                ));
+            }
+        }
+    }
+    // A reserve of ZERO on an axis that has a ceiling is the same failure in
+    // slower motion. The threshold is ceiling minus reserve, so it lands exactly
+    // ON the ceiling: the landing fires, writes its event, prints "-> goto
+    // wrap", and the ceiling check at the top of the very next iteration ends
+    // the run with the old hard error before the landing chain has run a single
+    // step. The flow validates, dry-run advertises the landing, and the feature
+    // does nothing - which is the silence the two checks above exist to prevent,
+    // reached by a third route. Refused per axis, because the axes are
+    // independent: reserving cost does not buy the wall-clock landing a second.
+    if flow.defaults.on_budget.is_some() {
+        for (ceiling, key, unreserved) in [
+            (
+                "max_cost_usd",
+                "budget_reserve.cost_usd",
+                flow.defaults.max_cost_usd.is_some() && flow.defaults.budget_reserve_usd() <= 0.0,
+            ),
+            (
+                "wall_clock_sec",
+                "budget_reserve.wall_clock_sec",
+                flow.defaults.wall_clock_sec.is_some() && flow.defaults.budget_reserve_sec() == 0,
+            ),
+        ] {
+            if unreserved {
+                return Err(format!(
+                    "defaults.on_budget is set and defaults.{ceiling} holds nothing back: the landing threshold is {ceiling} minus reserve, so a reserve of 0 lands ON the ceiling and the run still dies there with the landing chain unrun. Set defaults.{key} to at least the longest single step plus the whole landing chain"
+                ));
+            }
+        }
+    }
     let action = |what: &str, s: &Step, v: &Option<String>, is_child: bool| -> Result<(), String> {
         let Some(oe) = v else { return Ok(()) };
         if let Some(g) = oe.strip_prefix("goto:") {
-            if g == "end" || g == "fail" {
-                return Ok(());
-            }
+            // is_child FIRST, terminals included. A member's on_error is only
+            // ever asked whether it says "continue"; every other spelling makes
+            // the group hard-fail and the run exit 1. Accepting `goto:stuck`
+            // here and then ignoring it handed back exit 1 ("the plumbing broke,
+            // retry") where the author had asked for exit 4 ("work saved, a
+            // human should look") - the exact confusion the third terminal was
+            // added to end. `goto:end` and `goto:fail` were quietly inert the
+            // same way.
             if is_child {
                 return Err(format!(
-                    "step '{}': {what} goto is not allowed inside parallel: (use fail or continue)",
+                    "step '{}': {what} goto is not allowed inside parallel: (use fail or continue; the group's own {what} decides where the run goes)",
                     s.id
                 ));
+            }
+            if TERMINALS.contains(&g) {
+                return Ok(());
             }
             return check_goto(&format!("step '{}' {what}", s.id), g);
         }
@@ -678,9 +890,14 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         }
         for (i, r) in s.route.iter().enumerate() {
             check_goto(&format!("step '{}' route[{i}]", s.id), &r.goto)?;
-            for rx in [&r.when_matches, &r.when_last_line_matches]
-                .into_iter()
-                .flatten()
+            check_when_members(s, i, r)?;
+            for rx in [
+                &r.when_matches,
+                &r.when_last_line_matches,
+                &r.when_stderr_matches,
+            ]
+            .into_iter()
+            .flatten()
             {
                 if !rx.contains("{{") {
                     regex::Regex::new(rx)
@@ -708,6 +925,99 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     }
     for warning in branch_fallthrough_warnings(flow) {
         eprintln!("sfh: warning: {warning}");
+    }
+    Ok(())
+}
+
+/// Everything about a `when_members` rule that can be settled without running
+/// anything. All of it fails the flow rather than warning: a route rule that
+/// cannot match is not a smaller version of one that can, it is a branch the
+/// author believes in and will never take.
+fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
+    let Some(wm) = &r.when_members else {
+        return Ok(());
+    };
+    let at = format!("step '{}' route[{i}]", s.id);
+    if s.parallel.is_none() && s.foreach.is_none() {
+        return Err(format!(
+            "{at}: when_members counts the members of a fan-out, so it needs parallel: or foreach: on the same step. For a single step's own verdict use when_last_line_is"
+        ));
+    }
+    // No AND with the other predicates. The text ones read the members' output
+    // glued together, when_members reads each member's record separately, and a
+    // rule that mixed them would answer two different questions about two
+    // different texts under one goto - with no way to see which half failed.
+    // when_exit / when_stderr_matches are excluded for the same reason at a
+    // different granularity: on a fan-out step they judge the GROUP (the
+    // composite exit, and a stderr file the group does not even have), never the
+    // members being counted here.
+    for (name, present) in [
+        ("when_contains", r.when_contains.is_some()),
+        ("when_matches", r.when_matches.is_some()),
+        (
+            "when_last_line_contains",
+            r.when_last_line_contains.is_some(),
+        ),
+        ("when_last_line_is", r.when_last_line_is.is_some()),
+        ("when_last_line_matches", r.when_last_line_matches.is_some()),
+        ("when_exit", r.when_exit.is_some()),
+        ("when_stderr_matches", r.when_stderr_matches.is_some()),
+    ] {
+        if present {
+            return Err(format!(
+                "{at}: when_members cannot share a rule with {name} - one counts members, the other judges the group as a whole. Give each its own rule"
+            ));
+        }
+    }
+    match (wm.at_least, wm.all) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{at}: when_members takes at_least: <n> or all: true, not both"
+            ))
+        }
+        (None, None) => {
+            return Err(format!(
+                "{at}: when_members needs a quantifier - at_least: <n> or all: true"
+            ))
+        }
+        (Some(0), None) => {
+            return Err(format!(
+                "{at}: when_members at_least must be 1 or more - at_least: 0 would match a fan-out in which nobody agreed"
+            ))
+        }
+        // Nothing sensible to do with it: the only meaning would be "match when
+        // not all agreed", which is what the catch-all rule after it already is.
+        (None, Some(false)) => {
+            return Err(format!(
+                "{at}: when_members all: false can never match - use all: true, or let the next rule catch the disagreement"
+            ))
+        }
+        _ => {}
+    }
+    // A parallel group's size is written in the flow, so asking for more votes
+    // than it can ever cast is a typo the author should hear about now. A
+    // foreach's size is only known once the previous step has spoken, so the
+    // same mistake there can only fail closed at run time (documented).
+    if let (Some(n), Some(children)) = (wm.at_least, &s.parallel) {
+        if n as usize > children.len() {
+            return Err(format!(
+                "{at}: when_members at_least is {n} but the parallel group has {} members, so the rule can never match",
+                children.len()
+            ));
+        }
+    }
+    // The recorded verdict line is cut to this length, and the comparison uses
+    // the cut form so that a live decision and a resumed one cannot disagree.
+    // A longer needle therefore could not match anything; say so now instead of
+    // quietly never firing. A templated one is only known at run time (also
+    // documented).
+    if !wm.last_line_is.contains("{{")
+        && wm.last_line_is.chars().count() > crate::engine::ROUTE_LINE_CHARS
+    {
+        return Err(format!(
+            "{at}: when_members last_line_is is longer than {} characters, which is where the recorded verdict line is cut, so it could never match",
+            crate::engine::ROUTE_LINE_CHARS
+        ));
     }
     Ok(())
 }
@@ -824,6 +1134,8 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             || s.timeout_sec.is_some()
             || s.max_prompt_chars.is_some()
             || s.retry.is_some()
+            || s.retry_on.is_some()
+            || s.hang_after_sec.is_some()
             || !s.fallback.is_empty()
             || !s.env.is_empty()
             || !s.env_remove.is_empty()
@@ -1240,6 +1552,100 @@ mod tests {
     }
 
     #[test]
+    fn on_budget_needs_a_ceiling_a_target_and_the_goto_spelling() {
+        let steps = "steps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n";
+        // Both halves together, under a ceiling, is the working shape.
+        assert!(parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  on_budget: goto:wrap\n  budget_reserve: {{cost_usd: 1.0}}\n{steps}"
+        ))
+        .is_ok());
+        // The three terminals are landing targets like any other.
+        for t in ["end", "fail", "stuck"] {
+            let y = format!("name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: goto:{t}\n  budget_reserve: {{wall_clock_sec: 10}}\n{steps}");
+            assert!(parse(&y).is_ok(), "goto:{t} should be a valid landing");
+        }
+        // A reserve alone only decides how early a landing that does not exist
+        // would fire, so it is refused rather than silently ignored.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  budget_reserve: {{cost_usd: 1.0}}\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("on_budget"), "{e}");
+        // A landing with no ceiling above it can never fire.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  on_budget: goto:wrap\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("max_cost_usd"), "{e}");
+        // Bare step ids and unknown targets are both refused.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: wrap\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("goto:<id>"), "{e}");
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: goto:nowhere\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("nowhere"), "{e}");
+        // A negative reserve would lift the threshold ABOVE the ceiling and
+        // quietly restore the hard failure the flow was written to avoid.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  on_budget: goto:wrap\n  budget_reserve: {{cost_usd: -1.0}}\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("budget_reserve.cost_usd"), "{e}");
+    }
+
+    #[test]
+    fn budget_reserve_defaults_to_nothing_held_back_on_axes_with_no_ceiling() {
+        let load = |y: &str| -> Flow {
+            let f: Flow = yaml::from_str(y).expect("test flow parses");
+            validate(&f, false).expect("test flow validates");
+            f
+        };
+        // Only the cost axis has a ceiling, so only the cost axis needs a
+        // reserve; the wall-clock accessor still reports the 0 default.
+        let f = load("name: t\ndefaults:\n  max_cost_usd: 10.0\n  on_budget: goto:wrap\n  budget_reserve: {cost_usd: 1.0}\nsteps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n");
+        assert_eq!(f.defaults.budget_goto(), Some("wrap"));
+        assert_eq!(f.defaults.budget_reserve_usd(), 1.0);
+        assert_eq!(f.defaults.budget_reserve_sec(), 0);
+        // No landing declared at all is the pre-F5 flow, unchanged.
+        let f = load("name: t\nsteps:\n  - id: a\n    cmd: echo hi\n");
+        assert_eq!(f.defaults.budget_goto(), None);
+        assert_eq!(f.defaults.budget_reserve_usd(), 0.0);
+        assert_eq!(f.defaults.budget_reserve_sec(), 0);
+    }
+
+    /// A landing whose threshold IS the ceiling fires and is then overtaken by
+    /// the ceiling check on the same numbers, one loop iteration later, with the
+    /// landing chain still unrun. Per axis: reserving on one buys the other
+    /// nothing.
+    #[test]
+    fn refuses_a_landing_that_holds_nothing_back_on_a_declared_ceiling() {
+        let steps = "steps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n";
+        for (defaults, axis) in [
+            ("  max_cost_usd: 10.0\n  on_budget: goto:wrap\n", "max_cost_usd"),
+            ("  wall_clock_sec: 60\n  on_budget: goto:wrap\n", "wall_clock_sec"),
+            // Reserved on cost, silent on wall-clock: the wall axis alone is
+            // enough to refuse, and naming it is the point.
+            ("  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {cost_usd: 2.0}\n", "wall_clock_sec"),
+            ("  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {wall_clock_sec: 30}\n", "max_cost_usd"),
+            // Written out as zero is the same thing said out loud.
+            ("  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {wall_clock_sec: 0}\n", "wall_clock_sec"),
+        ] {
+            let e = parse(&format!("name: t\ndefaults:\n{defaults}{steps}")).unwrap_err();
+            assert!(e.contains(axis), "expected {axis} to be named, got: {e}");
+            assert!(e.contains("budget_reserve"), "{e}");
+        }
+        // Both axes reserved is the working shape.
+        assert!(parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {{cost_usd: 2.0, wall_clock_sec: 30}}\n{steps}"
+        ))
+        .is_ok());
+    }
+
+    #[test]
     fn accepts_on_max_visits_end() {
         let y = "name: t\nsteps:\n  - id: a\n    cmd: echo hi\n    max_visits: 2\n    on_max_visits: goto:end\n";
         assert!(parse(y).is_ok());
@@ -1423,6 +1829,36 @@ mod tests {
                 .unwrap_err()
                 .contains("retry_on")
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_budget_and_tool_parallel_values() {
+        for value in ["-0.01", ".nan", ".inf", "-.inf"] {
+            let error = parse(&format!(
+                "name: t\ndefaults:\n  max_cost_usd: {value}\nsteps:\n  - id: a\n    cmd: echo hi\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("max_cost_usd"), "{value}: {error}");
+            assert!(error.contains("finite number >= 0"), "{value}: {error}");
+        }
+
+        let error = parse(
+            "name: t\ndefaults:\n  tool_max_parallel: {claude: 0}\nsteps:\n  - id: a\n    cmd: echo hi\n",
+        )
+        .unwrap_err();
+        assert!(error.contains("tool_max_parallel.claude"), "{error}");
+        assert!(error.contains("forever"), "{error}");
+    }
+
+    #[test]
+    fn rejects_leaf_retry_settings_silently_attached_to_a_group() {
+        for field in ["retry_on: any", "hang_after_sec: 0"] {
+            let error = parse(&format!(
+                "name: t\nsteps:\n  - id: g\n    {field}\n    parallel:\n      - id: c\n        cmd: echo hi\n"
+            ))
+            .unwrap_err();
+            assert!(error.contains("carries only"), "{field}: {error}");
+        }
     }
 
     #[test]

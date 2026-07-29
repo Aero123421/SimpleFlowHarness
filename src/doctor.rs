@@ -287,7 +287,7 @@ fn run_probe(built: preset::Built, timeout_sec: u64) -> Result<Detail, String> {
         Some(Duration::from_secs(timeout_sec)),
         &built.env_remove,
         &built.env_set,
-        None,
+        execute::Observe::default(),
     )?;
     if out.timed_out {
         return Err(format!("no answer within {timeout_sec}s"));

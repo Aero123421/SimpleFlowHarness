@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "sfh"
-version = "1.0.0"
+version = "1.1.1"
 dependencies = [
  "libc",
  "regex",
