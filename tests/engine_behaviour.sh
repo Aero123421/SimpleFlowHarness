@@ -3417,6 +3417,408 @@ steps:
 YAML
 "$SFH" validate f5-terminals.yaml > f5t.out 2> f5t.err
 check "F5: landing on the stuck terminal validates" 0 $?
+# --- F1: when_members, the deterministic fan-out vote -------------------------
+# Counting agreement by grepping the aggregate is broken three ways: it needs a
+# shell, it counts a needle QUOTED inside the prose, and a group's route only
+# ever saw the whole concatenation's last line. The decisive fact is subtler: a
+# fan-out's ROUTING text carries a failed member's raw output with no banner at
+# all (the "[sfh: FAILED]" marker goes on the labeled aggregate only), so no
+# amount of text matching can tell "said VOTE-YES" from "said VOTE-YES and
+# exited 1". The vote is counted from the engine's own record of each member.
+#
+# The resume tests come first, per spec invariant 7: this feature decides
+# branches from data that has to survive a crash, and a resume that re-decides
+# differently from live is the failure mode worth writing down first.
+
+# --- F1 resume: the aggregate_end snapshot decides exactly as live did --------
+# vc says the winning words and exits 1. Live must not count it; a resume that
+# re-reads the routing text instead of the member record would find three
+# VOTE-YES lines and take the other branch.
+cat > f1-banner.yaml <<YAML
+name: f1-banner
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: va
+        cmd: ["echo", "VOTE-YES"]
+        on_error: continue
+      - id: vb
+        cmd: ["echo", "VOTE-YES"]
+        on_error: continue
+      - id: vc
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "VOTE-YES", "--stub-exit", "1"]
+        on_error: continue
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 3 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-banner.yaml --runs-dir f1b-runs -q > f1b.out 2> f1b.err
+check "F1: a group whose member failed still routes (on_error: continue)" 0 $?
+F1B_DIR="$(dirname "$(find f1b-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F1: the member that said the words but exited 1 is not counted" "NO-CONSENSUS" f1b.out
+if grep -qF "ALL-AGREED" f1b.out; then
+  echo "FAIL - F1: a failed member was counted as a vote"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: exit status decides the vote, not the text"
+  pass=$((pass + 1))
+fi
+# The point of the test, stated as a fact about the run dir: the text a string
+# count would have read really does hold three copies of the needle.
+F1B_LINES="$(grep -c '^VOTE-YES$' "$F1B_DIR/fan.plain.txt")"
+check "F1: the routing text carries the failed member's words unmarked" 3 "$F1B_LINES"
+contains "F1: aggregate_end snapshots the member that failed" '"exit":1,"id":"vc","last_line":"VOTE-YES","ok":false' "$F1B_DIR/log.jsonl"
+contains "F1: aggregate_end snapshots a member that passed" '"exit":0,"id":"va","last_line":"VOTE-YES","ok":true' "$F1B_DIR/log.jsonl"
+
+# Cut the log where a crash between the aggregate and the routing decision would
+# have cut it: everything through aggregate_end, nothing after. The snapshot is
+# the real writer's, not a hand-built one.
+cp -r "$F1B_DIR" f1-snap
+awk '/"event":"aggregate_end"/ { print; exit } { print }' "$F1B_DIR/log.jsonl" > f1-snap/log.jsonl
+"$SFH" run f1-banner.yaml --resume f1-snap -q > f1snap.out 2> f1snap.err
+check "F1: a run killed between the aggregate and the route resumes" 0 $?
+contains "F1: the resumed route decides from the snapshot, as live did" "NO-CONSENSUS" f1snap.out
+if grep -qF "ALL-AGREED" f1snap.out; then
+  echo "FAIL - F1: the resumed route counted the failed member"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: live and resumed agree on who voted"
+  pass=$((pass + 1))
+fi
+
+# The same snapshot, same cut, one rule change: two votes are now enough.
+# Without this the pair above would also pass an implementation that counts
+# nobody at all.
+sed 's/at_least: 3/at_least: 2/' f1-banner.yaml > f1-banner2.yaml
+"$SFH" run f1-banner2.yaml --runs-dir f1b2-runs -q > f1b2.out 2> f1b2.err
+check "F1: the two members that finished cleanly do carry the vote" 0 $?
+contains "F1: two clean votes meet at_least: 2" "ALL-AGREED" f1b2.out
+
+# --- F1 resume: a snapshot without member records is refused, never guessed --
+# Only reachable by editing a flow onto a run made before the records existed.
+# Falling through to the catch-all would change routing by run generation, in
+# silence, so it is an error with a name.
+# From the ORIGINAL run dir, not from f1-snap: that one has been resumed to
+# completion by now, and a completed run is refused for an unrelated reason.
+cp -r "$F1B_DIR" f1-nomembers
+awk '/"event":"aggregate_end"/ { print; exit } { print }' "$F1B_DIR/log.jsonl" \
+  | sed 's/"members":\[[^]]*\],//' > f1-nomembers/log.jsonl
+"$SFH" run f1-banner.yaml --resume f1-nomembers -q > f1nm.out 2> f1nm.err
+check "F1: a pending route with no member record fails the run" 1 $?
+contains "F1: the refusal says the run predates per-member records" "predates per-member route records" f1nm.err
+if grep -qE "NO-CONSENSUS|ALL-AGREED" f1nm.out; then
+  echo "FAIL - F1: a route with no member record picked a branch anyway"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: no branch is taken when the votes cannot be known"
+  pass=$((pass + 1))
+fi
+
+# --- F1 resume: members carried over from a crashed lap still vote ------------
+# The other resume shape: the group itself was cut in half, so there is no
+# aggregate_end at all. The members that finished are restored and skipped on
+# the way back in, and their votes have to come back with them - `all: true`
+# fails the moment one of the three goes missing from the count.
+cat > f1-carry.yaml <<'YAML'
+name: f1-carry
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: ca
+        cmd: ["echo", "VOTE-YES"]
+      - id: cb
+        cmd: ["echo", "VOTE-YES"]
+      - id: cc
+        cmd: ["sh", "-c", "if [ -f f1-carry-trip ]; then echo VOTE-YES; else touch f1-carry-trip; exit 7; fi"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: true }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-carry.yaml --runs-dir f1c-runs -q > f1c1.out 2> f1c1.err
+check "F1: the first lap dies on the member that is not primed yet" 1 $?
+F1C_DIR="$(ls -d f1c-runs/*/ | head -1 | sed 's:/*$::')"
+"$SFH" run f1-carry.yaml --resume "$F1C_DIR" --runs-dir f1c-runs -q > f1c2.out 2> f1c2.err
+check "F1: the resumed group runs to the end" 0 $?
+contains "F1: members carried over from the dead lap still count as votes" "ALL-AGREED" f1c2.out
+
+# --- F1: the ordinary case, and what the log says about it -------------------
+cat > f1-all.yaml <<'YAML'
+name: f1-all
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: ua
+        cmd: ["echo", "VOTE-YES"]
+      - id: ub
+        cmd: ["echo", "VOTE-YES"]
+      - id: uc
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 3 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-all.yaml --runs-dir f1a-runs -q > f1a.out 2> f1a.err
+check "F1: three members agreeing meet at_least: 3" 0 $?
+contains "F1: unanimous agreement takes the agreeing branch" "ALL-AGREED" f1a.out
+F1A_DIR="$(dirname "$(find f1a-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F1: the position event records the tally" '"votes":3' "$F1A_DIR/log.jsonl"
+contains "F1: the position event names the voters" '"voters":["ua","ub","uc"]' "$F1A_DIR/log.jsonl"
+contains "F1: a member rule is logged as a rule, not as the catch-all" '"via":"rule","voters"' "$F1A_DIR/log.jsonl"
+contains "F1: the position event names which rule counted" '"rule":0' "$F1A_DIR/log.jsonl"
+
+# --- F1: a needle quoted in the prose is not a vote --------------------------
+# The old grep counted any line equal to the needle anywhere in the body. Only
+# the last non-empty line of a member's own output decides.
+cat > f1-quote.yaml <<YAML
+name: f1-quote
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: qa
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-quote", "VOTE-YES", "--stub-last-line", "VOTE-NO"]
+      - id: qb
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-quote", "VOTE-YES", "--stub-last-line", "VOTE-NO"]
+      - id: qc
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-quote", "VOTE-YES", "--stub-last-line", "VOTE-NO"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-quote.yaml --runs-dir f1q-runs -q > f1q.out 2> f1q.err
+check "F1: a group whose members all quote the needle still routes" 0 $?
+F1Q_DIR="$(dirname "$(find f1q-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F1: the needle really is present in the routing text" "VOTE-YES" "$F1Q_DIR/fan.plain.txt"
+contains "F1: a needle quoted mid-body is not a vote, even at at_least: 1" "NO-CONSENSUS" f1q.out
+contains "F1: the snapshot records the last line, not the quoted one" '"last_line":"VOTE-NO"' "$F1Q_DIR/log.jsonl"
+
+# --- F1: a trailing CR does not cost a member its vote -----------------------
+cat > f1-crlf.yaml <<YAML
+name: f1-crlf
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: ra
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", 'VOTE-YES\r']
+      - id: rb
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", 'VOTE-YES\r']
+      - id: rc
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", 'VOTE-YES\r']
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: true }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-crlf.yaml --runs-dir f1r-runs -q > f1r.out 2> f1r.err
+check "F1: a CRLF verdict line runs" 0 $?
+contains "F1: a verdict line ending in CR still matches" "ALL-AGREED" f1r.out
+
+# --- F1: an empty foreach never agrees ---------------------------------------
+# `all: true` over nothing is true in logic and wrong here: a fan-out that
+# produced no workers has decided nothing (invariant 6, fail-closed).
+cat > f1-empty.yaml <<'YAML'
+name: f1-empty
+steps:
+  - id: each
+    foreach: { from: "[]", split: json }
+    cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: true }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-empty.yaml --runs-dir f1e-runs -q > f1e.out 2> f1e.err
+check "F1: a foreach that produced no items still routes" 0 $?
+contains "F1: all: true over an empty fan-out does not agree" "NO-CONSENSUS" f1e.out
+if grep -qF "ALL-AGREED" f1e.out; then
+  echo "FAIL - F1: the empty set satisfied all: true"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: a fan-out with no members has decided nothing"
+  pass=$((pass + 1))
+fi
+
+# A foreach that DOES produce items counts them, so the test above is measuring
+# the empty case and not a foreach that cannot count at all.
+sed 's/from: "\[\]"/from: "a\\nb"/; s/split: json/split: lines/' f1-empty.yaml > f1-two.yaml
+"$SFH" run f1-two.yaml --runs-dir f1t-runs -q > f1t.out 2> f1t.err
+check "F1: a foreach with items runs" 0 $?
+contains "F1: every item agreeing satisfies all: true" "ALL-AGREED" f1t.out
+
+# --- F1: what validate refuses ------------------------------------------------
+cat > f1-v-leaf.yaml <<'YAML'
+name: f1-v-leaf
+steps:
+  - id: solo
+    cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        goto: end
+YAML
+"$SFH" validate f1-v-leaf.yaml > f1vl.out 2> f1vl.err
+check "F1: when_members on a step with no members is refused" 2 $?
+contains "F1: the refusal says it needs parallel: or foreach:" "parallel" f1vl.err
+
+cat > f1-v-mixed.yaml <<'YAML'
+name: f1-v-mixed
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        when_contains: "something"
+        goto: end
+YAML
+"$SFH" validate f1-v-mixed.yaml > f1vm.out 2> f1vm.err
+check "F1: when_members combined with another condition is refused" 2 $?
+contains "F1: the refusal says the rule must stand alone" "when_contains" f1vm.err
+
+# F1 x F6: the exclusivity has to cover the predicates F6 added too. On a
+# fan-out step when_exit is the GROUP's composite and when_stderr_matches has no
+# file to read, so ANDing either with a per-member tally would put two questions
+# about two different things under one goto - the same trap the text predicates
+# are refused for. Neither branch could write this check alone; it is the merge's.
+for pred in 'when_exit: 0' 'when_stderr_matches: "boom"'; do
+  cat > f1-v-f6mix.yaml <<YAML
+name: f1-v-f6mix
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        $pred
+        goto: end
+YAML
+  "$SFH" validate f1-v-f6mix.yaml > f1vx.out 2> f1vx.err
+  check "F1xF6: when_members combined with ${pred%%:*} is refused" 2 $?
+  contains "F1xF6: the refusal names ${pred%%:*}" "${pred%%:*}" f1vx.err
+done
+
+cat > f1-v-none.yaml <<'YAML'
+name: f1-v-none
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES" }
+        goto: end
+YAML
+"$SFH" validate f1-v-none.yaml > f1vn.out 2> f1vn.err
+check "F1: when_members with no quantifier is refused" 2 $?
+contains "F1: the refusal names both quantifiers" "at_least" f1vn.err
+
+cat > f1-v-both.yaml <<'YAML'
+name: f1-v-both
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1, all: true }
+        goto: end
+YAML
+"$SFH" validate f1-v-both.yaml > f1vb.out 2> f1vb.err
+check "F1: when_members with two quantifiers is refused" 2 $?
+
+cat > f1-v-zero.yaml <<'YAML'
+name: f1-v-zero
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 0 }
+        goto: end
+YAML
+"$SFH" validate f1-v-zero.yaml > f1vz.out 2> f1vz.err
+check "F1: at_least: 0 is refused (it would match a silent fan-out)" 2 $?
+
+cat > f1-v-over.yaml <<'YAML'
+name: f1-v-over
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+      - id: m2
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 3 }
+        goto: end
+YAML
+"$SFH" validate f1-v-over.yaml > f1vo.out 2> f1vo.err
+check "F1: asking more votes than a parallel group has members is refused" 2 $?
+contains "F1: the refusal counts the members it does have" "2" f1vo.err
+
+# A foreach's size is only known at run time, so the same mistake cannot be
+# caught statically - it has to be accepted by validate and never match.
+cat > f1-v-fe.yaml <<'YAML'
+name: f1-v-fe
+steps:
+  - id: each
+    foreach: { from: "a\nb" }
+    cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 99 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" validate f1-v-fe.yaml > f1vf.out 2> f1vf.err
+check "F1: a foreach quantifier over its run-time size passes validate" 0 $?
+"$SFH" run f1-v-fe.yaml --runs-dir f1vf-runs -q > f1vfr.out 2> f1vfr.err
+check "F1: and the run it cannot satisfy still finishes" 0 $?
+contains "F1: an unsatisfiable foreach quantifier falls to the catch-all" "NO-CONSENSUS" f1vfr.out
 
 echo
 echo "engine behaviour: $pass passed, $fail failed"

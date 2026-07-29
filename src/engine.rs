@@ -222,6 +222,9 @@ fn precheck(
             {
                 chk(&ctx_base, "route condition", t)?;
             }
+            if let Some(wm) = &r.when_members {
+                chk(&ctx_base, "route condition", &wm.last_line_is)?;
+            }
         }
         if let Some(c) = &s.compact {
             if let Some(i) = &c.instruction {
@@ -396,6 +399,42 @@ struct PendingRoute {
     /// matched against, so a plain-sourced route must NOT be patched from the
     /// precompact file the way a leaf's chain-sourced route is.
     from_plain: bool,
+    /// The aggregate_end member snapshot, for a `when_members` rule to count.
+    /// None on a leaf's route (nobody to count) and on a fan-out recorded
+    /// before the snapshot existed - the router tells those two apart from the
+    /// flow, and refuses the second rather than guessing (see `Members`).
+    members: Option<Vec<MemberVerdict>>,
+}
+
+/// The per-member snapshot an aggregate_end carries, or None when the event has
+/// none (a run from before they were recorded) or contradicts itself.
+///
+/// All-or-nothing on purpose. Skipping one unreadable entry and keeping the
+/// rest would shrink the denominator, and a smaller denominator is exactly how
+/// `all: true` starts passing on a group that did not agree. None sends the
+/// router down the "cannot answer this" path instead.
+fn restored_members(v: &serde_json::Value) -> Option<Vec<MemberVerdict>> {
+    let arr = v.get("members")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for m in arr {
+        let id = m.get("id")?.as_str()?.to_string();
+        let exit = i32::try_from(m.get("exit")?.as_i64()?).ok()?;
+        let last_line = m.get("last_line")?.as_str()?.to_string();
+        out.push(MemberVerdict {
+            id,
+            // Both halves must agree before a member votes. log.jsonl is
+            // rewritable in a run dir on --resume, and trusting "ok" alone
+            // would promote a member that exited 7 to a voter by editing one
+            // word - the same fail-closed reading the step_end restore uses.
+            ok: m.get("ok")?.as_bool()? && exit == 0,
+            exit,
+            // Re-cut: the writer already did, but a hand-edited longer value
+            // must not be comparable to something the live path could not have
+            // produced.
+            last_line: clip(&last_line, ROUTE_LINE_CHARS),
+        });
+    }
+    Some(out)
 }
 
 #[derive(Clone)]
@@ -769,17 +808,20 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                             visit,
                             route_text: chain.trim_end().to_string(),
                             from_plain: false,
+                            members: None,
                         })
                     } else if ev == "aggregate_end" && ok {
                         // Runs written before plain_file existed have no
                         // headerless copy: leave the route unset (as before)
                         // so the fan-out re-runs rather than routing on
                         // headered text live never matched against.
+                        let members = restored_members(&v);
                         plain.map(|p| PendingRoute {
                             step: step.clone(),
                             visit,
                             route_text: p.trim_end().to_string(),
                             from_plain: true,
+                            members,
                         })
                     } else {
                         None
@@ -1900,7 +1942,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 step_ids: &step_ids,
                 builtins,
             };
-            let target = evaluate_route(step, &pending.route_text, &ctx, &run_dir)?;
+            // Which of the two "no members" cases this is comes from the FLOW,
+            // not from the record: if the flow says this step is a fan-out, its
+            // members were countable and a missing snapshot is a gap to refuse,
+            // not an empty set to route on.
+            let members = if step.parallel.is_some() || step.foreach.is_some() {
+                match &pending.members {
+                    Some(m) => Members::Known(m),
+                    None => Members::Unrecorded,
+                }
+            } else {
+                Members::NotAGroup
+            };
+            let target = evaluate_route(step, &pending.route_text, &ctx, &run_dir, members)?;
             match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                 None => {
                     log_position(
@@ -2217,11 +2271,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // ---- execute the step (leaf / parallel / foreach) ----
             // route_text: what route conditions match against - always the
             // pre-compact text, without sfh's "--- id ---" aggregate headers.
-            let (mut chain_output, route_text, errored): (String, String, bool) = if let Some(
-                children,
-            ) =
-                &step.parallel
-            {
+            let (mut chain_output, route_text, errored, members): (
+                String,
+                String,
+                bool,
+                Option<Vec<MemberVerdict>>,
+            ) = if let Some(children) = &step.parallel {
                 // Members the crashed attempt already finished: their step_end
                 // events restored their output, session and cost, so a resume
                 // must NOT prepare or execute them again (rev_regression: the
@@ -2305,6 +2360,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 }
                 let mut agg = String::new();
                 let mut plain = String::new();
+                let mut verdicts: Vec<MemberVerdict> = Vec::with_capacity(children.len());
                 let mut hard_fail = false;
                 let mut di = 0usize;
                 for c in children.iter() {
@@ -2321,6 +2377,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         if so.exit != 0 && c.on_error.as_deref() != Some("continue") {
                             hard_fail = true;
                         }
+                        // Only members the log recorded as ok are ever carried
+                        // over, so this text is the member's own output with no
+                        // failure wrapper around it - the same bytes the live
+                        // path votes on. The exit test is belt and braces.
+                        verdicts.push(MemberVerdict::new(&c.id, so.exit == 0, so.exit, &so.output));
                         agg.push_str(&format!("--- {} ---\n{}\n\n", c.id, so.output.trim_end()));
                         plain.push_str(&format!("{}\n\n", so.output.trim_end()));
                         continue;
@@ -2379,6 +2440,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             d.exit_code, d.timed_out
                         )
                     };
+                    // From the child's OWN output and the engine's own verdict
+                    // on it, not from `exposed` and not from the aggregate: the
+                    // aggregate is where the two become indistinguishable.
+                    verdicts.push(MemberVerdict::new(
+                        &c.id,
+                        d.ok(),
+                        d.exit_code,
+                        &d.chain_output,
+                    ));
                     agg.push_str(&format!(
                         "--- {}{} ---\n{}\n\n",
                         c.id,
@@ -2397,14 +2467,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
                 log_aggregate_end(
                     &mut log,
-                    &step.id,
-                    visit,
-                    &gtag,
-                    hard_fail,
-                    &plain,
-                    &plain_name,
+                    AggregateEnd {
+                        step: &step.id,
+                        visit,
+                        gtag: &gtag,
+                        failed: hard_fail,
+                        plain: &plain,
+                        plain_file: &plain_name,
+                        members: &verdicts,
+                    },
                 );
-                (agg, plain, hard_fail)
+                (agg, plain, hard_fail, Some(verdicts))
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
                 let pf = run_dir.join(format!("{gtag}.from.txt"));
@@ -2512,6 +2585,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 }
                 let mut agg = String::new();
                 let mut plain = String::new();
+                let mut verdicts: Vec<MemberVerdict> = Vec::with_capacity(items.len());
                 let mut any_fail = false;
                 let mut di = 0usize;
                 #[allow(clippy::needless_range_loop)]
@@ -2525,6 +2599,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         if so.exit != 0 {
                             any_fail = true;
                         }
+                        // See the parallel branch: a carried-over item was
+                        // recorded ok, so its stored text carries no wrapper.
+                        verdicts.push(MemberVerdict::new(
+                            &label,
+                            so.exit == 0,
+                            so.exit,
+                            &so.output,
+                        ));
                         agg.push_str(&format!(
                             "--- {}[{i}] item: {} ---\n{}\n\n",
                             step.id,
@@ -2561,6 +2643,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             d.exit_code, d.timed_out
                         )
                     };
+                    verdicts.push(MemberVerdict::new(
+                        &label,
+                        d.ok(),
+                        d.exit_code,
+                        &d.chain_output,
+                    ));
                     agg.push_str(&format!(
                         "--- {}[{i}]{} item: {} ---\n{}\n\n",
                         step.id,
@@ -2579,14 +2667,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
                 log_aggregate_end(
                     &mut log,
-                    &step.id,
-                    visit,
-                    &gtag,
-                    hard_fail,
-                    &plain,
-                    &plain_name,
+                    AggregateEnd {
+                        step: &step.id,
+                        visit,
+                        gtag: &gtag,
+                        failed: hard_fail,
+                        plain: &plain,
+                        plain_file: &plain_name,
+                        members: &verdicts,
+                    },
                 );
-                (agg, plain, hard_fail)
+                (agg, plain, hard_fail, Some(verdicts))
             } else {
                 if total + 1 > max_total {
                     return Err(format!("exceeded max_total_steps ({max_total})"));
@@ -2670,7 +2761,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     },
                 );
                 let rt = d.chain_output.clone();
-                (d.chain_output.clone(), rt, !d.ok())
+                // A leaf has no members, which is not the same as having none
+                // recorded - see `Members`.
+                (d.chain_output.clone(), rt, !d.ok(), None)
             };
             let notes_output = chain_output.clone();
 
@@ -2857,7 +2950,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     step_ids: &step_ids,
                     builtins,
                 };
-                evaluate_route(step, &route_text, &ctx, &run_dir)?
+                evaluate_route(
+                    step,
+                    &route_text,
+                    &ctx,
+                    &run_dir,
+                    match &members {
+                        Some(m) => Members::Known(m),
+                        None => Members::NotAGroup,
+                    },
+                )?
             };
             match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                 None => {
@@ -3543,7 +3645,7 @@ impl PositionVia {
 /// How many characters of routing text a position event records. The same cut
 /// the fan-out member snapshot uses: enough to recognise a verdict line, not
 /// enough for a runaway step to bloat log.jsonl.
-const ROUTE_LINE_CHARS: usize = 200;
+pub(crate) const ROUTE_LINE_CHARS: usize = 200;
 
 fn clip(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -3558,6 +3660,95 @@ fn route_line_of(r: &flow::Route, route_text: &str, last: &str) -> String {
         clip(route_text, ROUTE_LINE_CHARS)
     } else {
         clip(last, ROUTE_LINE_CHARS)
+    }
+}
+
+/// One fan-out member's contribution to a `when_members` tally.
+///
+/// Deliberately not derived from the group's routing text. That text is the
+/// members' raw output concatenated, and a FAILED member's output goes into it
+/// unmarked - the "[sfh: FAILED]" banner is added to the labeled aggregate
+/// only. In the text, "said the winning line" and "said the winning line and
+/// exited 1" are the same bytes; here they are different facts.
+#[derive(Clone)]
+struct MemberVerdict {
+    id: String,
+    /// `LeafDone::ok()` for a member this process ran; the recorded equivalent
+    /// for one restored from a crashed attempt.
+    ok: bool,
+    exit: i32,
+    /// The trimmed last non-empty line of the member's own pre-compact output,
+    /// cut to ROUTE_LINE_CHARS. Cut on the way IN rather than on the way to the
+    /// log, because the tally compares this value: cutting only for the log
+    /// would let an over-long verdict match live and miss after a resume.
+    last_line: String,
+}
+
+impl MemberVerdict {
+    fn new(id: &str, ok: bool, exit: i32, output: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            ok,
+            exit,
+            last_line: clip(leaf::last_line(output), ROUTE_LINE_CHARS),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({"id": self.id, "ok": self.ok, "exit": self.exit, "last_line": self.last_line})
+    }
+}
+
+/// What the router knows about the step's fan-out members.
+enum Members<'a> {
+    /// Not a fan-out at all, so there is nobody to count. validate refuses
+    /// `when_members` on such a step; if a rule reaches the router anyway it
+    /// decides nothing.
+    NotAGroup,
+    Known(&'a [MemberVerdict]),
+    /// A fan-out whose recorded aggregate_end carries no per-member records.
+    Unrecorded,
+}
+
+impl Members<'_> {
+    /// Who voted, and whether that is enough. `Ok(None)` = the rule does not
+    /// match; `Err` = the question cannot be answered honestly at all.
+    fn tally(
+        &self,
+        wm: &flow::WhenMembers,
+        needle: &str,
+        step: &str,
+        idx: usize,
+    ) -> Result<Option<(u32, Vec<String>)>, String> {
+        let ms = match self {
+            Self::NotAGroup => return Ok(None),
+            // Only reachable by editing when_members into a flow and resuming a
+            // run recorded before per-member records existed. Falling through
+            // to the catch-all would make the branch depend on which sfh wrote
+            // the run, silently, so the run stops and says so.
+            Self::Unrecorded => {
+                return Err(format!(
+                    "step '{step}' route[{idx}]: this run predates per-member route records; re-run the group step or remove when_members"
+                ))
+            }
+            Self::Known(m) => *m,
+        };
+        let voters: Vec<String> = ms
+            .iter()
+            .filter(|m| m.ok && m.last_line == needle)
+            .map(|m| m.id.clone())
+            .collect();
+        let votes = voters.len();
+        // A fan-out that produced no members has decided nothing. `all: true`
+        // over the empty set is true in logic and fail-OPEN here, which is the
+        // one thing a gate may never be (invariant 6).
+        let enough = !ms.is_empty()
+            && match (wm.at_least, wm.all) {
+                (Some(n), _) => votes as u64 >= u64::from(n),
+                (None, Some(true)) => votes == ms.len(),
+                _ => false,
+            };
+        Ok(enough.then_some((votes as u32, voters)))
     }
 }
 
@@ -3609,6 +3800,7 @@ fn evaluate_route(
     route_text: &str,
     ctx: &template::Ctx<'_>,
     run_dir: &Path,
+    members: Members<'_>,
 ) -> Result<Option<RouteHit>, String> {
     let last = leaf::last_line(route_text).to_string();
     // Read at most once per routing decision, and only when a rule asks.
@@ -3641,6 +3833,19 @@ fn evaluate_route(
             if let Some(t) = &r.when_last_line_is {
                 if last != template::render(t, ctx)? {
                     matched = false;
+                }
+            }
+        }
+        // Exclusive with everything above (validate), so this decides the rule
+        // on its own; the guard only keeps a hand-built Route from rendering a
+        // template it does not need.
+        let mut tally = None;
+        if matched {
+            if let Some(wm) = &r.when_members {
+                let needle = template::render(&wm.last_line_is, ctx)?;
+                match members.tally(wm, &needle, &step.id, idx)? {
+                    Some(t) => tally = Some(t),
+                    None => matched = false,
                 }
             }
         }
@@ -3679,6 +3884,7 @@ fn evaluate_route(
                 && r.when_last_line_matches.is_none()
                 && r.when_exit.is_none()
                 && r.when_stderr_matches.is_none()
+                && r.when_members.is_none()
             {
                 PositionVia::CatchAll
             } else {
@@ -3689,8 +3895,8 @@ fn evaluate_route(
                 via,
                 rule: idx,
                 line: route_line_of(r, route_text, &last),
-                votes: None,
-                voters: None,
+                votes: tally.as_ref().map(|(n, _)| *n),
+                voters: tally.map(|(_, v)| v),
             }));
         }
     }
@@ -3759,23 +3965,33 @@ fn log_step_end(
     );
 }
 
-fn log_aggregate_end(
-    f: &mut std::fs::File,
-    step: &str,
+/// How a fan-out lap ended, as the log records it. A struct rather than eight
+/// positional arguments, so the parallel and foreach branches cannot drift into
+/// writing different shapes of the same event.
+struct AggregateEnd<'a> {
+    step: &'a str,
     visit: u32,
-    gtag: &str,
+    gtag: &'a str,
     failed: bool,
-    plain: &str,
-    plain_file: &str,
-) {
+    plain: &'a str,
+    plain_file: &'a str,
+    members: &'a [MemberVerdict],
+}
+
+fn log_aggregate_end(f: &mut std::fs::File, a: AggregateEnd<'_>) {
     log_event(
         f,
         json!({
-            "ts": utc_stamp(), "event": "aggregate_end", "step": step, "visit": visit,
-            "failed": failed, "exit": if failed { 1 } else { 0 },
-            "output_hash": fingerprint(plain),
-            "chain_file": format!("{gtag}.chain.txt"), "out_file": format!("{gtag}.out.txt"),
-            "plain_file": plain_file,
+            "ts": utc_stamp(), "event": "aggregate_end", "step": a.step, "visit": a.visit,
+            "failed": a.failed, "exit": if a.failed { 1 } else { 0 },
+            "output_hash": fingerprint(a.plain),
+            "chain_file": format!("{}.chain.txt", a.gtag), "out_file": format!("{}.out.txt", a.gtag),
+            "plain_file": a.plain_file,
+            // Who said what, per member. A resume re-decides a `when_members`
+            // route from THIS and nothing else: the artifacts on disk hold the
+            // members' text but not which of them completed, and the text alone
+            // cannot answer that (see MemberVerdict).
+            "members": a.members.iter().map(MemberVerdict::to_json).collect::<Vec<_>>(),
         }),
     );
 }
@@ -3889,6 +4105,7 @@ mod tests {
             when_last_line_matches: None,
             when_exit: None,
             when_stderr_matches: None,
+            when_members: None,
             goto: "end".to_string(),
         }
     }
@@ -3974,7 +4191,7 @@ mod tests {
                 step_ids: &ids,
                 builtins: BTreeMap::new(),
             };
-            let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."))
+            let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."), Members::NotAGroup)
                 .unwrap()
                 .expect("some rule always matches here");
             assert_eq!(hit.goto, want, "exit {exit}");
@@ -3989,7 +4206,7 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."))
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."), Members::NotAGroup)
             .unwrap()
             .unwrap();
         assert!(matches!(hit.via, PositionVia::Rule));
@@ -4011,7 +4228,7 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."))
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, Path::new("."), Members::NotAGroup)
             .unwrap()
             .unwrap();
         assert_eq!(hit.goto, "other");
@@ -4034,13 +4251,13 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir)
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
             .unwrap()
             .unwrap();
         assert_eq!(hit.goto, "guard_fired");
 
         std::fs::remove_file(&err).unwrap();
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir)
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
             .unwrap()
             .unwrap();
         assert_eq!(hit.goto, "broken", "a missing stderr file must not match");
@@ -4054,7 +4271,7 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir)
+        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
             .unwrap()
             .unwrap();
         assert_eq!(hit.goto, "broken");
@@ -4193,6 +4410,149 @@ mod tests {
             "the recorded outputs the skip lives on must be restored too"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn verdicts(spec: &[(&str, bool, &str)]) -> Vec<MemberVerdict> {
+        spec.iter()
+            .map(|(id, ok, line)| MemberVerdict::new(id, *ok, i32::from(!*ok), line))
+            .collect()
+    }
+
+    fn quantifier(at_least: Option<u32>, all: Option<bool>) -> flow::WhenMembers {
+        flow::WhenMembers {
+            last_line_is: "YES".into(),
+            at_least,
+            all,
+        }
+    }
+
+    #[test]
+    fn a_member_vote_needs_both_a_clean_exit_and_the_exact_line() {
+        // F1: the two halves of a vote. The failing member here says exactly
+        // the right words - which is the whole point, because in the group's
+        // routing text that is all anyone can see.
+        let ms = verdicts(&[("a", true, "YES"), ("b", true, "YES"), ("c", false, "YES")]);
+        let m = Members::Known(&ms);
+        let (votes, voters) = m
+            .tally(&quantifier(Some(2), None), "YES", "fan", 0)
+            .unwrap()
+            .expect("two clean members agreed");
+        assert_eq!(votes, 2);
+        assert_eq!(voters, vec!["a".to_string(), "b".to_string()]);
+        assert!(
+            m.tally(&quantifier(Some(3), None), "YES", "fan", 0)
+                .unwrap()
+                .is_none(),
+            "the member that said the words and failed must not make three"
+        );
+        assert!(
+            m.tally(&quantifier(None, Some(true)), "YES", "fan", 0)
+                .unwrap()
+                .is_none(),
+            "all: true cannot hold while one member failed"
+        );
+        // Only the member's OWN last line counts, and only in full.
+        assert!(
+            m.tally(&quantifier(Some(1), None), "YE", "fan", 0)
+                .unwrap()
+                .is_none(),
+            "a prefix of the verdict is not the verdict"
+        );
+    }
+
+    #[test]
+    fn an_empty_fan_out_never_agrees() {
+        // Invariant 6. "All of nothing" is true in logic, and a foreach that
+        // produced zero workers has decided nothing - the one reading that
+        // would let a gate open on silence.
+        let none: [MemberVerdict; 0] = [];
+        let m = Members::Known(&none);
+        assert!(m
+            .tally(&quantifier(None, Some(true)), "YES", "each", 0)
+            .unwrap()
+            .is_none());
+        assert!(m
+            .tally(&quantifier(Some(1), None), "YES", "each", 0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_route_that_cannot_count_refuses_rather_than_guesses() {
+        // Two different kinds of "no members", told apart by the caller: a leaf
+        // step has none to count (validate refuses when_members there, so this
+        // is defence only), while a fan-out whose record predates the snapshot
+        // COULD have been counted and no longer can. Falling through to the
+        // catch-all in the second case would make the branch depend on which
+        // sfh wrote the run, silently.
+        let wm = quantifier(Some(1), None);
+        assert!(Members::NotAGroup
+            .tally(&wm, "YES", "solo", 0)
+            .unwrap()
+            .is_none());
+        let err = Members::Unrecorded
+            .tally(&wm, "YES", "fan", 2)
+            .expect_err("a fan-out with no record must not decide");
+        assert!(err.contains("predates per-member route records"), "{err}");
+        assert!(err.contains("route[2]"), "{err}");
+    }
+
+    #[test]
+    fn a_restored_snapshot_is_read_whole_or_not_at_all() {
+        // The denominator is the point. Dropping one unreadable entry and
+        // counting the rest would SHRINK the group, and a smaller group is how
+        // `all: true` starts passing on a fan-out that did not agree.
+        let good = json!({"members": [
+            {"id": "a", "ok": true, "exit": 0, "last_line": "YES"},
+            {"id": "b", "ok": false, "exit": 1, "last_line": "YES"},
+        ]});
+        let ms = restored_members(&good).expect("a well-formed snapshot");
+        assert_eq!(ms.len(), 2);
+        assert!(ms[0].ok && !ms[1].ok);
+        let torn = json!({"members": [
+            {"id": "a", "ok": true, "exit": 0, "last_line": "YES"},
+            {"id": "b", "ok": true, "exit": 0},
+        ]});
+        assert!(
+            restored_members(&torn).is_none(),
+            "one unreadable member must void the whole snapshot"
+        );
+        assert!(
+            restored_members(&json!({"failed": false})).is_none(),
+            "an aggregate_end from before the snapshot existed has none"
+        );
+    }
+
+    #[test]
+    fn a_recorded_vote_needs_its_two_halves_to_agree() {
+        // log.jsonl is rewritable inside a run dir on --resume. Trusting `ok`
+        // on its own would promote a member that exited 7 to a voter by editing
+        // one word, so the exit code has to agree with it - the same reading
+        // the step_end restore already uses.
+        let forged = json!({"members": [{"id": "a", "ok": true, "exit": 7, "last_line": "YES"}]});
+        let ms = restored_members(&forged).expect("well-formed, just contradictory");
+        assert!(
+            !ms[0].ok,
+            "a member that exited 7 must not vote however the log labels it"
+        );
+    }
+
+    #[test]
+    fn a_recorded_verdict_line_is_trimmed_and_cut_the_same_way_live_and_restored() {
+        // The tally compares this value, so live and resumed have to produce
+        // identical bytes or a resume could pick a different branch.
+        let crlf = MemberVerdict::new("a", true, 0, "prose\r\nVOTE-YES\r\n");
+        assert_eq!(crlf.last_line, "VOTE-YES", "a CRLF trailer still votes");
+        let long = MemberVerdict::new("a", true, 0, &"x".repeat(400));
+        assert_eq!(long.last_line.chars().count(), ROUTE_LINE_CHARS);
+        let restored = restored_members(
+            &json!({"members": [{"id": "a", "ok": true, "exit": 0, "last_line": "x".repeat(400)}]}),
+        )
+        .expect("snapshot");
+        assert_eq!(
+            restored[0].last_line, long.last_line,
+            "a hand-lengthened record must not become comparable to something live could not produce"
+        );
     }
 
     #[test]
