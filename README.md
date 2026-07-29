@@ -150,7 +150,7 @@ defaults:                    # 全ステップの既定値(すべて任意)
   max_cost_usd: 5.0          # 報告されたコストの累計がこれを超えたら中断
   wall_clock_sec: 7200       # フロー全体の実時間上限
   on_budget: goto:wrap       # 上限−reserve に達したら中断せずここへ着地(1 run 1回)
-  budget_reserve:            # 着地連鎖のために各上限から取り置く分(既定0)
+  budget_reserve:            # 着地連鎖のために各上限から取り置く分(宣言した上限には必須)
     cost_usd: 0.5
     wall_clock_sec: 600
   retry: { max: 2, backoff_sec: 5 }   # 失敗時のリトライ(指数バックオフ)
@@ -175,7 +175,8 @@ steps:
     timeout_sec: 1800        # 超過でプロセスツリーをkill
     max_prompt_chars: 50000
     notes: append            # このステップの出力を {{notes}} (run_dir/notes.md) に蓄積
-    on_error: fail           # fail(既定) | continue | goto:<id> | goto:end | goto:fail
+    on_error: fail           # fail(既定) | continue | goto:<id> | goto:end | goto:fail | goto:stuck
+                             #   ※parallel:の子はfail/continueのみ(goto:は全部validateエラー)
     on_max_visits: goto:end  # 差し戻し回数を使い切った時の降格先(既定fail=フロー終了)
     retry: { max: 2 }        # このステップだけのリトライ
     hang_after_sec: 600      # このステップだけのハング判定しきい値(既定はdefaults、無指定なら300)
@@ -402,7 +403,7 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 
 ### 第3の終端: `goto: stuck`(exit 4 = 作業は残っているが人間待ち)
 
-「**作業は保存されているが、人間の判断なしに先へ進んではいけない**」を機械可読にする終端。`end`(exit 0)/`fail`(exit 1)と同格の予約 goto 先で、`route[].goto` / `on_error: goto:stuck` / `on_max_visits: goto:stuck` のどこでも書ける。
+「**作業は保存されているが、人間の判断なしに先へ進んではいけない**」を機械可読にする終端。`end`(exit 0)/`fail`(exit 1)と同格の予約 goto 先で、`route[].goto` / `on_error: goto:stuck` / `on_max_visits: goto:stuck` のどこでも書ける。ただし **`parallel:` の子には書けない**(validate エラー)。メンバーの `on_error` は `fail` か `continue` しか意味を持たず、跳び先はグループ自身の `on_error` / `route:` が決めるため — 受理して黙って無視すれば exit 4 を頼んだ人に exit 1 が返る。
 
 ```yaml
   - id: verdict
@@ -447,7 +448,7 @@ defaults:
   max_cost_usd: 60.0
   wall_clock_sec: 43200
   on_budget: goto:wrap                                       # 未指定なら従来どおり即エラー
-  budget_reserve: { cost_usd: 2.0, wall_clock_sec: 900 }     # 省略時 0
+  budget_reserve: { cost_usd: 2.0, wall_clock_sec: 900 }     # 宣言した上限ごとに必須(0 不可)
 steps:
   # …本題のループ…
   - id: wrap
@@ -470,7 +471,9 @@ steps:
 | `sfh runs show` | `budget  : landed on cost after $58.0312 / 1204s -> goto wrap` |
 | `--dry-run` | `budget landing: goto wrap (cost reserve $2.00, wall reserve 900s)` — `route:` に現れない唯一の goto なので、ここで可視化する |
 
-**validate が拒否するもの**: 跳び先が実在しない / `goto:` を付けていない / `budget_reserve` だけで `on_budget` が無い(reserve は「どれだけ早く着地するか」を決めるだけなので、単体では何もしない) / `on_budget` があるのに `max_cost_usd` も `wall_clock_sec` も無い(上限が無ければ閾値も無い)。
+**validate が拒否するもの**: 跳び先が実在しない / `goto:` を付けていない / `budget_reserve` だけで `on_budget` が無い(reserve は「どれだけ早く着地するか」を決めるだけなので、単体では何もしない) / `on_budget` があるのに `max_cost_usd` も `wall_clock_sec` も無い(上限が無ければ閾値も無い)/ **宣言した上限のどれかに reserve が無い(または 0)**。
+
+最後のものが一番効く。reserve が 0 だと閾値は上限そのものになり、着地はするが**その次のループ先頭で上限検査が同じ値で発火して**、着地連鎖が 1 ステップも走らないまま従来のエラーで終わる — `budget_landing` イベントと `-> goto wrap` の表示だけが増えて、結果は何も変わらない。軸ごとに独立なので、コスト側に reserve を書いても時間側の着地は買えない。
 
 #### 既知の限界(全部読んでから reserve を決めること)
 
@@ -557,7 +560,7 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | `{{steps.ID.output}}` | 最新出力(compact後)。未実行なら空 |
 | `{{steps.ID.outputs}}` | 集約/原文(parallel・foreach・compact原文) |
 | `{{steps.ID.output_file}}` | 出力ファイルパス |
-| `{{steps.ID.exit}}` | sfhが正規化した終了コード。プロセス終了コードそのものではなく、出力解析・空出力・セッション検証等の結果も反映する。診断用テンプレート値であり `route:` の述語ではない |
+| `{{steps.ID.exit}}` | sfhが正規化した終了コード。プロセス終了コードそのものではなく、出力解析・空出力・セッション検証等の結果も反映する。同じ値で分岐するには `route:` の [`when_exit`](#正しい理由で落ちたゲート-when_exit--when_stderr_matches) を使う |
 | `{{steps.ID.stderr_file}}` | 標準エラー出力ファイルのパス |
 | `{{item}}` `{{item_index}}` | foreach内のみ |
 | `{{notes}}` | 共有ノートの現在内容 |
@@ -983,8 +986,10 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 `aggregate_end`(parallel / foreach 共通)には `members` が入る:
 
 ```json
-"members": [{"id": "rev_a", "ok": true, "exit": 0, "last_line": "REVIEW-PASS"}, …]
+"members": [{"id": "rev_a", "ok": true, "exit": 0, "last_line": "REVIEW-PASS", "clipped": false}, …]
 ```
+
+`last_line` は 200 文字で切る。切ったかどうかを `clipped` が持ち、**`clipped: true` のメンバーは絶対に票に数えない** — 切った後の値は前方一致でしかなく、判定文字列がちょうど 200 文字だったとき「判定文字列を言ってからさらに喋ったメンバー」を 1 票に数えてしまうため。切った先は残っていないので「同じことを言ったか分からない」が正直な答えであり、分からないものは不成立側に倒す。
 
 **この記録が resume 時の唯一の情報源である。** 集約テキストは run ディレクトリに
 残るが、どのメンバーが完走したかはテキストからは分からない(前述のとおり失敗の印が
@@ -1000,6 +1005,13 @@ run の世代によって分岐が静かに変わるくらいなら止まるほ�
 `{"mode":"continue"|"fork","step":"<接続先ステップ>","tool":"<CLI>","id":"<親のセッションID>"}`、
 自前の文脈で始まったステップは `null`。フローを編集して `--force-resume` した後は
 フロー側を読んでも実際の親子関係が分からないため、ログ側に残す。
+
+**fan-out のメンバーも自分の `step_start` を書く。** `parallel:` の子が全員 `fork_from` で
+同じ親に付く形は `fork_from` の主用途そのものなので、ここが記録されないと肝心の系統が読めない。
+メンバーの行には `parent`(所属グループの id)が付き、これが目印になる:
+`sfh` 自身は `parent` 付きの `step_start` を**再開地点として数えない**(子の id は再開できる場所ではなく、
+グループ全体は `group_start` / `foreach_start` が代表しているため)。`foreach:` のメンバーは
+`step_end` と同じく `<id>[<i>]` の名前で並ぶ。
 
 ```bash
 # どのステップがどの行でどこへ跳んだか
@@ -1040,7 +1052,7 @@ grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next
 
 ```bash
 cargo test                              # 140本の単体テスト
-bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト460本
+bash tests/engine_behaviour.sh ./target/release/sfh   # AIを呼ばない挙動テスト508本
 ```
 
 挙動テストは冒頭で `tests/stub/session_stub.rs` を `rustc` で1回ビルドする。

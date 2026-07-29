@@ -210,12 +210,19 @@ fn precheck(
             chk(&ctx_base, "foreach.from", &f.from)?;
         }
         for r in &s.route {
+            // EVERY predicate whose text is template-rendered at routing time
+            // belongs here. when_stderr_matches was missed when it was added:
+            // its template was rendered only in evaluate_route, so a typo in it
+            // passed validate and dry-run and killed the run after the step it
+            // guards had already been executed and billed - the one thing this
+            // function exists to prevent.
             for t in [
                 &r.when_contains,
                 &r.when_matches,
                 &r.when_last_line_contains,
                 &r.when_last_line_is,
                 &r.when_last_line_matches,
+                &r.when_stderr_matches,
             ]
             .into_iter()
             .flatten()
@@ -432,6 +439,12 @@ fn restored_members(v: &serde_json::Value) -> Option<Vec<MemberVerdict>> {
             // must not be comparable to something the live path could not have
             // produced.
             last_line: clip(&last_line, ROUTE_LINE_CHARS),
+            // Either the writer said it cut the line, or the recorded value is
+            // longer than the writer could have written - both mean the value
+            // being compared is a prefix. Missing key = an unclipped line, the
+            // shape every ordinary verdict has.
+            clipped: m.get("clipped").and_then(|c| c.as_bool()).unwrap_or(false)
+                || last_line.chars().count() > ROUTE_LINE_CHARS,
         });
     }
     Some(out)
@@ -549,6 +562,12 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     }
                 }
             }
+            // A MEMBER's step_start (it carries `parent`) is a lineage record
+            // only. Tracking it as an unfinished step would hand the resume a
+            // child id as the place to restart, which is not a top-level step;
+            // the group's own group_start/foreach_start below already stands for
+            // the whole fan-out.
+            "step_start" if v.get("parent").is_some_and(|p| !p.is_null()) => {}
             "step_start" => {
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
                 unfinished.insert(
@@ -568,11 +587,12 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     },
                 );
             }
-            // A fan-out logs NO step_start (its members do), so without these
-            // events a crash mid-fan-out - before aggregate_end - leaves no
-            // record of where the run was. A flow whose FIRST step is a fan-out
-            // then has nothing to resume from at all. Track the group exactly
-            // like an unfinished leaf; aggregate_end clears it.
+            // A fan-out logs no step_start of its OWN (only its members do, and
+            // those are skipped just above), so without these events a crash
+            // mid-fan-out - before aggregate_end - leaves no record of where the
+            // run was. A flow whose FIRST step is a fan-out then has nothing to
+            // resume from at all. Track the group exactly like an unfinished
+            // leaf; aggregate_end clears it.
             "group_start" | "foreach_start" => {
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
                 // A new lap opened, so whatever the previous one left behind is
@@ -1942,11 +1962,31 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 step_ids: &step_ids,
                 builtins,
             };
-            // Which of the two "no members" cases this is comes from the FLOW,
-            // not from the record: if the flow says this step is a fan-out, its
+            // Which of the "no members" cases this is comes from the FLOW, not
+            // from the record: if the flow says this step is a fan-out, its
             // members were countable and a missing snapshot is a gap to refuse,
             // not an empty set to route on.
-            let members = if step.parallel.is_some() || step.foreach.is_some() {
+            //
+            // The size has to come from the flow too. A snapshot of N members
+            // satisfies `all: true` on its own terms, so a flow edited to
+            // declare N+1 (which requires --force-resume, which is exactly when
+            // this happens) would report unanimity on a group the new member was
+            // never asked about - a live run of the same flow takes the other
+            // branch. validate already compares `at_least` against the declared
+            // size statically; this is the same comparison at the one moment the
+            // two can disagree.
+            let members = if let Some(children) = &step.parallel {
+                match &pending.members {
+                    Some(m) if m.len() != children.len() => Members::Mismatch {
+                        recorded: m.len(),
+                        declared: children.len(),
+                    },
+                    Some(m) => Members::Known(m),
+                    None => Members::Unrecorded,
+                }
+            } else if step.foreach.is_some() {
+                // A foreach's size is whatever the upstream step produced, so
+                // there is no declared count to check it against.
                 match &pending.members {
                     Some(m) => Members::Known(m),
                     None => Members::Unrecorded,
@@ -1997,9 +2037,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
             }
             // F5: land before the cliff, once per run. Checked BEFORE the two
-            // ceiling checks below, so a flow that reserves nothing still lands
-            // at the exact point the hard error used to fire instead of racing
-            // it. After the landing this whole block is skipped and the ceiling
+            // ceiling checks below, but that head start is worth exactly the
+            // reserve and no more: the landing jumps and `continue`s, which
+            // brings control straight back HERE, where the untouched ceiling
+            // checks now run. A landing with a zero reserve therefore fires on
+            // the same values the ceiling is about to fail on and the chain
+            // never gets a step - which is why validate refuses a zero reserve
+            // on any declared ceiling instead of leaving it to fail silently.
+            // After the landing this whole block is skipped and the ceiling
             // checks are all that is left - spend the reserve too and the run
             // ends the way it always did.
             if let (Some(plan), false) = (&budget_plan, budget_landed) {
@@ -2348,6 +2393,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
                     );
                 }
+                log_member_starts(
+                    &mut log,
+                    &step.id,
+                    visit,
+                    preps
+                        .iter()
+                        .zip(fresh_idx.iter())
+                        .map(|(p, &ci)| (children[ci].id.clone(), p)),
+                );
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
                 for (pos, &ci) in fresh_idx.iter().enumerate() {
                     let c = &children[ci];
@@ -2569,6 +2623,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": preps.len()}),
                     );
                 }
+                log_member_starts(
+                    &mut log,
+                    &step.id,
+                    visit,
+                    preps
+                        .iter()
+                        .zip(fresh_idx.iter())
+                        .map(|(p, &i)| (format!("{}[{i}]", step.id), p)),
+                );
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
                 for (pos, &i) in fresh_idx.iter().enumerate() {
                     let tag = if visit == 1 {
@@ -3593,6 +3656,32 @@ fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
     let _ = writeln!(f, "{v}");
 }
 
+/// The fan-out members' own step_start lines: one per member about to run, each
+/// naming the session it attached to.
+///
+/// `parallel:` with a `fork_from:` on every child is the documented shape of
+/// session reuse, so recording `session_parent` for top-level leaves only left
+/// the exact case the key was added for unrecorded - and after the flow edit
+/// that makes the log the only account of what ran, unrecoverable.
+///
+/// The `parent` key is what tells these apart from a top-level step_start:
+/// load_resume uses step_start to remember "this started and never ended, so
+/// resume here", and a member id is not a place a resume can start. The group's
+/// own group_start / foreach_start already stands for the whole fan-out there.
+fn log_member_starts<'a, I>(f: &mut std::fs::File, group: &str, visit: u32, members: I)
+where
+    I: Iterator<Item = (String, &'a leaf::Prepared)>,
+{
+    for (id, prep) in members {
+        log_event(
+            f,
+            json!({"ts": utc_stamp(), "event": "step_start", "step": id, "parent": group,
+                   "visit": visit, "cmd": prep.inv.describe(),
+                   "session_parent": session_parent_json(prep)}),
+        );
+    }
+}
+
 /// The session a step attached to, for step_start. Null - like `session` in
 /// step_end - when the step opened its own context.
 fn session_parent_json(prep: &leaf::Prepared) -> serde_json::Value {
@@ -3696,20 +3785,31 @@ struct MemberVerdict {
     /// log, because the tally compares this value: cutting only for the log
     /// would let an over-long verdict match live and miss after a resume.
     last_line: String,
+    /// Whether that cut removed anything. A cut line is a PREFIX, and comparing
+    /// a prefix for equality is how a member that said the verdict and then kept
+    /// talking gets counted as having voted - the needle may itself be
+    /// ROUTE_LINE_CHARS long, so "equal after cutting" does not imply "equal".
+    /// The full line is not kept (that is what the cut is for), so the honest
+    /// answer to "did this member say exactly that" is "cannot tell", and
+    /// invariant 6 puts that on the not-matching side.
+    clipped: bool,
 }
 
 impl MemberVerdict {
     fn new(id: &str, ok: bool, exit: i32, output: &str) -> Self {
+        let full = leaf::last_line(output);
         Self {
             id: id.to_string(),
             ok,
             exit,
-            last_line: clip(leaf::last_line(output), ROUTE_LINE_CHARS),
+            last_line: clip(full, ROUTE_LINE_CHARS),
+            clipped: full.chars().count() > ROUTE_LINE_CHARS,
         }
     }
 
     fn to_json(&self) -> serde_json::Value {
-        json!({"id": self.id, "ok": self.ok, "exit": self.exit, "last_line": self.last_line})
+        json!({"id": self.id, "ok": self.ok, "exit": self.exit,
+               "last_line": self.last_line, "clipped": self.clipped})
     }
 }
 
@@ -3722,6 +3822,12 @@ enum Members<'a> {
     Known(&'a [MemberVerdict]),
     /// A fan-out whose recorded aggregate_end carries no per-member records.
     Unrecorded,
+    /// A `parallel:` group whose recorded member count is not the one the flow
+    /// now declares - only reachable by editing the group and `--force-resume`.
+    Mismatch {
+        recorded: usize,
+        declared: usize,
+    },
 }
 
 impl Members<'_> {
@@ -3745,11 +3851,20 @@ impl Members<'_> {
                     "step '{step}' route[{idx}]: this run predates per-member route records; re-run the group step or remove when_members"
                 ))
             }
+            // Counting the old votes under the new quantifier would answer a
+            // question about a group that no longer exists, and `all: true`
+            // would answer it YES - fail-open on the one predicate whose whole
+            // job is to be a gate. Stop and say which two numbers disagree.
+            Self::Mismatch { recorded, declared } => {
+                return Err(format!(
+                    "step '{step}' route[{idx}]: the recorded vote has {recorded} member(s) but the flow now declares {declared}; re-run the group step so every declared member votes, or resume with the flow the record was made under"
+                ))
+            }
             Self::Known(m) => *m,
         };
         let voters: Vec<String> = ms
             .iter()
-            .filter(|m| m.ok && m.last_line == needle)
+            .filter(|m| m.ok && !m.clipped && m.last_line == needle)
             .map(|m| m.id.clone())
             .collect();
         let votes = voters.len();
@@ -4585,6 +4700,67 @@ mod tests {
             restored[0].last_line, long.last_line,
             "a hand-lengthened record must not become comparable to something live could not produce"
         );
+        assert!(
+            restored[0].clipped,
+            "a record longer than the writer could have written is a cut line"
+        );
+    }
+
+    #[test]
+    fn a_cut_verdict_line_never_votes() {
+        // The needle may be ROUTE_LINE_CHARS long itself - validate only refuses
+        // LONGER ones - and a cut line is a prefix, so "equal after cutting"
+        // would count a member that said the verdict and then kept talking. By
+        // then the rest of the line is gone, so the honest answer is "cannot
+        // tell", and invariant 6 puts that on the not-matching side.
+        let needle = "A".repeat(ROUTE_LINE_CHARS);
+        let overlong = MemberVerdict::new("a", true, 0, &"A".repeat(ROUTE_LINE_CHARS + 50));
+        assert_eq!(overlong.last_line, needle, "the cut value compares equal");
+        assert!(overlong.clipped);
+        let exact = MemberVerdict::new("b", true, 0, &needle);
+        assert!(!exact.clipped, "a line that fits whole was not cut");
+        let ms = vec![overlong, exact];
+        let m = Members::Known(&ms);
+        let (votes, voters) = m
+            .tally(&quantifier(Some(1), None), &needle, "fan", 0)
+            .unwrap()
+            .expect("the member whose line fits still votes");
+        assert_eq!(votes, 1);
+        assert_eq!(voters, vec!["b".to_string()]);
+        assert!(
+            m.tally(&quantifier(None, Some(true)), &needle, "fan", 0)
+                .unwrap()
+                .is_none(),
+            "a cut line must not complete a unanimous vote"
+        );
+        // And the same answer after a resume, read back from the record.
+        let restored = restored_members(&json!({"members": [
+            {"id": "a", "ok": true, "exit": 0, "last_line": needle, "clipped": true},
+            {"id": "b", "ok": true, "exit": 0, "last_line": needle},
+        ]}))
+        .expect("snapshot");
+        let (votes, voters) = Members::Known(&restored)
+            .tally(&quantifier(Some(1), None), &needle, "fan", 0)
+            .unwrap()
+            .expect("the unclipped member votes after a resume too");
+        assert_eq!(votes, 1);
+        assert_eq!(voters, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn a_resumed_vote_is_counted_against_the_group_the_flow_declares() {
+        // The snapshot satisfies `all: true` on its own terms whatever the flow
+        // now says, so a group edited from 3 members to 4 (which needs
+        // --force-resume, which is when this happens) would report unanimity on
+        // a member that was never asked. Live and resumed must not disagree.
+        let err = Members::Mismatch {
+            recorded: 3,
+            declared: 4,
+        }
+        .tally(&quantifier(None, Some(true)), "YES", "fan", 1)
+        .expect_err("a snapshot of a different group cannot decide this one");
+        assert!(err.contains('3') && err.contains('4'), "{err}");
+        assert!(err.contains("route[1]"), "{err}");
     }
 
     #[test]

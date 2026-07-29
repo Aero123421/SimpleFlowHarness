@@ -261,10 +261,14 @@ pub enum Cmd {
 }
 
 /// One `route:` rule. Every `when_*` present in a rule must hold (AND); a rule
-/// with none is the catch-all. Adding one here means adding it to three other
+/// with none is the catch-all. Adding one here means adding it to four other
 /// places: schema/flow.schema.json, the catch-all test in `evaluate_route`
-/// (a rule with a condition must not log as `via: catch_all`), and any
-/// exclusivity check that enumerates predicates.
+/// (a rule with a condition must not log as `via: catch_all`), any exclusivity
+/// check that enumerates predicates, and - if its text is templated -
+/// `engine::precheck`'s route-condition list. The precheck one is the easiest
+/// to miss and the most expensive: without it a template typo survives validate
+/// and dry-run and only kills the run after the guarded step has been billed
+/// (that is exactly what happened to `when_stderr_matches`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Route {
@@ -726,17 +730,54 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             }
         }
     }
+    // A reserve of ZERO on an axis that has a ceiling is the same failure in
+    // slower motion. The threshold is ceiling minus reserve, so it lands exactly
+    // ON the ceiling: the landing fires, writes its event, prints "-> goto
+    // wrap", and the ceiling check at the top of the very next iteration ends
+    // the run with the old hard error before the landing chain has run a single
+    // step. The flow validates, dry-run advertises the landing, and the feature
+    // does nothing - which is the silence the two checks above exist to prevent,
+    // reached by a third route. Refused per axis, because the axes are
+    // independent: reserving cost does not buy the wall-clock landing a second.
+    if flow.defaults.on_budget.is_some() {
+        for (ceiling, key, unreserved) in [
+            (
+                "max_cost_usd",
+                "budget_reserve.cost_usd",
+                flow.defaults.max_cost_usd.is_some() && flow.defaults.budget_reserve_usd() <= 0.0,
+            ),
+            (
+                "wall_clock_sec",
+                "budget_reserve.wall_clock_sec",
+                flow.defaults.wall_clock_sec.is_some() && flow.defaults.budget_reserve_sec() == 0,
+            ),
+        ] {
+            if unreserved {
+                return Err(format!(
+                    "defaults.on_budget is set and defaults.{ceiling} holds nothing back: the landing threshold is {ceiling} minus reserve, so a reserve of 0 lands ON the ceiling and the run still dies there with the landing chain unrun. Set defaults.{key} to at least the longest single step plus the whole landing chain"
+                ));
+            }
+        }
+    }
     let action = |what: &str, s: &Step, v: &Option<String>, is_child: bool| -> Result<(), String> {
         let Some(oe) = v else { return Ok(()) };
         if let Some(g) = oe.strip_prefix("goto:") {
-            if TERMINALS.contains(&g) {
-                return Ok(());
-            }
+            // is_child FIRST, terminals included. A member's on_error is only
+            // ever asked whether it says "continue"; every other spelling makes
+            // the group hard-fail and the run exit 1. Accepting `goto:stuck`
+            // here and then ignoring it handed back exit 1 ("the plumbing broke,
+            // retry") where the author had asked for exit 4 ("work saved, a
+            // human should look") - the exact confusion the third terminal was
+            // added to end. `goto:end` and `goto:fail` were quietly inert the
+            // same way.
             if is_child {
                 return Err(format!(
-                    "step '{}': {what} goto is not allowed inside parallel: (use fail or continue)",
+                    "step '{}': {what} goto is not allowed inside parallel: (use fail or continue; the group's own {what} decides where the run goes)",
                     s.id
                 ));
+            }
+            if TERMINALS.contains(&g) {
+                return Ok(());
             }
             return check_goto(&format!("step '{}' {what}", s.id), g);
         }
@@ -1504,8 +1545,7 @@ mod tests {
         .is_ok());
         // The three terminals are landing targets like any other.
         for t in ["end", "fail", "stuck"] {
-            let y =
-                format!("name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: goto:{t}\n{steps}");
+            let y = format!("name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: goto:{t}\n  budget_reserve: {{wall_clock_sec: 10}}\n{steps}");
             assert!(parse(&y).is_ok(), "goto:{t} should be a valid landing");
         }
         // A reserve alone only decides how early a landing that does not exist
@@ -1542,19 +1582,51 @@ mod tests {
     }
 
     #[test]
-    fn budget_reserve_defaults_to_nothing_held_back() {
+    fn budget_reserve_defaults_to_nothing_held_back_on_axes_with_no_ceiling() {
         let load = |y: &str| -> Flow {
             let f: Flow = yaml::from_str(y).expect("test flow parses");
             validate(&f, false).expect("test flow validates");
             f
         };
-        let f = load("name: t\ndefaults:\n  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\nsteps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n");
+        // Only the cost axis has a ceiling, so only the cost axis needs a
+        // reserve; the wall-clock accessor still reports the 0 default.
+        let f = load("name: t\ndefaults:\n  max_cost_usd: 10.0\n  on_budget: goto:wrap\n  budget_reserve: {cost_usd: 1.0}\nsteps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n");
         assert_eq!(f.defaults.budget_goto(), Some("wrap"));
-        assert_eq!(f.defaults.budget_reserve_usd(), 0.0);
+        assert_eq!(f.defaults.budget_reserve_usd(), 1.0);
         assert_eq!(f.defaults.budget_reserve_sec(), 0);
         // No landing declared at all is the pre-F5 flow, unchanged.
         let f = load("name: t\nsteps:\n  - id: a\n    cmd: echo hi\n");
         assert_eq!(f.defaults.budget_goto(), None);
+        assert_eq!(f.defaults.budget_reserve_usd(), 0.0);
+        assert_eq!(f.defaults.budget_reserve_sec(), 0);
+    }
+
+    /// A landing whose threshold IS the ceiling fires and is then overtaken by
+    /// the ceiling check on the same numbers, one loop iteration later, with the
+    /// landing chain still unrun. Per axis: reserving on one buys the other
+    /// nothing.
+    #[test]
+    fn refuses_a_landing_that_holds_nothing_back_on_a_declared_ceiling() {
+        let steps = "steps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n";
+        for (defaults, axis) in [
+            ("  max_cost_usd: 10.0\n  on_budget: goto:wrap\n", "max_cost_usd"),
+            ("  wall_clock_sec: 60\n  on_budget: goto:wrap\n", "wall_clock_sec"),
+            // Reserved on cost, silent on wall-clock: the wall axis alone is
+            // enough to refuse, and naming it is the point.
+            ("  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {cost_usd: 2.0}\n", "wall_clock_sec"),
+            ("  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {wall_clock_sec: 30}\n", "max_cost_usd"),
+            // Written out as zero is the same thing said out loud.
+            ("  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {wall_clock_sec: 0}\n", "wall_clock_sec"),
+        ] {
+            let e = parse(&format!("name: t\ndefaults:\n{defaults}{steps}")).unwrap_err();
+            assert!(e.contains(axis), "expected {axis} to be named, got: {e}");
+            assert!(e.contains("budget_reserve"), "{e}");
+        }
+        // Both axes reserved is the working shape.
+        assert!(parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\n  budget_reserve: {{cost_usd: 2.0, wall_clock_sec: 30}}\n{steps}"
+        ))
+        .is_ok());
     }
 
     #[test]

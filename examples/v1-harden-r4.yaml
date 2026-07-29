@@ -686,18 +686,16 @@ steps:
           **最後の行に `REVIEW-PASS`(全て 3 OS で同一)か
           `REVIEW-FAIL`(OS 依存がある)を単独で書くこと。**
 
-  # 3体の最終行を機械的に数える。LLM に合議させない。
-  # 末尾の空白と CR を許容する(CRLF で来ても数えられるように)。
-  - id: verdict
-    cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS[[:space:]]*$' - || true); echo \"PASSES=$n\""]
-    stdin: prompt
-    prompt: "{{steps.review.outputs}}"
-    on_error: continue
-    retry_on: never
+    # 3体の最終行を sfh 自身が数える。LLM に合議させない。
+    # 以前はここが `sh -c "grep -c '^REVIEW-PASS$'"` の別ステップだった。それは
+    # (a) Windows で Git Bash を要求し、(b) 本文中に単独行で引用された needle も
+    # 1票に数え、(c) 何より「合格と書いた上で落ちたメンバー」を数えていた
+    # (グループの判定テキストには失敗の印が付かない)。when_members は engine が
+    # 持つ成否から数えるので、この 3 つが全部消える。
     route:
-      - when_last_line_is: "PASSES=3"
+      - when_members: { last_line_is: "REVIEW-PASS", all: true }
         goto: wrap
-      - goto: fixC
+      - goto: fixC                   # 数えられない出力・失敗・タイムアウトは全部こちら
 
   # 差し戻し。**不足と判定された項目だけ**を渡す(全文を読み直させない)。
   - id: fixC
@@ -735,10 +733,13 @@ steps:
         goto: stage
       - goto: fixC
 
+  # 非収束は成功ではない。exit 0 で終わると、呼び出し元(親エージェントや CI)は
+  # 「11項目が全員一致で通った」run と区別できない。作業は run dir に残っているので
+  # 失敗(exit 1 = 配管が壊れた、再実行しろ)でもない。第 3 の終端で申告する。
   - id: unresolved
     cmd: ["sh", "-c", "echo 'UNRESOLVED: the 11-item checklist did not reach unanimous pass'; git --no-pager diff --stat main"]
     retry_on: never
-    route: [{ goto: end }]
+    route: [{ goto: stuck }]
 
   - id: wrap
     cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED THE 11-ITEM CHECKLIST'; git --no-pager diff --stat main; echo '--- unit ---'; cargo test 2>&1 | tail -3"]

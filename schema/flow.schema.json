@@ -49,7 +49,7 @@
     "action": {
       "type": "string",
       "pattern": "^(fail|continue|goto:[A-Za-z0-9_-]+|goto:end|goto:fail|goto:stuck)$",
-      "description": "fail | continue | goto:<step-id> | goto:end | goto:fail | goto:stuck"
+      "description": "fail | continue | goto:<step-id> | goto:end | goto:fail | goto:stuck. Inside parallel: only fail and continue - a member's on_error cannot route the run, and validate refuses every goto: spelling there."
     },
     "retry": {
       "type": "object",
@@ -82,7 +82,7 @@
         "max_emit_chars": { "type": "integer", "minimum": 1, "default": 200000 },
         "max_cost_usd": { "type": "number", "minimum": 0, "description": "Abort once reported spend reaches this." },
         "wall_clock_sec": { "type": "integer", "minimum": 1 },
-        "on_budget": { "type": "string", "pattern": "^goto:", "description": "Where to jump ONCE per run when spend or elapsed time reaches ceiling minus budget_reserve, instead of failing at the ceiling. goto:<step-id>, or goto:end / goto:fail / goto:stuck. Needs max_cost_usd and/or wall_clock_sec." },
+        "on_budget": { "type": "string", "pattern": "^goto:", "description": "Where to jump ONCE per run when spend or elapsed time reaches ceiling minus budget_reserve, instead of failing at the ceiling. goto:<step-id>, or goto:end / goto:fail / goto:stuck. Needs max_cost_usd and/or wall_clock_sec, and a NON-ZERO budget_reserve on each ceiling declared: with a reserve of 0 the landing fires on the ceiling itself and the ceiling ends the run before the landing chain runs a step (validate refuses it)." },
         "budget_reserve": { "$ref": "#/definitions/budget_reserve" },
         "retry": { "$ref": "#/definitions/retry" },
         "retry_on": { "enum": ["transient", "any", "never"], "default": "transient" },
@@ -94,10 +94,10 @@
     "budget_reserve": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Headroom kept back from each ceiling for the on_budget landing chain to spend. Requires on_budget. The axes are independent: threshold = ceiling - reserve, per axis.",
+      "description": "Headroom kept back from each ceiling for the on_budget landing chain to spend. Requires on_budget, and on_budget requires it: every ceiling declared needs a reserve above 0. The axes are independent: threshold = ceiling - reserve, per axis.",
       "properties": {
-        "cost_usd": { "type": "number", "minimum": 0, "description": "USD held back from max_cost_usd (default 0)." },
-        "wall_clock_sec": { "type": "integer", "minimum": 0, "description": "Seconds held back from wall_clock_sec (default 0). Budget for the longest single step plus the whole landing chain." }
+        "cost_usd": { "type": "number", "minimum": 0, "description": "USD held back from max_cost_usd. Required (above 0) when max_cost_usd and on_budget are both set." },
+        "wall_clock_sec": { "type": "integer", "minimum": 0, "description": "Seconds held back from wall_clock_sec. Required (above 0) when wall_clock_sec and on_budget are both set. Budget for the longest single step plus the whole landing chain." }
       }
     },
     "profile": {
