@@ -74,6 +74,8 @@ FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the sc
   {{vars.name}} {{steps.<id>.output}} {{steps.<id>.outputs}} {{steps.<id>.output_file}}
   {{steps.<id>.exit}} {{steps.<id>.stderr_file}}
   {{item}} {{item_index}} {{notes}} {{run_dir}} {{flow_dir}} {{step_id}} {{visit}} {{os}}
+  {{budget.spent_usd}} {{budget.elapsed_sec}} {{budget.remaining_usd}} {{budget.remaining_sec}}
+  (remaining_* is the string `unlimited` when that axis has no ceiling)
   Filters: | head:N | tail:N | truncate:N | lines:A-B | trim
   Preset tools: codex, claude, opencode, grok, agy, pi, cursor.
   Custom cmd: array form = spawned directly; string form = via cmd /C | sh -c.

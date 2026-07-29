@@ -2991,6 +2991,217 @@ contains "F3: the status refusal names the nonce problem" "nonce" f3f-status.err
 check "F3: sfh wait does not report a forged stuck as fact" 1 $?
 contains "F3: the wait refusal names the nonce problem" "nonce" f3f-wait.err
 
+# --- F5: on_budget, the landing before the cliff ------------------------------
+# A ceiling is a cliff: max_cost_usd / wall_clock_sec end the run with an error
+# and nothing handed back. on_budget turns the last slice of the budget into a
+# landing strip - threshold = ceiling - reserve, per axis - so the flow gets one
+# chance to wrap up. The resume test comes FIRST, because "once per run" is the
+# only part of this feature that a crash can silently undo.
+
+# 1. Once per run, ACROSS a resume. Reported cost survives a resume, so a
+#    resumed run arrives with the threshold already crossed and would land a
+#    second time if the log did not say it already had. The landing target is
+#    `stuck`, the idiom the README recommends: work saved, exit 4, a human
+#    looks. Resuming re-runs the step the landing pre-empted.
+cat > f5-resume.yaml <<YAML
+name: f5-resume
+defaults:
+  max_cost_usd: 1.0
+  on_budget: goto:stuck
+  budget_reserve: { cost_usd: 0.95 }
+steps:
+  - id: spend
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    env:
+      SFH_STUB_COST: "0.10"
+    prompt: "spend some budget"
+  - id: after
+    cmd: ["echo", "AFTER-RAN"]
+YAML
+"$SFH" run f5-resume.yaml --runs-dir f5r-runs -q > f5r1.out 2> f5r1.err
+check "F5: crossing the cost threshold lands on stuck (exit 4)" 4 $?
+F5R_DIR="$(dirname "$(find f5r-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F5: the landing is logged as an event" '"event":"budget_landing"' "$F5R_DIR/log.jsonl"
+contains "F5: the landing names the axis that crossed" '"trigger":"cost"' "$F5R_DIR/log.jsonl"
+contains "F5: the landing records what had been spent" '"spent_usd":0.1' "$F5R_DIR/log.jsonl"
+contains "F5: the landing is recorded as a position, via budget" '"via":"budget"' "$F5R_DIR/log.jsonl"
+if grep -qF "AFTER-RAN" f5r1.out; then
+  echo "FAIL - F5: the landing did not pre-empt the next step"
+  fail=$((fail + 1))
+else
+  echo "ok   - F5: the step the landing pre-empted did not run"
+  pass=$((pass + 1))
+fi
+"$SFH" run f5-resume.yaml --runs-dir f5r-runs --resume "$F5R_DIR" -q > f5r2.out 2> f5r2.err
+check "F5: the resumed run finishes instead of landing again" 0 $?
+contains "F5: the resume ran the step the landing had pre-empted" "AFTER-RAN" f5r2.out
+F5R_LANDINGS="$(grep -cF '"event":"budget_landing"' "$F5R_DIR/log.jsonl")"
+check "F5: one landing per run, resume included" 1 "$F5R_LANDINGS"
+"$SFH" runs show "$F5R_DIR" > f5r-show.out 2>&1
+contains "F5: runs show reports the landing" "budget  : landed on cost" f5r-show.out
+
+# 2. The wall-clock axis, on its own clock. Threshold is 120 - 118 = 2s, so the
+#    first step (3s) puts the run over it while the ceiling itself is still two
+#    minutes away - the landing has to be what ends the loop, not the ceiling.
+cat > f5-wall.yaml <<YAML
+name: f5-wall
+defaults:
+  wall_clock_sec: 120
+  on_budget: goto:wrap
+  budget_reserve: { wall_clock_sec: 118 }
+steps:
+  - id: work
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-sleep", "3", "--stub-last-line", "WORKED"]
+    route:
+      - goto: work
+  - id: wrap
+    cmd: ["echo", "WRAPPED"]
+YAML
+"$SFH" run f5-wall.yaml --runs-dir f5w-runs -q > f5w.out 2> f5w.err
+check "F5: a wall-clock landing ends the loop and the run succeeds" 0 $?
+F5W_DIR="$(dirname "$(find f5w-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F5: the wall-clock landing names its axis" '"trigger":"wall_clock"' "$F5W_DIR/log.jsonl"
+contains "F5: the landing target ran" "WRAPPED" f5w.out
+F5W_WORK="$(grep -F '"event":"step_end"' "$F5W_DIR/log.jsonl" | grep -cF '"step":"work"')"
+check "F5: the looping step ran once before the landing" 1 "$F5W_WORK"
+
+# 3. The reserve is headroom, not an extension. Once the landing has been spent
+#    the ceiling check is all that is left, and a landing chain that eats the
+#    reserve too ends the run the old way: an error, fail-closed.
+cat > f5-overrun.yaml <<YAML
+name: f5-overrun
+defaults:
+  wall_clock_sec: 5
+  on_budget: goto:wrap
+  budget_reserve: { wall_clock_sec: 4 }
+steps:
+  - id: work
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-sleep", "2", "--stub-last-line", "WORKED"]
+    route:
+      - goto: work
+  - id: wrap
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-sleep", "6", "--stub-last-line", "WRAPPED"]
+    route:
+      - goto: tail
+  - id: tail
+    cmd: ["echo", "TAIL-RAN"]
+YAML
+"$SFH" run f5-overrun.yaml --runs-dir f5o-runs -q > f5o.out 2> f5o.err
+check "F5: eating the reserve too still fails at the ceiling" 1 $?
+contains "F5: the ceiling failure is the old wall_clock_sec one" "exceeded wall_clock_sec" f5o.err
+F5O_DIR="$(dirname "$(find f5o-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F5: the landing had fired before the ceiling did" '"event":"budget_landing"' "$F5O_DIR/log.jsonl"
+if grep -qF "TAIL-RAN" f5o.out; then
+  echo "FAIL - F5: the run continued past the ceiling"
+  fail=$((fail + 1))
+else
+  echo "ok   - F5: the ceiling still stops the run dead"
+  pass=$((pass + 1))
+fi
+
+# 4. The template variables. remaining_* is the string `unlimited` on an axis
+#    with no ceiling - not 0, and not empty, either of which reads as a budget
+#    that has run out.
+cat > f5-vars.yaml <<'YAML'
+name: f5-vars
+defaults:
+  max_cost_usd: 2.0
+steps:
+  - id: show
+    cmd: ["echo", "SPENT={{budget.spent_usd}} SECS={{budget.elapsed_sec}} RUSD={{budget.remaining_usd}} RSEC={{budget.remaining_sec}}"]
+YAML
+"$SFH" run f5-vars.yaml --runs-dir f5v-runs -q > f5v.out 2> f5v.err
+check "F5: the budget template variables render" 0 $?
+contains "F5: spend renders to four decimals" "SPENT=0.0000" f5v.out
+contains "F5: elapsed seconds render" "SECS=0" f5v.out
+contains "F5: a declared ceiling renders as what is left" "RUSD=2.0000" f5v.out
+contains "F5: an undeclared ceiling renders as unlimited" "RSEC=unlimited" f5v.out
+
+# 5. dry-run shows the one goto that appears in no step's route:.
+cat > f5-dry.yaml <<'YAML'
+name: f5-dry
+defaults:
+  max_cost_usd: 60.0
+  wall_clock_sec: 43200
+  on_budget: goto:wrap
+  budget_reserve: { cost_usd: 2.0, wall_clock_sec: 900 }
+steps:
+  - id: work
+    cmd: ["echo", "work"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" run f5-dry.yaml --runs-dir f5d-runs --dry-run > f5d.out 2> f5d.err
+check "F5: a flow with a landing dry-runs" 0 $?
+contains "F5: dry-run prints the landing and both reserves" "budget landing: goto wrap (cost reserve \$2.00, wall reserve 900s)" f5d.out
+
+# 6. validate. Each half of the feature is useless without the other, and a
+#    landing that names nothing real is a silent dead end - all refused loudly.
+cat > f5-bad-reserve.yaml <<'YAML'
+name: f5-bad-reserve
+defaults:
+  max_cost_usd: 10.0
+  budget_reserve: { cost_usd: 1.0 }
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+YAML
+"$SFH" validate f5-bad-reserve.yaml > f5br.out 2> f5br.err
+check "F5: a reserve with no on_budget is refused" 2 $?
+contains "F5: the refusal names on_budget" "on_budget" f5br.err
+cat > f5-bad-noceiling.yaml <<'YAML'
+name: f5-bad-noceiling
+defaults:
+  on_budget: goto:wrap
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" validate f5-bad-noceiling.yaml > f5bn.out 2> f5bn.err
+check "F5: on_budget with no ceiling at all is refused" 2 $?
+contains "F5: the refusal names the missing ceilings" "max_cost_usd" f5bn.err
+cat > f5-bad-goto.yaml <<'YAML'
+name: f5-bad-goto
+defaults:
+  wall_clock_sec: 60
+  on_budget: goto:nowhere
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+YAML
+"$SFH" validate f5-bad-goto.yaml > f5bg.out 2> f5bg.err
+check "F5: a landing on a step that does not exist is refused" 2 $?
+contains "F5: the refusal names the missing target" "nowhere" f5bg.err
+cat > f5-bad-form.yaml <<'YAML'
+name: f5-bad-form
+defaults:
+  wall_clock_sec: 60
+  on_budget: wrap
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" validate f5-bad-form.yaml > f5bf.out 2> f5bf.err
+check "F5: on_budget without the goto: prefix is refused" 2 $?
+contains "F5: the refusal shows the accepted spelling" "goto:<id>" f5bf.err
+cat > f5-terminals.yaml <<'YAML'
+name: f5-terminals
+defaults:
+  wall_clock_sec: 60
+  on_budget: goto:stuck
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+YAML
+"$SFH" validate f5-terminals.yaml > f5t.out 2> f5t.err
+check "F5: landing on the stuck terminal validates" 0 $?
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
