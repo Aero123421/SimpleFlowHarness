@@ -1155,25 +1155,31 @@ fn check_flow_fingerprint(
     // way for them. This does not weaken anything: the check asks "is this the
     // same flow", and a flow that differs only in CRLF vs LF is the same flow,
     // which is why new runs normalise before hashing in the first place.
-    let normalised = flow_text.replace("\r\n", "\n");
+    // BOTH directions. Trying only the LF form covered an old run recorded on
+    // Unix being resumed from a CRLF checkout, and left the reverse - recorded
+    // on Windows, resumed from an LF checkout - rejected, which is the more
+    // common way round for a project whose CI is Linux.
+    let lf = flow_text.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    let first_match = |candidates: [String; 3]| -> String {
+        candidates
+            .iter()
+            .find(|c| *c == old_fp)
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone())
+    };
     let expected = match old_algo {
         FINGERPRINT_ALGO => fingerprint(flow_text),
-        RAW_SHA_FINGERPRINT_ALGO => {
-            let raw = crate::sha256::hex(flow_text.as_bytes());
-            if old_fp == raw {
-                raw
-            } else {
-                crate::sha256::hex(normalised.as_bytes())
-            }
-        }
-        LEGACY_FINGERPRINT_ALGO => {
-            let raw = legacy_fingerprint_fnv(flow_text);
-            if old_fp == raw {
-                raw
-            } else {
-                legacy_fingerprint_fnv(&normalised)
-            }
-        }
+        RAW_SHA_FINGERPRINT_ALGO => first_match([
+            crate::sha256::hex(flow_text.as_bytes()),
+            crate::sha256::hex(lf.as_bytes()),
+            crate::sha256::hex(crlf.as_bytes()),
+        ]),
+        LEGACY_FINGERPRINT_ALGO => first_match([
+            legacy_fingerprint_fnv(flow_text),
+            legacy_fingerprint_fnv(&lf),
+            legacy_fingerprint_fnv(&crlf),
+        ]),
         other => {
             return Err(format!(
                 "{} records an unknown flow_fingerprint_algo '{other}'; the flow cannot be verified as unchanged (use --force-resume to resume anyway)",
@@ -1995,18 +2001,25 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         restored.len()
                     );
                 }
+                // A skipped member writes no step_end of its own, so THIS log
+                // would not remember it and a second crash in the same fan-out
+                // would run and re-bill it on the third attempt. Record the
+                // carry-over explicitly. It is not a step_end: nothing ran, so
+                // it must not add to the leaf count or the cost.
+                //
+                // BEFORE group_start, and that order is load-bearing. Reading
+                // group_start is what cancels the previous lap's carry, so a
+                // kill landing between the two lines would drop the members
+                // that had not been written yet and run them again. Written
+                // first, a kill anywhere in here leaves no group_start at all,
+                // the old carry still stands, and nothing is lost.
+                log_restored_members(&mut log, &step.id, visit, &restored);
                 if !preps.is_empty() {
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
                     );
                 }
-                // A skipped member writes no step_end of its own, so THIS log
-                // would not remember it and a second crash in the same fan-out
-                // would run and re-bill it on the third attempt. Record the
-                // carry-over explicitly. It is not a step_end: nothing ran, so
-                // it must not add to the leaf count or the cost.
-                log_restored_members(&mut log, &step.id, visit, &restored);
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
                 for (pos, &ci) in fresh_idx.iter().enumerate() {
                     let c = &children[ci];
@@ -2200,15 +2213,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         restored.len()
                     );
                 }
+                // See the parallel branch, including why this goes BEFORE the
+                // foreach_start line: reading that line is what cancels the
+                // previous lap's carry.
+                log_restored_members(&mut log, &step.id, visit, &restored);
                 if !preps.is_empty() {
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": preps.len()}),
                     );
                 }
-                // See the parallel branch: without this a second crash in the
-                // same foreach re-runs the items the first resume carried over.
-                log_restored_members(&mut log, &step.id, visit, &restored);
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
                 for (pos, &i) in fresh_idx.iter().enumerate() {
                     let tag = if visit == 1 {

@@ -1225,6 +1225,82 @@ if [ "$rc" -ne 0 ]
   then ok  "wait: a run resolved to dead is not reported as success"
   else bad "wait: FAIL-OPEN - a run resolved to dead returned 0"; fi
 
+# ------------------------------------------------------ 21. seventh round
+sec "21. cases the seventh review round found missing"
+
+# (a) F-9: PowerShell takes any UNAMBIGUOUS prefix, so -CommandW already means
+# -CommandWithArgs. Matching only the exact name and -cwa left those spellings
+# hitting no branch at all - the script text passed as ordinary argv data.
+for sw in '-CommandW' '-commandwi' '-CommandWithArg'; do
+  cat > f21a.yaml <<YAML
+name: cwa-prefix
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "$sw", "Write-Output {{steps.a.output}}"]
+YAML
+  if "$SFH" validate f21a.yaml >/dev/null 2>&1
+    then bad "validate let a template through the command part of pwsh $sw"
+    else ok  "validate recognised pwsh $sw as -CommandWithArgs"; fi
+done
+# ...and their $args tails stay allowed.
+cat > f21b.yaml <<'YAML'
+name: cwa-prefix-args
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+  - id: b
+    cmd: ["pwsh", "-CommandW", "Write-Output $args[0]", "{{steps.a.output}}"]
+YAML
+if "$SFH" validate f21b.yaml >/dev/null 2>&1
+  then ok  "LEGIT: the \$args tail of an abbreviated -CommandWithArgs is allowed"
+  else bad "LEGIT: an abbreviated -CommandWithArgs refuses its \$args"; fi
+
+# (b) legacy fingerprints, BOTH directions. A run recorded from a CRLF
+# checkout and resumed from an LF one is the common case for a project whose
+# CI is Linux, and it was the direction that did not work.
+for dir in lf2crlf crlf2lf; do
+  rm -rf "c21_$dir"
+  mkdir -p "c21_$dir/run"
+  (
+  cd "c21_$dir" || exit
+  if [ "$dir" = "lf2crlf" ]; then
+    printf 'name: fp\nsteps:\n  - id: a\n    cmd: ["echo", "one"]\n  - id: b\n    cmd: ["echo", "two"]\n' > recorded.yaml
+    printf 'name: fp\r\nsteps:\r\n  - id: a\r\n    cmd: ["echo", "one"]\r\n  - id: b\r\n    cmd: ["echo", "two"]\r\n' > flow.yaml
+  else
+    printf 'name: fp\r\nsteps:\r\n  - id: a\r\n    cmd: ["echo", "one"]\r\n  - id: b\r\n    cmd: ["echo", "two"]\r\n' > recorded.yaml
+    printf 'name: fp\nsteps:\n  - id: a\n    cmd: ["echo", "one"]\n  - id: b\n    cmd: ["echo", "two"]\n' > flow.yaml
+  fi
+  # An sfh 0.9 run dir: the raw SHA of the flow AS IT WAS THEN. sha256sum on
+  # Linux and Git Bash, shasum on macOS.
+  if command -v sha256sum >/dev/null 2>&1; then
+    FP="$(sha256sum recorded.yaml | cut -d' ' -f1)"
+  elif command -v shasum >/dev/null 2>&1; then
+    FP="$(shasum -a 256 recorded.yaml | cut -d' ' -f1)"
+  else
+    FP=""
+  fi
+  if [ -z "$FP" ]; then echo "nosha" > ../c21_$dir.verdict; exit 0; fi
+  printf '{"sfh_version":"0.9.0","flow":"flow.yaml","flow_fingerprint":"%s","flow_fingerprint_algo":"sha256","name":"fp","started_utc":"20250101-000000","os":"linux","vars":{},"tools":{},"resumed":false}' "$FP" > run/meta.json
+  {
+    printf '{"ts":"20250101-000000","event":"run_start","sfh_version":"0.9.0","resumed":false,"flow_fingerprint":"%s"}\n' "$FP"
+    printf '{"ts":"20250101-000001","event":"step_end","step":"a","parent":null,"visit":1,"exit":0,"timed_out":false,"interrupted":false,"attempts":1,"dur_ms":1,"output_chars":3,"output_hash":"x","chain_file":"a.chain.txt","out_file":"a.out.txt","cmd":"echo one","session":null}\n'
+  } > run/log.jsonl
+  echo "one" > run/a.chain.txt; echo "one" > run/a.out.txt
+  "$SFH" run flow.yaml --resume run -q >/dev/null 2>../c21_$dir.err
+  echo "$?" > ../c21_$dir.verdict
+  )
+  v="$(cat "c21_$dir.verdict" 2>/dev/null || echo missing)"
+  if [ "$v" = "nosha" ]; then
+    warn "legacy fingerprint ($dir): no way to compute the recorded hash from the CLI"
+  elif grep -q "different version" "c21_$dir.err" 2>/dev/null; then
+    bad "legacy fingerprint ($dir): the same flow read as a changed flow"
+  else
+    ok "legacy fingerprint ($dir): line endings alone do not invalidate an old run"
+  fi
+done
+
 # ---------------------------------------------------------------- summary
 sec "summary"
 echo "  pass $pass   fail $fail   skip $skip"

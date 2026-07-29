@@ -387,10 +387,16 @@ pub fn shell_script_span(argv: &[String]) -> Option<std::ops::Range<usize>> {
             //   ["pwsh","-CommandWithArgs","Write-Output $args[0]","{{x}}"]
             // which is the safe way to write it.
             //
-            // Matched by exact name only. PowerShell resolves -c to -Command,
-            // not to -CommandWithArgs, so accepting prefixes of the longer name
-            // would take spellings the shell itself reads the other way.
-            if bare == "cwa" || bare == "commandwithargs" {
+            // PowerShell takes any UNAMBIGUOUS prefix, so -CommandW and
+            // -CommandWi already mean -CommandWithArgs. Matching only the exact
+            // name and -cwa left those spellings hitting neither branch - not
+            // over-rejected but UNDETECTED, with the script text passing as
+            // ordinary argv data. Anything longer than "command" can only be
+            // heading for the longer name; "command" itself and shorter is
+            // -Command, which is how the shell resolves them too.
+            if bare == "cwa"
+                || (bare.len() > "command".len() && "commandwithargs".starts_with(bare))
+            {
                 return Some(i + 1..(i + 2).min(argv.len()));
             }
             // -EncodedCommand also takes exactly one argument, a base64 blob.
@@ -2710,10 +2716,17 @@ mod tests {
             Some(2..3)
         );
         assert_eq!(s(&["pwsh", "-cwa", "x", "a", "b"]), Some(2..3));
-        // PowerShell resolves -c and -com to -Command, never to
-        // -CommandWithArgs, so those must still take the whole tail.
+        // Any unambiguous prefix of the longer name resolves to it in the
+        // shell, so it has to here as well - these used to match no branch at
+        // all and let the script text through as ordinary argv data.
+        assert_eq!(s(&["pwsh", "-CommandW", "x", "a"]), Some(2..3));
+        assert_eq!(s(&["pwsh", "-commandwi", "x", "a"]), Some(2..3));
+        assert_eq!(s(&["pwsh", "-CommandWithArg", "x", "a"]), Some(2..3));
+        // PowerShell resolves -c, -com and the exact -Command to -Command,
+        // never to -CommandWithArgs, so those still take the whole tail.
         assert_eq!(s(&["pwsh", "-c", "echo", "a"]), Some(2..4));
         assert_eq!(s(&["pwsh", "-com", "echo", "a"]), Some(2..4));
+        assert_eq!(s(&["pwsh", "-Command", "echo", "a"]), Some(2..4));
         // Either introducer, and a path- or extension-qualified name, on every
         // OS: this is parsed by hand rather than with Path so that a Windows
         // path is still recognised when the check runs on Linux.
