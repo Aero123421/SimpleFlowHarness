@@ -1,0 +1,13 @@
+# A CRLF shell script is a syntax error to /bin/sh, and CI runs tests/*.sh on
+# Linux and macOS. Pin them to LF so a Windows checkout with core.autocrlf=true
+# cannot produce a tree that only works on the machine it was cloned on.
+*.sh text eol=lf
+
+# Flow files travel between machines inside run dirs. sfh normalises line
+# endings before fingerprinting (so a CRLF checkout and an LF one are the same
+# flow), but keeping the checkout itself LF avoids pointless churn.
+*.yaml text eol=lf
+*.yml  text eol=lf
+
+# Rust sources: rustfmt writes LF, and a mixed tree makes every diff noisy.
+*.rs   text eol=lf

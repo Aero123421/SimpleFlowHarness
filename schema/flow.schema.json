@@ -7,7 +7,19 @@
   "required": ["steps"],
   "additionalProperties": false,
   "properties": {
-    "name": { "type": "string", "description": "Used in the run directory name." },
+    "name": {
+      "type": "string",
+      "description": "Used in the run directory name. Unicode, spaces and dots are allowed; path separators (/ \\), control characters, NUL, and the Windows-reserved characters <>:\"|?* are forbidden, as are the reserved names '.' and '..'.",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "const": "." },
+          { "const": ".." },
+          { "pattern": "[/\\\\\\x00-\\x1f\\x7f<>:\"|?*]" },
+          { "pattern": "[ .]$" }
+        ]
+      }
+    },
     "vars": {
       "type": "object",
       "description": "Flow variables, referenced as {{vars.NAME}} and overridable with --var NAME=value.",
@@ -32,8 +44,7 @@
     },
     "access": {
       "enum": ["read", "write", "full"],
-      "default": "write",
-      "description": "read = no writes, write = workspace edits, full = auto-approve everything."
+      "description": "read = no writes, write = workspace edits (never an auto-approved shell), full = auto-approve everything. Mandatory for AI steps (on the step, its profile, or defaults); there is no implicit default. cursor supports only read and full."
     },
     "action": {
       "type": "string",
@@ -145,13 +156,28 @@
         "model": { "type": "string" },
         "effort": { "type": "string" },
         "access": { "$ref": "#/definitions/access" },
+        "allow_access_override": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit escape hatch: accept args: that override the declared access level, and continue_from/fork_from at a higher access than the original session. Both are refused by default (fail-closed)."
+        },
         "agent": { "type": "string" },
         "args": { "type": "array", "items": { "type": "string" } },
         "cmd": {
           "oneOf": [
-            { "type": "string", "description": "Run via cmd /C | sh -c. Substituted values may not contain shell metacharacters." },
-            { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Spawned directly (recommended)." }
+            { "type": "string", "description": "Run via cmd /C | sh -c. Template expansion is disabled by default (refused at validation); set unsafe_shell_template: true to allow it, in which case substituted values may not contain shell metacharacters." },
+            { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Spawned directly, no shell (recommended). Templates expand per argument; a substituted value stays one argument, but is still an argument to the target program. argv[0] is executed-privileged and refuses run-derived templates (see allow_dynamic_exec_paths). An array that wraps a shell ([\"sh\",\"-c\",...]) applies the string-form shell-template rules to its shell text." }
           ]
+        },
+        "unsafe_shell_template": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit escape hatch: allow template expansion inside a string-form cmd, and inside the shell text of an array-form cmd that wraps a shell (e.g. [\"sh\",\"-c\",\"...\"]). Off by default because a substituted value is re-parsed by the shell and a metacharacter blacklist is not a security boundary. Prefer an array form that does not wrap a shell."
+        },
+        "allow_dynamic_exec_paths": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicit escape hatch: allow run-derived templates (step output, notes, foreach items, vars restored from a resumed run dir) in executed-privileged fields: bin, cwd and argv[0] of a custom cmd. Off by default because those fields run with sfh's own OS rights and untrusted values there select an arbitrary binary or working directory."
         },
         "prompt": { "type": "string" },
         "stdin": { "enum": ["prompt", "none"], "description": "cmd: steps only." },

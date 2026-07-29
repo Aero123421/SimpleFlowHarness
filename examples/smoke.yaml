@@ -8,14 +8,14 @@ vars:
 
 steps:
   - id: draft
-    cmd: "echo draft v{{visit}} for {{vars.topic}}"
+    cmd: ["echo", "draft v{{visit}} for {{vars.topic}}"]
     route:
       - when_contains: "v2"
         goto: verdict
       - goto: draft
 
   - id: verdict
-    cmd: "echo checked [{{steps.draft.output}}] VERDICT: OK"
+    cmd: ["echo", "checked [{{steps.draft.output}}] VERDICT: OK"]
     route:
       - when_contains: "VERDICT: OK"
         goto: end

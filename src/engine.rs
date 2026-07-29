@@ -1,6 +1,6 @@
-use crate::{execute, flow, leaf, preset, template};
+use crate::{contain, execute, flow, leaf, preset, template};
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -48,7 +48,7 @@ pub fn validate(path: &Path, var_overrides: &[(String, String)]) -> i32 {
         for (k, v) in var_overrides {
             vars.insert(k.clone(), v.clone());
         }
-        precheck(&flow, &vars)?;
+        precheck(&flow, &vars, &HashSet::new())?;
         eprintln!("OK: {} ({} steps)", path.display(), flow.steps.len());
         for s in &flow.steps {
             eprintln!("  - {} ({})", s.id, describe_kind(&flow, s));
@@ -92,8 +92,15 @@ fn describe_kind(flow: &flow::Flow, s: &flow::Step) -> String {
 }
 
 /// Render every template once with empty step outputs so typos surface before
-/// any expensive agent runs. Also checks profile/access resolution.
-fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), String> {
+/// any expensive agent runs. Also checks profile/access resolution, and applies
+/// the executed-privileged template rules (bin / cwd / argv[0] / shell-wrapped
+/// cmd text) with the run's tainted-var set, so a resumed run dir's vars are
+/// refused in those fields before any step spends anything (rev_break #12).
+fn precheck(
+    flow: &flow::Flow,
+    vars: &BTreeMap<String, String>,
+    tainted_vars: &HashSet<String>,
+) -> Result<(), String> {
     let step_ids = flow.step_ids();
     let outputs = BTreeMap::new();
     let mut all: Vec<&flow::Step> = Vec::new();
@@ -146,11 +153,46 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
         if let Some(p) = &s.prompt {
             chk(body_ctx, "prompt", p)?;
         }
+        // Same privilege rules prepare_leaf applies at spawn time, repeated here
+        // so the failure surfaces before any step runs (rev_break #12/#13).
+        let exec_chk = |ctx: &template::Ctx, label: &str, text: &str| -> Result<(), String> {
+            if s.allow_dynamic_exec_paths.unwrap_or(false) {
+                return chk(ctx, label, text);
+            }
+            template::render_checked(text, ctx, &leaf::exec_template_check(tainted_vars))
+                .map(|_| ())
+                .map_err(|e| format!("step '{}' {label}: {e}", s.id))
+        };
+        let shell_chk = |ctx: &template::Ctx, text: &str| -> Result<(), String> {
+            // flow.legacy_resume: the lenient loader already warned about this
+            // exact template and let it through so a 0.x run could be resumed.
+            // Refusing it again here made that warning a lie - the resume died
+            // one step later. The METACHARACTER check still applies; only the
+            // blanket "no templates in shell text" rule is relaxed.
+            if s.unsafe_shell_template.unwrap_or(false) || flow.legacy_resume {
+                template::render_checked(text, ctx, &leaf::shell_metachar_check)
+                    .map(|_| ())
+                    .map_err(|e| format!("step '{}' cmd: {e}", s.id))
+            } else {
+                template::render_checked(text, ctx, &|key, _| {
+                    Err(leaf::shell_expansion_refused("string-form cmd", key))
+                })
+                .map(|_| ())
+                .map_err(|e| format!("step '{}' cmd: {e}", s.id))
+            }
+        };
         match &s.cmd {
-            Some(flow::Cmd::Shell(c)) => chk(body_ctx, "cmd", c)?,
+            Some(flow::Cmd::Shell(c)) => shell_chk(body_ctx, c)?,
             Some(flow::Cmd::Argv(v)) => {
-                for c in v {
-                    chk(body_ctx, "cmd", c)?;
+                if let Some(first) = v.first() {
+                    exec_chk(body_ctx, "cmd[0]", first)?;
+                }
+                let script_span = leaf::shell_script_span(v);
+                for (i, c) in v.iter().enumerate().skip(1) {
+                    match &script_span {
+                        Some(span) if span.contains(&i) => shell_chk(body_ctx, c)?,
+                        _ => chk(body_ctx, "cmd", c)?,
+                    }
                 }
             }
             None => {}
@@ -189,15 +231,37 @@ fn precheck(flow: &flow::Flow, vars: &BTreeMap<String, String>) -> Result<(), St
                     ("model", &eff.model),
                     ("effort", &eff.effort),
                     ("agent", &eff.agent),
-                    ("bin", &eff.bin),
-                    ("cwd", &eff.cwd),
                 ] {
                     if let Some(t) = v {
                         chk(body_ctx, label, t)?;
                     }
                 }
+                // bin / cwd are executed-privileged: apply the run-derived
+                // template refusal (with this run's tainted vars), not a plain
+                // render (rev_break #12).
+                for (label, v) in [("bin", &eff.bin), ("cwd", &eff.cwd)] {
+                    if let Some(t) = v {
+                        exec_chk(body_ctx, label, t)?;
+                    }
+                }
+                // args may render into permission flags (vars are known now;
+                // step outputs render empty here and are re-checked right
+                // before each spawn). The whole rendered argv is checked at
+                // once so flag+value pairs are read together. Fail-closed like
+                // validation.
+                let mut rendered_args = Vec::with_capacity(eff.args.len());
                 for a in &eff.args {
-                    chk(body_ctx, "args", a)?;
+                    rendered_args.push(
+                        template::render(a, body_ctx)
+                            .map_err(|e| format!("step '{}' args: {e}", s.id))?,
+                    );
+                }
+                if eff.access != preset::Access::Full && !s.allow_access_override.unwrap_or(false) {
+                    if let Some(t) = &eff.tool {
+                        if let Some(e) = preset::find_escalation(t, eff.access, &rendered_args) {
+                            return Err(preset::escalation_error(&s.id, eff.access, &e));
+                        }
+                    }
                 }
                 for v in eff.env.values() {
                     chk(body_ctx, "env", v)?;
@@ -255,6 +319,11 @@ struct PendingRoute {
     step: String,
     visit: u32,
     route_text: String,
+    /// True when route_text came from a fan-out's headerless plain output.
+    /// Compaction rewrites the chain file but never changes what live routing
+    /// matched against, so a plain-sourced route must NOT be patched from the
+    /// precompact file the way a leaf's chain-sourced route is.
+    from_plain: bool,
 }
 
 #[derive(Clone)]
@@ -278,15 +347,48 @@ struct ResumeState {
     last_executed: Option<String>,
     last_success: Option<String>,
     completed: bool,
+    /// Fan-out members that already finished in a crashed attempt, keyed by
+    /// (parent step id, visit). A resume that re-runs a parallel/foreach group
+    /// SKIPS these instead of executing them a second time: re-running spent
+    /// money twice, opened duplicate sessions, and could push the restored
+    /// count plus a full fresh batch past max_total_steps, wedging the resume
+    /// (rev_regression: fan-out members re-executed after a mid-group crash).
+    completed_members: HashMap<(String, u32), HashSet<String>>,
 }
 
 fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
-    let log = std::fs::read_to_string(run_dir.join("log.jsonl"))
-        .map_err(|e| format!("cannot read {}/log.jsonl: {e}", run_dir.display()))?;
+    // Contained, no-follow read: log.jsonl is a fixed name in a directory an
+    // attacker controls on --resume, and a symlink there used to be followed
+    // to an external JSONL file that was then ingested as the run's entire
+    // restored state (rev_break #6). A missing log is a hard error (the caller
+    // already verified the dir looks like a run).
+    let log = contain::read_contained_opt(run_dir, "log.jsonl")?
+        .ok_or_else(|| format!("cannot read {}/log.jsonl: file missing", run_dir.display()))?;
     let mut st = ResumeState::default();
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
+    // Groups whose finished members a resume should carry into the next visit,
+    // and the visit to carry them FROM. Populated when a fan-out's lap ends in
+    // failure, and removed the moment the log shows the run did something else
+    // with that group afterwards - routed back into it, or opened a new lap.
+    //
+    // Read from the log in order rather than reconstructed at the end. Four
+    // attempts at inferring this from the finished state (highest visit with
+    // members, whether a visit was left open, whether the last lap failed) each
+    // leaked a different case, because "the run stopped here" and "the flow
+    // deliberately came back here" look identical once the log is a set of
+    // facts. In sequence they do not: one is a failed aggregate_end with
+    // nothing after it, the other has a position or a group_start after it.
+    let mut carry_from: HashMap<String, u32> = HashMap::new();
     for line in log.lines() {
+        // A malformed line is skipped, not a hard error: the log is append-only
+        // and the last line is routinely torn when sfh is killed mid-write, so
+        // refusing to resume over it would defeat crash recovery. This is
+        // fail-SAFE, not fail-open: dropping a line removes that step's
+        // completion record, which makes the step look UNFINISHED and re-run -
+        // it can never fabricate a success. Success additionally requires a
+        // positively recorded exit 0 (see the `ok` computation below), so an
+        // attacker who corrupts a line gains nothing (rev_break #12).
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -301,17 +403,32 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             // is already right. `outputs` has to be walked back to what was
             // summarized, or a resumed run sees strictly less than a live one.
             "compact_end" | "compact_failed" => {
-                let precompact = v
-                    .get("precompact_file")
-                    .and_then(|x| x.as_str())
-                    .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok());
+                // A live run counts the summarizer as one more leaf run and
+                // adds its cost the moment compact starts; a resume that drops
+                // both under-reports steps_done and cost, which can push a
+                // resumed run past max_total_steps / max_cost_usd that the
+                // live run would have honoured.
+                st.total += 1;
+                if ev == "compact_end" {
+                    if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
+                        st.cost_usd += c.max(0.0);
+                    }
+                }
+                // A path that escapes the run dir fails the resume outright;
+                // only a genuinely absent file reads as None (S1-4).
+                let precompact = match v.get("precompact_file").and_then(|x| x.as_str()) {
+                    Some(p) => contain::read_contained_opt(run_dir, p)?,
+                    None => None,
+                };
                 if let (Some(e), Some(p)) = (st.outputs.get_mut(&step), precompact.as_ref()) {
                     e.outputs = p.trim_end().to_string();
                 }
                 if let (Some(pending), Some(p)) = (st.pending_route.as_mut(), precompact) {
-                    if pending.step == step {
+                    if pending.step == step && !pending.from_plain {
                         // Live routing uses the pre-compact text, even though
                         // the chain file now contains the summary/head+tail.
+                        // A fan-out's route text is its headerless plain
+                        // output, which compaction never touches.
                         pending.route_text = p.trim_end().to_string();
                     }
                 }
@@ -335,46 +452,188 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     },
                 );
             }
+            // A fan-out logs NO step_start (its members do), so without these
+            // events a crash mid-fan-out - before aggregate_end - leaves no
+            // record of where the run was. A flow whose FIRST step is a fan-out
+            // then has nothing to resume from at all. Track the group exactly
+            // like an unfinished leaf; aggregate_end clears it.
+            "group_start" | "foreach_start" => {
+                let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                // A new lap opened, so whatever the previous one left behind is
+                // not something to carry into it.
+                carry_from.remove(&step);
+                let (kind, members) = if ev == "group_start" {
+                    ("parallel", "children")
+                } else {
+                    ("foreach", "items")
+                };
+                let n = v.get(members).and_then(|x| x.as_u64()).unwrap_or(0);
+                unfinished.insert(
+                    (step.clone(), visit),
+                    UnfinishedStep {
+                        started: v
+                            .get("ts")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        cmd: format!("{kind} fan-out ({n} members)"),
+                        step,
+                    },
+                );
+            }
+            // A member an earlier resume carried over rather than executed. It
+            // has no output, cost or session of its own to restore - those came
+            // back with the ORIGINAL step_end, which is still in this same log -
+            // so all this records is "do not run it again".
+            "members_restored" => {
+                if let Some(parent) = v
+                    .get("parent")
+                    .and_then(|p| p.as_str())
+                    .filter(|p| !p.is_empty())
+                {
+                    let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                    let entry = st
+                        .completed_members
+                        .entry((parent.to_string(), visit))
+                        .or_default();
+                    for name in v
+                        .get("steps")
+                        .and_then(|s| s.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|s| s.as_str())
+                    {
+                        entry.insert(name.to_string());
+                    }
+                }
+            }
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
                     st.total += 1;
                 }
+                // A run dir is untrusted on --resume: a NEGATIVE cost_usd in an
+                // edited log would subtract from the running total and let a
+                // resumed run slip under max_cost_usd. Reported cost can only be
+                // spent, never refunded, so clamp at zero (rev_break #12).
                 if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
-                    st.cost_usd += c;
+                    st.cost_usd += c.max(0.0);
                 }
                 let visit = v.get("visit").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
                 let is_child = v.get("parent").is_some_and(|p| !p.is_null());
-                if ev == "step_end" {
-                    unfinished.remove(&(step.clone(), visit));
-                }
+                // step_end clears an unfinished leaf; aggregate_end clears the
+                // fan-out group opened by group_start/foreach_start. A child's
+                // step_end is keyed by the CHILD id, so it cannot clear its
+                // parent group's entry.
+                unfinished.remove(&(step.clone(), visit));
                 if !is_child {
                     let e = st.visits.entry(step.clone()).or_insert(0);
                     *e = (*e).max(visit);
                     last_step = Some(step.clone());
                     st.last_executed = Some(step.clone());
                 }
-                let ok = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) == 0
-                    && !v
-                        .get("timed_out")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false)
-                    && !v
-                        .get("interrupted")
-                        .and_then(|x| x.as_bool())
-                        .unwrap_or(false)
-                    && !v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false);
-                let rd = |k: &str| -> Option<String> {
-                    v.get(k)
-                        .and_then(|x| x.as_str())
-                        .and_then(|p| std::fs::read_to_string(run_dir.join(p)).ok())
+                // Fail-CLOSED on missing or mistyped success fields. The old
+                // `.unwrap_or(0)` / `.unwrap_or(false)` let an edited log drop
+                // `exit` (or set it to a non-integer), or drop timed_out /
+                // interrupted, and have a failed step read back as a clean
+                // success, which a resume then skipped instead of re-running.
+                // A step is only "ok" when the log POSITIVELY records exit 0,
+                // timed_out false and interrupted false; anything absent or
+                // ambiguous is treated as not-ok and re-run (rev_break #12).
+                // The two writers emit DIFFERENT field sets, so "fail closed on
+                // a missing field" has to ask each event for the fields its own
+                // writer produces: step_end carries exit/timed_out/interrupted,
+                // aggregate_end carries exit/failed. Demanding the union marked
+                // every honestly written aggregate_end as not-ok, which dropped
+                // fan-out groups out of last_success and left a resumed run
+                // emitting the wrong step at the end.
+                //
+                // Fields the event does not owe are still not allowed to
+                // contradict: present-but-true, or present-but-mistyped, is
+                // never a success.
+                let exit_raw = v.get("exit").and_then(|x| x.as_i64());
+                let timed_out_raw = v.get("timed_out").and_then(|x| x.as_bool());
+                let interrupted_raw = v.get("interrupted").and_then(|x| x.as_bool());
+                let failed_raw = v.get("failed").and_then(|x| x.as_bool());
+                let absent_or_false =
+                    |key: &str, parsed: Option<bool>| v.get(key).is_none() || parsed == Some(false);
+                let owed_fields_false = if ev == "step_end" {
+                    timed_out_raw == Some(false) && interrupted_raw == Some(false)
+                } else {
+                    failed_raw == Some(false)
                 };
-                let chain = rd("chain_file").unwrap_or_default();
-                let exit = v.get("exit").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+                // How this group's most recent lap ENDED, kept per group rather
+                // than inferred later. Deciding whether a resume is continuing
+                // an interrupted batch or starting a fresh lap by looking at
+                // proxies - the highest visit that has completed members, or
+                // whether some visit is still open - got the answer wrong three
+                // times in three review rounds. The question is simply "did the
+                // last aggregate_end for this group say failed", so record that.
+                if ev == "aggregate_end" && !is_child {
+                    if failed_raw == Some(false) {
+                        carry_from.remove(&step);
+                    } else {
+                        carry_from.insert(step.clone(), visit);
+                    }
+                }
+                let ok = exit_raw == Some(0)
+                    && absent_or_false("timed_out", timed_out_raw)
+                    && absent_or_false("interrupted", interrupted_raw)
+                    && absent_or_false("failed", failed_raw)
+                    && owed_fields_false;
+                // A SUCCESSFUL fan-out member: remember it under its PARENT
+                // group so a resume that re-enters the group skips it instead
+                // of spending money and sessions a second time (rev_regression:
+                // completed members re-executed). The member key is exactly the
+                // `step` the member logged under - a parallel child's id, or a
+                // foreach item's "id[i]" label - and the group re-derives the
+                // same keys when it rebuilds its batch.
+                //
+                // Gated on `ok`, and it must stay that way: the crash being
+                // resumed from is usually ONE member failing, and recording
+                // that member as complete is how a resume ends up skipping the
+                // only step that still needs to run. It then finishes with the
+                // failure text as the member's output and never retries it.
+                if ok {
+                    if let Some(parent) = v
+                        .get("parent")
+                        .and_then(|p| p.as_str())
+                        .filter(|p| !p.is_empty())
+                    {
+                        st.completed_members
+                            .entry((parent.to_string(), visit))
+                            .or_default()
+                            .insert(step.clone());
+                    }
+                }
+                // A run dir is untrusted input on --resume: the artifact paths
+                // recorded in the log must stay inside it, symlinks resolved.
+                // A path pointing elsewhere used to be swallowed into empty
+                // output; it now fails the whole resume instead (S1-4).
+                let chain = match v.get("chain_file").and_then(|x| x.as_str()) {
+                    Some(p) => contain::read_contained_opt(run_dir, p)?.unwrap_or_default(),
+                    None => String::new(),
+                };
+                // Fan-out steps route against the headerless plain
+                // concatenation, NOT the labeled aggregate the chain file
+                // holds: live routing matches `plain`, so a resume that
+                // re-reads the chain would test conditions against "--- id ---"
+                // headers and could pick a different branch.
+                let plain = match v.get("plain_file").and_then(|x| x.as_str()) {
+                    Some(p) => contain::read_contained_opt(run_dir, p)?,
+                    None => None,
+                };
+                let exit = exit_raw.and_then(|c| i32::try_from(c).ok()).unwrap_or(1);
                 let timed_out = v
                     .get("timed_out")
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false);
-                let exposed = if ev == "step_end" && !ok {
+                // Both event types, not just step_end. The LIVE path already
+                // wraps a failed fan-out's text in the same banner, so leaving
+                // aggregate_end out meant a resumed run handed downstream steps
+                // a failed group's output as if it were a clean result - and a
+                // forged aggregate_end could hand them any text in the run dir
+                // with nothing marking it. Live and resumed have to agree.
+                let exposed = if !ok {
                     failed_output(&step, chain.trim_end(), exit, timed_out)
                 } else {
                     chain.trim_end().to_string()
@@ -385,16 +644,28 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 // noise into a resumed prompt. Uncompacted steps have no
                 // separate original, so chain is the original. A compacted
                 // step patches this from its compact_end event below.
-                let file = v
-                    .get("out_file")
-                    .and_then(|x| x.as_str())
-                    .map(|p| run_dir.join(p).display().to_string())
+                // out_file gets the same canonicalized containment check as
+                // chain_file: the old lexical-only test let a symlink inside
+                // the run dir point at an arbitrary path (S1-4).
+                let out_canon = match v.get("out_file").and_then(|x| x.as_str()) {
+                    Some(p) => contain::contained_opt(run_dir, p)?,
+                    None => None,
+                };
+                let file = out_canon
+                    .as_ref()
+                    .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                let stderr_file = v
-                    .get("out_file")
-                    .and_then(|x| x.as_str())
-                    .map(|p| stderr_file_for(&run_dir.join(p)).display().to_string())
-                    .filter(|p| Path::new(p).exists())
+                // The stderr path is derived from the (already contained) out_file,
+                // but the .err.txt it names could itself be a symlink planted in the
+                // run dir and pointing outside it; `{{steps.x.stderr_file}}` would
+                // then hand a downstream agent/cmd a path that reads an external
+                // file. Require the derived path to resolve under the run dir, not
+                // merely to exist, before exposing it (rev_break #5).
+                let stderr_file = out_canon
+                    .as_ref()
+                    .map(|p| stderr_file_for(p))
+                    .filter(|p| p.exists() && contain::is_under(run_dir, p))
+                    .map(|p| p.display().to_string())
                     .unwrap_or_default();
                 st.outputs.insert(
                     step.clone(),
@@ -408,17 +679,49 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                 );
                 if !is_child {
                     if let Some(p) = v.get("chain_file").and_then(|x| x.as_str()) {
-                        st.chain_files.insert(step.clone(), run_dir.join(p));
+                        if let Some(canon) = contain::contained_opt(run_dir, p)? {
+                            st.chain_files.insert(step.clone(), canon);
+                        }
                     }
                     if ok {
                         st.last_success = Some(step.clone());
                     }
-                    st.pending_route = (ev == "step_end" && ok).then(|| PendingRoute {
-                        step: step.clone(),
-                        visit,
-                        route_text: chain.trim_end().to_string(),
-                    });
+                    st.pending_route = if ev == "step_end" && ok {
+                        Some(PendingRoute {
+                            step: step.clone(),
+                            visit,
+                            route_text: chain.trim_end().to_string(),
+                            from_plain: false,
+                        })
+                    } else if ev == "aggregate_end" && ok {
+                        // Runs written before plain_file existed have no
+                        // headerless copy: leave the route unset (as before)
+                        // so the fan-out re-runs rather than routing on
+                        // headered text live never matched against.
+                        plain.map(|p| PendingRoute {
+                            step: step.clone(),
+                            visit,
+                            route_text: p.trim_end().to_string(),
+                            from_plain: true,
+                        })
+                    } else {
+                        None
+                    };
                 }
+                // Trust model for the recorded session (rev_break #11): the
+                // session id/marker/access restored here come from log.jsonl,
+                // which is mutable on --resume. The access-escalation guard they
+                // feed (leaf::prepare_leaf) is aimed at untrusted CONTENT a read
+                // step ingested (e.g. a web page) being promoted into a write/full
+                // agent - that attacker controls the content, not this run dir, so
+                // the dir's own record is the trustworthy source. A LOCAL attacker
+                // who can edit log.jsonl already has the user's OS privileges (the
+                // runs root is 0700) and can equally edit the flow or the prompts;
+                // the log is not a boundary against them. Two hardenings still
+                // apply: a MISSING access fails closed (cannot be deleted to
+                // escalate), and a resume that reports no session id is refused
+                // (check_session), so a fresh/other session cannot be passed off
+                // as the recorded one.
                 if ok {
                     if let Some(s) = v.get("session") {
                         if let (Some(t), Some(id)) = (
@@ -435,6 +738,16 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                                         .get("marker")
                                         .and_then(|x| x.as_str())
                                         .map(String::from),
+                                    // Absent in logs written before access was
+                                    // recorded: the resume guard warns on None.
+                                    access: s
+                                        .get("access")
+                                        .and_then(|x| x.as_str())
+                                        .and_then(|a| preset::Access::parse(Some(a)).ok()),
+                                    // Present-but-unparsable stays `true`: the
+                                    // key IS there, it is just not a level, and
+                                    // that is an edit rather than an old run.
+                                    access_recorded: s.get("access").is_some(),
                                 },
                             );
                         }
@@ -449,6 +762,10 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     st.start = None;
                 } else {
                     st.completed = false;
+                    // Routing INTO a fan-out is the flow asking for a fresh lap
+                    // of it, however the previous lap ended. The run did not
+                    // simply stop at a failure, so there is nothing to carry.
+                    carry_from.remove(next);
                     st.start = Some(next.to_string());
                 }
             }
@@ -465,22 +782,157 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
             st.start = last_step;
         }
     }
+    // A fan-out that FAILS still logs an aggregate_end, so `visits` restores
+    // that visit and the resume re-enters the group one higher - while the
+    // members that finished are recorded under the visit that crashed. Without
+    // carrying them forward the lookup misses every one and the resume re-runs,
+    // and re-bills, the whole batch. That is the F-2 double-billing bug: the
+    // skip logic was right, the key it looked under was one lap stale.
+    //
+    // The condition is exactly: this resume restarts at the group, and the
+    // group's most recent lap ended in FAILURE at the visit whose members we
+    // are carrying. Nothing else qualifies, and the three narrower conditions
+    // tried before this all leaked one of these cases:
+    //
+    //   killed with no aggregate_end -> no entry here, and the resume re-enters
+    //     the SAME visit, which the original key already covers. Carrying
+    //     forward as well planted a set that a later route-back picked up.
+    //   lap SUCCEEDED, flow routed back, crash before the new lap finished ->
+    //     failed=false, so no carry. The old "highest visit with completed
+    //     members" test saw visit 1 and skipped the whole of visit 2, which the
+    //     flow had deliberately asked for.
+    //   two crashes running -> the second lap logs its own failed aggregate_end
+    //     and its carried members are in the log as members_restored, so the
+    //     third attempt carries from visit 2, not visit 1.
+    if let Some(resume_at) = st.start.clone() {
+        if let Some(&visit) = carry_from.get(&resume_at) {
+            if let Some(set) = st
+                .completed_members
+                .get(&(resume_at.clone(), visit))
+                .cloned()
+            {
+                // extend, not or_insert: a member known complete from either
+                // source is complete, and replacing an existing entry - or
+                // declining to touch it - would drop one side of the union.
+                st.completed_members
+                    .entry((resume_at, visit + 1))
+                    .or_default()
+                    .extend(set);
+            }
+        }
+    }
     Ok(st)
+}
+
+/// Make the session access levels restored from log.jsonl agree with what the
+/// flow actually declares (rev_break #11). The log is mutable on --resume, so a
+/// recorded access the flow cannot have produced - e.g. a read step's session
+/// edited to "access":"full" - is tampering: it is dropped to None, which the
+/// resume guard in leaf::prepare_leaf fails closed on. The flow itself is the
+/// trustworthy source because check_flow_fingerprint verified it is unchanged
+/// (callers skip this reconciliation when --force-resume waived that check).
+///
+/// A fallback profile can legitimately run a step at a different tier than its
+/// primary settings, so the recorded level may be the primary access OR any
+/// fallback profile's access; anything else is the tampered case.
+///
+/// `legacy_era` covers runs created by sfh 0.x, before access was recorded at
+/// all: their logs have NO access field, which is honest, not tampered. For
+/// them a missing level is filled from the flow's primary declaration - what
+/// the step actually ran under - so pre-1.0 continue_from/fork_from still
+/// resume at write/full without an override (rev_regression: old runs could
+/// not be resumed at any tier above read once the guard failed closed).
+fn reconcile_session_access(
+    sessions: &mut HashMap<String, leaf::SessionInfo>,
+    flow: &flow::Flow,
+    legacy_era: bool,
+) {
+    for (step_id, info) in sessions.iter_mut() {
+        let Some(step) = flow.find_step(step_id) else {
+            continue;
+        };
+        let Ok(primary) = leaf::effective(flow, step) else {
+            continue;
+        };
+        // Any level the step COULD have run at, primary or fallback, counts as
+        // untampered. A reviewer noted that when a fallback declares a higher
+        // level than the primary, a forged log claiming that higher level is
+        // accepted - which is true, and deliberate. The set comes from the flow,
+        // and check_flow_fingerprint has already established the flow is the one
+        // that produced this run: the author declared that this step may run at
+        // that level, so resuming its session there is inside what they asked
+        // for. Narrowing it would need the log to say WHICH profile ran, and the
+        // log is the thing being distrusted. Recorded as B-16.
+        let mut possible: Vec<preset::Access> = vec![primary.access];
+        for fb in &step.fallback {
+            if let Ok(e) = leaf::effective_with(flow, step, Some(fb)) {
+                possible.push(e.access);
+            }
+        }
+        match info.access {
+            Some(a) if !possible.contains(&a) => {
+                eprintln!(
+                    "sfh: warning: step '{step_id}' recorded access {} but the flow declares {}; treating the recorded level as tampered and failing closed on any escalation",
+                    a.as_str(),
+                    possible
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                );
+                info.access = None;
+            }
+            // A genuinely pre-1.0 run has NO access key, which is honest. A run
+            // that has the key but whose value is not a level has been edited,
+            // and claiming to be old must not launder that: without
+            // access_recorded here, setting `sfh_version: 0.x` and corrupting
+            // the level got the same free fill as an authentic old run.
+            None if legacy_era && !info.access_recorded => {
+                info.access = Some(primary.access);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Newest run directory produced by THIS flow file. Several flows usually share
 /// one runs root, so picking the newest directory overall would resume the
 /// wrong run.
+///
+/// Trust bound (rev_break #12): this only matches meta.flow and the presence of
+/// log.jsonl, so in a SHARED, world-writable runs root an attacker could plant a
+/// directory that matches and have --resume-latest pick it. The defence is that
+/// the runs root sfh creates is 0700 (protect_runs_root); a caller who points
+/// --runs-dir at a shared writable root is opting out of that guarantee. A
+/// planted dir still has to survive the flow fingerprint check below (unless
+/// --force-resume) and, once loaded, every artifact path it records is
+/// canonicalized and required to stay inside it (load_resume / contained_opt),
+/// so it cannot read or write outside itself - but the root itself must be
+/// trusted for --resume-latest to be meaningful.
 fn latest_run_dir(root: &Path, flow_path: &Path) -> Option<PathBuf> {
     let want = abs(flow_path).display().to_string();
+    // A planted symlink/junction under the runs root must not be selected as
+    // "the latest run": is_dir()/exists() follow links, so the old filter would
+    // happily resume a directory OUTSIDE the root. Enumerate by lstat and
+    // require the resolved candidate to stay under the resolved root, the same
+    // rule watch::run_dirs applies to status/wait/stop (rev_break #7).
+    let canon_root = root.canonicalize().ok()?;
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)
         .ok()?
         .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.join("log.jsonl").exists())
+        .filter(|p| p.join("log.jsonl").exists())
+        .filter(|p| match p.canonicalize() {
+            Ok(c) => c.starts_with(&canon_root),
+            Err(_) => false,
+        })
         .filter(|p| {
-            std::fs::read_to_string(p.join("meta.json"))
+            // A meta.json that is a symlink or resolves outside the candidate
+            // is not a vote for that candidate: read it contained (rev_break #6).
+            contain::read_contained_opt(p, "meta.json")
                 .ok()
+                .flatten()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
                 .and_then(|m| m.get("flow").and_then(|x| x.as_str()).map(String::from))
                 .map(|f| f == want)
@@ -493,8 +945,9 @@ fn latest_run_dir(root: &Path, flow_path: &Path) -> Option<PathBuf> {
 
 /// Hand this run to a background copy of sfh, print the run dir, and return.
 /// The child's command line is rebuilt from RunOpts rather than filtered out of
-/// argv, so it does not depend on how the caller spelled the flags.
-fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, String> {
+/// argv, so it does not depend on how the caller spelled the flags. The child
+/// inherits `nonce` through SFH_NONCE so both processes record the same value.
+fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> Result<i32, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot locate the sfh executable to detach: {e}"))?;
 
@@ -539,37 +992,47 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, St
         &args,
         &run_dir.join("detached.out.txt"),
         &run_dir.join("detached.err.txt"),
+        &[("SFH_NONCE", nonce)],
     )?;
     if let Some(w) = &d.warning {
         eprintln!("sfh: warning: {w}");
     }
+    // Bind the nonce to the child's pid AND start time BEFORE anything else
+    // touches the run dir, so a `sfh stop` landing right after the detach
+    // already sees a consistent (pid, start, nonce) triple. The child rewrites
+    // the same bytes with its own pid - which is exactly d.pid - so there is no
+    // window of disagreement (rev_break #8).
+    let child_start = execute::pid_start_time(d.pid);
+    contain::write_nonce(run_dir, d.pid, child_start, nonce)
+        .map_err(|e| format!("cannot write the stop nonce: {e}"))?;
     // Seed status.json only if the child has not already written its own, so
     // `sfh status` has something to report either way and neither clobbers.
-    if !status_path.exists() {
-        write_status(
-            &status_path,
-            &Status {
-                state: "running",
-                step: String::new(),
-                started: utc_stamp(),
-                steps_done: 0,
-                cost_usd: 0.0,
-                run_dir: run_dir.display().to_string(),
-                flow: abs(&opts.flow_path).display().to_string(),
-                pid: d.pid,
-                exit_code: None,
-                emit_step: None,
-                emit_file: None,
-                error: None,
-                unfinished_step: None,
-            },
-        );
-    }
+    // The create_new guard inside seed_status makes this race-free.
+    seed_status(
+        &status_path,
+        &Status {
+            state: "running",
+            step: String::new(),
+            started: utc_stamp(),
+            steps_done: 0,
+            cost_usd: 0.0,
+            run_dir: run_dir.display().to_string(),
+            flow: abs(&opts.flow_path).display().to_string(),
+            pid: d.pid,
+            exit_code: None,
+            emit_step: None,
+            emit_file: None,
+            error: None,
+            unfinished_step: None,
+            nonce: nonce.to_string(),
+            pid_start: child_start,
+        },
+    );
     if !opts.quiet {
         eprintln!(
             "sfh: detached (pid {}). poll with: sfh status {}",
             d.pid,
-            run_dir.display()
+            execute::shell_quote(&run_dir.display().to_string())
         );
     }
     // stdout gets the run dir and nothing else, so a caller can capture it.
@@ -579,26 +1042,172 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool) -> Result<i32, St
 
 /// Drop a self-ignoring .gitignore into the runs root, the way cargo does for
 /// target/. Run dirs hold rendered prompts, model output and session ids in
-/// plaintext inside the user's own repo; one `git add -A` should not be able to
-/// publish them. Never overwrites an existing file.
-fn protect_runs_root(root: &Path) {
+/// plaintext inside the user's own repo; one `git add -A` should not be able
+/// to publish them. A hostile repo can pre-place an EMPTY .gitignore to make
+/// the old "skip if exists" behaviour leave everything tracked, so an existing
+/// file is verified: unless an effective `*` pattern is present, sfh appends
+/// one and says so.
+fn protect_runs_root(root: &Path) -> Result<(), String> {
+    contain::mkdir_private(root)
+        .map_err(|e| format!("cannot create runs dir {}: {e}", root.display()))?;
     let f = root.join(".gitignore");
-    if f.exists() {
-        return;
-    }
-    if std::fs::create_dir_all(root).is_ok() {
-        let _ = std::fs::write(&f, "# Created by sfh. Run artifacts are not source.\n*\n");
+    const BODY: &str = "# Created by sfh. Run artifacts are not source.\n*\n";
+    // Write AND re-read: a failure used to be silently ignored, so a
+    // read-only .gitignore left every run artifact committable while the run
+    // proceeded as if protected (S3-3).
+    let write_and_verify = |text: &str| -> Result<(), String> {
+        contain::write_private(&f, text).map_err(|e| {
+            format!(
+                "cannot write {} ({e}); run artifacts would be committable, so this run refuses to start",
+                f.display()
+            )
+        })?;
+        let back = std::fs::read_to_string(&f).map_err(|e| {
+            format!(
+                "cannot re-read {} after writing it ({e}); cannot confirm run artifacts are protected",
+                f.display()
+            )
+        })?;
+        if !gitignore_ignores_everything(&back) {
+            return Err(format!(
+                "{} was written but still does not ignore everything; run artifacts could be committed",
+                f.display()
+            ));
+        }
+        Ok(())
+    };
+    match std::fs::read_to_string(&f) {
+        Err(_) => write_and_verify(BODY),
+        Ok(text) => {
+            if gitignore_ignores_everything(&text) {
+                return Ok(());
+            }
+            eprintln!(
+                "sfh: warning: {} does not ignore everything; appending '*' so run artifacts cannot be committed",
+                f.display()
+            );
+            write_and_verify(&format!(
+                "{text}\n# Added by sfh: run artifacts are not source.\n*\n"
+            ))
+        }
     }
 }
 
-/// Cheap change-detection fingerprint (FNV-1a); not a security hash.
+/// True when the gitignore has an effective pattern that ignores every entry:
+/// a non-comment line that is exactly `*` (or `/*`). A `*` inside a comment or
+/// a pattern like `*.log` does NOT count - git would still track the rest.
+fn gitignore_ignores_everything(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#') && (t == "*" || t == "/*")
+    })
+}
+
+/// Change-detection fingerprint of the flow file, recorded in meta.json and
+/// used to refuse `--resume` of a run whose flow has changed. SHA-256 because
+/// this is a security boundary: with FNV-1a a crafted flow could collide with
+/// another and slip a changed flow past the resume guard.
+/// Line endings are normalised first. The same flow file checked out on
+/// Windows and on Linux differs by a CR on every line, and hashing the raw
+/// bytes made those two "different versions of the flow" - so a run dir moved
+/// between machines, or a working copy re-checked-out under a different
+/// core.autocrlf, could not be resumed even though nothing about the flow had
+/// changed. Every other cross-OS decision in sfh is byte-identical; this one
+/// has to be too. A CR that is NOT part of a line ending still changes the
+/// hash, so this is not a way to smuggle an edit past the check.
 fn fingerprint(s: &str) -> String {
+    crate::sha256::hex(s.replace("\r\n", "\n").as_bytes())
+}
+
+/// The FNV-1a 64 fingerprint sfh <= 0.9 recorded in meta.json. Kept ONLY so
+/// --resume can verify run dirs that predate the SHA-256 switch: such a dir
+/// records no flow_fingerprint_algo, and comparing its 16-hex value against a
+/// 64-hex SHA would report EVERY unchanged flow as "a different version",
+/// making old runs unresumable. New runs always record sha256.
+fn legacy_fingerprint_fnv(s: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.bytes() {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}")
+}
+
+/// Recorded next to the fingerprint in meta.json so resume compares like with
+/// like instead of guessing which algorithm wrote the stored value.
+const FINGERPRINT_ALGO: &str = "sha256-nl";
+/// What sfh 0.9 recorded: the same SHA-256, but over the raw bytes, so a
+/// CRLF working copy and an LF one disagreed. Runs written by 0.9 are still
+/// verified the way 0.9 computed it - re-hashing them the new way would
+/// report every unchanged flow as changed.
+const RAW_SHA_FINGERPRINT_ALGO: &str = "sha256";
+/// meta.json dirs without a flow_fingerprint_algo field were written before
+/// the field existed, when the algorithm was FNV-1a.
+const LEGACY_FINGERPRINT_ALGO: &str = "fnv1a";
+
+/// Verify that the flow file has not changed since the run dir was created,
+/// honouring the algorithm the dir actually recorded (R-2). Returns Ok(())
+/// when unchanged, Err when the flow differs or cannot be verified.
+fn check_flow_fingerprint(
+    meta: &serde_json::Value,
+    flow_text: &str,
+    dir: &Path,
+    flow_path: &Path,
+) -> Result<(), String> {
+    let old_fp = meta
+        .get("flow_fingerprint")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let old_algo = meta
+        .get("flow_fingerprint_algo")
+        .and_then(|x| x.as_str())
+        .unwrap_or(LEGACY_FINGERPRINT_ALGO);
+    // The older algorithms hashed raw bytes, so an old run and a re-checked-out
+    // flow disagree over nothing but line endings - and those are exactly the
+    // runs the legacy path exists to rescue. Accept the value computed either
+    // way for them. This does not weaken anything: the check asks "is this the
+    // same flow", and a flow that differs only in CRLF vs LF is the same flow,
+    // which is why new runs normalise before hashing in the first place.
+    // BOTH directions. Trying only the LF form covered an old run recorded on
+    // Unix being resumed from a CRLF checkout, and left the reverse - recorded
+    // on Windows, resumed from an LF checkout - rejected, which is the more
+    // common way round for a project whose CI is Linux.
+    let lf = flow_text.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    let first_match = |candidates: [String; 3]| -> String {
+        candidates
+            .iter()
+            .find(|c| *c == old_fp)
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone())
+    };
+    let expected = match old_algo {
+        FINGERPRINT_ALGO => fingerprint(flow_text),
+        RAW_SHA_FINGERPRINT_ALGO => first_match([
+            crate::sha256::hex(flow_text.as_bytes()),
+            crate::sha256::hex(lf.as_bytes()),
+            crate::sha256::hex(crlf.as_bytes()),
+        ]),
+        LEGACY_FINGERPRINT_ALGO => first_match([
+            legacy_fingerprint_fnv(flow_text),
+            legacy_fingerprint_fnv(&lf),
+            legacy_fingerprint_fnv(&crlf),
+        ]),
+        other => {
+            return Err(format!(
+                "{} records an unknown flow_fingerprint_algo '{other}'; the flow cannot be verified as unchanged (use --force-resume to resume anyway)",
+                dir.display()
+            ))
+        }
+    };
+    if old_fp != expected {
+        return Err(format!(
+            "{} was produced by a different version of {} (the flow file has changed since that run; use --force-resume to resume anyway)",
+            dir.display(),
+            flow_path.display()
+        ));
+    }
+    Ok(())
 }
 
 struct Status {
@@ -619,9 +1228,15 @@ struct Status {
     emit_file: Option<String>,
     error: Option<String>,
     unfinished_step: Option<UnfinishedStep>,
+    /// Random token proving this status.json was written by the sfh that owns
+    /// the run dir. `sfh stop` refuses to kill without a matching nonce file.
+    nonce: String,
+    /// Start time of the owning process, so a reused pid is told apart from
+    /// the process that started the run (rev_break #8).
+    pid_start: Option<u64>,
 }
 
-fn write_status(path: &Path, s: &Status) {
+fn status_json(s: &Status) -> String {
     let unfinished_step = s.unfinished_step.as_ref().map(|u| {
         json!({
             "step": u.step,
@@ -646,27 +1261,102 @@ fn write_status(path: &Path, s: &Status) {
         "emit_file": s.emit_file,
         "error": s.error,
         "unfinished_step": unfinished_step,
+        "nonce": s.nonce,
+        "pid_start": s.pid_start,
     });
-    let text = serde_json::to_string_pretty(&v).unwrap_or_default();
+    serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
+fn write_status(path: &Path, s: &Status) {
+    let text = status_json(s);
     // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
     // seconds, and a plain write lets them read a half-written document. Rename
     // is atomic on both platforms, so a reader sees the old or the new file and
-    // never a torn one.
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+    // never a torn one. The tmp name carries the pid: the detaching parent and
+    // its child both write status.json, and a SHARED tmp name let them clobber
+    // each other's in-flight write (rev_regression: detach status race).
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    if contain::write_private(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
         return;
     }
     let _ = std::fs::remove_file(&tmp);
-    let _ = std::fs::write(path, &text);
+    let _ = contain::write_private(path, &text);
+}
+
+/// Seed status.json for a detached run ONLY if the child has not already written
+/// its own. `create_new` is the atomic guard: an `exists()` check followed by a
+/// write is not exclusive, so a short flow's child could finish (writing `done`)
+/// between the parent's check and its write, and the parent's `running` seed
+/// would then clobber the terminal status, leaving a finished run stuck on
+/// `running` forever (rev_regression: detach status race). create_new fails
+/// harmlessly once the file exists.
+fn seed_status(path: &Path, s: &Status) {
+    use std::io::Write as _;
+    let text = status_json(s);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        let _ = f.write_all(text.as_bytes());
+        contain::restrict_file(&f);
+    }
 }
 
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
-    let flow = flow::load(&opts.flow_path)?;
+    let runs_root = opts
+        .runs_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
+
+    // Resolve the resume target BEFORE loading the flow. The era recorded in
+    // meta.json decides whether the lenient loader (which restores pre-1.0
+    // defaults for flows that predate the mandatory-access and string-cmd
+    // rules) may be used: a fresh run, or a resume of a run created by sfh
+    // >= 1.0, always goes through the strict loader (rev_break #14 - the old
+    // code fell back to lenient on ANY strict failure whenever --resume was
+    // given, so a crafted run dir could execute a flow that a fresh run
+    // rejects, at write access, without the flow ever having changed).
+    let resume_dir: Option<PathBuf> = if opts.dry_run {
+        None
+    } else {
+        resume_target(opts, &runs_root)?.map(|d| abs(&d))
+    };
+    // meta.json is read through the containment check: a symlink at the fixed
+    // name used to be followed to an external JSON file that was then ingested
+    // as the run's recorded vars and fingerprint (rev_break #6). A missing
+    // meta.json is still allowed (a very old run dir); a violation is fatal.
+    let resume_meta: Option<serde_json::Value> = match &resume_dir {
+        Some(dir) => Some(match contain::read_contained_opt(dir, "meta.json")? {
+            Some(t) => serde_json::from_str(&t)
+                .map_err(|e| format!("{}: unreadable meta.json: {e}", dir.display()))?,
+            None => json!({}),
+        }),
+        None => None,
+    };
+    // Legacy era = created by sfh 0.x, before the mandatory-access rule and
+    // the string-cmd template ban. Such a run's flow legitimately parsed
+    // under the old rules, so the lenient loader restores them; the flow
+    // fingerprint check below still refuses a flow that actually CHANGED
+    // without --force-resume (rev_regression R-2).
+    let legacy_era = resume_meta
+        .as_ref()
+        .and_then(|m| m.get("sfh_version").and_then(|x| x.as_str()))
+        .map(|v| v.starts_with("0."))
+        .unwrap_or(false);
+    let flow = match flow::load(&opts.flow_path) {
+        Ok(f) => f,
+        Err(e) => {
+            if resume_dir.is_some() && legacy_era {
+                flow::load_lenient(&opts.flow_path).map_err(|_| e)?
+            } else {
+                return Err(e);
+            }
+        }
+    };
     let mut vars = flow.vars_string_map()?;
-    for (k, v) in &opts.vars {
-        vars.insert(k.clone(), v.clone());
-    }
-    precheck(&flow, &vars)?;
     let step_ids = flow.step_ids();
     if let Some(e) = &opts.emit {
         if !step_ids.contains(e) {
@@ -677,12 +1367,62 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let flow_dir = abs(opts.flow_path.parent().unwrap_or(Path::new(".")));
     let flow_text = std::fs::read_to_string(&opts.flow_path).unwrap_or_default();
     let flow_fp = fingerprint(&flow_text);
-    let runs_root = opts
-        .runs_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
-    protect_runs_root(&runs_root);
+    // Same rule `sfh validate` enforces through flow::validate: only characters
+    // that would affect the run dir PATH are forbidden (R-6).
     let name = flow.name.clone().unwrap_or_else(|| "flow".into());
+    flow::validate_name(&name)?;
+
+    // Keys whose values came from the resumed run dir's meta.json (and were NOT
+    // overridden by an explicit --var on THIS command). These are run-derived
+    // UNTRUSTED input and may not flow into executed-privileged template sinks
+    // (bin / cwd / argv[0]); an explicit --var is the user's own value and stays
+    // trusted (rev_break #12).
+    let mut tainted_vars: HashSet<String> = HashSet::new();
+    if let Some(dir) = &resume_dir {
+        let meta = resume_meta.as_ref().expect("resume meta read above");
+        if !opts.force_resume {
+            check_flow_fingerprint(meta, &flow_text, dir, &opts.flow_path)?;
+        }
+        // A resumed dir must be a real directory, not a symlink/junction sfh
+        // would resolve into somewhere the caller did not point at; and on Unix
+        // a group/world-writable dir means another local user can swap files
+        // between sfh's containment check and its open, so warn loudly about the
+        // residual TOCTOU (rev_break #5).
+        match dir.symlink_metadata() {
+            Ok(md) if md.is_symlink() => {
+                return Err(format!(
+                    "{} is a symlink, not a run directory; refusing to resume through it",
+                    dir.display()
+                ))
+            }
+            #[cfg(unix)]
+            Ok(md) => {
+                use std::os::unix::fs::PermissionsExt;
+                if md.permissions().mode() & 0o022 != 0 {
+                    eprintln!(
+                        "sfh: warning: {} is group/world-writable; another local user could modify it while this run reads it",
+                        dir.display()
+                    );
+                }
+            }
+            _ => {}
+        }
+        // Recorded vars override the flow's defaults; an explicit --var on
+        // THIS command overrides both (applied after this block).
+        if let Some(obj) = meta.get("vars").and_then(|x| x.as_object()) {
+            for (k, v) in obj {
+                if let Some(s) = v.as_str() {
+                    vars.insert(k.clone(), s.to_string());
+                    tainted_vars.insert(k.clone());
+                }
+            }
+        }
+    }
+    for (k, v) in &opts.vars {
+        vars.insert(k.clone(), v.clone());
+        tainted_vars.remove(k); // an explicit --var is the user's own value
+    }
+    precheck(&flow, &vars, &tainted_vars)?;
 
     // Which steps must produce resumable sessions (continue_from targets).
     let mut needed_sessions: HashSet<String> = HashSet::new();
@@ -707,28 +1447,44 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let run_dir: PathBuf;
     let mut is_resume = false;
     if opts.dry_run {
+        protect_runs_root(&runs_root)?;
         let base = format!("{}-{}-dryrun", utc_stamp(), name);
         run_dir = abs(&runs_root.join(base));
-        std::fs::create_dir_all(&run_dir)
+        contain::mkdir_private(&run_dir)
             .map_err(|e| format!("cannot create run dir {}: {e}", run_dir.display()))?;
-    } else if let Some(dir) = resume_target(opts, &runs_root)? {
-        let dir = abs(&dir);
-        let meta: serde_json::Value = std::fs::read_to_string(dir.join("meta.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or(json!({}));
-        let old_fp = meta
-            .get("flow_fingerprint")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        if old_fp != flow_fp && !opts.force_resume {
-            return Err(format!(
-                "{} was produced by a different version of {} (use --force-resume to override)",
-                dir.display(),
-                opts.flow_path.display()
-            ));
-        }
+    } else if let Some(dir) = resume_dir {
+        // The resumed dir was protected when it was first created; nothing
+        // here writes to the runs root, so its state is not this run's
+        // concern (and the root may be absent or read-only by design).
         resumed = load_resume(&dir)?;
+        // Cross-check the recorded session access against the flow (which the
+        // fingerprint check above verified is unchanged, unless --force-resume
+        // waived it): a log edited to claim a higher access than the flow
+        // declares for that step is tampering and reads back as None, which
+        // the resume guard fails closed on (rev_break #11). A LEGACY-era run
+        // predates access recording entirely, so a missing access there is
+        // filled from the flow's own declaration instead - that is what the
+        // step actually ran under, and it keeps pre-1.0 runs resumable at
+        // write/full without an override (rev_regression: old continue_from).
+        if opts.force_resume {
+            // --force-resume waives the FINGERPRINT check, which is exactly the
+            // thing that made the flow a trustworthy yardstick for the recorded
+            // access. Skipping the cross-check here left the log's own claim as
+            // the only evidence, so editing a read session to "access":"full"
+            // and adding --force-resume walked straight past the escalation
+            // guard. It is not a substitute for allow_access_override.
+            //
+            // Drop every restored level to unknown instead. The guard in
+            // prepare_leaf fails closed on that, and a caller who really means
+            // to resume these sessions says so per step with
+            // allow_access_override: true.
+            for info in resumed.sessions.values_mut() {
+                info.access = None;
+                info.access_recorded = true;
+            }
+        } else {
+            reconcile_session_access(&mut resumed.sessions, &flow, legacy_era);
+        }
         if resumed.completed {
             return Err(format!(
                 "{} already completed - nothing to resume",
@@ -753,10 +1509,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // The detaching parent already picked (and created) this directory so
         // it could print the path before the background copy came up.
         let d = abs(d);
-        std::fs::create_dir_all(&d)
+        contain::mkdir_private(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = d;
     } else {
+        protect_runs_root(&runs_root)?;
         let base = format!("{}-{}", utc_stamp(), name);
         let mut d = runs_root.join(&base);
         let mut n = 1;
@@ -764,9 +1521,41 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             n += 1;
             d = runs_root.join(format!("{base}-{n}"));
         }
-        std::fs::create_dir_all(&d)
+        contain::mkdir_private(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = abs(&d);
+    }
+    // Defense-in-depth: even though `name` is charset-validated, confirm the
+    // resolved run dir is actually under the runs root (guards symlink tricks).
+    if !is_resume && opts.run_dir.is_none() && !contain::is_under(&runs_root, &run_dir) {
+        return Err(format!(
+            "run dir {} escapes the runs root {}",
+            run_dir.display(),
+            runs_root.display()
+        ));
+    }
+    // The nonce is minted in exactly ONE place per attempt. A detached child
+    // inherits the parent's value through SFH_NONCE instead of minting its own,
+    // so status.json and sfh-nonce can never disagree, even for the instant the
+    // old "both sides generate" design left open (R-4). The nonce file binds
+    // the token to the owning pid AND its start time (see contain::write_nonce),
+    // which is what lets `sfh stop` refuse a status.json rewritten to point at
+    // another pid, or a pid the OS reused after the run died (rev_break #8).
+    let nonce = match std::env::var("SFH_NONCE") {
+        Ok(n) if !n.trim().is_empty() => {
+            // Consume it: a flow step that launches sfh itself must not carry
+            // this run's nonce into the nested run.
+            std::env::remove_var("SFH_NONCE");
+            n.trim().to_string()
+        }
+        _ => contain::random_nonce(),
+    };
+    let pid_start = execute::pid_start_time(std::process::id());
+    if !opts.detach {
+        // The detaching parent writes the file itself, after the spawn, when
+        // it knows the child's pid (in detach_run).
+        contain::write_nonce(&run_dir, std::process::id(), pid_start, &nonce)
+            .map_err(|e| format!("cannot write the stop nonce: {e}"))?;
     }
     let notes_file = run_dir.join("notes.md");
 
@@ -774,6 +1563,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         return dry_run(
             &flow,
             &vars,
+            &tainted_vars,
             &run_dir,
             &flow_dir,
             &notes_file,
@@ -785,29 +1575,34 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // Everything above this point is validation, so a broken flow still fails
     // in the caller's face instead of dying silently in the background.
     if opts.detach {
-        return detach_run(opts, &run_dir, is_resume);
+        return detach_run(opts, &run_dir, is_resume, &nonce);
     }
 
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(run_dir.join("log.jsonl"))
+    let mut log = contain::append_private(&run_dir.join("log.jsonl"))
         .map_err(|e| format!("cannot open log: {e}"))?;
 
-    // Provenance: which sfh, which tool builds. Cheap, no AI calls.
+    // Provenance: which sfh, which tool builds. Cheap, no AI calls. Probe only
+    // the (tool, bin) pairs the flow actually resolves to: an unused profile's
+    // bin is data, and data must never be executed.
     let mut tool_versions = serde_json::Map::new();
     if !is_resume {
-        for t in flow.tools_used() {
-            let bin = flow
-                .profiles
-                .values()
-                .find(|p| p.tool.as_deref() == Some(t.as_str()) && p.bin.is_some())
-                .and_then(|p| p.bin.clone())
-                .unwrap_or_else(|| t.clone());
-            if let Some(v) = execute::probe_version(&bin) {
-                tool_versions.insert(t.clone(), json!({"bin": bin, "version": v}));
+        let mut by_tool: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+        for rt in flow.resolved_tools() {
+            by_tool.entry(rt.tool).or_default().insert(rt.bin);
+        }
+        for (tool, bins) in by_tool {
+            let entries: Vec<serde_json::Value> = bins
+                .into_iter()
+                .map(|bin| {
+                    let program = bin.unwrap_or_else(|| preset::default_program(&tool));
+                    let version = execute::probe_version(&program);
+                    json!({"bin": program, "version": version})
+                })
+                .collect();
+            if entries.len() == 1 {
+                tool_versions.insert(tool, entries.into_iter().next().unwrap());
             } else {
-                tool_versions.insert(t.clone(), json!({"bin": bin, "version": null}));
+                tool_versions.insert(tool, json!(entries));
             }
         }
     }
@@ -816,6 +1611,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "sfh_version": VERSION,
         "flow": abs(&opts.flow_path).display().to_string(),
         "flow_fingerprint": flow_fp,
+        "flow_fingerprint_algo": FINGERPRINT_ALGO,
         "name": name,
         "started_utc": started,
         "os": std::env::consts::OS,
@@ -823,8 +1619,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "tools": tool_versions,
         "resumed": is_resume,
     });
-    let _ = std::fs::write(
-        run_dir.join("meta.json"),
+    let _ = contain::write_private(
+        &run_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
     );
     log_event(
@@ -853,6 +1649,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         emit_file: None,
         error: None,
         unfinished_step: resumed.unfinished_step.clone(),
+        nonce: nonce.clone(),
+        pid_start,
     }));
     {
         let s = Arc::clone(&status);
@@ -884,6 +1682,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut last_executed = resumed.last_executed;
     let mut last_success = resumed.last_success;
     let pending_route = resumed.pending_route;
+    let completed_members = resumed.completed_members;
     // step id -> the chain file its LAST visit wrote. A re-visited step writes
     // <id>.v2.chain.txt, so nothing may assume <id>.chain.txt.
     let mut chain_files = resumed.chain_files;
@@ -949,6 +1748,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 notes_file: &notes_file,
                 sessions: &sessions,
                 needed_sessions: &needed_sessions,
+                tainted_vars: &tainted_vars,
                 quiet: opts.quiet,
                 verbose: opts.verbose,
             };
@@ -1103,6 +1903,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         notes_file: &notes_file,
                         sessions: $sessions,
                         needed_sessions: &needed_sessions,
+                        tainted_vars: &tainted_vars,
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     }
@@ -1161,15 +1962,37 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             ) =
                 &step.parallel
             {
+                // Members the crashed attempt already finished: their step_end
+                // events restored their output, session and cost, so a resume
+                // must NOT prepare or execute them again (rev_regression: the
+                // old code rebuilt the whole batch, double-spending, opening
+                // duplicate sessions, and counting restored + fresh members
+                // against max_total_steps until the resume wedged). A member
+                // whose restored output is missing (torn log line) falls back
+                // to running.
+                let restored: HashSet<String> = completed_members
+                    .get(&(step.id.clone(), visit))
+                    .map(|set| {
+                        set.iter()
+                            .filter(|k| outputs.contains_key(*k))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let cx = mk_cx!(&outputs, &sessions);
                 let mut preps = Vec::new();
-                for c in children {
+                let mut fresh_idx: Vec<usize> = Vec::new();
+                for (ci, c) in children.iter().enumerate() {
+                    if restored.contains(&c.id) {
+                        continue;
+                    }
                     let ctag = if visit == 1 {
                         c.id.clone()
                     } else {
                         format!("{}.v{visit}", c.id)
                     };
                     preps.push(leaf::prepare_leaf(&cx, c, visit, &ctag, &[], None)?);
+                    fresh_idx.push(ci);
                 }
                 if total + preps.len() as u32 > max_total {
                     return Err(format!(
@@ -1185,28 +2008,65 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     .unwrap_or(4) as usize;
                 if !opts.quiet {
                     eprintln!(
-                        "sfh: [{}] parallel: {} children, max_parallel={mp}",
+                        "sfh: [{}] parallel: {} children ({} restored), max_parallel={mp}",
                         step.id,
-                        preps.len()
+                        preps.len(),
+                        restored.len()
                     );
                 }
-                log_event(
-                    &mut log,
-                    json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
-                );
+                // A skipped member writes no step_end of its own, so THIS log
+                // would not remember it and a second crash in the same fan-out
+                // would run and re-bill it on the third attempt. Record the
+                // carry-over explicitly. It is not a step_end: nothing ran, so
+                // it must not add to the leaf count or the cost.
+                //
+                // BEFORE group_start, and that order is load-bearing. Reading
+                // group_start is what cancels the previous lap's carry, so a
+                // kill landing between the two lines would drop the members
+                // that had not been written yet and run them again. Written
+                // first, a kill anywhere in here leaves no group_start at all,
+                // the old carry still stands, and nothing is lost.
+                log_restored_members(&mut log, &step.id, visit, &restored);
+                if !preps.is_empty() {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "group_start", "step": step.id, "visit": visit, "children": preps.len()}),
+                    );
+                }
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
-                for (ci, c) in children.iter().enumerate() {
+                for (pos, &ci) in fresh_idx.iter().enumerate() {
+                    let c = &children[ci];
                     let ctag = if visit == 1 {
                         c.id.clone()
                     } else {
                         format!("{}.v{visit}", c.id)
                     };
-                    fan_fallback!(dones[ci], c, c.id, ctag, &c.fallback, &[]);
+                    fan_fallback!(dones[pos], c, c.id, ctag, &c.fallback, &[]);
                 }
                 let mut agg = String::new();
                 let mut plain = String::new();
                 let mut hard_fail = false;
-                for (c, d) in children.iter().zip(dones.iter()) {
+                let mut di = 0usize;
+                for c in children.iter() {
+                    if restored.contains(&c.id) {
+                        // Restored member: its cost was already counted and its
+                        // step_end already logged by the crashed attempt; only
+                        // the aggregate text is rebuilt. The stored output is
+                        // the exposed (failure-wrapped) form, so it goes into
+                        // both agg and plain as-is; for a failed member plain
+                        // therefore differs slightly from what the live run
+                        // matched against (raw text), which only matters when
+                        // the group routes on despite a failed member.
+                        let so = outputs.get(&c.id).expect("filtered above");
+                        if so.exit != 0 && c.on_error.as_deref() != Some("continue") {
+                            hard_fail = true;
+                        }
+                        agg.push_str(&format!("--- {} ---\n{}\n\n", c.id, so.output.trim_end()));
+                        plain.push_str(&format!("{}\n\n", so.output.trim_end()));
+                        continue;
+                    }
+                    let d = &dones[di];
+                    di += 1;
                     let exposed = if d.ok() {
                         d.chain_output.clone()
                     } else {
@@ -1243,6 +2103,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 id: sid.clone(),
                                 cwd: d.cwd.clone(),
                                 marker: d.session_marker.clone(),
+                                access: d.access,
+                                // Opened by this process, so the level is
+                                // first-hand rather than read back from a log.
+                                access_recorded: true,
                             },
                         );
                     }
@@ -1265,8 +2129,21 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 }
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
+                // The headerless routing text, kept separately: the chain file
+                // holds the labeled aggregate, and a resume must route against
+                // exactly what this live run routed against (see load_resume).
+                let plain_name = format!("{gtag}.plain.txt");
+                let _ = contain::write_private(&run_dir.join(&plain_name), &plain);
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
+                log_aggregate_end(
+                    &mut log,
+                    &step.id,
+                    visit,
+                    &gtag,
+                    hard_fail,
+                    &plain,
+                    &plain_name,
+                );
                 (agg, plain, hard_fail)
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
@@ -1292,8 +2169,28 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 if items.is_empty() {
                     eprintln!("sfh: warning: step '{}': foreach produced 0 items", step.id);
                 }
+                // Items the crashed attempt already finished, keyed by the
+                // "id[i]" label they logged under; skipped, not re-run
+                // (rev_regression - see the parallel branch above). Item order
+                // is re-derived from the same template and restored inputs, so
+                // the indices line up; an item whose restored output is missing
+                // falls back to running.
+                let restored: HashSet<String> = completed_members
+                    .get(&(step.id.clone(), visit))
+                    .map(|set| {
+                        set.iter()
+                            .filter(|k| outputs.contains_key(*k))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let mut preps = Vec::new();
+                let mut fresh_idx: Vec<usize> = Vec::new();
                 for (i, it) in items.iter().enumerate() {
+                    let label = format!("{}[{i}]", step.id);
+                    if restored.contains(&label) {
+                        continue;
+                    }
                     let tag = if visit == 1 {
                         format!("{}.i{i}", step.id)
                     } else {
@@ -1307,33 +2204,40 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         &[("item", it.clone()), ("item_index", i.to_string())],
                         None,
                     )?);
+                    fresh_idx.push(i);
                 }
-                if total + items.len() as u32 > max_total {
+                if total + preps.len() as u32 > max_total {
                     return Err(format!(
                             "step '{}' would bring total leaf runs to {} over max_total_steps ({max_total})",
                             step.id,
-                            total + items.len() as u32
+                            total + preps.len() as u32
                         ));
                 }
-                total += items.len() as u32;
+                total += preps.len() as u32;
                 let mp = step
                     .max_parallel
                     .or(flow.defaults.max_parallel)
                     .unwrap_or(4) as usize;
                 if !opts.quiet {
                     eprintln!(
-                        "sfh: [{}] foreach: {} items, max_parallel={mp}",
+                        "sfh: [{}] foreach: {} items ({} restored), max_parallel={mp}",
                         step.id,
-                        items.len()
+                        preps.len(),
+                        restored.len()
                     );
                 }
-                log_event(
-                    &mut log,
-                    json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": items.len()}),
-                );
+                // See the parallel branch, including why this goes BEFORE the
+                // foreach_start line: reading that line is what cancels the
+                // previous lap's carry.
+                log_restored_members(&mut log, &step.id, visit, &restored);
+                if !preps.is_empty() {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "foreach_start", "step": step.id, "visit": visit, "items": preps.len()}),
+                    );
+                }
                 let mut dones = leaf::run_pool(preps, mp, Arc::clone(&gate));
-                #[allow(clippy::needless_range_loop)]
-                for i in 0..dones.len() {
+                for (pos, &i) in fresh_idx.iter().enumerate() {
                     let tag = if visit == 1 {
                         format!("{}.i{i}", step.id)
                     } else {
@@ -1344,13 +2248,34 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         ("item_index", i.to_string()),
                     ];
                     let label = format!("{}[{i}]", step.id);
-                    fan_fallback!(dones[i], step, label, tag, &step.fallback, &extra);
+                    fan_fallback!(dones[pos], step, label, tag, &step.fallback, &extra);
                 }
                 let mut agg = String::new();
                 let mut plain = String::new();
                 let mut any_fail = false;
-                for (i, d) in dones.iter().enumerate() {
+                let mut di = 0usize;
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..items.len() {
                     let label = format!("{}[{i}]", step.id);
+                    if restored.contains(&label) {
+                        // Restored item: cost counted and step_end logged by the
+                        // crashed attempt; rebuild the aggregate text only (the
+                        // same plain-text caveat as the parallel branch applies).
+                        let so = outputs.get(&label).expect("filtered above");
+                        if so.exit != 0 {
+                            any_fail = true;
+                        }
+                        agg.push_str(&format!(
+                            "--- {}[{i}] item: {} ---\n{}\n\n",
+                            step.id,
+                            one_line(items.get(i).map(String::as_str).unwrap_or(""), 80),
+                            so.output.trim_end()
+                        ));
+                        plain.push_str(&format!("{}\n\n", so.output.trim_end()));
+                        continue;
+                    }
+                    let d = &dones[di];
+                    di += 1;
                     let exposed = if d.ok() {
                         d.chain_output.clone()
                     } else {
@@ -1389,8 +2314,18 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let hard_fail = any_fail && step.on_error.as_deref() != Some("continue");
                 let agg = agg.trim_end().to_string();
                 let plain = plain.trim_end().to_string();
+                let plain_name = format!("{gtag}.plain.txt");
+                let _ = contain::write_private(&run_dir.join(&plain_name), &plain);
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail);
-                log_aggregate_end(&mut log, &step.id, visit, &gtag, hard_fail, &plain);
+                log_aggregate_end(
+                    &mut log,
+                    &step.id,
+                    visit,
+                    &gtag,
+                    hard_fail,
+                    &plain,
+                    &plain_name,
+                );
                 (agg, plain, hard_fail)
             } else {
                 if total + 1 > max_total {
@@ -1452,6 +2387,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             id: sid.clone(),
                             cwd: d.cwd.clone(),
                             marker: d.session_marker.clone(),
+                            access: d.access,
+                            // Opened by this process: first-hand.
+                            access_recorded: true,
                         },
                     );
                 }
@@ -1493,7 +2431,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // documented as the pre-compact original - including after
                     // a --resume, which can only read files.
                     let pre_name = format!("{gtag}.precompact.txt");
-                    let _ = std::fs::write(run_dir.join(&pre_name), &chain_output);
+                    let _ = contain::write_private(&run_dir.join(&pre_name), &chain_output);
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "compact_start", "step": step.id, "chars": chain_output.chars().count()}),
@@ -1544,8 +2482,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             }
                         }
                     }
-                    let _ =
-                        std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), &chain_output);
+                    let _ = contain::write_private(
+                        &run_dir.join(format!("{gtag}.chain.txt")),
+                        &chain_output,
+                    );
                 }
             }
 
@@ -1555,10 +2495,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
             // ---- notes ----
             if step.notes.as_deref() == Some("append") && !errored {
-                let mut f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&notes_file)
+                let mut f = contain::append_private(&notes_file)
                     .map_err(|e| format!("cannot open notes: {e}"))?;
                 let _ = writeln!(
                     f,
@@ -1693,8 +2630,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             json!(if result.is_ok() { "ok" } else { "failed" }),
         );
     }
-    let _ = std::fs::write(
-        run_dir.join("meta.json"),
+    let _ = contain::write_private(
+        &run_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta_final).unwrap_or_default(),
     );
 
@@ -1764,10 +2701,21 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
             finish("failed", cost_usd, 1, pick.as_deref(), Some(&msg));
             eprintln!("sfh: run dir: {}", run_dir.display());
+            // Paths are quoted (flow names may carry spaces since R-6, and so
+            // may the runs dir) and this attempt's --var overrides are
+            // repeated, so the printed command works when pasted back even on
+            // a resume that predates meta.json var restoration.
+            let mut var_args = String::new();
+            for (k, v) in &opts.vars {
+                var_args.push_str(&format!(
+                    " --var {}",
+                    execute::shell_quote(&format!("{k}={v}"))
+                ));
+            }
             eprintln!(
-                "sfh: resume with: sfh run {} --resume {}",
-                opts.flow_path.display(),
-                run_dir.display()
+                "sfh: resume with: sfh run {}{var_args} --resume {}",
+                execute::shell_quote(&opts.flow_path.display().to_string()),
+                execute::shell_quote(&run_dir.display().to_string())
             );
             Ok(1)
         }
@@ -1834,8 +2782,8 @@ fn write_aggregate(
     failed: bool,
 ) {
     let gfile = run_dir.join(format!("{gtag}.out.txt"));
-    let _ = std::fs::write(&gfile, agg);
-    let _ = std::fs::write(run_dir.join(format!("{gtag}.chain.txt")), agg);
+    let _ = contain::write_private(&gfile, agg);
+    let _ = contain::write_private(&run_dir.join(format!("{gtag}.chain.txt")), agg);
     outputs.insert(
         step_id.to_string(),
         template::StepOutput {
@@ -1918,7 +2866,7 @@ fn run_compact(
     let prompt = format!("{instr}\n\n---\n{body}");
     let ctag = format!("{tag}.compact");
     let prompt_file = run_dir.join(format!("{ctag}.prompt.txt"));
-    std::fs::write(&prompt_file, &prompt).map_err(|e| e.to_string())?;
+    contain::write_private(&prompt_file, &prompt).map_err(|e| e.to_string())?;
     let last = run_dir.join(format!("{ctag}.last.txt"));
     let paths = preset::BuildPaths {
         last_msg: &last,
@@ -1960,10 +2908,12 @@ fn run_compact(
         warmup_key: None,
         env_remove: built.env_remove,
         env_set: built.env_set,
+        run_dir: run_dir.to_path_buf(),
         out_file: run_dir.join(format!("{ctag}.out.txt")),
         err_file: run_dir.join(format!("{ctag}.err.txt")),
         chain_file: run_dir.join(format!("{ctag}.chain.txt")),
         tool: Some(tool),
+        access: Some(preset::Access::Read),
         allow_empty: false,
         retry: leaf::RetryCfg::default(),
         quiet,
@@ -2045,6 +2995,7 @@ fn one_line(s: &str, max: usize) -> String {
 fn dry_run(
     flow: &flow::Flow,
     vars: &BTreeMap<String, String>,
+    tainted_vars: &HashSet<String>,
     run_dir: &Path,
     flow_dir: &Path,
     notes_file: &Path,
@@ -2053,16 +3004,16 @@ fn dry_run(
     let step_ids = flow.step_ids();
     let outputs: BTreeMap<String, template::StepOutput> = BTreeMap::new();
     let mut sessions: HashMap<String, leaf::SessionInfo> = HashMap::new();
-    // Fake sessions so continue_from steps can render their resume command.
+    // Fake sessions so continue_from/fork_from steps can render their resume
+    // command. The target's own access comes along, so a dry run already shows
+    // the escalation guard refusing a higher-access resume.
     for s in &flow.steps {
-        let targets: Vec<&String> = std::iter::once(&s.continue_from)
-            .chain(
-                s.parallel
-                    .iter()
-                    .flat_map(|cs| cs.iter().map(|c| &c.continue_from)),
-            )
-            .flatten()
-            .collect();
+        let mut targets: Vec<&String> = Vec::new();
+        for st in std::iter::once(s).chain(s.parallel.iter().flat_map(|cs| cs.iter())) {
+            for t in [&st.continue_from, &st.fork_from].into_iter().flatten() {
+                targets.push(t);
+            }
+        }
         for t in targets {
             if let Some(target_step) = flow.find_step(t) {
                 if let Ok(eff) = leaf::effective(flow, target_step) {
@@ -2074,6 +3025,8 @@ fn dry_run(
                                 id: "<session-id>".into(),
                                 cwd: None,
                                 marker: None,
+                                access: Some(eff.access),
+                                access_recorded: true,
                             },
                         );
                     }
@@ -2093,6 +3046,7 @@ fn dry_run(
         notes_file,
         sessions: &sessions,
         needed_sessions,
+        tainted_vars,
         quiet: true,
         verbose: false,
     };
@@ -2160,6 +3114,35 @@ fn dry_run(
 
 fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
     let _ = writeln!(f, "{v}");
+}
+
+/// Remember, in THIS run's log, the fan-out members a resume carried over
+/// instead of executing. Without it the carry-over lives only in memory: the
+/// skipped members write no step_end, so a second crash in the same fan-out
+/// leaves the next resume with no record of them and they run - and bill - a
+/// second time. Sorted so the log is reproducible.
+///
+/// ONE event carrying the whole set, not one line per member. Written a line
+/// at a time, a kill part-way through left a PARTIAL set recorded against the
+/// new visit, and the carry-forward would not replace it - the members whose
+/// line had not been written yet ran again. A single line is either read whole
+/// or, torn, fails to parse and is skipped like any other torn line, which
+/// leaves the previous visit's carry standing and nothing lost.
+fn log_restored_members(
+    f: &mut std::fs::File,
+    group: &str,
+    visit: u32,
+    restored: &HashSet<String>,
+) {
+    if restored.is_empty() {
+        return;
+    }
+    let mut names: Vec<&String> = restored.iter().collect();
+    names.sort();
+    log_event(
+        f,
+        json!({"ts": utc_stamp(), "event": "members_restored", "steps": names, "parent": group, "visit": visit}),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -2256,7 +3239,7 @@ fn log_step_end(
 ) {
     let session = match (&d.tool, &d.session_id) {
         (Some(t), Some(id)) => {
-            json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker})
+            json!({"tool": t, "id": id, "cwd": d.cwd, "marker": d.session_marker, "access": d.access.map(|a| a.as_str())})
         }
         _ => serde_json::Value::Null,
     };
@@ -2284,6 +3267,7 @@ fn log_aggregate_end(
     gtag: &str,
     failed: bool,
     plain: &str,
+    plain_file: &str,
 ) {
     log_event(
         f,
@@ -2292,6 +3276,7 @@ fn log_aggregate_end(
             "failed": failed, "exit": if failed { 1 } else { 0 },
             "output_hash": fingerprint(plain),
             "chain_file": format!("{gtag}.chain.txt"), "out_file": format!("{gtag}.out.txt"),
+            "plain_file": plain_file,
         }),
     );
 }
@@ -2355,6 +3340,141 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resume_restores_recorded_access_and_fails_closed_on_bogus() {
+        // rev_complete S2-4 / rev_break #11: the access a step ran under is read
+        // back from log.jsonl on --resume. A valid value restores; a bogus one
+        // (an edited log) must restore as None so the escalation guard refuses
+        // it, and a missing one is likewise None.
+        let dir =
+            std::env::temp_dir().join(format!("sfh-resume-access-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Real step_end lines always carry timed_out/interrupted (log_step_end
+        // writes them); with rev_break #15 a line missing them is not "ok", so
+        // include them here to exercise access restoration on a clean success.
+        let log = concat!(
+            "{\"event\":\"step_end\",\"step\":\"good\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"session\":{\"tool\":\"claude\",\"id\":\"s1\",\"access\":\"read\"}}\n",
+            "{\"event\":\"step_end\",\"step\":\"bogus\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"session\":{\"tool\":\"claude\",\"id\":\"s2\",\"access\":\"bogus\"}}\n",
+            "{\"event\":\"step_end\",\"step\":\"missing\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"session\":{\"tool\":\"claude\",\"id\":\"s3\"}}\n",
+        );
+        std::fs::write(dir.join("log.jsonl"), log).unwrap();
+
+        let st = load_resume(&dir).expect("load_resume");
+        assert_eq!(
+            st.sessions.get("good").and_then(|s| s.access),
+            Some(preset::Access::Read),
+            "a valid recorded access must restore"
+        );
+        assert_eq!(
+            st.sessions.get("bogus").and_then(|s| s.access),
+            None,
+            "an unparseable recorded access must restore as None (fail closed)"
+        );
+        assert_eq!(
+            st.sessions.get("missing").and_then(|s| s.access),
+            None,
+            "an absent recorded access must restore as None"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_treats_missing_exit_as_failure() {
+        // rev_break #12: a step_end with no integer `exit` (an edited log) must
+        // not read back as a clean success. Without a positive exit 0 the step
+        // is not "ok", so it is not recorded as the last success.
+        let dir = std::env::temp_dir().join(format!("sfh-resume-exit-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"step_end\",\"step\":\"a\",\"visit\":1}\n",
+        )
+        .unwrap();
+        let st = load_resume(&dir).expect("load_resume");
+        assert_eq!(
+            st.last_success, None,
+            "a step with no exit must not be a success"
+        );
+        assert_eq!(
+            st.outputs.get("a").map(|o| o.exit),
+            Some(1),
+            "an absent exit restores as a failure code"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_records_completed_fanout_members_under_parent_and_visit() {
+        // F-2: a crash mid-fan-out leaves step_end events for the members that
+        // already finished. load_resume must hand them back keyed by (parent
+        // group id, visit) under the member's own log label - a parallel child
+        // id or a foreach "id[i]" - which is exactly what the group re-derives
+        // on resume, so it skips those members instead of executing them a
+        // second time (double billing, duplicate sessions, and a restored
+        // count plus a full fresh batch that wedges max_total_steps).
+        let dir =
+            std::env::temp_dir().join(format!("sfh-resume-members-{}", contain::random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"group_start\",\"step\":\"fan\",\"visit\":1,\"children\":2}\n\
+             {\"event\":\"step_end\",\"step\":\"fa\",\"parent\":\"fan\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"chain_file\":\"fa.chain.txt\",\"out_file\":\"fa.out.txt\"}\n\
+             {\"event\":\"foreach_start\",\"step\":\"each\",\"visit\":2,\"items\":2}\n\
+             {\"event\":\"step_end\",\"step\":\"each[0]\",\"parent\":\"each\",\"visit\":2,\"exit\":0,\"timed_out\":false,\"interrupted\":false,\"chain_file\":\"each.i0.chain.txt\",\"out_file\":\"each.i0.out.txt\"}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("fa.chain.txt"), "FA-A\n").unwrap();
+        std::fs::write(dir.join("fa.out.txt"), "FA-A\n").unwrap();
+        std::fs::write(dir.join("each.i0.chain.txt"), "item-alpha\n").unwrap();
+        std::fs::write(dir.join("each.i0.out.txt"), "item-alpha\n").unwrap();
+
+        let st = load_resume(&dir).expect("load_resume");
+        let fan = st
+            .completed_members
+            .get(&("fan".to_string(), 1))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            fan.contains("fa"),
+            "a completed parallel child must be recorded under its parent group"
+        );
+        assert!(
+            !fan.contains("fb"),
+            "an unstarted sibling must not be marked completed"
+        );
+        let each = st
+            .completed_members
+            .get(&("each".to_string(), 2))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            each.contains("each[0]"),
+            "a completed foreach item must be recorded under its parent step and visit"
+        );
+        assert!(
+            st.outputs.contains_key("fa") && st.outputs.contains_key("each[0]"),
+            "the recorded outputs the skip lives on must be restored too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gitignore_revalidation_accepts_only_an_effective_star() {
+        // rev_complete S3-3: protect_runs_root writes the .gitignore and then
+        // RE-READS it, refusing the run unless an effective `*` pattern is
+        // present. This pins the predicate that drives that revalidation: only a
+        // non-comment `*` (or `/*`) counts. A `*` inside a comment, or a narrower
+        // pattern like `*.log`, would still let git track the rest and must read
+        // as "not protected" so the run fails instead of proceeding unprotected.
+        assert!(gitignore_ignores_everything("*\n"));
+        assert!(gitignore_ignores_everything("# Created by sfh.\n*\n"));
+        assert!(gitignore_ignores_everything("/*\n"));
+        assert!(!gitignore_ignores_everything(""));
+        assert!(!gitignore_ignores_everything("# *\n"));
+        assert!(!gitignore_ignores_everything("*.log\n"));
+        assert!(!gitignore_ignores_everything("# comment\n*.txt\n"));
+    }
+
+    #[test]
     fn splits_items_by_mode() {
         assert_eq!(split_items(" a \n\n b \n", None).unwrap(), vec!["a", "b"]);
         assert_eq!(
@@ -2395,7 +3515,87 @@ mod tests {
     fn fingerprint_detects_flow_edits() {
         assert_eq!(fingerprint("a"), fingerprint("a"));
         assert_ne!(fingerprint("a"), fingerprint("b"));
-        assert_eq!(fingerprint("").len(), 16);
+        assert_eq!(fingerprint("").len(), 64);
+        // The resume guard trusts this value; pin it to the known SHA-256 of "".
+        assert_eq!(
+            fingerprint(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        // The SAME flow checked out with CRLF and with LF is the same flow.
+        // Hashing raw bytes made those two different versions of it, so a run
+        // dir could not travel between a Windows and a Unix working copy - and
+        // sfh's whole premise is that a flow file behaves identically on all
+        // three. Every other cross-OS decision here is byte-identical.
+        assert_eq!(
+            fingerprint("name: x\nsteps:\n  - id: a\n"),
+            fingerprint("name: x\r\nsteps:\r\n  - id: a\r\n")
+        );
+        // Still a change-detector: a lone CR that is not a line ending, and a
+        // real edit, both move the hash.
+        assert_ne!(fingerprint("a\rb"), fingerprint("ab"));
+        assert_ne!(
+            fingerprint("name: x\nsteps:\n"),
+            fingerprint("name: y\nsteps:\n")
+        );
+        // Runs written by 0.9 recorded the RAW hash under a different algo id,
+        // and must keep verifying the way 0.9 computed them.
+        assert_ne!(FINGERPRINT_ALGO, RAW_SHA_FINGERPRINT_ALGO);
+        assert_eq!(
+            crate::sha256::hex("a\r\nb".as_bytes()),
+            crate::sha256::hex("a\r\nb".as_bytes())
+        );
+        assert_ne!(
+            fingerprint("a\r\nb"),
+            crate::sha256::hex("a\r\nb".as_bytes())
+        );
+    }
+
+    #[test]
+    fn legacy_fingerprint_is_fnv1a_16hex() {
+        let fp = legacy_fingerprint_fnv("hello");
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, legacy_fingerprint_fnv("hello"));
+        assert_ne!(fp, legacy_fingerprint_fnv("world"));
+    }
+
+    #[test]
+    fn check_flow_fingerprint_honours_recorded_algo() {
+        let flow_text = "name: test\nsteps:\n  - id: a\n    cmd: [\"echo\"]\n";
+        let sha_fp = fingerprint(flow_text);
+        let fnv_fp = legacy_fingerprint_fnv(flow_text);
+        let dir = Path::new("/tmp/fake");
+        let flow_path = Path::new("test.yaml");
+
+        let meta_sha = serde_json::json!({
+            "flow_fingerprint": sha_fp,
+            "flow_fingerprint_algo": "sha256"
+        });
+        assert!(check_flow_fingerprint(&meta_sha, flow_text, dir, flow_path).is_ok());
+
+        let meta_fnv = serde_json::json!({
+            "flow_fingerprint": fnv_fp,
+            "flow_fingerprint_algo": "fnv1a"
+        });
+        assert!(check_flow_fingerprint(&meta_fnv, flow_text, dir, flow_path).is_ok());
+
+        let meta_legacy = serde_json::json!({
+            "flow_fingerprint": fnv_fp
+        });
+        assert!(check_flow_fingerprint(&meta_legacy, flow_text, dir, flow_path).is_ok());
+
+        let meta_wrong = serde_json::json!({
+            "flow_fingerprint": sha_fp,
+            "flow_fingerprint_algo": "fnv1a"
+        });
+        assert!(check_flow_fingerprint(&meta_wrong, flow_text, dir, flow_path).is_err());
+
+        let meta_unknown = serde_json::json!({
+            "flow_fingerprint": "abc",
+            "flow_fingerprint_algo": "md5"
+        });
+        assert!(check_flow_fingerprint(&meta_unknown, flow_text, dir, flow_path).is_err());
     }
 
     #[test]

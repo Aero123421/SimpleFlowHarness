@@ -9,6 +9,7 @@ steps:
     route: [{goto: end}]       # always terminate a branch
   - id: fix
     tool: codex
+    access: full               # AI steps must declare access: read | write | full
     prompt: "{{steps.build.stderr_file}}: read this file and fix the failure"
     route: [{goto: build}]
 ```
@@ -17,9 +18,7 @@ Use `sh -c` only to join multiple commands; on Windows it requires Git Bash.
 
 MINIMAL TWO-STEP FLOW:
 ```yaml
-steps:
-  - {id: inspect, cmd: ["sfh", "--version"]}
-  - {id: check, cmd: ["sfh", "validate", "flow.yaml"]}
+steps: [{id: inspect, cmd: ["sfh", "--version"]}, {id: check, cmd: ["sfh", "validate", "flow.yaml"]}]
 ```
 
 AI GOAL VERDICT — require exactly one final-line token and fail closed:
@@ -27,6 +26,7 @@ AI GOAL VERDICT — require exactly one final-line token and fail closed:
 steps:
   - id: judge
     tool: codex
+    access: read
     prompt: "Assess the goal. Last line: ACHIEVED, UNMET, or UNCLEAR."
     route:
       - {when_last_line_is: ACHIEVED, goto: achieved}
@@ -43,11 +43,13 @@ BOUNDED REWORK WITH DEGRADATION:
 steps:
   - id: revise
     tool: codex
+    access: full
     max_visits: 3
     on_max_visits: goto:degraded
     prompt: "Revise using: {{steps.review.output}}"
   - id: review
     tool: codex
+    access: read
     prompt: "Review. Last line: PASS or REVISE."
     route:
       - {when_last_line_is: PASS, goto: end}
@@ -72,9 +74,7 @@ steps:
 HUMAN ANSWER — the command waits; timeout_sec is the deadline:
 ```yaml
 steps:
-  - id: approval
-    cmd: ["approval-cli", "wait", "--question", "Ship this build?"]
-    timeout_sec: 3600
+  - {id: approval, cmd: ["approval-cli", "wait", "--question", "Ship this build?"], timeout_sec: 3600}
 ```
 DETACH AND COLLECT: `sfh run flow.yaml --detach` → `sfh status` → `sfh wait` / `sfh stop`
 Details: README. If stuck: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.
