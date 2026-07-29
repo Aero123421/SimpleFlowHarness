@@ -5562,7 +5562,12 @@ fn log_step_end_with_next(
             "next_fallback": next_fallback,
             "postprocess_pending": postprocess_pending,
             "visit": visit, "exit": d.exit_code, "timed_out": d.timed_out,
-            "interrupted": d.interrupted, "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
+            // A signal handler may reap the process group before run_cmd
+            // observes the flag. Snapshot the run-level cancellation at the
+            // durable commit point too, so resume never mistakes that race for
+            // an ordinary completed leaf.
+            "interrupted": d.interrupted || execute::interrupted(),
+            "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
             "idle_ms": d.idle_ms,
             "output_chars": d.chain_output.chars().count(),
             "output_hash": fingerprint(&d.chain_output),

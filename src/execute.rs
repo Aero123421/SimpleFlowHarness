@@ -965,6 +965,11 @@ pub fn run_cmd(
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    // The signal handler kills tracked process groups directly. The child can
+    // therefore become waitable between `try_wait` and the loop's interrupt
+    // check; preserve the run-level cause instead of reporting an ordinary
+    // exit merely because reaping won that race.
+    was_interrupted |= interrupted();
     untrack(pid);
     #[cfg(windows)]
     drop(leaf_job);
@@ -1033,7 +1038,10 @@ pub fn run_cmd(
     Ok(ExecOutcome {
         exit_code: status.code().unwrap_or(-1),
         timed_out,
-        interrupted: was_interrupted,
+        // Catch a signal that arrived while the already-dead child's pipes
+        // were being drained as well. The engine treats cancellation as
+        // stronger than a completed leaf.
+        interrupted: was_interrupted || interrupted(),
         stdout,
         stderr,
         dur_ms: start.elapsed().as_millis(),
