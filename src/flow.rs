@@ -49,6 +49,13 @@ pub struct Defaults {
     pub max_cost_usd: Option<f64>,
     /// Abort the flow after this many wall-clock seconds.
     pub wall_clock_sec: Option<u64>,
+    /// Where to jump when the run comes within `budget_reserve` of a ceiling,
+    /// as `goto:<id>` (end/fail/stuck allowed). Unset keeps the old behaviour:
+    /// the ceiling itself ends the run with an error and no wrap-up.
+    pub on_budget: Option<String>,
+    /// Headroom held back from each ceiling for the landing chain to spend.
+    /// Omitted axes reserve nothing, so the landing fires at the ceiling.
+    pub budget_reserve: Option<BudgetReserve>,
     pub retry: Option<Retry>,
     /// transient (default) | any | never
     pub retry_on: Option<String>,
@@ -62,6 +69,40 @@ pub struct Defaults {
     /// first one alone so the provider's prompt cache is warm before the rest
     /// start. auto (default: only where it measurably pays) | always | never.
     pub fork_warmup: Option<String>,
+}
+
+/// How much of each ceiling `on_budget` keeps back for the landing chain. The
+/// landing threshold is `ceiling - reserve` on each axis INDEPENDENTLY: cost
+/// and wall-clock never borrow from one another.
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetReserve {
+    pub cost_usd: Option<f64>,
+    pub wall_clock_sec: Option<u64>,
+}
+
+impl Defaults {
+    /// The step (or terminal) `on_budget` lands on, with the `goto:` prefix
+    /// removed. None when the flow declared no landing - validate has already
+    /// refused any other spelling, so an unprefixed value cannot reach here.
+    pub fn budget_goto(&self) -> Option<&str> {
+        self.on_budget.as_deref()?.strip_prefix("goto:")
+    }
+
+    /// USD the landing chain may still spend after it fires (0 when unset).
+    pub fn budget_reserve_usd(&self) -> f64 {
+        self.budget_reserve
+            .and_then(|r| r.cost_usd)
+            .unwrap_or(0.0)
+            .max(0.0)
+    }
+
+    /// Seconds the landing chain may still take after it fires (0 when unset).
+    pub fn budget_reserve_sec(&self) -> u64 {
+        self.budget_reserve
+            .and_then(|r| r.wall_clock_sec)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -613,6 +654,41 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
     if let Some(w) = &flow.defaults.fork_warmup {
         if !["auto", "always", "never"].contains(&w.as_str()) {
             return Err("defaults.fork_warmup must be auto/always/never".into());
+        }
+    }
+    // on_budget and budget_reserve are two halves of one mechanism and are
+    // useless apart, so neither is accepted alone: a reserve with nowhere to
+    // land is a number that does nothing, and a landing with no ceiling above
+    // it can never fire. Both would be silent, which is exactly the failure
+    // mode a budget guard must not have.
+    if flow.defaults.on_budget.is_none() && flow.defaults.budget_reserve.is_some() {
+        return Err(
+            "defaults.budget_reserve is set but defaults.on_budget is not: the reserve only decides how EARLY the landing fires, so on its own it changes nothing. Add on_budget: goto:<id>"
+                .into(),
+        );
+    }
+    if let Some(action) = &flow.defaults.on_budget {
+        if flow.defaults.max_cost_usd.is_none() && flow.defaults.wall_clock_sec.is_none() {
+            return Err(
+                "defaults.on_budget is set but neither defaults.max_cost_usd nor defaults.wall_clock_sec is: the landing threshold is ceiling minus reserve, and with no ceiling there is nothing to land before"
+                    .into(),
+            );
+        }
+        let target = action.strip_prefix("goto:").ok_or_else(|| {
+            format!("defaults.on_budget must be written as goto:<id> (got '{action}'); end, fail and stuck are allowed targets")
+        })?;
+        check_goto("defaults.on_budget", target)?;
+    }
+    if let Some(r) = &flow.defaults.budget_reserve {
+        // A negative or NaN reserve would push the landing threshold ABOVE the
+        // ceiling, so the landing could never fire and the flow would quietly
+        // get the old hard error it was written to avoid.
+        if let Some(c) = r.cost_usd {
+            if !(c.is_finite() && c >= 0.0) {
+                return Err(format!(
+                    "defaults.budget_reserve.cost_usd must be a finite number >= 0 (got {c})"
+                ));
+            }
         }
     }
     let action = |what: &str, s: &Step, v: &Option<String>, is_child: bool| -> Result<(), String> {
@@ -1287,6 +1363,69 @@ mod tests {
         let y = "name: t\nsteps:\n  - id: seed\n    tool: claude\n    access: read\n    prompt: x\n  - id: g\n    parallel:\n      - id: c1\n        tool: claude\n        access: read\n        continue_from: seed\n        prompt: x\n      - id: c2\n        tool: claude\n        access: read\n        continue_from: seed\n        prompt: x\n";
         let e = parse(y).unwrap_err();
         assert!(e.contains("two concurrent resumes"), "{e}");
+    }
+
+    #[test]
+    fn on_budget_needs_a_ceiling_a_target_and_the_goto_spelling() {
+        let steps = "steps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n";
+        // Both halves together, under a ceiling, is the working shape.
+        assert!(parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  on_budget: goto:wrap\n  budget_reserve: {{cost_usd: 1.0}}\n{steps}"
+        ))
+        .is_ok());
+        // The three terminals are landing targets like any other.
+        for t in ["end", "fail", "stuck"] {
+            let y =
+                format!("name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: goto:{t}\n{steps}");
+            assert!(parse(&y).is_ok(), "goto:{t} should be a valid landing");
+        }
+        // A reserve alone only decides how early a landing that does not exist
+        // would fire, so it is refused rather than silently ignored.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  budget_reserve: {{cost_usd: 1.0}}\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("on_budget"), "{e}");
+        // A landing with no ceiling above it can never fire.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  on_budget: goto:wrap\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("max_cost_usd"), "{e}");
+        // Bare step ids and unknown targets are both refused.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: wrap\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("goto:<id>"), "{e}");
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  wall_clock_sec: 60\n  on_budget: goto:nowhere\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("nowhere"), "{e}");
+        // A negative reserve would lift the threshold ABOVE the ceiling and
+        // quietly restore the hard failure the flow was written to avoid.
+        let e = parse(&format!(
+            "name: t\ndefaults:\n  max_cost_usd: 10.0\n  on_budget: goto:wrap\n  budget_reserve: {{cost_usd: -1.0}}\n{steps}"
+        ))
+        .unwrap_err();
+        assert!(e.contains("budget_reserve.cost_usd"), "{e}");
+    }
+
+    #[test]
+    fn budget_reserve_defaults_to_nothing_held_back() {
+        let load = |y: &str| -> Flow {
+            let f: Flow = yaml::from_str(y).expect("test flow parses");
+            validate(&f, false).expect("test flow validates");
+            f
+        };
+        let f = load("name: t\ndefaults:\n  max_cost_usd: 10.0\n  wall_clock_sec: 60\n  on_budget: goto:wrap\nsteps:\n  - id: a\n    cmd: echo hi\n  - id: wrap\n    cmd: echo bye\n");
+        assert_eq!(f.defaults.budget_goto(), Some("wrap"));
+        assert_eq!(f.defaults.budget_reserve_usd(), 0.0);
+        assert_eq!(f.defaults.budget_reserve_sec(), 0);
+        // No landing declared at all is the pre-F5 flow, unchanged.
+        let f = load("name: t\nsteps:\n  - id: a\n    cmd: echo hi\n");
+        assert_eq!(f.defaults.budget_goto(), None);
     }
 
     #[test]

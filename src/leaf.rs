@@ -286,6 +286,43 @@ pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
     }
 }
 
+/// What `{{budget.*}}` renders to for one step. Snapshot values, taken when the
+/// step is prepared: a prompt that says "you have $2 left" has to mean the
+/// moment the prompt was written, not some later moment.
+///
+/// `remaining_*` is None when that axis has no ceiling, which renders as the
+/// string `unlimited` rather than as an empty value or a made-up number - a
+/// prompt reading "0 seconds left" when nothing is capped would be a lie.
+#[derive(Clone, Copy, Default)]
+pub struct BudgetVars {
+    pub spent_usd: f64,
+    pub elapsed_sec: u64,
+    pub remaining_usd: Option<f64>,
+    pub remaining_sec: Option<u64>,
+}
+
+impl BudgetVars {
+    /// `spent_usd` is reported cost so far (restored cost included on a
+    /// resume); `elapsed_sec` is measured from the start of THIS process's flow
+    /// loop, which is the same clock `wall_clock_sec` is judged on.
+    ///
+    /// Both remainders are measured against the CEILING, not against the
+    /// on_budget threshold: the reserve is headroom for the landing chain, and
+    /// a landing step asking "how much is left" means how much is really left.
+    /// They clamp at zero, because "how much budget remains" cannot be a
+    /// negative quantity even when a single step overshot the ceiling.
+    pub fn new(defaults: &flow::Defaults, spent_usd: f64, elapsed_sec: u64) -> Self {
+        Self {
+            spent_usd,
+            elapsed_sec,
+            remaining_usd: defaults.max_cost_usd.map(|m| (m - spent_usd).max(0.0)),
+            remaining_sec: defaults
+                .wall_clock_sec
+                .map(|s| s.saturating_sub(elapsed_sec)),
+        }
+    }
+}
+
 pub struct PrepCtx<'a> {
     pub flow: &'a flow::Flow,
     pub vars: &'a BTreeMap<String, String>,
@@ -304,6 +341,8 @@ pub struct PrepCtx<'a> {
     pub tainted_vars: &'a HashSet<String>,
     /// Run-level activity clock handed to every leaf this context prepares.
     pub run_clock: Option<&'a Arc<std::sync::atomic::AtomicU64>>,
+    /// Spend and time as of now, exposed to templates as `{{budget.*}}`.
+    pub budget: BudgetVars,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -503,6 +542,29 @@ pub fn make_builtins(
     b.insert("visit".into(), visit.to_string());
     b.insert("os".into(), std::env::consts::OS.to_string());
     b.insert("prompt_file".into(), prompt_file.display().to_string());
+    // Cost is printed to 4 decimals everywhere else in sfh (progress lines,
+    // run_end, runs list), so a prompt that quotes it matches what the operator
+    // sees. Seconds are whole, like every other duration in a flow file.
+    b.insert(
+        "budget.spent_usd".into(),
+        format!("{:.4}", cx.budget.spent_usd),
+    );
+    b.insert(
+        "budget.elapsed_sec".into(),
+        cx.budget.elapsed_sec.to_string(),
+    );
+    b.insert(
+        "budget.remaining_usd".into(),
+        cx.budget
+            .remaining_usd
+            .map_or_else(|| "unlimited".to_string(), |v| format!("{v:.4}")),
+    );
+    b.insert(
+        "budget.remaining_sec".into(),
+        cx.budget
+            .remaining_sec
+            .map_or_else(|| "unlimited".to_string(), |v| v.to_string()),
+    );
     b.insert(
         "notes".into(),
         std::fs::read_to_string(cx.notes_file).unwrap_or_default(),
@@ -2423,6 +2485,7 @@ mod tests {
             needed_sessions: needed,
             tainted_vars: no_tainted_vars(),
             run_clock: None,
+            budget: BudgetVars::default(),
             quiet: true,
             verbose: false,
         }
@@ -3078,6 +3141,7 @@ mod tests {
             needed_sessions: &needed,
             tainted_vars: &tainted,
             run_clock: None,
+            budget: BudgetVars::default(),
             quiet: true,
             verbose: false,
         };
@@ -3125,6 +3189,29 @@ mod tests {
         let bad = check_session(&fork, &parsed_with(None, None, None), "answer")
             .expect("no reported session id on a fork must fail");
         assert!(bad.contains("fork unverified"), "{bad}");
+    }
+
+    #[test]
+    fn budget_vars_measure_against_the_ceiling_and_never_go_negative() {
+        let f: flow::Flow = serde_yaml_ng::from_str(
+            "defaults:\n  max_cost_usd: 2.0\nsteps:\n  - id: a\n    cmd: [\"echo\"]\n",
+        )
+        .expect("test flow parses");
+        let b = BudgetVars::new(&f.defaults, 0.5, 10);
+        assert_eq!(b.spent_usd, 0.5);
+        assert_eq!(b.elapsed_sec, 10);
+        // Measured against max_cost_usd, NOT against the on_budget threshold: a
+        // landing step asking what is left means what is really left.
+        assert_eq!(b.remaining_usd, Some(1.5));
+        // No wall_clock_sec declared, so that axis has no remainder to report -
+        // which make_builtins spells `unlimited` rather than 0.
+        assert_eq!(b.remaining_sec, None);
+        // A single step can overshoot the ceiling before the next check sees
+        // it. "How much budget is left" is then none, not a negative amount.
+        assert_eq!(
+            BudgetVars::new(&f.defaults, 3.0, 10).remaining_usd,
+            Some(0.0)
+        );
     }
 
     #[test]

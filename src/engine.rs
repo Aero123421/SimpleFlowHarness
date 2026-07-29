@@ -121,6 +121,14 @@ fn precheck(
             "os",
             "prompt_file",
             "notes",
+            // The F5 budget snapshot. Listed here as well as in make_builtins
+            // because this check is what decides whether `sfh validate`
+            // accepts a key, and a validator that rejects what the runtime
+            // accepts is as wrong as the other way round.
+            "budget.spent_usd",
+            "budget.elapsed_sec",
+            "budget.remaining_usd",
+            "budget.remaining_sec",
         ] {
             b.insert(k.to_string(), String::new());
         }
@@ -319,6 +327,54 @@ enum FlowEnd {
     },
 }
 
+/// The `on_budget` landing (F5): where to jump, and the point on each axis at
+/// which to jump there. Threshold = ceiling - reserve, cost and wall-clock
+/// independently, so a run gets a wrap-up chain BEFORE the ceiling that would
+/// otherwise end it with an error and nothing to hand back.
+///
+/// The ceiling checks stay exactly as they were and keep running afterwards:
+/// the reserve is headroom, not an extension, and a landing chain that eats it
+/// too still ends the run the hard way (fail-closed preservation).
+struct BudgetPlan {
+    /// Step id or terminal, already stripped of the `goto:` prefix.
+    goto: String,
+    /// Reported spend at which to land. None when no cost ceiling is declared.
+    cost_at: Option<f64>,
+    /// Moment at which to land. None when no wall-clock ceiling is declared.
+    wall_at: Option<Instant>,
+}
+
+impl BudgetPlan {
+    fn of(defaults: &flow::Defaults, flow_start: Instant) -> Option<Self> {
+        let goto = defaults.budget_goto()?.to_string();
+        // A reserve larger than its own ceiling clamps to "land at once"
+        // rather than wrapping around into a threshold in the past/negative.
+        // That is the honest reading of "keep 20 minutes of a 10 minute
+        // budget": there was never room for the work in the first place.
+        let reserve_usd = defaults.budget_reserve_usd();
+        let reserve_sec = defaults.budget_reserve_sec();
+        Some(Self {
+            goto,
+            cost_at: defaults.max_cost_usd.map(|m| (m - reserve_usd).max(0.0)),
+            wall_at: defaults
+                .wall_clock_sec
+                .map(|s| flow_start + Duration::from_secs(s.saturating_sub(reserve_sec))),
+        })
+    }
+
+    /// Which axis (if any) has crossed its threshold. Wall-clock is asked
+    /// first only so the answer is stable when both cross at once.
+    fn trigger(&self, now: Instant, cost_usd: f64) -> Option<&'static str> {
+        if self.wall_at.is_some_and(|t| now > t) {
+            return Some("wall_clock");
+        }
+        if self.cost_at.is_some_and(|c| cost_usd >= c) {
+            return Some("cost");
+        }
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Run state that survives a crash: everything needed by --resume.
 // ---------------------------------------------------------------------------
@@ -363,6 +419,11 @@ struct ResumeState {
     last_executed: Option<String>,
     last_success: Option<String>,
     completed: bool,
+    /// True once this run has already spent its one `on_budget` landing. The
+    /// log is the only record of it: without this the resumed run would arrive
+    /// with the restored cost still over the threshold and land a second time,
+    /// which turns "one wrap-up chain per run" into "one per crash".
+    budget_landed: bool,
     /// Fan-out members that already finished in a crashed attempt, keyed by
     /// (parent step id, visit). A resume that re-runs a parallel/foreach group
     /// SKIPS these instead of executing them a second time: re-running spent
@@ -801,6 +862,10 @@ fn load_resume(run_dir: &Path) -> Result<ResumeState, String> {
                     st.start = Some(next.to_string());
                 }
             }
+            // One landing per run, across resumes too. Only the fact is
+            // restored, not the trigger or the numbers: what matters on the way
+            // back in is that the wrap-up chain has already been paid for once.
+            "budget_landing" => st.budget_landed = true,
             "run_end" => {}
             _ => {}
         }
@@ -1778,10 +1843,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .map(|(k, v)| (k.clone(), *v))
             .collect(),
     );
+    // One clock for both the ceiling and the landing threshold, so the two can
+    // never disagree about how long this attempt has been running. A resume
+    // starts it again from zero, exactly as wall_clock_sec always has.
+    let flow_start = Instant::now();
     let wall_deadline = flow
         .defaults
         .wall_clock_sec
-        .map(|s| Instant::now() + Duration::from_secs(s));
+        .map(|s| flow_start + Duration::from_secs(s));
+    let budget_plan = BudgetPlan::of(&flow.defaults, flow_start);
+    let mut budget_landed = resumed.budget_landed;
 
     let result: Result<FlowEnd, String> = (|| {
         if let Some(pending) = pending_route {
@@ -1812,6 +1883,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 // Nothing is executed on this path - it only re-evaluates a
                 // recorded route - so there is no child to time.
                 run_clock: None,
+                // The restored spend is real; the clock is this attempt's, the
+                // same one wall_clock_sec is judged on.
+                budget: leaf::BudgetVars::new(
+                    &flow.defaults,
+                    cost_usd,
+                    flow_start.elapsed().as_secs(),
+                ),
                 quiet: opts.quiet,
                 verbose: opts.verbose,
             };
@@ -1863,6 +1941,85 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         loop {
             if execute::interrupted() {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
+            }
+            // F5: land before the cliff, once per run. Checked BEFORE the two
+            // ceiling checks below, so a flow that reserves nothing still lands
+            // at the exact point the hard error used to fire instead of racing
+            // it. After the landing this whole block is skipped and the ceiling
+            // checks are all that is left - spend the reserve too and the run
+            // ends the way it always did.
+            if let (Some(plan), false) = (&budget_plan, budget_landed) {
+                let elapsed = flow_start.elapsed();
+                if let Some(trigger) = plan.trigger(Instant::now(), cost_usd) {
+                    budget_landed = true;
+                    // The step the landing PRE-EMPTED: it has not run and will
+                    // not, unless a resume comes back for it. Recorded as the
+                    // position's `after` because that is where the run stood
+                    // when the decision was made, and because a landing on
+                    // `stuck` resumes from exactly this point.
+                    let pending_step = flow.steps[cur].id.clone();
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "budget_landing", "trigger": trigger,
+                               "spent_usd": cost_usd, "elapsed_sec": elapsed.as_secs(),
+                               "goto": plan.goto}),
+                    );
+                    if !opts.quiet {
+                        eprintln!(
+                            "sfh: budget landing ({trigger}): ${cost_usd:.4} spent, {}s elapsed -> goto {}",
+                            elapsed.as_secs(),
+                            plan.goto
+                        );
+                    }
+                    match plan.goto.as_str() {
+                        "end" => {
+                            log_position(
+                                &mut log,
+                                &pending_step,
+                                "end".into(),
+                                PositionVia::Budget,
+                                None,
+                            );
+                            return Ok(FlowEnd::Completed);
+                        }
+                        "fail" => {
+                            log_position(
+                                &mut log,
+                                &pending_step,
+                                "fail".into(),
+                                PositionVia::Budget,
+                                None,
+                            );
+                            return Err(format!(
+                                "on_budget ({trigger}) routed to fail: ${cost_usd:.4} spent, {}s elapsed",
+                                elapsed.as_secs()
+                            ));
+                        }
+                        "stuck" => {
+                            log_position(
+                                &mut log,
+                                &pending_step,
+                                "stuck".into(),
+                                PositionVia::Budget,
+                                None,
+                            );
+                            return Ok(FlowEnd::Stuck {
+                                after: pending_step,
+                            });
+                        }
+                        id => {
+                            log_position(
+                                &mut log,
+                                &pending_step,
+                                id.to_string(),
+                                PositionVia::Budget,
+                                None,
+                            );
+                            cur = index_of[id];
+                            continue;
+                        }
+                    }
+                }
             }
             if let Some(d) = wall_deadline {
                 if Instant::now() > d {
@@ -1999,6 +2156,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         needed_sessions: &needed_sessions,
                         tainted_vars: &tainted_vars,
                         run_clock: Some(&run_clock),
+                        // Read at expansion time, so every step (and every
+                        // retry, fallback and compaction inside it) renders
+                        // {{budget.*}} from the totals as they stand now.
+                        budget: leaf::BudgetVars::new(
+                            &flow.defaults,
+                            cost_usd,
+                            flow_start.elapsed().as_secs(),
+                        ),
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     }
@@ -3205,7 +3370,27 @@ fn dry_run(
         }
     }
     println!("dry run: steps in file order (routing not simulated)");
-    println!("run dir (prompts rendered here): {}\n", run_dir.display());
+    println!("run dir (prompts rendered here): {}", run_dir.display());
+    // The one goto that never appears in any step's route:, so a reader of the
+    // flow cannot see it by following the steps. Print it where the jump is
+    // declared - at the top, with the flow, not against any step.
+    if let Some(target) = flow.defaults.budget_goto() {
+        let mut reserves = Vec::new();
+        if flow.defaults.max_cost_usd.is_some() {
+            reserves.push(format!(
+                "cost reserve ${:.2}",
+                flow.defaults.budget_reserve_usd()
+            ));
+        }
+        if flow.defaults.wall_clock_sec.is_some() {
+            reserves.push(format!(
+                "wall reserve {}s",
+                flow.defaults.budget_reserve_sec()
+            ));
+        }
+        println!("budget landing: goto {target} ({})", reserves.join(", "));
+    }
+    println!();
     let cx = leaf::PrepCtx {
         flow,
         vars,
@@ -3219,6 +3404,10 @@ fn dry_run(
         tainted_vars,
         // A dry run renders and prints; it spawns nothing to time.
         run_clock: None,
+        // Nothing has been spent and no time has passed, so {{budget.*}} shows
+        // the whole declared budget - which is what a prompt reviewer wants to
+        // see, and it exercises the `unlimited` spelling for undeclared axes.
+        budget: leaf::BudgetVars::new(&flow.defaults, 0.0, 0),
         quiet: true,
         verbose: false,
     };
@@ -3333,6 +3522,9 @@ enum PositionVia {
     Fallthrough,
     OnError,
     MaxVisits,
+    /// The `on_budget` landing. The only via whose `after` names a step that
+    /// did NOT run: the jump happens on entry to it, not after it.
+    Budget,
 }
 
 impl PositionVia {
@@ -3343,6 +3535,7 @@ impl PositionVia {
             Self::Fallthrough => "fallthrough",
             Self::OnError => "on_error",
             Self::MaxVisits => "max_visits",
+            Self::Budget => "budget",
         }
     }
 }

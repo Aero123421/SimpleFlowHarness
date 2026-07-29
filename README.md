@@ -149,6 +149,10 @@ defaults:                    # 全ステップの既定値(すべて任意)
   max_emit_chars: 200000     # stdoutに出す最大文字数(既定20万。超過分は切って保存先を案内)
   max_cost_usd: 5.0          # 報告されたコストの累計がこれを超えたら中断
   wall_clock_sec: 7200       # フロー全体の実時間上限
+  on_budget: goto:wrap       # 上限−reserve に達したら中断せずここへ着地(1 run 1回)
+  budget_reserve:            # 着地連鎖のために各上限から取り置く分(既定0)
+    cost_usd: 0.5
+    wall_clock_sec: 600
   retry: { max: 2, backoff_sec: 5 }   # 失敗時のリトライ(指数バックオフ)
   retry_on: transient        # transient(既定,429/5xx/切断など) | any | never
   hang_after_sec: 300        # この秒数以上無出力のままタイムアウトしたら「ハング」=一過性と分類(既定300)
@@ -323,7 +327,7 @@ fork失敗の検知: 4ツールとも存在しない親IDには**モデル呼び
 - 進捗表示に `$0.0661` のように出る / `log.jsonl` の各 `step_end` に `input_tokens` `output_tokens` `cost_usd`
 - `sfh runs list --json` / `sfh runs show <dir> --json` で後から機械集計できる。`visit` は最大訪問番号、`repeat` は同じステップで同一 `output_hash` が連続した時の初回を除く最大反復回数
 - `runs list` の末尾(`--json` では `total_cost_usd`)は、`-n` 適用後に選ばれたrun群の報告済みコスト合計
-- `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)
+- `defaults.max_cost_usd` を超えたら**次のステップを始める前に中断**(無人運転の金額ガード)。中断ではなく畳ませたいなら [`on_budget`](#予算の崖を着地パスにon_budget) で着地パスへ回す
 - コスト報告があるのは claude / grok / opencode。codex と agy はトークン数のみ
 
 ### 失敗からの回復
@@ -373,7 +377,7 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 | `sfh status` / `sfh wait` の exit code | **4**(`sfh wait` は部分出力も stdout に出す) |
 | `runs list` / `runs show` の STATUS | `stuck` |
 | stdout | 失敗時と同じ部分出力(`--no-partial-emit` で抑制可) |
-| `log.jsonl` | 通常の `position` イベント(`"next":"stuck"`、`via` は rule / catch_all / on_error / max_visits) |
+| `log.jsonl` | 通常の `position` イベント(`"next":"stuck"`、`via` は rule / catch_all / on_error / max_visits / budget) |
 
 偽装された `status.json` の `state: "stuck"` は `failed` と同じ nonce 検査を通らないと報告されない(新しい状態名だからといって信用度は上がらない)。
 
@@ -383,6 +387,50 @@ sfh run research.yaml --resume .sfh/runs/20260727-120000-research
 - **on_max_visits 経由**: 再開すると入場時の visit 検査に再び引っかかり、**即座にまた stuck になる**。これは仕様。visit カウンタを黙ってリセットするほうが嘘になる。正しい道はフローの `max_visits` を直して `--force-resume` すること。
 
 > **破壊的変更**: ステップ id `stuck`(**大文字小文字を無視**して比較。id の重複検査と同じ規則)は予約語になり、`sfh validate` が明示エラーで拒否する。既存フローに `stuck` という id があれば改名が必要 — ただし黙って挙動が変わるのではなく、validate が大声で落ちる。
+
+### 予算の崖を着地パスに: `on_budget`
+
+`max_cost_usd` / `wall_clock_sec` は**崖**だった。超えた瞬間にエラーで終わり、呼び出し元には何も渡らない。`on_budget` は予算の最後の一切れを**着地滑走路**に変える:
+
+```yaml
+defaults:
+  max_cost_usd: 60.0
+  wall_clock_sec: 43200
+  on_budget: goto:wrap                                       # 未指定なら従来どおり即エラー
+  budget_reserve: { cost_usd: 2.0, wall_clock_sec: 900 }     # 省略時 0
+steps:
+  # …本題のループ…
+  - id: wrap
+    prompt: |
+      予算上限に達した。ここまでの結果を引き継ぎ用にまとめろ。
+      使用済み: ${{budget.spent_usd}} / {{budget.elapsed_sec}}秒経過(残り ${{budget.remaining_usd}} / {{budget.remaining_sec}}秒)
+    route:
+      - goto: stuck        # 「未完了だが整理済み」を exit 4 で申告する(推奨)
+```
+
+- **閾値 = 上限 − reserve**。コスト軸と時間軸は**独立**で、互いに融通しない。どちらか一方が閾値を超えた時点で着地する
+- 発火点は**既存の予算検査と同じループ先頭**(ステップとステップの間)。跳び先は `route[].goto` と同じ書式で、`end` / `fail` / `stuck` も指定できる
+- **1 run に 1 回だけ。** `--resume` を挟んでも `log.jsonl` の `budget_landing` イベントから「着地済み」を復元するので、2 度目は起きない
+- 着地後は**上限本体の検査がそのまま生きる**。reserve まで食い潰したら従来どおりエラーで終わる(fail-closed は温存。reserve は延長ではなく余白)
+
+| 見え方 | 値 |
+|---|---|
+| `log.jsonl` | `{"event":"budget_landing","trigger":"cost"\|"wall_clock","spent_usd":…,"elapsed_sec":…,"goto":…}` に続けて `position`(`"via":"budget"`) |
+| `position` の `after` | **着地に先を越されたステップ**の id(唯一「まだ走っていないステップ」を指す via)。`goto: stuck` で着地した run を `--resume` すると、ここから再開する |
+| `sfh runs show` | `budget  : landed on cost after $58.0312 / 1204s -> goto wrap` |
+| `--dry-run` | `budget landing: goto wrap (cost reserve $2.00, wall reserve 900s)` — `route:` に現れない唯一の goto なので、ここで可視化する |
+
+**validate が拒否するもの**: 跳び先が実在しない / `goto:` を付けていない / `budget_reserve` だけで `on_budget` が無い(reserve は「どれだけ早く着地するか」を決めるだけなので、単体では何もしない) / `on_budget` があるのに `max_cost_usd` も `wall_clock_sec` も無い(上限が無ければ閾値も無い)。
+
+#### 既知の限界(全部読んでから reserve を決めること)
+
+1. **コストは報告値のみ。** USD を報告しないツール構成(codex / agy はトークン数だけ)ではコスト軸は永久に発火しない。**信頼できるのは wall-clock 軸**。コスト軸だけを頼りにした無人運転は、報告が無ければ崖に戻る
+2. **検査はステップとステップの間だけ。** 走行中のステップが上限を突き破るのは止められない(F12 が入るまで sfh は時計でプロセスを殺さない)。したがって reserve は最低でも**「最長ステップ 1 本 + 着地連鎖が使う分」**を見込む必要がある
+   - 見積もり指針: `reserve.wall_clock_sec ≥ 最長ステップの timeout_sec + 着地連鎖の全ステップの timeout_sec 合計`
+   - `reserve.cost_usd ≥ 最も高いステップ 1 回分の実測コスト + 着地連鎖の実測コスト`。実測は `sfh runs show <dir>` の COST_USD 列から取る
+   - 迷ったら多めに。reserve が大きすぎても損は「早めに畳む」だけだが、小さすぎると着地連鎖の途中でエラー終了して着地の意味が消える
+   - reserve が上限以上なら閾値は 0 に丸められ、**最初のステップの前に着地する**。「10 分の予算から 20 分を取り置く」は最初から仕事の余地が無かった、という素直な読み方
+3. **推奨イディオム**: 着地連鎖の終端は `goto: stuck` にする。予算切れは成功ではないので `goto: end`(exit 0)は嘘になり、かといって配管は壊れていないので `fail`(exit 1)も違う。「整理は済んだが未完了、人間が見ろ」= exit 4 が正しい申告
 
 ### 投げっぱなし実行: `--detach`(親の寿命から切り離す)
 
@@ -464,6 +512,8 @@ Ctrl+C・親プロセスの死・強制終了のいずれでも、**起動済み
 | `{{item}}` `{{item_index}}` | foreach内のみ |
 | `{{notes}}` | 共有ノートの現在内容 |
 | `{{run_dir}}` `{{flow_dir}}` `{{step_id}}` `{{visit}}` `{{os}}` `{{prompt_file}}` | 実行環境 |
+| `{{budget.spent_usd}}` `{{budget.elapsed_sec}}` | 報告済みコスト(小数4桁)と経過秒。常に使える。resume 後の経過秒は**その試行の開始から** |
+| `{{budget.remaining_usd}}` `{{budget.remaining_sec}}` | 上限(`max_cost_usd` / `wall_clock_sec`)までの残り。**上限未設定の軸は文字列 `unlimited`**(0 でも空でもない)。reserve ではなく上限までの残りを出す |
 | `{{raw}}...{{endraw}}` | 中身をそのまま出す。**テンプレートの話をするプロンプト**(「このHandlebarsを直して: `{{user.name}}`」)はこれで囲む。囲まないと未定義キーとして実行前にエラーになる |
 
 ## プリセット → 実コマンド対応(2026-07-27 実機検証)
@@ -802,8 +852,12 @@ resume を重ねても二重バナーにならない。parallel / foreach は集
 | `rule` | 一致した規則の `route:` 内での 0 始まり番号 |
 | `route_line` | その規則が実際に照合したテキスト。最終行系述語(`when_last_line_*`)と catch-all は**最終非空行**、全文系(`when_contains` / `when_matches`)は**判定テキストの先頭**。いずれも 200 文字で機械的に切る。`when_exit` / `when_stderr_matches` は判定テキストを見ないので、catch-all と同じく最終非空行が入る(判定した値そのものではない — exit は `step_end` の `exit`、stderr は `<id>.err.txt` を見ること) |
 
-`via` が `fallthrough` / `on_error` / `max_visits` の position は規則を見ていないので、
+`via` が `fallthrough` / `on_error` / `max_visits` / `budget` の position は規則を見ていないので、
 この 2 キーは付かない(「どの規則か」を騙らないため)。
+
+`via` が `budget` の position だけは、`after` が**まだ走っていないステップ**を指す。
+`on_budget` の着地はステップの後ではなくステップに入る手前で起きるからで、
+直前の `budget_landing` イベントがその判断の材料(どの軸が、いくら使った時点で)を持つ。
 
 `step_end` には `os`(`windows` / `linux` / `macos`)が入る。ログは書いた機械と別の機械で
 読まれるのが普通なので、「こっちでは通る」の一次資料をログ自身に持たせる。
