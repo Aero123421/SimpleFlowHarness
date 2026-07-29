@@ -52,6 +52,22 @@ impl Default for RetryCfg {
     }
 }
 
+/// The session this step was resolved to continue or fork, as decided while
+/// preparing it. Recorded in step_start so a reader of log.jsonl can follow the
+/// session lineage without re-deriving it from the flow (which, after an edit
+/// plus --force-resume, no longer describes what actually ran).
+#[derive(Clone)]
+pub struct SessionParent {
+    /// "continue" (same session) or "fork" (a branch of it).
+    pub mode: &'static str,
+    /// The step whose session this one attached to.
+    pub step: String,
+    pub tool: String,
+    /// The PARENT's session id. A fork's own child id is minted inside the
+    /// preset builder and is reported back by the tool, so it lands in step_end.
+    pub id: String,
+}
+
 /// Everything the engine resolves on the main thread before a leaf runs.
 /// Workers only execute; they never touch shared flow state.
 #[derive(Clone)]
@@ -85,6 +101,8 @@ pub struct Prepared {
     /// Declared access of this run (preset steps only); recorded with the
     /// session so later steps cannot resume it at a higher level.
     pub access: Option<preset::Access>,
+    /// Set when continue_from / fork_from resolved to a recorded session.
+    pub session_parent: Option<SessionParent>,
     pub allow_empty: bool,
     pub retry: RetryCfg,
     pub quiet: bool,
@@ -600,6 +618,7 @@ pub fn prepare_leaf(
     let mut forbid_session: Option<String> = None;
     let mut expect_parent: Option<String> = None;
     let mut warmup_key: Option<String> = None;
+    let mut session_parent: Option<SessionParent> = None;
     let (inv, tool_used) = match &step.cmd {
         Some(flow::Cmd::Shell(s)) => {
             // Substituted values land in a cmd /C | sh -c string. By default
@@ -806,6 +825,14 @@ pub fn prepare_leaf(
                         }
                     }
                 }
+                // Every guard above has passed, so this attachment is the one
+                // the step will actually run under. Record it for step_start.
+                session_parent = Some(SessionParent {
+                    mode: if is_fork { "fork" } else { "continue" },
+                    step: target.clone(),
+                    tool: info.tool.clone(),
+                    id: info.id.clone(),
+                });
                 if is_fork {
                     let child = gen_uuid();
                     let mut b = preset::build_fork(&tool, &info.id, &child, inp, &paths)?;
@@ -959,6 +986,7 @@ pub fn prepare_leaf(
         chain_file,
         access: tool_used.as_ref().map(|_| eff.access),
         tool: tool_used,
+        session_parent,
         // Custom commands may legitimately print nothing; agent steps may not.
         allow_empty: step.allow_empty.unwrap_or(!is_preset),
         retry: retry_cfg(cx.flow, step),

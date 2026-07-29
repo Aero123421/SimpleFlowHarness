@@ -1760,32 +1760,33 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 builtins,
             };
             let target = evaluate_route(step, &pending.route_text, &ctx)?;
-            match target.as_ref().map(|(target, via)| (target.as_str(), *via)) {
+            match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                 None => {
                     log_position(
                         &mut log,
                         &step.id,
                         next_label(completed_idx + 1, &flow),
                         PositionVia::Fallthrough,
+                        None,
                     );
                     cur = completed_idx + 1;
                     if cur >= n_steps {
                         return Ok(());
                     }
                 }
-                Some(("end", via)) => {
-                    log_position(&mut log, &step.id, "end".into(), via);
+                Some(("end", hit)) => {
+                    log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
                     return Ok(());
                 }
-                Some(("fail", via)) => {
-                    log_position(&mut log, &step.id, "fail".into(), via);
+                Some(("fail", hit)) => {
+                    log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
                     return Err(format!("step '{}' routed to fail", step.id));
                 }
-                Some((id, via)) => {
+                Some((id, hit)) => {
                     if !opts.quiet {
                         eprintln!("sfh: [{}] -> goto {id}", step.id);
                     }
-                    log_position(&mut log, &step.id, id.to_string(), via);
+                    log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit));
                     cur = index_of[id];
                 }
             }
@@ -1838,6 +1839,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             &step.id,
                             next_label(cur + 1, &flow),
                             PositionVia::MaxVisits,
+                            None,
                         );
                         cur += 1;
                         if cur >= n_steps {
@@ -1852,6 +1854,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 &step.id,
                                 "end".into(),
                                 PositionVia::MaxVisits,
+                                None,
                             );
                             return Ok(());
                         }
@@ -1861,6 +1864,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 &step.id,
                                 "fail".into(),
                                 PositionVia::MaxVisits,
+                                None,
                             );
                             return Err(format!("step '{}' exhausted max_visits ({max_v})", step.id));
                         }
@@ -1870,6 +1874,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                 &step.id,
                                 id.to_string(),
                                 PositionVia::MaxVisits,
+                                None,
                             );
                             cur = index_of[id];
                             continue;
@@ -2337,7 +2342,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
                     log_event(
                         &mut log,
-                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe()}),
+                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep)}),
                     );
                     leaf::exec_leaf(prep)
                 };
@@ -2521,11 +2526,23 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     "continue" => {}
                     oe if oe.starts_with("goto:") => match &oe[5..] {
                         "end" => {
-                            log_position(&mut log, &step.id, "end".into(), PositionVia::OnError);
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "end".into(),
+                                PositionVia::OnError,
+                                None,
+                            );
                             return Ok(());
                         }
                         "fail" => {
-                            log_position(&mut log, &step.id, "fail".into(), PositionVia::OnError);
+                            log_position(
+                                &mut log,
+                                &step.id,
+                                "fail".into(),
+                                PositionVia::OnError,
+                                None,
+                            );
                             return Err(format!(
                                 "step '{}' failed and on_error routed to fail",
                                 step.id
@@ -2538,6 +2555,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                     &step.id,
                                     id.to_string(),
                                     PositionVia::OnError,
+                                    None,
                                 );
                                 cur = *i;
                                 continue;
@@ -2573,32 +2591,33 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 };
                 evaluate_route(step, &route_text, &ctx)?
             };
-            match target.as_ref().map(|(target, via)| (target.as_str(), *via)) {
+            match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                 None => {
                     log_position(
                         &mut log,
                         &step.id,
                         next_label(cur + 1, &flow),
                         PositionVia::Fallthrough,
+                        None,
                     );
                     cur += 1;
                     if cur >= n_steps {
                         return Ok(());
                     }
                 }
-                Some(("end", via)) => {
-                    log_position(&mut log, &step.id, "end".into(), via);
+                Some(("end", hit)) => {
+                    log_position(&mut log, &step.id, "end".into(), hit.via, Some(hit));
                     return Ok(());
                 }
-                Some(("fail", via)) => {
-                    log_position(&mut log, &step.id, "fail".into(), via);
+                Some(("fail", hit)) => {
+                    log_position(&mut log, &step.id, "fail".into(), hit.via, Some(hit));
                     return Err(format!("step '{}' routed to fail", step.id));
                 }
-                Some((id, via)) => {
+                Some((id, hit)) => {
                     if !opts.quiet {
                         eprintln!("sfh: [{}] -> goto {id}", step.id);
                     }
-                    log_position(&mut log, &step.id, id.to_string(), via);
+                    log_position(&mut log, &step.id, id.to_string(), hit.via, Some(hit));
                     cur = index_of[id];
                 }
             }
@@ -2914,6 +2933,7 @@ fn run_compact(
         chain_file: run_dir.join(format!("{ctag}.chain.txt")),
         tool: Some(tool),
         access: Some(preset::Access::Read),
+        session_parent: None,
         allow_empty: false,
         retry: leaf::RetryCfg::default(),
         quiet,
@@ -3116,6 +3136,15 @@ fn log_event(f: &mut std::fs::File, v: serde_json::Value) {
     let _ = writeln!(f, "{v}");
 }
 
+/// The session a step attached to, for step_start. Null - like `session` in
+/// step_end - when the step opened its own context.
+fn session_parent_json(prep: &leaf::Prepared) -> serde_json::Value {
+    match &prep.session_parent {
+        Some(p) => json!({"mode": p.mode, "step": p.step, "tool": p.tool, "id": p.id}),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// Remember, in THIS run's log, the fan-out members a resume carried over
 /// instead of executing. Without it the carry-over lives only in memory: the
 /// skipped members write no step_end, so a second crash in the same fan-out
@@ -3166,13 +3195,49 @@ impl PositionVia {
     }
 }
 
+/// How many characters of routing text a position event records. The same cut
+/// the fan-out member snapshot uses: enough to recognise a verdict line, not
+/// enough for a runaway step to bloat log.jsonl.
+const ROUTE_LINE_CHARS: usize = 200;
+
+fn clip(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// The text a rule was judged on, for the log. Whole-text predicates are not
+/// judged on a line at all, so they record the head of the routing text;
+/// everything else - the last-line predicates and the catch-all - records the
+/// last non-empty line, which is what they compared against.
+fn route_line_of(r: &flow::Route, route_text: &str, last: &str) -> String {
+    if r.when_contains.is_some() || r.when_matches.is_some() {
+        clip(route_text, ROUTE_LINE_CHARS)
+    } else {
+        clip(last, ROUTE_LINE_CHARS)
+    }
+}
+
+/// A route rule that fired, and why - written into the position event so the
+/// routing decision can be read back without re-running the flow.
+struct RouteHit {
+    goto: String,
+    via: PositionVia,
+    /// 0-based index into the step's `route:` list.
+    rule: usize,
+    /// See `route_line_of`.
+    line: String,
+    /// Filled in by member-quantified rules (F1); `log_position` omits both
+    /// keys while they are None, so no other caller has to know about them.
+    votes: Option<u32>,
+    voters: Option<Vec<String>>,
+}
+
 fn evaluate_route(
     step: &flow::Step,
     route_text: &str,
     ctx: &template::Ctx<'_>,
-) -> Result<Option<(String, PositionVia)>, String> {
+) -> Result<Option<RouteHit>, String> {
     let last = leaf::last_line(route_text).to_string();
-    for r in &step.route {
+    for (idx, r) in step.route.iter().enumerate() {
         let mut matched = true;
         let mut check = |needle: &Option<String>, hay: &str, is_rx: bool| -> Result<(), String> {
             if !matched {
@@ -3214,20 +3279,44 @@ fn evaluate_route(
             } else {
                 PositionVia::Rule
             };
-            return Ok(Some((r.goto.clone(), via)));
+            return Ok(Some(RouteHit {
+                goto: r.goto.clone(),
+                via,
+                rule: idx,
+                line: route_line_of(r, route_text, &last),
+                votes: None,
+                voters: None,
+            }));
         }
     }
     Ok(None)
 }
 
-fn log_position(f: &mut std::fs::File, after: &str, next: String, via: PositionVia) {
-    log_event(
-        f,
-        json!({
-            "ts": utc_stamp(), "event": "position", "after": after,
-            "next": next, "via": via.as_str(),
-        }),
-    );
+/// `hit` is Some only for the two vias that come from evaluating `route:`
+/// (rule / catch_all); on_error, max_visits and fallthrough judged no rule, so
+/// they carry no rule index and no routing text.
+fn log_position(
+    f: &mut std::fs::File,
+    after: &str,
+    next: String,
+    via: PositionVia,
+    hit: Option<&RouteHit>,
+) {
+    let mut ev = json!({
+        "ts": utc_stamp(), "event": "position", "after": after,
+        "next": next, "via": via.as_str(),
+    });
+    if let (Some(h), Some(o)) = (hit, ev.as_object_mut()) {
+        o.insert("rule".into(), json!(h.rule));
+        o.insert("route_line".into(), json!(h.line));
+        if let Some(n) = h.votes {
+            o.insert("votes".into(), json!(n));
+        }
+        if let Some(v) = &h.voters {
+            o.insert("voters".into(), json!(v));
+        }
+    }
+    log_event(f, ev);
 }
 
 fn log_step_end(
@@ -3256,6 +3345,10 @@ fn log_step_end(
             "chain_file": file_name(&d.out_file).map(|n| n.replace(".out.txt", ".chain.txt")),
             "out_file": file_name(&d.out_file),
             "cmd": d.cmd, "session": session,
+            // Which OS produced this step. A log is routinely read on a
+            // different machine from the one that wrote it, and "it passes on
+            // mine" is exactly the class of report this answers.
+            "os": std::env::consts::OS,
         }),
     );
 }
@@ -3338,6 +3431,72 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route(
+        when_contains: Option<&str>,
+        when_matches: Option<&str>,
+        when_last_line_is: Option<&str>,
+    ) -> flow::Route {
+        flow::Route {
+            when_contains: when_contains.map(String::from),
+            when_matches: when_matches.map(String::from),
+            when_last_line_contains: None,
+            when_last_line_is: when_last_line_is.map(String::from),
+            when_last_line_matches: None,
+            goto: "end".to_string(),
+        }
+    }
+
+    #[test]
+    fn route_line_follows_what_the_rule_actually_judged() {
+        // F4: a position event has to say what the rule was tested against.
+        // A whole-text predicate is not judged on a line, so it records the head
+        // of the routing text; last-line predicates and the catch-all record the
+        // last line, which IS what they compared.
+        let text = "first line\nlast line";
+        assert_eq!(
+            route_line_of(&route(None, None, Some("last line")), text, "last line"),
+            "last line"
+        );
+        assert_eq!(
+            route_line_of(&route(None, None, None), text, "last line"),
+            "last line",
+            "the catch-all records the last line too"
+        );
+        assert_eq!(
+            route_line_of(&route(Some("first"), None, None), text, "last line"),
+            text
+        );
+        assert_eq!(
+            route_line_of(&route(None, Some("^first"), None), text, "last line"),
+            text
+        );
+        // A rule that mixes both is judged on the whole text as well.
+        assert_eq!(
+            route_line_of(
+                &route(Some("first"), None, Some("last line")),
+                text,
+                "last line"
+            ),
+            text
+        );
+    }
+
+    #[test]
+    fn route_line_is_clipped_by_characters_not_bytes() {
+        // A step is free to end in one enormous line; the log is not the place
+        // to keep it. Clipping counts characters, so a multi-byte last line
+        // cannot be cut in the middle of one.
+        let long: String = "ab".repeat(400);
+        assert_eq!(
+            route_line_of(&route(None, None, None), &long, &long).len(),
+            200
+        );
+        let wide: String = "日".repeat(400);
+        let cut = route_line_of(&route(None, None, None), &wide, &wide);
+        assert_eq!(cut.chars().count(), 200);
+        assert_eq!(cut.len(), 600, "each kept char must still be whole");
+    }
 
     #[test]
     fn resume_restores_recorded_access_and_fails_closed_on_bogus() {
