@@ -19,7 +19,7 @@ const STALE_SEC: u64 = 60;
 
 pub struct Snapshot {
     pub dir: PathBuf,
-    /// Resolved state: running | done | failed | dead | unknown.
+    /// Resolved state: running | done | failed | stuck | dead | unknown.
     pub state: &'static str,
     pub reason: Option<String>,
     pub step: String,
@@ -33,6 +33,12 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub flow: String,
     pub started: String,
+    /// The idle clocks (F2). All three are absent from a status.json written by
+    /// sfh <= 1.0, and the display drops the whole segment when they are, rather
+    /// than printing "0s elapsed" about a run it cannot time.
+    pub step_started: Option<String>,
+    pub last_output: Option<String>,
+    pub visit: Option<u64>,
     pub nonce: Option<String>,
     /// Start time of the owning process, recorded when the run began. Lets
     /// `sfh stop` tell a reused pid apart from the original (rev_break #8).
@@ -40,16 +46,23 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// "stuck" belongs here: the run is over and will not move on its own. It
+    /// is listed with the other terminals rather than beside "running" so that
+    /// every check guarding a terminal report (above all the nonce
+    /// authentication) covers it too. A forged `state: "stuck"` gets no more
+    /// trust for being the newest state name.
     pub fn terminal(&self) -> bool {
-        matches!(self.state, "done" | "failed" | "dead" | "stopped")
+        matches!(self.state, "done" | "failed" | "stuck" | "dead" | "stopped")
     }
 
-    /// 0 = done, 1 = failed / dead / stopped, 3 = still running, 2 = cannot tell.
+    /// 0 = done, 1 = failed / dead / stopped, 3 = still running, 2 = cannot
+    /// tell, 4 = stuck (the flow reached a `goto: stuck` and wants a human).
     pub fn exit(&self) -> i32 {
         match self.state {
             "done" => 0,
             "failed" | "dead" | "stopped" => 1,
             "running" => 3,
+            "stuck" => 4,
             _ => 2,
         }
     }
@@ -164,6 +177,7 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
     let state = match raw.as_str() {
         "done" => "done",
         "failed" => "failed",
+        "stuck" => "stuck",
         "stopped" => "stopped",
         "running" => {
             if !pid_valid {
@@ -202,9 +216,50 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
         error: opt("error"),
         flow: s("flow"),
         started: s("started_utc"),
+        step_started: opt("step_started_utc"),
+        last_output: opt("last_output_utc"),
+        visit: v.get("visit").and_then(|x| x.as_u64()),
         nonce: opt("nonce"),
         pid_start: v.get("pid_start").and_then(|x| x.as_u64()),
     })
+}
+
+/// Round a duration to one human-sized unit. Precision past this is noise for
+/// the question being asked ("is this thing moving?").
+fn human_dur(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// "<n> since <stamp>", or None when the stamp is missing or unparseable. A
+/// stamp in the future (clock skew between the writer and this process) reports
+/// 0s rather than a wrapped number.
+fn since(stamp: Option<&String>) -> Option<String> {
+    let secs = crate::engine::parse_utc_stamp(stamp?.as_str())?;
+    Some(human_dur(crate::execute::epoch_secs().saturating_sub(secs)))
+}
+
+/// The second half of the running line: how long the current step has been in
+/// there and how long since anything it started said a word. This is the pair
+/// that tells a 40-minute step that is working from one that died quietly
+/// (B-12); every signal the caller had before this - pid alive, heartbeat
+/// fresh, state "running" - said the wedged run was healthy.
+fn idle_segment(snap: &Snapshot) -> Option<String> {
+    let elapsed = since(snap.step_started.as_ref())?;
+    let visit = match snap.visit {
+        Some(v) if v > 0 => format!(" (visit {v})"),
+        _ => String::new(),
+    };
+    let quiet = match since(snap.last_output.as_ref()) {
+        Some(q) => format!("{q} since last output"),
+        // Null last_output_utc is a fact, not a gap: no child of this run has
+        // written a byte yet.
+        None => "no output yet".to_string(),
+    };
+    Some(format!("{}{visit}, {elapsed} elapsed, {quiet}", snap.step))
 }
 
 /// The flow path for a command hint: a placeholder when unknown, otherwise
@@ -264,6 +319,9 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 "flow": snap.flow,
                 "started_utc": snap.started,
                 "current_step": snap.step,
+                "step_started_utc": snap.step_started,
+                "last_output_utc": snap.last_output,
+                "visit": snap.visit,
                 "steps_done": snap.steps_done,
                 "cost_usd": snap.cost_usd,
                 "pid": snap.pid,
@@ -279,11 +337,16 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     }
 
     let extra = match snap.state {
-        "running" => format!(
-            "step '{}', {}s since heartbeat",
-            snap.step, snap.heartbeat_age_sec
-        ),
-        "failed" => snap.error.clone().unwrap_or_default(),
+        // The idle clocks replace the bare step name when the run dir carries
+        // them; a status.json from an older sfh keeps the original line.
+        "running" => match idle_segment(&snap) {
+            Some(seg) => format!("{seg}, {}s since heartbeat", snap.heartbeat_age_sec),
+            None => format!(
+                "step '{}', {}s since heartbeat",
+                snap.step, snap.heartbeat_age_sec
+            ),
+        },
+        "failed" | "stuck" => snap.error.clone().unwrap_or_default(),
         _ => snap.reason.clone().unwrap_or_default(),
     };
     println!(
@@ -302,6 +365,13 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         ),
         "done" => eprintln!(
             "sfh: result: sfh wait {}",
+            execute::shell_quote(&snap.dir.display().to_string())
+        ),
+        // A stuck run is finished but not done with: the work is saved and
+        // waiting on a human, so say how to pick it up again.
+        "stuck" => eprintln!(
+            "sfh: this run stopped for a human decision. after fixing what it is stuck on: sfh run {} --resume {}",
+            flow_arg(&snap.flow),
             execute::shell_quote(&snap.dir.display().to_string())
         ),
         "stopped" | "dead" => eprintln!(
@@ -658,6 +728,23 @@ pub fn wait(
                     }
                     eprintln!("sfh: run dir: {}", snap.dir.display());
                 }
+                // Same shape as "failed": the caller gets the partial result,
+                // because a stuck run has produced real work and the point of
+                // the exit code is to say who has to look at it next.
+                "stuck" => {
+                    eprintln!(
+                        "sfh: FLOW STUCK: {}",
+                        snap.error.as_deref().unwrap_or("(no reason recorded)")
+                    );
+                    if let Err(e) = print_result(&snap) {
+                        eprintln!("sfh: {e}");
+                        return 1;
+                    }
+                    eprintln!(
+                        "sfh: run dir: {} - resume it once a human has decided",
+                        snap.dir.display()
+                    );
+                }
                 _ => {
                     eprintln!(
                         "sfh: run did not finish ({}). resume with: sfh run {} --resume {}",
@@ -671,11 +758,15 @@ pub fn wait(
                 }
             }
             // The recorded exit code is honoured ONLY for a nonce-authenticated
-            // "done". failed/dead/stopped always exit 1, whatever status.json
-            // claims: exit_code:0 next to a non-done state used to return 0,
-            // laundering a forged "stopped" into success (rev_break #10). For
-            // "done", anything that does not fit an i32 is treated as a failure
-            // (an unchecked `as i32` wrapped 4294967296 to 0 - rev_break #7).
+            // "done". failed/dead/stopped always exit 1 and stuck always exits
+            // 4, whatever status.json claims: exit_code:0 next to a non-done
+            // state used to return 0, laundering a forged "stopped" into
+            // success (rev_break #10), and a forged "stuck" must not be able to
+            // launder itself the same way. The state IS the exit code for those
+            // - a real stuck run records 4 - so nothing is lost by deriving it.
+            // For "done", anything that does not fit an i32 is treated as a
+            // failure (an unchecked `as i32` wrapped 4294967296 to 0 -
+            // rev_break #7).
             return match snap.state {
                 "done" => snap
                     .exit_code

@@ -16,11 +16,6 @@ steps:
 This is the only form with exactly the same behavior on Windows, macOS, and Linux.
 Use `sh -c` only to join multiple commands; on Windows it requires Git Bash.
 
-MINIMAL TWO-STEP FLOW:
-```yaml
-steps: [{id: inspect, cmd: ["sfh", "--version"]}, {id: check, cmd: ["sfh", "validate", "flow.yaml"]}]
-```
-
 AI GOAL VERDICT — require exactly one final-line token and fail closed:
 ```yaml
 steps:
@@ -58,14 +53,17 @@ steps:
 ```
 Limits are checked on entry, so the node entered first in a loop reaches its limit first.
 
-PARALLEL MEMBERS / ONE BRANCH PER ITEM:
+PARALLEL MEMBERS / ONE BRANCH PER ITEM — when_members counts verdicts, never text:
 ```yaml
 vars: {targets: "--version\n--help"}
 steps:
-  - id: fixed
-    parallel:
-      - {id: version, cmd: ["sfh", "--version"]}
-      - {id: help, cmd: ["sfh", "--help"]}
+  - id: review
+    parallel:                  # members need on_error: continue, or one failure skips the route
+      - {id: rev_a, tool: codex, access: read, on_error: continue, prompt: "Last line: PASS or FAIL."}
+      - {id: rev_b, tool: codex, access: read, on_error: continue, prompt: "Last line: PASS or FAIL."}
+    route:                     # a member votes only if it exited 0 AND its own last line matches
+      - {when_members: {last_line_is: PASS, all: true}, goto: per_target}
+      - {goto: fail}
   - id: per_target
     foreach: {from: "{{vars.targets}}", split: lines}
     cmd: ["sfh", "{{item}}"]
@@ -77,4 +75,4 @@ steps:
   - {id: approval, cmd: ["approval-cli", "wait", "--question", "Ship this build?"], timeout_sec: 3600}
 ```
 DETACH AND COLLECT: `sfh run flow.yaml --detach` → `sfh status` → `sfh wait` / `sfh stop`
-Details: README. If stuck: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.
+Details: README. If unsure: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.

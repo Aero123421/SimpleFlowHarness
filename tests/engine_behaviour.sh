@@ -5,6 +5,9 @@ set -uo pipefail
 
 SFH="${1:-./target/release/sfh}"
 SFH="$(cd "$(dirname "$SFH")" && pwd)/$(basename "$SFH")"
+# Resolved before the cd below, because the session stub's source lives next to
+# this script and everything after the cd is relative to a temp dir.
+SUITE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d)"
 # Windows holds a directory busy while any process still has a handle inside
 # it, and this suite deliberately starts DETACHED runs that outlive it - that
@@ -69,6 +72,108 @@ fnv1a64() {
   done
   printf '%016x' "$h"
 }
+
+# --- session-reporting stub CLI (T-0 / B-15) ---------------------------------
+# `bin: "echo"` cannot report a session id, so every test that stands echo in
+# for claude fails F-11's "resume unverified" check and can only prove that a
+# guard did NOT fire. tests/stub/session_stub.rs speaks the shape sfh parses
+# (`claude -p --output-format json`: one envelope with .result/.session_id/
+# .usage), so a session can be opened and continued for real without calling an
+# AI. Built once here, into this suite's own temp dir, with the rustc that built
+# sfh - a missing toolchain is a loud failure, not a silent skip.
+STUB_NAME="sfh-session-stub"
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) STUB_NAME="sfh-session-stub.exe" ;;
+esac
+STUB="$WORK/$STUB_NAME"
+if rustc -O --edition 2021 -o "$STUB" "$SUITE_DIR/stub/session_stub.rs" > stub-build.log 2>&1; then
+  echo "ok   - the session stub builds"
+  pass=$((pass + 1))
+else
+  echo "FAIL - the session stub did not build (needs rustc on PATH)"
+  sed -n '1,40p' stub-build.log
+  fail=$((fail + 1))
+fi
+# What a flow's bin: gets. sfh is a native binary, so under msys it cannot
+# resolve the /tmp/... path bash sees; hand it the drive-letter form. Absolute
+# either way, so a step with its own cwd: still finds it.
+if command -v cygpath > /dev/null 2>&1; then
+  STUB_BIN="$(cygpath -m "$STUB")"
+else
+  STUB_BIN="$STUB"
+fi
+
+# Smoke test: the stub answers in the one shape sfh parses, echoes the session
+# id sfh assigned, and keeps its knobs independent of each other.
+"$STUB" -p --output-format json --permission-mode dontAsk --tools "Read,Grep" \
+  --session-id stub-smoke-1 --stub-last-line VERDICT-OK --stub-quote VERDICT-OK \
+  < /dev/null > stub-smoke.json 2> stub-smoke.err
+check "the stub exits 0 and ignores the preset's own flags" 0 $?
+STUB_SMOKE_LINES="$(awk 'END { print NR }' stub-smoke.json)"
+check "the stub answers on exactly one line" 1 "$STUB_SMOKE_LINES"
+contains "the stub echoes the session id sfh assigned" '"session_id":"stub-smoke-1"' stub-smoke.json
+contains "the stub reports usage" '"usage":{"input_tokens":11,"output_tokens":7}' stub-smoke.json
+contains "the stub can quote a needle inside the body" 'VERDICT-OK\nsfh-stub: the line above was quoted' stub-smoke.json
+contains "the quoted needle is not the last line" '\nVERDICT-OK","session_id"' stub-smoke.json
+# A fork gets -r <parent> AND --session-id <child>; sfh fails the step when the
+# child id comes back as the parent, so the child has to win.
+"$STUB" -p --output-format json -r stub-parent --fork-session --session-id stub-child \
+  < /dev/null > stub-fork.json 2>&1
+contains "a fork reports the child session, not the parent" '"session_id":"stub-child"' stub-fork.json
+# Exit code and verdict text are independent: "said the right thing, still
+# failed" is the case a member-vote count has to refuse to count.
+SFH_STUB_LAST_LINE=VERDICT-OK "$STUB" --stub-exit 1 < /dev/null > stub-exit.json 2>&1
+check "the stub takes its exit code and last line from the environment" 1 $?
+contains "a failing stub still reports the requested last line" '\nVERDICT-OK","session_id"' stub-exit.json
+"$STUB" --stub-plain --stub-stderr-every 20 --stub-sleep 0.2 --stub-last-line PLAIN-OK \
+  < /dev/null > stub-plain.out 2> stub-plain.err
+check "the stub runs as a plain cmd: leaf" 0 $?
+contains "plain mode prints the body, not JSON" "PLAIN-OK" stub-plain.out
+contains "progress goes to stderr only" "sfh-stub: progress 1" stub-plain.err
+if grep -q "progress" stub-plain.out; then
+  echo "FAIL - stderr progress leaked into stdout"
+  fail=$((fail + 1))
+else
+  echo "ok   - stderr progress stays out of stdout"
+  pass=$((pass + 1))
+fi
+
+# The payoff (B-15): a session opened by the stub can actually be continued, and
+# sfh verifies the continuation instead of merely failing to object.
+cat > stub-session.yaml <<YAML
+name: stub-session
+steps:
+  - id: first
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    prompt: "open a session"
+  - id: second
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    continue_from: first
+    prompt: "continue it"
+YAML
+"$SFH" run stub-session.yaml --runs-dir stub-runs -q > stub-session.out 2> stub-session.err
+check "a stub session can be opened and continued" 0 $?
+STUB_LOG="$(find stub-runs -type f -name 'log.jsonl' -print -quit)"
+STUB_SESSIONS="$(grep -cF '"session":{"access":"read"' "$STUB_LOG")"
+check "both steps record the session they ran under" 2 "$STUB_SESSIONS"
+if grep -q "resume unverified" stub-session.err; then
+  echo "FAIL - the continuation was not verifiable against a reported session id"
+  fail=$((fail + 1))
+else
+  echo "ok   - the continuation was verified against the reported session id"
+  pass=$((pass + 1))
+fi
+# Negative control. The same flow with the old stand-in must still fail, or the
+# check above proves nothing about the stub: echo reports no session id, so
+# F-11 cannot tell a resume from a fresh session and refuses.
+sed "s#$STUB_BIN#echo#g" stub-session.yaml > stub-session-echo.yaml
+"$SFH" run stub-session-echo.yaml -q > stub-session-echo.out 2> stub-session-echo.err
+check "the same flow with bin: echo still cannot verify the resume" 1 $?
+contains "echo fails for the session reason, not another one" "resume unverified" stub-session-echo.err
 
 # --- built-in AI guide -------------------------------------------------------
 "$SFH" guide > guide.out 2> guide.err
@@ -2051,8 +2156,13 @@ r3c_rc=1
 # so strip both records and stop at once; retry if a heartbeat lands between.
 for _ in 1 2 3; do
   rm -f "$R3C_DIR/sfh-nonce"
+  # Dropping a line can leave a dangling comma on the new last key, and which
+  # key that is depends on the (alphabetical) field order - naming one of them
+  # here broke the moment status.json grew a field later in the alphabet.
+  # Strip the comma from whatever line now sits above the closing brace.
   grep -v '"nonce":' "$R3C_DIR/status.json" |
-    sed 's/\("unfinished_step": null\),/\1/' > "$R3C_DIR/status.json.tmp"
+    awk '{l[NR] = $0} END {for (i = 1; i <= NR; i++) {if (i == NR - 1) sub(/,[ \t]*$/, "", l[i]); print l[i]}}' \
+      > "$R3C_DIR/status.json.tmp"
   mv "$R3C_DIR/status.json.tmp" "$R3C_DIR/status.json"
   "$SFH" stop "$R3C_DIR" > r3c.out 2>r3c.err
   r3c_rc=$?
@@ -2430,6 +2540,1649 @@ case "$(uname 2>/dev/null)" in
     fi
     ;;
 esac
+
+# --- F2: the idle clock -------------------------------------------------------
+# B-12 was 112 minutes of silence in which every external signal - pid alive,
+# heartbeat fresh, state "running" - reported a healthy run. sfh reads the
+# child's chunks as they arrive and used to throw the arrival times away. These
+# tests are about the second clock: not "how long has this taken" but "how long
+# since anything was said".
+
+# 1. Speaks once, then goes quiet for good. A timeout at the end of that is a
+#    hang, and a hang is transient - a retry costs nothing and often works.
+cat > f2-hang.yaml <<'YAML'
+name: f2-hang
+defaults:
+  hang_after_sec: 1
+steps:
+  - id: wedge
+    cmd: ["sh", "-c", "echo FIRST-AND-LAST; sleep 30"]
+    timeout_sec: 4
+    retry: { max: 1, backoff_sec: 1 }
+    retry_on: transient
+    on_error: continue
+YAML
+"$SFH" run f2-hang.yaml --runs-dir f2-hang-runs -q > /dev/null 2>f2-hang.err
+F2_HANG_DIR="$(dirname "$(find f2-hang-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$F2_HANG_DIR/wedge.a2.out.txt" ]; then
+  echo "ok   - a timeout after long silence is retried as a hang"
+  pass=$((pass + 1))
+else
+  echo "FAIL - a hung step was not retried (no wedge.a2.out.txt in $F2_HANG_DIR)"
+  ls "$F2_HANG_DIR"
+  fail=$((fail + 1))
+fi
+contains "step_end records idle_ms" '"idle_ms":' "$F2_HANG_DIR/log.jsonl"
+F2_HANG_IDLE="$(sed -n 's/.*"event":"step_end".*"idle_ms":\([0-9]*\).*/\1/p' "$F2_HANG_DIR/log.jsonl" | head -1)"
+if [ -n "$F2_HANG_IDLE" ] && [ "$F2_HANG_IDLE" -ge 2000 ]; then
+  echo "ok   - the recorded idle_ms covers the silent stretch (${F2_HANG_IDLE}ms)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - idle_ms was '$F2_HANG_IDLE'ms after ~4s of silence"
+  fail=$((fail + 1))
+fi
+
+# 2. Talks the whole way through and still runs out of clock. That is overrun,
+#    not a hang: retrying it would just burn the same budget again.
+#
+#    hang_after_sec has to be SHORTER than the timeout or this test proves
+#    nothing: with a threshold above the step's whole lifetime, an idle clock
+#    that had failed completely (idle_ms == elapsed, which is what a stdout
+#    reader that stopped touching the clock produces) would still be under it
+#    and the "no retry" branch would pass for the wrong reason. At 2s against a
+#    5s timeout, that broken clock reads 5000ms, crosses the threshold, and the
+#    step comes back retried. The idle_ms assertion below says the same thing
+#    directly.
+cat > f2-chatty.yaml <<'YAML'
+name: f2-chatty
+defaults:
+  hang_after_sec: 2
+steps:
+  - id: chatty
+    cmd: ["sh", "-c", "i=0; while [ $i -lt 60 ]; do echo tick; sleep 1; i=$((i+1)); done"]
+    timeout_sec: 5
+    retry: { max: 1, backoff_sec: 1 }
+    retry_on: transient
+    on_error: continue
+YAML
+"$SFH" run f2-chatty.yaml --runs-dir f2-chatty-runs -q > /dev/null 2>f2-chatty.err
+F2_CHATTY_DIR="$(dirname "$(find f2-chatty-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$F2_CHATTY_DIR/chatty.a2.out.txt" ]; then
+  echo "FAIL - a step that never stopped talking was retried as a hang"
+  fail=$((fail + 1))
+else
+  echo "ok   - a timeout with steady output is overrun, not a hang, and is not retried"
+  pass=$((pass + 1))
+fi
+F2_CHATTY_IDLE="$(sed -n 's/.*"event":"step_end".*"idle_ms":\([0-9]*\).*/\1/p' "$F2_CHATTY_DIR/log.jsonl" | head -1)"
+if [ -n "$F2_CHATTY_IDLE" ] && [ "$F2_CHATTY_IDLE" -lt 2000 ]; then
+  echo "ok   - the idle clock followed stdout, so the timeout is overrun (${F2_CHATTY_IDLE}ms)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - idle_ms was '$F2_CHATTY_IDLE'ms although stdout spoke every second"
+  fail=$((fail + 1))
+fi
+
+# 2b. The same threshold written on the STEP instead of under defaults:. Nothing
+#     else in the suite exercises that override, so a refactor that dropped the
+#     step half of `step.hang_after_sec.or(defaults)` would leave every test
+#     green while a step that says "I go quiet for a long time, do not call it a
+#     hang" silently got the 300s default instead.
+cat > f2-step.yaml <<'YAML'
+name: f2-step
+steps:
+  - id: wedge
+    cmd: ["sh", "-c", "echo FIRST-AND-LAST; sleep 30"]
+    hang_after_sec: 1
+    timeout_sec: 4
+    retry: { max: 1, backoff_sec: 1 }
+    retry_on: transient
+    on_error: continue
+YAML
+"$SFH" run f2-step.yaml --runs-dir f2-step-runs -q > /dev/null 2>f2-step.err
+F2_STEP_DIR="$(dirname "$(find f2-step-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$F2_STEP_DIR/wedge.a2.out.txt" ]; then
+  echo "ok   - hang_after_sec on the step alone is honoured (retried as a hang)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - a step-level hang_after_sec was ignored (no wedge.a2.out.txt)"
+  ls "$F2_STEP_DIR"
+  fail=$((fail + 1))
+fi
+
+# 3. The decisive one: progress on stderr ONLY. Several CLIs report progress
+#    there and nowhere else, so a clock fed by stdout alone would file every one
+#    of their timeouts as a hang.
+cat > f2-stderr.yaml <<'YAML'
+name: f2-stderr
+defaults:
+  hang_after_sec: 2
+steps:
+  - id: noisy
+    cmd: ["sh", "-c", "i=0; while [ $i -lt 60 ]; do echo tick >&2; sleep 1; i=$((i+1)); done"]
+    timeout_sec: 5
+    retry: { max: 1, backoff_sec: 1 }
+    retry_on: transient
+    on_error: continue
+YAML
+"$SFH" run f2-stderr.yaml --runs-dir f2-stderr-runs -q > /dev/null 2>f2-stderr.err
+F2_ERR_DIR="$(dirname "$(find f2-stderr-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$F2_ERR_DIR/noisy.a2.out.txt" ]; then
+  echo "FAIL - a step that reported progress on stderr was treated as hung"
+  fail=$((fail + 1))
+else
+  echo "ok   - stderr output keeps the idle clock alive (no hang retry)"
+  pass=$((pass + 1))
+fi
+F2_ERR_IDLE="$(sed -n 's/.*"event":"step_end".*"idle_ms":\([0-9]*\).*/\1/p' "$F2_ERR_DIR/log.jsonl" | head -1)"
+if [ -n "$F2_ERR_IDLE" ] && [ "$F2_ERR_IDLE" -lt 2000 ]; then
+  echo "ok   - idle_ms follows stderr chunks too (${F2_ERR_IDLE}ms after a 5s step)"
+  pass=$((pass + 1))
+else
+  echo "FAIL - idle_ms was '$F2_ERR_IDLE'ms although stderr spoke every second"
+  fail=$((fail + 1))
+fi
+
+# 4. The same two clocks, live, for whoever is polling from outside.
+cat > f2-status.yaml <<'YAML'
+name: f2-status
+steps:
+  - id: slow
+    cmd: ["sh", "-c", "echo HELLO; sleep 8"]
+YAML
+F2_RUN="$("$SFH" run f2-status.yaml --runs-dir f2-status-runs --detach -q 2>/dev/null)"
+if [ -n "$F2_RUN" ]; then
+  sleep 3
+  contains "status.json dates the current step" '"step_started_utc": "2' "$F2_RUN/status.json"
+  contains "status.json records when a child last spoke" '"last_output_utc": "2' "$F2_RUN/status.json"
+  contains "status.json carries the visit number" '"visit": 1' "$F2_RUN/status.json"
+  "$SFH" status "$F2_RUN" > f2-status.out 2>/dev/null
+  contains "sfh status prints both clocks" "since last output" f2-status.out
+  "$SFH" wait "$F2_RUN" > /dev/null 2>&1
+else
+  echo "FAIL - could not detach the idle-clock status run"
+  fail=$((fail + 1))
+fi
+
+# --- F4: a resumed run reads a log that carries the new keys ------------------
+# Written before the enrichment itself: load_resume takes only the keys it knows
+# about, so adding keys must be invisible to it. This cuts a REAL new-format log
+# where a crash would cut it - just after a step_end, before its position - and
+# resumes from there.
+cat > f4res.yaml <<'YAML'
+name: f4res
+steps:
+  - id: one
+    cmd: ["echo", "first"]
+    route:
+      - {when_last_line_is: "first", goto: two}
+      - {goto: fail}
+  - id: two
+    cmd: ["echo", "second:{{steps.one.output | trim}}"]
+YAML
+"$SFH" run f4res.yaml --runs-dir f4res-runs -q > f4res-live.out 2>&1
+check "F4: the flow runs live before being resumed" 0 $?
+F4R_DIR="$(dirname "$(find f4res-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_end"/ && /"step":"one"/ { exit }' \
+  "$F4R_DIR/log.jsonl" > "$F4R_DIR/log.cut"
+mv "$F4R_DIR/log.cut" "$F4R_DIR/log.jsonl"
+"$SFH" run f4res.yaml --resume "$F4R_DIR" -q > f4res.out 2>f4res.err
+check "F4: a log carrying the new keys still resumes" 0 $?
+contains "F4: the resumed run restored the recorded output" "second:first" f4res.out
+
+# --- F4: position records which rule fired, and on what text -----------------
+cat > f4log.yaml <<'YAML'
+name: f4log
+steps:
+  - id: choose
+    cmd: ["printf", "prose that mentions VERDICT-OK in passing\nVERDICT-OK\n"]
+    route:
+      - {when_contains: "no such text anywhere", goto: fail}
+      - {when_last_line_is: "VERDICT-OK", goto: whole}
+  # TWO lines on purpose. With a one-line step "the head of the routing text"
+  # and "the last line" are the same bytes, and the assertion below would hold
+  # for an implementation that recorded the last line for every predicate -
+  # which is the distinction the key exists to make.
+  - id: whole
+    cmd: ["sh", "-c", "printf 'whole-text-judgement\nTAIL-LINE\n'"]
+    route:
+      - {when_contains: "whole-text", goto: catchall}
+  - id: catchall
+    cmd: ["echo", "no-predicate-here"]
+    route:
+      - {goto: end}
+YAML
+"$SFH" run f4log.yaml --runs-dir f4log-runs -q > f4log.out 2>f4log.err
+check "F4: the routed flow runs" 0 $?
+F4_LOG="$(find f4log-runs -type f -name 'log.jsonl' -print -quit)"
+contains "F4: position records the 0-based index of the rule that fired" \
+  '"rule":1' "$F4_LOG"
+contains "F4: a last-line rule records the last line it judged" \
+  '"route_line":"VERDICT-OK"' "$F4_LOG"
+contains "F4: a whole-text rule records the head of the routing text" \
+  '"route_line":"whole-text-judgement\nTAIL-LINE"' "$F4_LOG"
+if grep -F '"via":"catch_all"' "$F4_LOG" | grep -qF '"route_line":"no-predicate-here"'; then
+  echo "ok   - F4: the catch-all records the last line too"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: the catch-all recorded no route_line"
+  grep -F '"event":"position"' "$F4_LOG"
+  fail=$((fail + 1))
+fi
+# A rule index is a claim about `route:`; the vias that never consulted it must
+# not make one.
+F4_VISITS_LOG="$(find visits-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"via":"max_visits"' "$F4_VISITS_LOG" | grep -qF '"rule":'; then
+  echo "FAIL - F4: a max_visits position claimed a route rule"
+  fail=$((fail + 1))
+else
+  echo "ok   - F4: only rule/catch_all positions carry a rule index"
+  pass=$((pass + 1))
+fi
+
+# --- F4: step_end names the OS that produced it -------------------------------
+if grep -F '"event":"step_end"' "$F4_LOG" | grep -qE '"os":"(windows|linux|macos)"'; then
+  echo "ok   - F4: step_end records the OS it ran on"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: step_end has no os field"
+  grep -F '"event":"step_end"' "$F4_LOG" | head -1
+  fail=$((fail + 1))
+fi
+
+# --- F4: step_start records the session it attached to ------------------------
+# bin: "echo" stands in for claude exactly as the S2-4 block uses it: sfh
+# pre-assigns the session id, so continue_from/fork_from resolve without an AI.
+cat > f4sess.yaml <<'YAML'
+name: f4sess
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: again
+    tool: claude
+    bin: "echo"
+    access: read
+    continue_from: low
+    prompt: "y"
+YAML
+"$SFH" run f4sess.yaml --runs-dir f4sess-runs -q > f4sess.out 2>f4sess.err
+F4SESS_LOG="$(find f4sess-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"event":"step_start"' "$F4SESS_LOG" | grep -F '"step":"again"' |
+  grep -qF '"mode":"continue"'; then
+  echo "ok   - F4: step_start records a continue_from parent"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: step_start recorded no continue_from parent"
+  grep -F '"event":"step_start"' "$F4SESS_LOG"
+  fail=$((fail + 1))
+fi
+if grep -F '"event":"step_start"' "$F4SESS_LOG" | grep -F '"step":"again"' |
+  grep -qF '"session_parent":{"id":'; then
+  echo "ok   - F4: the recorded parent carries the session it attached to"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: the recorded parent has no session id"
+  fail=$((fail + 1))
+fi
+if grep -F '"event":"step_start"' "$F4SESS_LOG" | grep -F '"step":"low"' |
+  grep -qF '"session_parent":null'; then
+  echo "ok   - F4: a step that opened its own context records a null parent"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: a step with no session parent did not record null"
+  fail=$((fail + 1))
+fi
+cat > f4fork.yaml <<'YAML'
+name: f4fork
+steps:
+  - id: low
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: branch
+    tool: claude
+    bin: "echo"
+    access: read
+    fork_from: low
+    prompt: "y"
+YAML
+"$SFH" run f4fork.yaml --runs-dir f4fork-runs -q > f4fork.out 2>f4fork.err
+F4FORK_LOG="$(find f4fork-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"event":"step_start"' "$F4FORK_LOG" | grep -F '"step":"branch"' |
+  grep -qF '"mode":"fork"'; then
+  echo "ok   - F4: a fork_from parent is recorded as a fork"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: step_start did not distinguish a fork from a continue"
+  grep -F '"event":"step_start"' "$F4FORK_LOG"
+  fail=$((fail + 1))
+fi
+
+# --- F4: the members of a fan-out record their lineage too ---------------------
+# `parallel:` whose children each fork the same warm parent is the documented
+# use of fork_from, and the two tests above only cover top-level leaves. Without
+# this one, session_parent could be (and was) recorded for every case except the
+# one the key was added for.
+cat > f4fanp.yaml <<'YAML'
+name: f4fanp
+steps:
+  - id: plan
+    tool: claude
+    bin: "echo"
+    access: read
+    prompt: "x"
+  - id: fan
+    parallel:
+      - id: br_a
+        tool: claude
+        bin: "echo"
+        access: read
+        fork_from: plan
+        prompt: "a"
+      - id: br_b
+        tool: claude
+        bin: "echo"
+        access: read
+        fork_from: plan
+        prompt: "b"
+YAML
+"$SFH" run f4fanp.yaml --runs-dir f4fanp-runs -q > f4fanp.out 2>f4fanp.err
+F4FANP_LOG="$(find f4fanp-runs -type f -name 'log.jsonl' -print -quit)"
+for m in br_a br_b; do
+  if grep -F '"event":"step_start"' "$F4FANP_LOG" | grep -F "\"step\":\"$m\"" |
+    grep -qF '"mode":"fork","step":"plan"'; then
+    echo "ok   - F4: fan-out member $m records the session it forked from"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - F4: fan-out member $m recorded no session_parent"
+    grep -F '"event":"step_start"' "$F4FANP_LOG"
+    fail=$((fail + 1))
+  fi
+done
+if grep -F '"event":"step_start"' "$F4FANP_LOG" | grep -F '"step":"br_a"' |
+  grep -qF '"parent":"fan"'; then
+  echo "ok   - F4: a member's step_start names the group it belongs to"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F4: a member's step_start does not name its group"
+  fail=$((fail + 1))
+fi
+# ...and that `parent` is load-bearing: it is what keeps load_resume from
+# offering a CHILD id as the place to restart. Cut the log at the first member's
+# step_start, exactly where a kill mid-fan-out would cut it.
+cat > f4fanr.yaml <<'YAML'
+name: f4fanr
+steps:
+  - id: fan
+    parallel:
+      - {id: m1, cmd: ["echo", "one"]}
+      - {id: m2, cmd: ["echo", "two"]}
+  - id: after
+    cmd: ["echo", "AFTER-RAN"]
+YAML
+"$SFH" run f4fanr.yaml --runs-dir f4fanr-runs -q > f4fanr1.out 2>f4fanr1.err
+check "F4: the fan-out flow runs live before being cut" 0 $?
+F4FANR_DIR="$(dirname "$(find f4fanr-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_start"/ && /"step":"m1"/ { exit }' \
+  "$F4FANR_DIR/log.jsonl" > "$F4FANR_DIR/log.cut"
+mv "$F4FANR_DIR/log.cut" "$F4FANR_DIR/log.jsonl"
+"$SFH" run f4fanr.yaml --resume "$F4FANR_DIR" -q > f4fanr2.out 2>f4fanr2.err
+check "F4: a log cut inside a fan-out still resumes" 0 $?
+contains "F4: the resume restarts at the GROUP, not at a member" \
+  "step 'fan' started" f4fanr2.err
+contains "F4: and the flow finishes past the fan-out" "AFTER-RAN" f4fanr2.out
+
+# --- F3: stuck, the third terminal (exit 4) -----------------------------------
+# The resume tests come FIRST because resume is where this feature is decided.
+# A stuck run is not finished: the work is saved and a human has to look at it,
+# so the run stays resumable. A route-borne stuck therefore RE-RUNS the step
+# that made the decision instead of replaying its recorded verdict - replaying
+# would route to stuck again on the same text, forever.
+
+cat > f3-route-resume.yaml <<'YAML'
+name: f3-route-resume
+vars:
+  verdict: NEEDS-HUMAN
+steps:
+  - id: judge
+    cmd: ["echo", "{{vars.verdict}}"]
+    route:
+      - when_last_line_is: "OK"
+        goto: wrap
+      - goto: stuck
+  - id: wrap
+    cmd: ["echo", "WRAPPED"]
+YAML
+"$SFH" run f3-route-resume.yaml --runs-dir f3rr-runs -q > f3rr1.out 2> f3rr1.err
+check "F3: a route to stuck ends the run with exit 4" 4 $?
+F3RR_DIR="$(dirname "$(find f3rr-runs -type f -name 'log.jsonl' -print -quit)")"
+"$SFH" run f3-route-resume.yaml --runs-dir f3rr-runs --resume "$F3RR_DIR" --var verdict=OK -q \
+  > f3rr2.out 2> f3rr2.err
+if ! check "F3: a stuck run is resumable and can go on to succeed" 0 $?; then sed -n '1,20p' f3rr2.err; fi
+contains "F3: the resumed run reached the step past the stuck decision" "WRAPPED" f3rr2.out
+if [ "$(grep -F '"event":"step_end"' "$F3RR_DIR/log.jsonl" | grep -cF '"step":"judge"')" = "2" ]; then
+  echo "ok   - F3: resume re-ran the deciding step instead of replaying its verdict"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F3: the deciding step did not re-run exactly once on resume"
+  grep -F '"step":"judge"' "$F3RR_DIR/log.jsonl" | sed -n '1,10p'
+  fail=$((fail + 1))
+fi
+
+# A stuck reached through on_max_visits is different: resuming re-enters the
+# same exhausted node, so it sticks again immediately. That is the honest
+# answer - silently resetting the visit counter would be a lie - and the way
+# out is to fix max_visits in the flow and use --force-resume.
+cat > f3-maxvisits.yaml <<'YAML'
+name: f3-maxvisits
+steps:
+  - id: spin
+    max_visits: 2
+    on_max_visits: goto:stuck
+    cmd: ["echo", "SPIN"]
+    route:
+      - goto: spin
+YAML
+"$SFH" run f3-maxvisits.yaml --runs-dir f3mv-runs -q > f3mv1.out 2> f3mv1.err
+check "F3: on_max_visits goto:stuck ends the run with exit 4" 4 $?
+F3MV_DIR="$(dirname "$(find f3mv-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F3: the max_visits stuck is recorded as such" '"via":"max_visits"' "$F3MV_DIR/log.jsonl"
+"$SFH" run f3-maxvisits.yaml --runs-dir f3mv-runs --resume "$F3MV_DIR" -q > f3mv2.out 2> f3mv2.err
+check "F3: resuming a max_visits stuck lands on stuck again" 4 $?
+if [ "$(grep -F '"event":"step_end"' "$F3MV_DIR/log.jsonl" | grep -cF '"step":"spin"')" = "2" ]; then
+  echo "ok   - F3: the resumed max_visits run did not run the exhausted step again"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F3: the resumed max_visits run re-entered the exhausted step"
+  fail=$((fail + 1))
+fi
+
+cat > f3-basic.yaml <<'YAML'
+name: f3-basic
+steps:
+  - id: work
+    cmd: ["echo", "SAVED-WORK"]
+  - id: judge
+    cmd: ["echo", "NEEDS-HUMAN"]
+    route:
+      - when_last_line_is: "OK"
+        goto: ship
+      - goto: stuck
+  - id: ship
+    cmd: ["echo", "SHIPPED"]
+YAML
+"$SFH" run f3-basic.yaml --runs-dir f3b-runs -q > f3b.out 2> f3b.err
+check "F3: a flow that routes to stuck exits 4" 4 $?
+F3B_DIR="$(dirname "$(find f3b-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F3: status.json records the stuck state" '"state": "stuck"' "$F3B_DIR/status.json"
+contains "F3: status.json records exit code 4" '"exit_code": 4' "$F3B_DIR/status.json"
+contains "F3: the error names the step that routed to stuck" "routed to stuck after 'judge'" "$F3B_DIR/status.json"
+contains "F3: the position event records the stuck terminal" '"next":"stuck"' "$F3B_DIR/log.jsonl"
+contains "F3: the step after the stuck decision did not run" "NEEDS-HUMAN" f3b.out
+if grep -qF "SHIPPED" f3b.out; then
+  echo "FAIL - F3: the run continued past the stuck terminal"
+  fail=$((fail + 1))
+else
+  echo "ok   - F3: stuck is terminal, not a jump to the next step"
+  pass=$((pass + 1))
+fi
+"$SFH" status "$F3B_DIR" > f3b-status.out 2> f3b-status.err
+check "F3: sfh status exits 4 for a stuck run" 4 $?
+contains "F3: sfh status prints the stuck state" "stuck" f3b-status.out
+"$SFH" wait "$F3B_DIR" --timeout 5 > f3b-wait.out 2> f3b-wait.err
+check "F3: sfh wait exits 4 for a stuck run" 4 $?
+"$SFH" runs show "$F3B_DIR" > f3b-show.out 2>&1
+contains "F3: runs show reports the run as stuck" "stuck" f3b-show.out
+
+# The partial emit is the failure path's, not the success path's: a stuck run
+# has produced real work and the caller needs it.
+"$SFH" run f3-basic.yaml --runs-dir f3np-runs --no-partial-emit -q > f3np.out 2> f3np.err
+check "F3: --no-partial-emit still exits 4" 4 $?
+if [ -s f3np.out ]; then
+  echo "FAIL - F3: --no-partial-emit still printed a partial result"
+  sed -n '1,10p' f3np.out
+  fail=$((fail + 1))
+else
+  echo "ok   - F3: --no-partial-emit suppresses the stuck partial emit"
+  pass=$((pass + 1))
+fi
+
+cat > f3-onerror.yaml <<'YAML'
+name: f3-onerror
+steps:
+  - id: attempt
+    cmd: ["sh", "-c", "printf 'HALF-DONE\n'; exit 3"]
+    on_error: goto:stuck
+YAML
+"$SFH" run f3-onerror.yaml --runs-dir f3oe-runs -q > f3oe.out 2> f3oe.err
+check "F3: on_error goto:stuck ends the run with exit 4" 4 $?
+F3OE_DIR="$(dirname "$(find f3oe-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F3: the on_error stuck is recorded as such" '"via":"on_error"' "$F3OE_DIR/log.jsonl"
+
+# `stuck` is a reserved goto target, so it cannot also be a step id - the same
+# case-insensitive rule the duplicate-id check uses.
+cat > f3-reserved.yaml <<'YAML'
+name: f3-reserved
+steps:
+  - id: stuck
+    cmd: ["echo", "x"]
+YAML
+"$SFH" validate f3-reserved.yaml > f3res.out 2> f3res.err
+check "F3: a step id 'stuck' is refused" 2 $?
+contains "F3: the refusal says the id is reserved" "reserved" f3res.err
+cat > f3-reserved-upper.yaml <<'YAML'
+name: f3-reserved-upper
+steps:
+  - id: STUCK
+    cmd: ["echo", "x"]
+YAML
+"$SFH" validate f3-reserved-upper.yaml > f3resu.out 2> f3resu.err
+check "F3: a step id 'STUCK' is refused too (ids compare ignoring case)" 2 $?
+
+# A parallel member's on_error is only ever asked whether it says "continue";
+# every goto: spelling was accepted by validate and then ignored, so a member
+# that asked for exit 4 got exit 1 - "the plumbing broke, retry" instead of
+# "work saved, look at this". Refused where the author can still see it.
+for act in "goto:stuck" "goto:end" "goto:fail" "goto:elsewhere"; do
+  cat > f3-child-goto.yaml <<YAML
+name: f3-child-goto
+steps:
+  - id: fan
+    parallel:
+      - {id: ok1, cmd: ["echo", "fine"]}
+      - {id: bad, cmd: ["sh", "-c", "exit 5"], on_error: "$act"}
+  - id: elsewhere
+    cmd: ["echo", "ELSEWHERE"]
+YAML
+  "$SFH" validate f3-child-goto.yaml > f3cg.out 2> f3cg.err
+  check "F3: a parallel member's on_error: $act is refused" 2 $?
+  contains "F3: the refusal for $act says goto is not allowed there" \
+    "goto is not allowed inside parallel" f3cg.err
+done
+
+# A run dir is attacker-writable on a forged report, so a bare `state: stuck`
+# gets exactly the authentication `failed` gets - no more trust for being new.
+mkdir -p f3-forged
+cat > f3-forged/status.json <<'JSON'
+{
+  "state": "stuck",
+  "current_step": "judge",
+  "started_utc": "20250101-000000",
+  "heartbeat_utc": "20250101-000000",
+  "steps_done": 1,
+  "cost_usd": 0.0,
+  "run_dir": "f3-forged",
+  "flow": "x.yaml",
+  "pid": 99999,
+  "sfh_version": "1.0.0",
+  "exit_code": 0,
+  "emit_step": null,
+  "emit_file": null,
+  "error": null,
+  "unfinished_step": null,
+  "nonce": "forged-nonce"
+}
+JSON
+"$SFH" status f3-forged > f3f-status.out 2> f3f-status.err
+check "F3: sfh status does not report a forged stuck as fact" 1 $?
+contains "F3: the status refusal names the nonce problem" "nonce" f3f-status.err
+"$SFH" wait f3-forged --timeout 5 > f3f-wait.out 2> f3f-wait.err
+check "F3: sfh wait does not report a forged stuck as fact" 1 $?
+contains "F3: the wait refusal names the nonce problem" "nonce" f3f-wait.err
+
+# --- F6: when_exit routes on the step's own normalized exit code -------------
+# The gate an `on_error: continue` probe needs: "it failed, and it failed for
+# THE reason I am testing for". Written before the implementation because the
+# resume half re-evaluates a recorded route (see the f6res blocks below).
+cat > f6exit.yaml <<'YAML'
+name: f6exit
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'HALF-DONE\n'; exit 3"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: leaked}
+      - {when_exit: 3, goto: expected}
+      - {goto: other}
+  - id: leaked
+    cmd: ["echo", "F6-LEAKED"]
+    route:
+      - {goto: fail}
+  - id: expected
+    cmd: ["echo", "F6-EXPECTED"]
+    route:
+      - {goto: end}
+  - id: other
+    cmd: ["echo", "F6-OTHER"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6exit.yaml --runs-dir f6exit-runs -q > f6exit.out 2> f6exit.err
+check "F6: a step that exits 3 takes the when_exit: 3 branch" 0 $?
+contains "F6: the when_exit branch actually ran" "F6-EXPECTED" f6exit.out
+F6EXIT_LOG="$(find f6exit-runs -type f -name 'log.jsonl' -print -quit)"
+if grep -F '"event":"position"' "$F6EXIT_LOG" | grep -F '"after":"probe"' |
+  grep -qF '"via":"rule"'; then
+  echo "ok   - F6: a when_exit-only rule logs as a rule, not a catch-all"
+  pass=$((pass + 1))
+else
+  echo "FAIL - F6: a when_exit-only rule was not recorded as a rule"
+  grep -F '"event":"position"' "$F6EXIT_LOG"
+  fail=$((fail + 1))
+fi
+contains "F6: the position names the when_exit rule that fired" '"rule":1' "$F6EXIT_LOG"
+
+# The probe idiom from the spec: exit 0 means the attack fixture ran to
+# completion, i.e. the guard under test is GONE. A plain "did it fail" check
+# passes here; when_exit: 0 is what catches it.
+cat > f6probe.yaml <<'YAML'
+name: f6probe
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'attack fixture completed\n'"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: broken}
+      - {when_stderr_matches: "refusing to resume|no recorded access level", goto: guard_fired}
+      - {goto: broken}
+  - id: guard_fired
+    cmd: ["echo", "F6-GUARD-HELD"]
+    route:
+      - {goto: end}
+  - id: broken
+    cmd: ["echo", "F6-GUARD-GONE"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6probe.yaml --runs-dir f6probe-runs -q > f6probe.out 2> f6probe.err
+check "F6: a probe that exits 0 is caught as 'the guard is gone'" 1 $?
+contains "F6: the probe routed to the broken branch" "F6-GUARD-GONE" f6probe.out
+
+# The same probe, this time refused by the guard: the exit is non-zero AND the
+# refusal message is on stderr, so the verification is the one that counts.
+cat > f6err.yaml <<'YAML'
+name: f6err
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'sfh: refusing to resume: no recorded access level\n' >&2; exit 3"]
+    on_error: continue
+    route:
+      - {when_exit: 0, goto: broken}
+      - {when_exit: 3, when_stderr_matches: "refusing to resume|no recorded access level", goto: guard_fired}
+      - {goto: broken}
+  - id: guard_fired
+    cmd: ["echo", "F6-GUARD-HELD"]
+    route:
+      - {goto: end}
+  - id: broken
+    cmd: ["echo", "F6-GUARD-GONE"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6err.yaml --runs-dir f6err-runs -q > f6err.out 2> f6err.err
+check "F6: when_exit AND when_stderr_matches accept the right failure" 0 $?
+contains "F6: the stderr-verified branch ran" "F6-GUARD-HELD" f6err.out
+
+# Same refusal text, different exit: the AND must refuse it. This is the case
+# the "count any non-zero as proof" habit gets wrong.
+cat > f6and.yaml <<'YAML'
+name: f6and
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'sfh: refusing to resume: no recorded access level\n' >&2; exit 9"]
+    on_error: continue
+    route:
+      - {when_exit: 3, when_stderr_matches: "refusing to resume", goto: guard_fired}
+      - {goto: broken}
+  - id: guard_fired
+    cmd: ["echo", "F6-GUARD-HELD"]
+    route:
+      - {goto: end}
+  - id: broken
+    cmd: ["echo", "F6-WRONG-REASON"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6and.yaml --runs-dir f6and-runs -q > f6and.out 2> f6and.err
+check "F6: a matching stderr with the wrong exit does not satisfy the AND" 1 $?
+contains "F6: the wrong-reason failure was not counted as proof" "F6-WRONG-REASON" f6and.out
+
+# A group has no exit code of its own, so when_exit sees the composite sfh
+# records: 1 when the group hard-failed, 0 otherwise - never a child's 9.
+cat > f6group.yaml <<'YAML'
+name: f6group
+steps:
+  - id: fan
+    on_error: continue
+    parallel:
+      - {id: g_ok, cmd: ["echo", "OK"]}
+      - {id: g_bad, cmd: ["sh", "-c", "printf BAD; exit 9"]}
+    route:
+      - {when_exit: 9, goto: raw}
+      - {when_exit: 1, goto: dirty}
+      - {goto: clean}
+  - id: raw
+    cmd: ["echo", "F6-GROUP-RAW"]
+    route:
+      - {goto: fail}
+  - id: dirty
+    cmd: ["echo", "F6-GROUP-DIRTY"]
+    route:
+      - {goto: end}
+  - id: clean
+    cmd: ["echo", "F6-GROUP-CLEAN"]
+    route:
+      - {goto: fail}
+YAML
+"$SFH" run f6group.yaml --runs-dir f6group-runs -q > f6group.out 2> f6group.err
+check "F6: a fan-out group routes on its composite exit" 0 $?
+contains "F6: the group's when_exit saw 1, not the child's 9" "F6-GROUP-DIRTY" f6group.out
+
+# --- F6: resume re-evaluates when_exit / when_stderr_matches the same way ----
+# Both predicates read state that step_end already restores (the normalized exit
+# and the contained stderr path), so nothing new is persisted and a resume that
+# re-runs the recorded route has to pick the same branch.
+cat > f6res.yaml <<'YAML'
+name: f6res
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "printf 'sfh: refusing to resume: no recorded access level\n' >&2; printf 'PROBE-DONE\n'"]
+    route:
+      - {when_exit: 0, when_stderr_matches: "refusing to resume", goto: verified}
+      - {goto: inconclusive}
+  - id: verified
+    cmd: ["echo", "F6-VERIFIED"]
+    route:
+      - {goto: end}
+  - id: inconclusive
+    cmd: ["echo", "F6-INCONCLUSIVE"]
+    route:
+      - {goto: end}
+YAML
+"$SFH" run f6res.yaml --runs-dir f6res-runs -q > f6res-live.out 2> f6res-live.err
+check "F6: the stderr-gated flow runs live" 0 $?
+contains "F6: the live run took the verified branch" "F6-VERIFIED" f6res-live.out
+F6RES_DIR="$(dirname "$(find f6res-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_end"/ && /"step":"probe"/ { exit }' \
+  "$F6RES_DIR/log.jsonl" > "$F6RES_DIR/log.cut"
+mv "$F6RES_DIR/log.cut" "$F6RES_DIR/log.jsonl"
+"$SFH" run f6res.yaml --resume "$F6RES_DIR" -q > f6res-resume.out 2> f6res-resume.err
+check "F6: the resumed run re-evaluates the route" 0 $?
+contains "F6: resume picked the same branch as live" "F6-VERIFIED" f6res-resume.out
+# The point of the test is the RE-EVALUATION: if the resume had simply re-run
+# the probe, the branch would agree for the wrong reason.
+F6RES_STARTS="$(grep -cF '"event":"step_start"' "$F6RES_DIR/log.jsonl" | tr -d '[:space:]')"
+F6RES_PROBE="$(grep -F '"event":"step_start"' "$F6RES_DIR/log.jsonl" | grep -cF '"step":"probe"' | tr -d '[:space:]')"
+check "F6: the resume routed from the record instead of re-running the probe" 1 "$F6RES_PROBE"
+[ "$F6RES_STARTS" -ge 2 ] || echo "note: only $F6RES_STARTS step_start events after resume"
+
+# ... and the fail-closed half: the stderr file is what the predicate reads, so
+# a run dir whose <id>.err.txt was deleted must NOT match. A deleted artifact is
+# missing evidence, never a pass.
+"$SFH" run f6res.yaml --runs-dir f6gone-runs -q > f6gone-live.out 2> f6gone-live.err
+check "F6: the flow runs live before its stderr file is removed" 0 $?
+F6GONE_DIR="$(dirname "$(find f6gone-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_end"/ && /"step":"probe"/ { exit }' \
+  "$F6GONE_DIR/log.jsonl" > "$F6GONE_DIR/log.cut"
+mv "$F6GONE_DIR/log.cut" "$F6GONE_DIR/log.jsonl"
+rm -f "$F6GONE_DIR/probe.err.txt"
+"$SFH" run f6res.yaml --resume "$F6GONE_DIR" -q > f6gone.out 2> f6gone.err
+check "F6: a resume whose stderr file is gone still finishes" 0 $?
+contains "F6: a missing stderr file makes when_stderr_matches fail closed" \
+  "F6-INCONCLUSIVE" f6gone.out
+F6GONE_PROBE="$(grep -F '"event":"step_start"' "$F6GONE_DIR/log.jsonl" | grep -cF '"step":"probe"' | tr -d '[:space:]')"
+check "F6: the fail-closed resume did not re-run the probe either" 1 "$F6GONE_PROBE"
+
+# --- F6: validate checks the new regex like the other two --------------------
+cat > f6badrx.yaml <<'YAML'
+name: f6badrx
+steps:
+  - id: a
+    cmd: ["echo", "x"]
+    route:
+      - {when_stderr_matches: "([unclosed", goto: end}
+YAML
+"$SFH" validate f6badrx.yaml > f6badrx.out 2> f6badrx.err
+check "F6: a bad when_stderr_matches regex is refused" 2 $?
+contains "F6: the refusal names the regex" "bad regex" f6badrx.err
+
+# ...and the template inside it, which is the expensive half. The regex check
+# above SKIPS any pattern containing {{ (it cannot compile one until run time),
+# so precheck is the only thing standing between a typo here and a run that
+# executes - and pays for - the guarded step before dying on the route.
+cat > f6badtpl.yaml <<'YAML'
+name: f6badtpl
+steps:
+  - id: probe
+    cmd: ["sh", "-c", "echo boom >&2; exit 3"]
+    on_error: continue
+    route:
+      - {when_stderr_matches: "{{vars.nope}}", goto: hit}
+      - {goto: miss}
+  - id: hit
+    cmd: ["echo", "HIT"]
+    route: [{goto: end}]
+  - id: miss
+    cmd: ["echo", "MISS"]
+    route: [{goto: end}]
+YAML
+"$SFH" validate f6badtpl.yaml > f6bt.out 2> f6bt.err
+check "F6: an undefined variable in when_stderr_matches is refused by validate" 2 $?
+contains "F6: the refusal names the variable" "undefined variable 'nope'" f6bt.err
+"$SFH" run f6badtpl.yaml --runs-dir f6bt-runs --dry-run > f6btd.out 2> f6btd.err
+check "F6: dry-run refuses it too, before anything is spawned" 2 $?
+"$SFH" run f6badtpl.yaml --runs-dir f6bt2-runs -q > f6btr.out 2> f6btr.err
+check "F6: and a real run refuses it before the probe step spends anything" 2 $?
+if grep -rqF '"event":"step_start"' f6bt2-runs 2>/dev/null; then
+  echo "FAIL - F6: the guarded step ran before the bad route template was caught"
+  fail=$((fail + 1))
+else
+  echo "ok   - F6: no step ran before the route template was checked"
+  pass=$((pass + 1))
+fi
+
+# --- F5: on_budget, the landing before the cliff ------------------------------
+# A ceiling is a cliff: max_cost_usd / wall_clock_sec end the run with an error
+# and nothing handed back. on_budget turns the last slice of the budget into a
+# landing strip - threshold = ceiling - reserve, per axis - so the flow gets one
+# chance to wrap up. The resume test comes FIRST, because "once per run" is the
+# only part of this feature that a crash can silently undo.
+
+# 1. Once per run, ACROSS a resume. Reported cost survives a resume, so a
+#    resumed run arrives with the threshold already crossed and would land a
+#    second time if the log did not say it already had. The landing target is
+#    `stuck`, the idiom the README recommends: work saved, exit 4, a human
+#    looks. Resuming re-runs the step the landing pre-empted.
+cat > f5-resume.yaml <<YAML
+name: f5-resume
+defaults:
+  max_cost_usd: 1.0
+  on_budget: goto:stuck
+  budget_reserve: { cost_usd: 0.95 }
+steps:
+  - id: spend
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    env:
+      SFH_STUB_COST: "0.10"
+    prompt: "spend some budget"
+  - id: after
+    cmd: ["echo", "AFTER-RAN"]
+YAML
+"$SFH" run f5-resume.yaml --runs-dir f5r-runs -q > f5r1.out 2> f5r1.err
+check "F5: crossing the cost threshold lands on stuck (exit 4)" 4 $?
+F5R_DIR="$(dirname "$(find f5r-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F5: the landing is logged as an event" '"event":"budget_landing"' "$F5R_DIR/log.jsonl"
+contains "F5: the landing names the axis that crossed" '"trigger":"cost"' "$F5R_DIR/log.jsonl"
+contains "F5: the landing records what had been spent" '"spent_usd":0.1' "$F5R_DIR/log.jsonl"
+contains "F5: the landing is recorded as a position, via budget" '"via":"budget"' "$F5R_DIR/log.jsonl"
+if grep -qF "AFTER-RAN" f5r1.out; then
+  echo "FAIL - F5: the landing did not pre-empt the next step"
+  fail=$((fail + 1))
+else
+  echo "ok   - F5: the step the landing pre-empted did not run"
+  pass=$((pass + 1))
+fi
+"$SFH" run f5-resume.yaml --runs-dir f5r-runs --resume "$F5R_DIR" -q > f5r2.out 2> f5r2.err
+check "F5: the resumed run finishes instead of landing again" 0 $?
+contains "F5: the resume ran the step the landing had pre-empted" "AFTER-RAN" f5r2.out
+F5R_LANDINGS="$(grep -cF '"event":"budget_landing"' "$F5R_DIR/log.jsonl")"
+check "F5: one landing per run, resume included" 1 "$F5R_LANDINGS"
+"$SFH" runs show "$F5R_DIR" > f5r-show.out 2>&1
+contains "F5: runs show reports the landing" "budget  : landed on cost" f5r-show.out
+
+# 2. The wall-clock axis, on its own clock. Threshold is 120 - 118 = 2s, so the
+#    first step (3s) puts the run over it while the ceiling itself is still two
+#    minutes away - the landing has to be what ends the loop, not the ceiling.
+cat > f5-wall.yaml <<YAML
+name: f5-wall
+defaults:
+  wall_clock_sec: 120
+  on_budget: goto:wrap
+  budget_reserve: { wall_clock_sec: 118 }
+steps:
+  - id: work
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-sleep", "3", "--stub-last-line", "WORKED"]
+    route:
+      - goto: work
+  - id: wrap
+    cmd: ["echo", "WRAPPED"]
+YAML
+"$SFH" run f5-wall.yaml --runs-dir f5w-runs -q > f5w.out 2> f5w.err
+check "F5: a wall-clock landing ends the loop and the run succeeds" 0 $?
+F5W_DIR="$(dirname "$(find f5w-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F5: the wall-clock landing names its axis" '"trigger":"wall_clock"' "$F5W_DIR/log.jsonl"
+contains "F5: the landing target ran" "WRAPPED" f5w.out
+F5W_WORK="$(grep -F '"event":"step_end"' "$F5W_DIR/log.jsonl" | grep -cF '"step":"work"')"
+check "F5: the looping step ran once before the landing" 1 "$F5W_WORK"
+
+# 3. The reserve is headroom, not an extension. Once the landing has been spent
+#    the ceiling check is all that is left, and a landing chain that eats the
+#    reserve too ends the run the old way: an error, fail-closed.
+cat > f5-overrun.yaml <<YAML
+name: f5-overrun
+defaults:
+  wall_clock_sec: 5
+  on_budget: goto:wrap
+  budget_reserve: { wall_clock_sec: 4 }
+steps:
+  - id: work
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-sleep", "2", "--stub-last-line", "WORKED"]
+    route:
+      - goto: work
+  - id: wrap
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-sleep", "6", "--stub-last-line", "WRAPPED"]
+    route:
+      - goto: tail
+  - id: tail
+    cmd: ["echo", "TAIL-RAN"]
+YAML
+"$SFH" run f5-overrun.yaml --runs-dir f5o-runs -q > f5o.out 2> f5o.err
+check "F5: eating the reserve too still fails at the ceiling" 1 $?
+contains "F5: the ceiling failure is the old wall_clock_sec one" "exceeded wall_clock_sec" f5o.err
+F5O_DIR="$(dirname "$(find f5o-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F5: the landing had fired before the ceiling did" '"event":"budget_landing"' "$F5O_DIR/log.jsonl"
+if grep -qF "TAIL-RAN" f5o.out; then
+  echo "FAIL - F5: the run continued past the ceiling"
+  fail=$((fail + 1))
+else
+  echo "ok   - F5: the ceiling still stops the run dead"
+  pass=$((pass + 1))
+fi
+
+# 4. The template variables. remaining_* is the string `unlimited` on an axis
+#    with no ceiling - not 0, and not empty, either of which reads as a budget
+#    that has run out.
+cat > f5-vars.yaml <<'YAML'
+name: f5-vars
+defaults:
+  max_cost_usd: 2.0
+steps:
+  - id: show
+    cmd: ["echo", "SPENT={{budget.spent_usd}} SECS={{budget.elapsed_sec}} RUSD={{budget.remaining_usd}} RSEC={{budget.remaining_sec}}"]
+YAML
+"$SFH" run f5-vars.yaml --runs-dir f5v-runs -q > f5v.out 2> f5v.err
+check "F5: the budget template variables render" 0 $?
+contains "F5: spend renders to four decimals" "SPENT=0.0000" f5v.out
+contains "F5: elapsed seconds render" "SECS=0" f5v.out
+contains "F5: a declared ceiling renders as what is left" "RUSD=2.0000" f5v.out
+contains "F5: an undeclared ceiling renders as unlimited" "RSEC=unlimited" f5v.out
+
+# 5. dry-run shows the one goto that appears in no step's route:.
+cat > f5-dry.yaml <<'YAML'
+name: f5-dry
+defaults:
+  max_cost_usd: 60.0
+  wall_clock_sec: 43200
+  on_budget: goto:wrap
+  budget_reserve: { cost_usd: 2.0, wall_clock_sec: 900 }
+steps:
+  - id: work
+    cmd: ["echo", "work"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" run f5-dry.yaml --runs-dir f5d-runs --dry-run > f5d.out 2> f5d.err
+check "F5: a flow with a landing dry-runs" 0 $?
+contains "F5: dry-run prints the landing and both reserves" "budget landing: goto wrap (cost reserve \$2.00, wall reserve 900s)" f5d.out
+
+# 6. validate. Each half of the feature is useless without the other, and a
+#    landing that names nothing real is a silent dead end - all refused loudly.
+cat > f5-bad-reserve.yaml <<'YAML'
+name: f5-bad-reserve
+defaults:
+  max_cost_usd: 10.0
+  budget_reserve: { cost_usd: 1.0 }
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+YAML
+"$SFH" validate f5-bad-reserve.yaml > f5br.out 2> f5br.err
+check "F5: a reserve with no on_budget is refused" 2 $?
+contains "F5: the refusal names on_budget" "on_budget" f5br.err
+cat > f5-bad-noceiling.yaml <<'YAML'
+name: f5-bad-noceiling
+defaults:
+  on_budget: goto:wrap
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" validate f5-bad-noceiling.yaml > f5bn.out 2> f5bn.err
+check "F5: on_budget with no ceiling at all is refused" 2 $?
+contains "F5: the refusal names the missing ceilings" "max_cost_usd" f5bn.err
+cat > f5-bad-goto.yaml <<'YAML'
+name: f5-bad-goto
+defaults:
+  wall_clock_sec: 60
+  on_budget: goto:nowhere
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+YAML
+"$SFH" validate f5-bad-goto.yaml > f5bg.out 2> f5bg.err
+check "F5: a landing on a step that does not exist is refused" 2 $?
+contains "F5: the refusal names the missing target" "nowhere" f5bg.err
+cat > f5-bad-form.yaml <<'YAML'
+name: f5-bad-form
+defaults:
+  wall_clock_sec: 60
+  on_budget: wrap
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" validate f5-bad-form.yaml > f5bf.out 2> f5bf.err
+check "F5: on_budget without the goto: prefix is refused" 2 $?
+contains "F5: the refusal shows the accepted spelling" "goto:<id>" f5bf.err
+cat > f5-terminals.yaml <<'YAML'
+name: f5-terminals
+defaults:
+  wall_clock_sec: 60
+  on_budget: goto:stuck
+  budget_reserve: { wall_clock_sec: 30 }
+steps:
+  - id: a
+    cmd: ["echo", "a"]
+YAML
+"$SFH" validate f5-terminals.yaml > f5t.out 2> f5t.err
+check "F5: landing on the stuck terminal validates" 0 $?
+
+# 7. The reserve is not optional. Threshold = ceiling - reserve, so a reserve of
+#    zero puts the landing ON the ceiling: the landing fires, logs its event,
+#    prints "-> goto wrap", and the ceiling check at the top of the very next
+#    iteration ends the run on the same numbers with the landing chain unrun.
+#    That is the whole feature doing nothing in its shortest spelling, so it is
+#    refused where every other half-configured budget guard is refused. Per axis,
+#    because the axes never lend to each other.
+cat > f5-no-reserve.yaml <<'YAML'
+name: f5-no-reserve
+defaults:
+  wall_clock_sec: 60
+  on_budget: goto:wrap
+steps:
+  - id: work
+    cmd: ["echo", "work"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" validate f5-no-reserve.yaml > f5nr.out 2> f5nr.err
+check "F5: a landing that holds nothing back is refused" 2 $?
+contains "F5: the refusal names the axis with no reserve" "wall_clock_sec" f5nr.err
+contains "F5: the refusal says the landing chain would not run" "landing chain unrun" f5nr.err
+# The mixed case is the one that hides: cost is reserved, so the flow LOOKS
+# configured, and the wall-clock landing is still a no-op.
+cat > f5-half-reserve.yaml <<'YAML'
+name: f5-half-reserve
+defaults:
+  max_cost_usd: 10.0
+  wall_clock_sec: 60
+  on_budget: goto:wrap
+  budget_reserve: { cost_usd: 5.0 }
+steps:
+  - id: work
+    cmd: ["echo", "work"]
+  - id: wrap
+    cmd: ["echo", "wrap"]
+YAML
+"$SFH" validate f5-half-reserve.yaml > f5hr.out 2> f5hr.err
+check "F5: reserving one axis does not buy the other a landing" 2 $?
+contains "F5: the refusal names the unreserved axis, not the reserved one" \
+  "wall_clock_sec holds nothing back" f5hr.err
+# And a run of the shape that used to be silent: it never gets to run at all.
+"$SFH" run f5-no-reserve.yaml --runs-dir f5nr-runs -q > f5nrr.out 2> f5nrr.err
+check "F5: and the same flow is refused by run, not just by validate" 2 $?
+if grep -qF '"event":"budget_landing"' f5nr-runs/*/log.jsonl 2>/dev/null; then
+  echo "FAIL - F5: a zero-reserve landing was advertised by a real run"
+  fail=$((fail + 1))
+else
+  echo "ok   - F5: no run ever reports a landing it cannot deliver"
+  pass=$((pass + 1))
+fi
+# --- F1: when_members, the deterministic fan-out vote -------------------------
+# Counting agreement by grepping the aggregate is broken three ways: it needs a
+# shell, it counts a needle QUOTED inside the prose, and a group's route only
+# ever saw the whole concatenation's last line. The decisive fact is subtler: a
+# fan-out's ROUTING text carries a failed member's raw output with no banner at
+# all (the "[sfh: FAILED]" marker goes on the labeled aggregate only), so no
+# amount of text matching can tell "said VOTE-YES" from "said VOTE-YES and
+# exited 1". The vote is counted from the engine's own record of each member.
+#
+# The resume tests come first, per spec invariant 7: this feature decides
+# branches from data that has to survive a crash, and a resume that re-decides
+# differently from live is the failure mode worth writing down first.
+
+# --- F1 resume: the aggregate_end snapshot decides exactly as live did --------
+# vc says the winning words and exits 1. Live must not count it; a resume that
+# re-reads the routing text instead of the member record would find three
+# VOTE-YES lines and take the other branch.
+cat > f1-banner.yaml <<YAML
+name: f1-banner
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: va
+        cmd: ["echo", "VOTE-YES"]
+        on_error: continue
+      - id: vb
+        cmd: ["echo", "VOTE-YES"]
+        on_error: continue
+      - id: vc
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "VOTE-YES", "--stub-exit", "1"]
+        on_error: continue
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 3 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-banner.yaml --runs-dir f1b-runs -q > f1b.out 2> f1b.err
+check "F1: a group whose member failed still routes (on_error: continue)" 0 $?
+F1B_DIR="$(dirname "$(find f1b-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F1: the member that said the words but exited 1 is not counted" "NO-CONSENSUS" f1b.out
+if grep -qF "ALL-AGREED" f1b.out; then
+  echo "FAIL - F1: a failed member was counted as a vote"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: exit status decides the vote, not the text"
+  pass=$((pass + 1))
+fi
+# The point of the test, stated as a fact about the run dir: the text a string
+# count would have read really does hold three copies of the needle.
+F1B_LINES="$(grep -c '^VOTE-YES$' "$F1B_DIR/fan.plain.txt")"
+check "F1: the routing text carries the failed member's words unmarked" 3 "$F1B_LINES"
+contains "F1: aggregate_end snapshots the member that failed" '"exit":1,"id":"vc","last_line":"VOTE-YES","ok":false' "$F1B_DIR/log.jsonl"
+contains "F1: aggregate_end snapshots a member that passed" '"exit":0,"id":"va","last_line":"VOTE-YES","ok":true' "$F1B_DIR/log.jsonl"
+
+# Cut the log where a crash between the aggregate and the routing decision would
+# have cut it: everything through aggregate_end, nothing after. The snapshot is
+# the real writer's, not a hand-built one.
+cp -r "$F1B_DIR" f1-snap
+awk '/"event":"aggregate_end"/ { print; exit } { print }' "$F1B_DIR/log.jsonl" > f1-snap/log.jsonl
+"$SFH" run f1-banner.yaml --resume f1-snap -q > f1snap.out 2> f1snap.err
+check "F1: a run killed between the aggregate and the route resumes" 0 $?
+contains "F1: the resumed route decides from the snapshot, as live did" "NO-CONSENSUS" f1snap.out
+if grep -qF "ALL-AGREED" f1snap.out; then
+  echo "FAIL - F1: the resumed route counted the failed member"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: live and resumed agree on who voted"
+  pass=$((pass + 1))
+fi
+
+# The same snapshot, same cut, one rule change: two votes are now enough.
+# Without this the pair above would also pass an implementation that counts
+# nobody at all.
+sed 's/at_least: 3/at_least: 2/' f1-banner.yaml > f1-banner2.yaml
+"$SFH" run f1-banner2.yaml --runs-dir f1b2-runs -q > f1b2.out 2> f1b2.err
+check "F1: the two members that finished cleanly do carry the vote" 0 $?
+contains "F1: two clean votes meet at_least: 2" "ALL-AGREED" f1b2.out
+
+# --- F1 resume: a snapshot without member records is refused, never guessed --
+# Only reachable by editing a flow onto a run made before the records existed.
+# Falling through to the catch-all would change routing by run generation, in
+# silence, so it is an error with a name.
+# From the ORIGINAL run dir, not from f1-snap: that one has been resumed to
+# completion by now, and a completed run is refused for an unrelated reason.
+cp -r "$F1B_DIR" f1-nomembers
+awk '/"event":"aggregate_end"/ { print; exit } { print }' "$F1B_DIR/log.jsonl" \
+  | sed 's/"members":\[[^]]*\],//' > f1-nomembers/log.jsonl
+"$SFH" run f1-banner.yaml --resume f1-nomembers -q > f1nm.out 2> f1nm.err
+check "F1: a pending route with no member record fails the run" 1 $?
+contains "F1: the refusal says the run predates per-member records" "predates per-member route records" f1nm.err
+if grep -qE "NO-CONSENSUS|ALL-AGREED" f1nm.out; then
+  echo "FAIL - F1: a route with no member record picked a branch anyway"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: no branch is taken when the votes cannot be known"
+  pass=$((pass + 1))
+fi
+
+# --- F1 resume: members carried over from a crashed lap still vote ------------
+# The other resume shape: the group itself was cut in half, so there is no
+# aggregate_end at all. The members that finished are restored and skipped on
+# the way back in, and their votes have to come back with them - `all: true`
+# fails the moment one of the three goes missing from the count.
+cat > f1-carry.yaml <<'YAML'
+name: f1-carry
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: ca
+        cmd: ["echo", "VOTE-YES"]
+      - id: cb
+        cmd: ["echo", "VOTE-YES"]
+      - id: cc
+        cmd: ["sh", "-c", "if [ -f f1-carry-trip ]; then echo VOTE-YES; else touch f1-carry-trip; exit 7; fi"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: true }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-carry.yaml --runs-dir f1c-runs -q > f1c1.out 2> f1c1.err
+check "F1: the first lap dies on the member that is not primed yet" 1 $?
+F1C_DIR="$(ls -d f1c-runs/*/ | head -1 | sed 's:/*$::')"
+"$SFH" run f1-carry.yaml --resume "$F1C_DIR" --runs-dir f1c-runs -q > f1c2.out 2> f1c2.err
+check "F1: the resumed group runs to the end" 0 $?
+contains "F1: members carried over from the dead lap still count as votes" "ALL-AGREED" f1c2.out
+
+# --- F1: the ordinary case, and what the log says about it -------------------
+cat > f1-all.yaml <<'YAML'
+name: f1-all
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: ua
+        cmd: ["echo", "VOTE-YES"]
+      - id: ub
+        cmd: ["echo", "VOTE-YES"]
+      - id: uc
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 3 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-all.yaml --runs-dir f1a-runs -q > f1a.out 2> f1a.err
+check "F1: three members agreeing meet at_least: 3" 0 $?
+contains "F1: unanimous agreement takes the agreeing branch" "ALL-AGREED" f1a.out
+F1A_DIR="$(dirname "$(find f1a-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F1: the position event records the tally" '"votes":3' "$F1A_DIR/log.jsonl"
+contains "F1: the position event names the voters" '"voters":["ua","ub","uc"]' "$F1A_DIR/log.jsonl"
+contains "F1: a member rule is logged as a rule, not as the catch-all" '"via":"rule","voters"' "$F1A_DIR/log.jsonl"
+contains "F1: the position event names which rule counted" '"rule":0' "$F1A_DIR/log.jsonl"
+
+# --- F1: a needle quoted in the prose is not a vote --------------------------
+# The old grep counted any line equal to the needle anywhere in the body. Only
+# the last non-empty line of a member's own output decides.
+cat > f1-quote.yaml <<YAML
+name: f1-quote
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: qa
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-quote", "VOTE-YES", "--stub-last-line", "VOTE-NO"]
+      - id: qb
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-quote", "VOTE-YES", "--stub-last-line", "VOTE-NO"]
+      - id: qc
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-quote", "VOTE-YES", "--stub-last-line", "VOTE-NO"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-quote.yaml --runs-dir f1q-runs -q > f1q.out 2> f1q.err
+check "F1: a group whose members all quote the needle still routes" 0 $?
+F1Q_DIR="$(dirname "$(find f1q-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F1: the needle really is present in the routing text" "VOTE-YES" "$F1Q_DIR/fan.plain.txt"
+contains "F1: a needle quoted mid-body is not a vote, even at at_least: 1" "NO-CONSENSUS" f1q.out
+contains "F1: the snapshot records the last line, not the quoted one" '"last_line":"VOTE-NO"' "$F1Q_DIR/log.jsonl"
+
+# --- F1: a trailing CR does not cost a member its vote -----------------------
+cat > f1-crlf.yaml <<YAML
+name: f1-crlf
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - id: ra
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", 'VOTE-YES\r']
+      - id: rb
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", 'VOTE-YES\r']
+      - id: rc
+        cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", 'VOTE-YES\r']
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: true }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-crlf.yaml --runs-dir f1r-runs -q > f1r.out 2> f1r.err
+check "F1: a CRLF verdict line runs" 0 $?
+contains "F1: a verdict line ending in CR still matches" "ALL-AGREED" f1r.out
+
+# --- F1: a verdict line that had to be cut is not a vote ----------------------
+# The recorded line stops at 200 characters and the tally compares that. A needle
+# of exactly 200 is legal (validate only refuses LONGER ones), so "equal after
+# cutting" would count a member that said the verdict and then kept talking -
+# a prefix match on the one predicate whose whole job is to be a gate.
+NEEDLE_200="$(printf 'A%.0s' $(seq 1 200))"
+LONG_250="$(printf 'A%.0s' $(seq 1 250))"
+cat > f1-clip.yaml <<YAML
+name: f1-clip
+steps:
+  - id: fan
+    max_parallel: 2
+    parallel:
+      - id: ma
+        cmd: ["printf", "%s\\n", "$LONG_250"]
+      - id: mb
+        cmd: ["printf", "%s\\n", "$NEEDLE_200"]
+    route:
+      - when_members: { last_line_is: "$NEEDLE_200", at_least: 1 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-clip.yaml --runs-dir f1cl-runs -q > f1cl.out 2> f1cl.err
+check "F1: a group with an over-long member line routes" 0 $?
+F1CL_DIR="$(dirname "$(find f1cl-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "F1: the member whose line fits still votes" "ALL-AGREED" f1cl.out
+contains "F1: only the unclipped member is named a voter" '"voters":["mb"]' "$F1CL_DIR/log.jsonl"
+contains "F1: the clipped member is recorded as clipped" '"clipped":true,"exit":0,"id":"ma"' "$F1CL_DIR/log.jsonl"
+contains "F1: a line that fit whole is recorded as unclipped" '"clipped":false,"exit":0,"id":"mb"' "$F1CL_DIR/log.jsonl"
+# The decisive half: unanimity must not be completed by a line nobody can read
+# to the end. Both members' RECORDED lines are byte-identical here.
+sed 's/at_least: 1/all: true/' f1-clip.yaml > f1-clip-all.yaml
+"$SFH" run f1-clip-all.yaml --runs-dir f1cla-runs -q > f1cla.out 2> f1cla.err
+check "F1: the same group under all: true still routes" 0 $?
+contains "F1: a cut line cannot complete a unanimous vote" "NO-CONSENSUS" f1cla.out
+if grep -qF "ALL-AGREED" f1cla.out; then
+  echo "FAIL - F1: a prefix match was counted as a vote"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: an unreadable verdict falls to the non-matching side"
+  pass=$((pass + 1))
+fi
+
+# --- F1 resume: the denominator comes from the flow, not from the record ------
+# A snapshot of N members satisfies `all: true` on its own terms. Editing the
+# group to N+1 needs --force-resume, which is exactly when this happens, so the
+# resumed run would report unanimity on a member that was never asked - while a
+# live run of the same flow takes the other branch.
+cat > f1-grow.yaml <<'YAML'
+name: f1-grow
+steps:
+  - id: fan
+    max_parallel: 3
+    parallel:
+      - {id: ga, cmd: ["echo", "VOTE-YES"], on_error: continue}
+      - {id: gb, cmd: ["echo", "VOTE-YES"], on_error: continue}
+      - {id: gc, cmd: ["echo", "VOTE-YES"], on_error: continue}
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: true }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-grow.yaml --runs-dir f1g-runs -q > f1g.out 2> f1g.err
+check "F1: the three-member group agrees live" 0 $?
+contains "F1: three of three is unanimous" "ALL-AGREED" f1g.out
+F1G_DIR="$(dirname "$(find f1g-runs -type f -name 'log.jsonl' -print -quit)")"
+cp -r "$F1G_DIR" f1-grow-snap
+awk '/"event":"aggregate_end"/ { print; exit } { print }' "$F1G_DIR/log.jsonl" \
+  > f1-grow-snap/log.jsonl
+sed 's/      - {id: gc, .*/&\n      - {id: gd, cmd: ["echo", "VOTE-NO"], on_error: continue}/' \
+  f1-grow.yaml > f1-grow4.yaml
+"$SFH" run f1-grow4.yaml --runs-dir f1g4-runs -q > f1g4.out 2> f1g4.err
+check "F1: the four-member flow runs live" 0 $?
+contains "F1: live, the fourth member breaks the unanimity" "NO-CONSENSUS" f1g4.out
+"$SFH" run f1-grow4.yaml --resume f1-grow-snap --force-resume -q > f1gr.out 2> f1gr.err
+check "F1: resuming a three-vote record under a four-member group fails" 1 $?
+contains "F1: the refusal names both counts" \
+  "the recorded vote has 3 member(s) but the flow now declares 4" f1gr.err
+if grep -qF "ALL-AGREED" f1gr.out; then
+  echo "FAIL - F1: a stale snapshot carried a unanimous vote"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: the resumed vote is counted against the group the flow declares"
+  pass=$((pass + 1))
+fi
+
+# --- F1: an empty foreach never agrees ---------------------------------------
+# `all: true` over nothing is true in logic and wrong here: a fan-out that
+# produced no workers has decided nothing (invariant 6, fail-closed).
+cat > f1-empty.yaml <<'YAML'
+name: f1-empty
+steps:
+  - id: each
+    foreach: { from: "[]", split: json }
+    cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: true }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" run f1-empty.yaml --runs-dir f1e-runs -q > f1e.out 2> f1e.err
+check "F1: a foreach that produced no items still routes" 0 $?
+contains "F1: all: true over an empty fan-out does not agree" "NO-CONSENSUS" f1e.out
+if grep -qF "ALL-AGREED" f1e.out; then
+  echo "FAIL - F1: the empty set satisfied all: true"
+  fail=$((fail + 1))
+else
+  echo "ok   - F1: a fan-out with no members has decided nothing"
+  pass=$((pass + 1))
+fi
+
+# A foreach that DOES produce items counts them, so the test above is measuring
+# the empty case and not a foreach that cannot count at all.
+sed 's/from: "\[\]"/from: "a\\nb"/; s/split: json/split: lines/' f1-empty.yaml > f1-two.yaml
+"$SFH" run f1-two.yaml --runs-dir f1t-runs -q > f1t.out 2> f1t.err
+check "F1: a foreach with items runs" 0 $?
+contains "F1: every item agreeing satisfies all: true" "ALL-AGREED" f1t.out
+
+# --- F1: what validate refuses ------------------------------------------------
+cat > f1-v-leaf.yaml <<'YAML'
+name: f1-v-leaf
+steps:
+  - id: solo
+    cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        goto: end
+YAML
+"$SFH" validate f1-v-leaf.yaml > f1vl.out 2> f1vl.err
+check "F1: when_members on a step with no members is refused" 2 $?
+contains "F1: the refusal says it needs parallel: or foreach:" "parallel" f1vl.err
+
+cat > f1-v-mixed.yaml <<'YAML'
+name: f1-v-mixed
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        when_contains: "something"
+        goto: end
+YAML
+"$SFH" validate f1-v-mixed.yaml > f1vm.out 2> f1vm.err
+check "F1: when_members combined with another condition is refused" 2 $?
+contains "F1: the refusal says the rule must stand alone" "when_contains" f1vm.err
+
+# F1 x F6: the exclusivity has to cover the predicates F6 added too. On a
+# fan-out step when_exit is the GROUP's composite and when_stderr_matches has no
+# file to read, so ANDing either with a per-member tally would put two questions
+# about two different things under one goto - the same trap the text predicates
+# are refused for. Neither branch could write this check alone; it is the merge's.
+for pred in 'when_exit: 0' 'when_stderr_matches: "boom"'; do
+  cat > f1-v-f6mix.yaml <<YAML
+name: f1-v-f6mix
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1 }
+        $pred
+        goto: end
+YAML
+  "$SFH" validate f1-v-f6mix.yaml > f1vx.out 2> f1vx.err
+  check "F1xF6: when_members combined with ${pred%%:*} is refused" 2 $?
+  contains "F1xF6: the refusal names ${pred%%:*}" "${pred%%:*}" f1vx.err
+done
+
+cat > f1-v-none.yaml <<'YAML'
+name: f1-v-none
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES" }
+        goto: end
+YAML
+"$SFH" validate f1-v-none.yaml > f1vn.out 2> f1vn.err
+check "F1: when_members with no quantifier is refused" 2 $?
+contains "F1: the refusal names both quantifiers" "at_least" f1vn.err
+
+cat > f1-v-both.yaml <<'YAML'
+name: f1-v-both
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 1, all: true }
+        goto: end
+YAML
+"$SFH" validate f1-v-both.yaml > f1vb.out 2> f1vb.err
+check "F1: when_members with two quantifiers is refused" 2 $?
+
+# `all: false` parses (deny_unknown_fields lets the KEY through) and then falls
+# to the `_ => false` arm of the tally for ever: a branch the author believes in
+# that can never fire. Nothing else in the suite feeds it to validate.
+cat > f1-v-allfalse.yaml <<'YAML'
+name: f1-v-allfalse
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", all: false }
+        goto: end
+YAML
+"$SFH" validate f1-v-allfalse.yaml > f1va.out 2> f1va.err
+check "F1: all: false is refused (it could never match)" 2 $?
+contains "F1: the refusal names all: false" "all: false" f1va.err
+
+# A needle longer than the recorded verdict line could not match anything, for
+# the same reason a clipped member cannot vote: the comparison happens after the
+# cut. 201 characters is one past the edge.
+NEEDLE_201="$(printf 'A%.0s' $(seq 1 201))"
+cat > f1-v-long.yaml <<YAML
+name: f1-v-long
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "$NEEDLE_201", at_least: 1 }
+        goto: end
+YAML
+"$SFH" validate f1-v-long.yaml > f1vlong.out 2> f1vlong.err
+check "F1: a last_line_is longer than the recorded line is refused" 2 $?
+contains "F1: the refusal names the cut length" "longer than 200 characters" f1vlong.err
+
+cat > f1-v-zero.yaml <<'YAML'
+name: f1-v-zero
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 0 }
+        goto: end
+YAML
+"$SFH" validate f1-v-zero.yaml > f1vz.out 2> f1vz.err
+check "F1: at_least: 0 is refused (it would match a silent fan-out)" 2 $?
+
+cat > f1-v-over.yaml <<'YAML'
+name: f1-v-over
+steps:
+  - id: fan
+    parallel:
+      - id: m1
+        cmd: ["echo", "VOTE-YES"]
+      - id: m2
+        cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 3 }
+        goto: end
+YAML
+"$SFH" validate f1-v-over.yaml > f1vo.out 2> f1vo.err
+check "F1: asking more votes than a parallel group has members is refused" 2 $?
+contains "F1: the refusal counts the members it does have" "2" f1vo.err
+
+# A foreach's size is only known at run time, so the same mistake cannot be
+# caught statically - it has to be accepted by validate and never match.
+cat > f1-v-fe.yaml <<'YAML'
+name: f1-v-fe
+steps:
+  - id: each
+    foreach: { from: "a\nb" }
+    cmd: ["echo", "VOTE-YES"]
+    route:
+      - when_members: { last_line_is: "VOTE-YES", at_least: 99 }
+        goto: agreed
+      - goto: split
+  - id: agreed
+    cmd: ["echo", "ALL-AGREED"]
+    route: [{ goto: end }]
+  - id: split
+    cmd: ["echo", "NO-CONSENSUS"]
+YAML
+"$SFH" validate f1-v-fe.yaml > f1vf.out 2> f1vf.err
+check "F1: a foreach quantifier over its run-time size passes validate" 0 $?
+"$SFH" run f1-v-fe.yaml --runs-dir f1vf-runs -q > f1vfr.out 2> f1vfr.err
+check "F1: and the run it cannot satisfy still finishes" 0 $?
+contains "F1: an unsatisfiable foreach quantifier falls to the catch-all" "NO-CONSENSUS" f1vfr.out
 
 echo
 echo "engine behaviour: $pass passed, $fail failed"

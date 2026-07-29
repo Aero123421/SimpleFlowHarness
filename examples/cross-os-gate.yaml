@@ -1,0 +1,83 @@
+# 3 OS ゲート — 「PASS はそれを出した環境にスコープされる」を配管にしたフロー。
+#
+# **このフローはマシンローカルである。** WSL(ディストリ名 Ubuntu-24.04)と、
+# その中の ~/sfh にある作業用クローンを前提にしている。ディストリ名・パス・
+# 同期元は自分の環境に合わせて書き換えること。他マシンへそのまま持っていける
+# 種類のフローではない(sfh のフローとしては例外的)。CI にも入れない —
+# CI は 3 OS のランナーを持っているので、これはそれを手元で先取りする道具である。
+#
+# 出所: docs/v1-backlog.md「検証環境そのものの穴」。11 ラウンドのレビューと
+# 279 件の挙動テストを通した v1.0.0 が、Linux と macOS では**コンパイルすら
+# 通らなかった**。レビュアー(読み取り専用の AI)はコードを読むだけでコンパイル
+# しないし、Unix 専用の挙動テストは Windows では丸ごとスキップされる。
+# 続けて実際に Linux で走らせたら、Windows では原理的に観測できない挙動の
+# 失敗が 3 件出た。だから「3 OS 対応」を名乗るなら、**環境の数だけゲートが要る**。
+#
+# 3 つのゲート:
+#   1. windows_tests  — このマシン(Windows)でのユニットテスト
+#   2. unix_typecheck — Linux ターゲットへの型検査。**リンカ不要**なので Windows から
+#                       打てる。#[cfg(unix)] 分岐の import 漏れはここで死ぬ
+#   3. wsl_behaviour  — WSL で実際にビルドして挙動テストを走らせる。パーミッションや
+#                       SIGSTOP を通る分岐は、これでしか実行されない
+#
+# macOS 相当のゲートはこのマシンに置けないので CI(3 OS ランナー)に任せている。
+# 手元に Mac があるなら 4 つ目のゲートを足すこと。**主張する環境の数だけゲートが要る**
+# という規則に、手元に無い環境は例外にならない — 誰かがどこかで走らせる必要がある。
+#
+#   rustup target add x86_64-unknown-linux-gnu    # 2 の前提(一度だけ)
+#   sfh run examples/cross-os-gate.yaml
+name: cross-os-gate
+
+profiles:
+  fixer:
+    tool: codex
+    effort: high
+    access: full
+
+defaults:
+  timeout_sec: 3600
+  retry_on: never          # ゲートの失敗は一過性ではない。再試行は嘘をつくだけ
+
+steps:
+  - id: windows_tests
+    cmd: ["cargo", "test"]
+    on_error: goto:fix
+
+  - id: unix_typecheck
+    cmd: ["cargo", "clippy", "--target", "x86_64-unknown-linux-gnu",
+          "--all-targets", "--", "-D", "warnings"]
+    on_error: goto:fix
+
+  # WSL 側は別チェックアウト(~/sfh)。この Windows 側の作業ツリーから HEAD を
+  # 取り込んでから走らせるので、「手元で直したのに向こうは古い」が起きない。
+  # `git checkout -f` は ~/sfh 側の変更を捨てる — あちらは検証用の使い捨て。
+  # bash -lc のスクリプトにテンプレートを書かないこと(シェルに再解釈されるため
+  # sfh が拒否する)。ここは固定文字列でよい。このフロー自体がマシンローカルだから。
+  - id: wsl_behaviour
+    cmd: ["wsl", "-d", "Ubuntu-24.04", "--", "bash", "-lc",
+          "cd ~/sfh && git fetch /mnt/d/AI/SimpleFlowHarness HEAD && git checkout -f FETCH_HEAD && cargo build --release && bash tests/engine_behaviour.sh ./target/release/sfh"]
+    on_error: goto:fix
+
+  - id: all_green
+    cmd: ["sfh", "--version"]
+    route: [{goto: end}]
+
+  # 落ちたゲートだけを直して先頭から回し直す。3 周しても 3 環境が揃わないなら
+  # exit 4 で人間に返す — 「片方の OS でだけ通る」を成功として申告しないため。
+  - id: fix
+    use: fixer
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      sfh の 3 OS ゲートが落ちた。**落ちたゲートだけ**を直せ。
+
+      走っていないゲートのファイルパスは空文字列になる。空のものは無視すること。
+
+      windows_tests  (cargo test):            {{steps.windows_tests.stderr_file}}
+      unix_typecheck (clippy --target linux): {{steps.unix_typecheck.stderr_file}}
+      wsl_behaviour  (WSL engine_behaviour):  {{steps.wsl_behaviour.stderr_file}}
+
+      直したら停止せよ。ゲートは sfh が回し直す。
+      3 OS で同じ挙動になる直し方だけを採ること。`cfg!(windows)` で
+      **判定結果そのもの**が変わる修正は、このゲートを通っても間違いである。
+    route: [{goto: windows_tests}]

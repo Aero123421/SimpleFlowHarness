@@ -142,7 +142,56 @@ struct RunDetails {
     flow: Option<String>,
     sfh_version: Option<String>,
     tools: Value,
+    /// The `on_budget` landing, if this run spent one. Absent (null) is the
+    /// normal case and means the run never came within its reserve of a
+    /// ceiling - not that no budget was declared.
+    budget_landed: Option<BudgetLanding>,
     steps: Vec<StepSummary>,
+}
+
+#[derive(Serialize)]
+struct BudgetLanding {
+    /// "cost" or "wall_clock" - which axis crossed its threshold.
+    trigger: String,
+    spent_usd: f64,
+    elapsed_sec: u64,
+    goto: String,
+}
+
+/// The landing event, read straight out of the log. First one wins: a run gets
+/// one landing, and if a tampered log carries two, reporting the first is the
+/// same "earliest recorded fact" rule the rest of the resume path uses.
+fn budget_landing(dir: &Path) -> Option<BudgetLanding> {
+    let log = std::fs::read_to_string(dir.join("log.jsonl")).ok()?;
+    for line in log.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event.get("event").and_then(Value::as_str) != Some("budget_landing") {
+            continue;
+        }
+        return Some(BudgetLanding {
+            trigger: event
+                .get("trigger")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            spent_usd: event
+                .get("spent_usd")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+            elapsed_sec: event
+                .get("elapsed_sec")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            goto: event
+                .get("goto")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string(),
+        });
+    }
+    None
 }
 
 fn step_summaries(dir: &Path) -> Vec<StepSummary> {
@@ -220,6 +269,7 @@ fn details(dir: &Path) -> RunDetails {
         flow: opt_string(&m, "flow"),
         sfh_version: opt_string(&m, "sfh_version"),
         tools: m.get("tools").cloned().unwrap_or(Value::Null),
+        budget_landed: budget_landing(dir),
         steps,
     }
 }
@@ -302,6 +352,12 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
             .map(|x| x.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    if let Some(b) = &run.budget_landed {
+        println!(
+            "budget  : landed on {} after ${:.4} / {}s -> goto {}",
+            b.trigger, b.spent_usd, b.elapsed_sec, b.goto
+        );
+    }
     if let Some(t) = m.get("tools").and_then(Value::as_object) {
         for (k, v) in t {
             // A tool with several distinct bins records an array of entries.

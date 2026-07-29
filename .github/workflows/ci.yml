@@ -2,7 +2,10 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # Every branch, not just main. v1.0.0 shipped a binary that did not compile
+    # on Linux or macOS because the work branch was never pushed and CI only ran
+    # on main: three OS runners that nothing reaches are not a gate.
+    branches: ['**']
   pull_request:
 
 jobs:

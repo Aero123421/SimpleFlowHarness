@@ -40,7 +40,13 @@ pub struct RetryCfg {
     pub max: u32,
     pub backoff_sec: u64,
     pub mode: RetryMode,
+    /// Silence, in seconds, that makes a timeout count as a hang rather than as
+    /// honest overrun. Only `RetryMode::Transient` consults it.
+    pub hang_after_sec: u64,
 }
+
+/// Default silence before a timeout is read as a hang (seconds).
+pub const DEFAULT_HANG_AFTER_SEC: u64 = 300;
 
 impl Default for RetryCfg {
     fn default() -> Self {
@@ -48,8 +54,25 @@ impl Default for RetryCfg {
             max: 0,
             backoff_sec: 5,
             mode: RetryMode::Transient,
+            hang_after_sec: DEFAULT_HANG_AFTER_SEC,
         }
     }
+}
+
+/// The session this step was resolved to continue or fork, as decided while
+/// preparing it. Recorded in step_start so a reader of log.jsonl can follow the
+/// session lineage without re-deriving it from the flow (which, after an edit
+/// plus --force-resume, no longer describes what actually ran).
+#[derive(Clone)]
+pub struct SessionParent {
+    /// "continue" (same session) or "fork" (a branch of it).
+    pub mode: &'static str,
+    /// The step whose session this one attached to.
+    pub step: String,
+    pub tool: String,
+    /// The PARENT's session id. A fork's own child id is minted inside the
+    /// preset builder and is reported back by the tool, so it lands in step_end.
+    pub id: String,
 }
 
 /// Everything the engine resolves on the main thread before a leaf runs.
@@ -85,8 +108,13 @@ pub struct Prepared {
     /// Declared access of this run (preset steps only); recorded with the
     /// session so later steps cannot resume it at a higher level.
     pub access: Option<preset::Access>,
+    /// Set when continue_from / fork_from resolved to a recorded session.
+    pub session_parent: Option<SessionParent>,
     pub allow_empty: bool,
     pub retry: RetryCfg,
+    /// Run-level activity clock every child of this run touches when it writes
+    /// anything, so `status.json` can say how long the whole run has been quiet.
+    pub run_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -97,6 +125,8 @@ pub struct LeafDone {
     pub timed_out: bool,
     pub interrupted: bool,
     pub dur_ms: u128,
+    /// Silence before the child exited or was killed (see ExecOutcome::idle_ms).
+    pub idle_ms: u64,
     pub attempts: u32,
     pub chain_output: String,
     pub stderr_clean: String,
@@ -236,17 +266,60 @@ pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
         "never" => RetryMode::Never,
         _ => RetryMode::Transient,
     };
+    let hang_after_sec = step
+        .hang_after_sec
+        .or(flow.defaults.hang_after_sec)
+        .unwrap_or(DEFAULT_HANG_AFTER_SEC);
     match r {
         Some(r) => RetryCfg {
             max: r.max,
             backoff_sec: r.backoff_sec.unwrap_or(5),
             mode,
+            hang_after_sec,
         },
         None => RetryCfg {
             max: 0,
             backoff_sec: 5,
             mode,
+            hang_after_sec,
         },
+    }
+}
+
+/// What `{{budget.*}}` renders to for one step. Snapshot values, taken when the
+/// step is prepared: a prompt that says "you have $2 left" has to mean the
+/// moment the prompt was written, not some later moment.
+///
+/// `remaining_*` is None when that axis has no ceiling, which renders as the
+/// string `unlimited` rather than as an empty value or a made-up number - a
+/// prompt reading "0 seconds left" when nothing is capped would be a lie.
+#[derive(Clone, Copy, Default)]
+pub struct BudgetVars {
+    pub spent_usd: f64,
+    pub elapsed_sec: u64,
+    pub remaining_usd: Option<f64>,
+    pub remaining_sec: Option<u64>,
+}
+
+impl BudgetVars {
+    /// `spent_usd` is reported cost so far (restored cost included on a
+    /// resume); `elapsed_sec` is measured from the start of THIS process's flow
+    /// loop, which is the same clock `wall_clock_sec` is judged on.
+    ///
+    /// Both remainders are measured against the CEILING, not against the
+    /// on_budget threshold: the reserve is headroom for the landing chain, and
+    /// a landing step asking "how much is left" means how much is really left.
+    /// They clamp at zero, because "how much budget remains" cannot be a
+    /// negative quantity even when a single step overshot the ceiling.
+    pub fn new(defaults: &flow::Defaults, spent_usd: f64, elapsed_sec: u64) -> Self {
+        Self {
+            spent_usd,
+            elapsed_sec,
+            remaining_usd: defaults.max_cost_usd.map(|m| (m - spent_usd).max(0.0)),
+            remaining_sec: defaults
+                .wall_clock_sec
+                .map(|s| s.saturating_sub(elapsed_sec)),
+        }
     }
 }
 
@@ -266,6 +339,10 @@ pub struct PrepCtx<'a> {
     /// not overridden by an explicit --var: run-derived UNTRUSTED input, barred
     /// from executed-privileged template sinks (rev_break #12).
     pub tainted_vars: &'a HashSet<String>,
+    /// Run-level activity clock handed to every leaf this context prepares.
+    pub run_clock: Option<&'a Arc<std::sync::atomic::AtomicU64>>,
+    /// Spend and time as of now, exposed to templates as `{{budget.*}}`.
+    pub budget: BudgetVars,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -465,6 +542,29 @@ pub fn make_builtins(
     b.insert("visit".into(), visit.to_string());
     b.insert("os".into(), std::env::consts::OS.to_string());
     b.insert("prompt_file".into(), prompt_file.display().to_string());
+    // Cost is printed to 4 decimals everywhere else in sfh (progress lines,
+    // run_end, runs list), so a prompt that quotes it matches what the operator
+    // sees. Seconds are whole, like every other duration in a flow file.
+    b.insert(
+        "budget.spent_usd".into(),
+        format!("{:.4}", cx.budget.spent_usd),
+    );
+    b.insert(
+        "budget.elapsed_sec".into(),
+        cx.budget.elapsed_sec.to_string(),
+    );
+    b.insert(
+        "budget.remaining_usd".into(),
+        cx.budget
+            .remaining_usd
+            .map_or_else(|| "unlimited".to_string(), |v| format!("{v:.4}")),
+    );
+    b.insert(
+        "budget.remaining_sec".into(),
+        cx.budget
+            .remaining_sec
+            .map_or_else(|| "unlimited".to_string(), |v| v.to_string()),
+    );
     b.insert(
         "notes".into(),
         std::fs::read_to_string(cx.notes_file).unwrap_or_default(),
@@ -600,6 +700,7 @@ pub fn prepare_leaf(
     let mut forbid_session: Option<String> = None;
     let mut expect_parent: Option<String> = None;
     let mut warmup_key: Option<String> = None;
+    let mut session_parent: Option<SessionParent> = None;
     let (inv, tool_used) = match &step.cmd {
         Some(flow::Cmd::Shell(s)) => {
             // Substituted values land in a cmd /C | sh -c string. By default
@@ -806,6 +907,14 @@ pub fn prepare_leaf(
                         }
                     }
                 }
+                // Every guard above has passed, so this attachment is the one
+                // the step will actually run under. Record it for step_start.
+                session_parent = Some(SessionParent {
+                    mode: if is_fork { "fork" } else { "continue" },
+                    step: target.clone(),
+                    tool: info.tool.clone(),
+                    id: info.id.clone(),
+                });
                 if is_fork {
                     let child = gen_uuid();
                     let mut b = preset::build_fork(&tool, &info.id, &child, inp, &paths)?;
@@ -959,9 +1068,11 @@ pub fn prepare_leaf(
         chain_file,
         access: tool_used.as_ref().map(|_| eff.access),
         tool: tool_used,
+        session_parent,
         // Custom commands may legitimately print nothing; agent steps may not.
         allow_empty: step.allow_empty.unwrap_or(!is_preset),
         retry: retry_cfg(cx.flow, step),
+        run_clock: cx.run_clock.cloned(),
         quiet: cx.quiet,
         verbose: cx.verbose,
     })
@@ -1263,9 +1374,15 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
         let retryable = match cfg.mode {
             RetryMode::Never => false,
             RetryMode::Any => true,
+            // A timeout used to be categorically non-transient, which was right
+            // for "the model was still working when the clock ran out" and
+            // wrong for "the pipe went dead 38 minutes ago" (B-12). The idle
+            // clock separates them: silence longer than hang_after_sec is a
+            // hang, and a hang is exactly the kind of failure a retry fixes.
             RetryMode::Transient => {
-                !done.timed_out
-                    && execute::is_transient_failure(&done.stderr_clean, &done.chain_output)
+                (!done.timed_out
+                    && execute::is_transient_failure(&done.stderr_clean, &done.chain_output))
+                    || (done.timed_out && done.idle_ms >= cfg.hang_after_sec.saturating_mul(1000))
             }
         };
         if !retryable {
@@ -1273,10 +1390,14 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
         }
         let wait = cfg.backoff_sec.saturating_mul(1u64 << attempt.min(5));
         if !prep.quiet {
+            let why = if done.timed_out {
+                format!("timed out after {}s of silence", done.idle_ms / 1000)
+            } else {
+                format!("exit={}", done.exit_code)
+            };
             eprintln!(
-                "sfh: [{}] transient failure (exit={}), retrying in {wait}s ({}/{})",
+                "sfh: [{}] transient failure ({why}), retrying in {wait}s ({}/{})",
                 prep.tag,
-                done.exit_code,
                 attempt + 1,
                 cfg.max
             );
@@ -1362,6 +1483,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             timed_out: false,
             interrupted: false,
             dur_ms: 0,
+            idle_ms: 0,
             attempts: 1,
             chain_output: String::new(),
             stderr_clean: why,
@@ -1382,9 +1504,12 @@ fn exec_once(p: Prepared) -> LeafDone {
         p.timeout,
         &p.env_remove,
         &p.env_set,
-        // Tee to the step's out file so a long step is observable while it
-        // runs; the cleaned text replaces it once the child exits.
-        Some(p.out_file.clone()),
+        execute::Observe {
+            // Tee to the step's out file so a long step is observable while it
+            // runs; the cleaned text replaces it once the child exits.
+            tee: Some(p.out_file.clone()),
+            run_clock: p.run_clock.clone(),
+        },
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -1398,6 +1523,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 timed_out: false,
                 interrupted: execute::interrupted(),
                 dur_ms: 0,
+                idle_ms: 0,
                 attempts: 1,
                 chain_output: String::new(),
                 stderr_clean: e,
@@ -1501,6 +1627,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         timed_out: outcome.timed_out,
         interrupted: outcome.interrupted,
         dur_ms: outcome.dur_ms,
+        idle_ms: outcome.idle_ms,
         attempts: 1,
         chain_output,
         stderr_clean,
@@ -1920,6 +2047,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         timed_out: false,
         interrupted: false,
         dur_ms: 0,
+        idle_ms: 0,
         attempts: 1,
         chain_output: String::new(),
         stderr_clean: "sfh: internal error: worker thread died before producing a result".into(),
@@ -2356,6 +2484,8 @@ mod tests {
             sessions,
             needed_sessions: needed,
             tainted_vars: no_tainted_vars(),
+            run_clock: None,
+            budget: BudgetVars::default(),
             quiet: true,
             verbose: false,
         }
@@ -3010,6 +3140,8 @@ mod tests {
             sessions: &sessions,
             needed_sessions: &needed,
             tainted_vars: &tainted,
+            run_clock: None,
+            budget: BudgetVars::default(),
             quiet: true,
             verbose: false,
         };
@@ -3057,6 +3189,29 @@ mod tests {
         let bad = check_session(&fork, &parsed_with(None, None, None), "answer")
             .expect("no reported session id on a fork must fail");
         assert!(bad.contains("fork unverified"), "{bad}");
+    }
+
+    #[test]
+    fn budget_vars_measure_against_the_ceiling_and_never_go_negative() {
+        let f: flow::Flow = serde_yaml_ng::from_str(
+            "defaults:\n  max_cost_usd: 2.0\nsteps:\n  - id: a\n    cmd: [\"echo\"]\n",
+        )
+        .expect("test flow parses");
+        let b = BudgetVars::new(&f.defaults, 0.5, 10);
+        assert_eq!(b.spent_usd, 0.5);
+        assert_eq!(b.elapsed_sec, 10);
+        // Measured against max_cost_usd, NOT against the on_budget threshold: a
+        // landing step asking what is left means what is really left.
+        assert_eq!(b.remaining_usd, Some(1.5));
+        // No wall_clock_sec declared, so that axis has no remainder to report -
+        // which make_builtins spells `unlimited` rather than 0.
+        assert_eq!(b.remaining_sec, None);
+        // A single step can overshoot the ceiling before the next check sees
+        // it. "How much budget is left" is then none, not a negative amount.
+        assert_eq!(
+            BudgetVars::new(&f.defaults, 3.0, 10).remaining_usd,
+            Some(0.0)
+        );
     }
 
     #[test]
