@@ -2866,11 +2866,20 @@ cat > f2-status.yaml <<'YAML'
 name: f2-status
 steps:
   - id: slow
-    cmd: ["sh", "-c", "echo HELLO; sleep 8"]
+    cmd: ["sh", "-c", "echo HELLO; sleep 12"]
 YAML
 F2_RUN="$("$SFH" run f2-status.yaml --runs-dir f2-status-runs --detach -q 2>/dev/null)"
 if [ -n "$F2_RUN" ]; then
-  sleep 3
+  # The heartbeat interval is exactly three seconds. Sleeping exactly three
+  # races the heartbeat writer on loaded/macOS runners and can observe the
+  # initial null snapshot even though the reader already saw HELLO. Poll with
+  # a bounded deadline while the deliberately slow child is still running.
+  for _ in 1 2 3 4 5 6 7; do
+    if grep -qF '"last_output_utc": "2' "$F2_RUN/status.json"; then
+      break
+    fi
+    sleep 1
+  done
   contains "status.json dates the current step" '"step_started_utc": "2' "$F2_RUN/status.json"
   contains "status.json records when a child last spoke" '"last_output_utc": "2' "$F2_RUN/status.json"
   contains "status.json carries the visit number" '"visit": 1' "$F2_RUN/status.json"
