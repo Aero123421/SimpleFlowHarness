@@ -415,22 +415,26 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     );
     println!("run dir: {}", snap.dir.display());
     match snap.state {
-        "running" => eprintln!(
+        // Human status is one ordered stdout document. Mixing the summary and
+        // its next-action hint across stdout/stderr lets log collectors splice
+        // the two streams in the middle of a path or line. Scripts should use
+        // `status --json`; the human form stays together here.
+        "running" => println!(
             "sfh: still running (pid {}); `sfh wait` blocks until it finishes",
             snap.pid
         ),
-        "done" => eprintln!(
+        "done" => println!(
             "sfh: result: sfh wait {}",
             execute::shell_quote(&snap.dir.display().to_string())
         ),
         // A stuck run is finished but not done with: the work is saved and
         // waiting on a human, so say how to pick it up again.
-        "stuck" => eprintln!(
+        "stuck" => println!(
             "sfh: this run stopped for a human decision. after fixing what it is stuck on: sfh run {} --resume {}",
             flow_arg(&snap.flow),
             execute::shell_quote(&snap.dir.display().to_string())
         ),
-        "stopped" | "dead" => eprintln!(
+        "stopped" | "dead" => println!(
             "sfh: this run was killed before it finished. resume with: sfh run {} --resume {}",
             flow_arg(&snap.flow),
             execute::shell_quote(&snap.dir.display().to_string())
@@ -542,7 +546,7 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
         return 1;
     }
     println!("stopped {}", dir.display());
-    eprintln!(
+    println!(
         "sfh: killed pid {} and its children. ${:.4} was spent before the stop. resume with: sfh run {} --resume {}",
         snap.pid,
         snap.cost_usd,
@@ -795,14 +799,6 @@ pub fn wait(
                     if let Err(e) = print_result(&snap) {
                         eprintln!("sfh: {e}");
                         return 1;
-                    }
-                    if !quiet {
-                        eprintln!(
-                            "sfh: done. {} steps, ${:.4} reported. run dir: {}",
-                            snap.steps_done,
-                            snap.cost_usd,
-                            snap.dir.display()
-                        );
                     }
                 }
                 "failed" => {

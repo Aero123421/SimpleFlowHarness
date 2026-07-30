@@ -30,12 +30,14 @@ USAGE:
   sfh config show <flow.yaml>             Show merged config (env values redacted)
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
   sfh guide                              Show the compact AI-oriented flow guide
+  sfh help [command]                     Show overall or command-specific usage
   sfh runs list|show|why|clean [...]     Browse, explain or prune past runs
 
 RUN OPTIONS:
   --var key=value     Override a flow variable (repeatable)
   --emit <step-id>    Print this step's output at the end (default: last executed step)
   --runs-dir <dir>    Where to store run artifacts (default: .sfh/runs)
+  --run-dir <dir>     Use this exact run directory (advanced; choose a new/empty path)
   --detach            Run in the background, print the run dir, and exit at once.
                       The run survives this shell and its parent; poll it with
                       `sfh status` and collect it with `sfh wait`.
@@ -78,7 +80,8 @@ FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the sc
   Steps run top-to-bottom unless a route: rule redirects. Templates:
   {{vars.name}} {{steps.<id>.output}} {{steps.<id>.outputs}} {{steps.<id>.output_file}}
   {{steps.<id>.exit}} {{steps.<id>.stderr_file}}
-  {{item}} {{item_index}} {{notes}} {{run_dir}} {{flow_dir}} {{step_id}} {{visit}} {{os}}
+  {{item}} {{item_index}} {{notes}} {{run_dir}} {{flow_dir}} {{prompt_file}}
+  {{step_id}} {{visit}} {{os}}
   {{budget.spent_usd}} {{budget.elapsed_sec}} {{budget.remaining_usd}} {{budget.remaining_sec}}
   (remaining_* is the string `unlimited` when that axis has no ceiling)
   Filters: | head:N | tail:N | truncate:N | lines:A-B | trim | optional | default:text
@@ -90,7 +93,41 @@ fn main() {
     execute::install_process_guard();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
-        Some(cmd) if args.get(1).is_some_and(|a| a == "-h" || a == "--help") => cmd_help(cmd),
+        Some("help") => match args.as_slice() {
+            [_] => {
+                print!("{HELP}");
+                0
+            }
+            [_, command] => cmd_help(command),
+            _ => usage_err("usage: sfh help [command]"),
+        },
+        // These have a second command word, so let their own parser choose the
+        // precise nested help instead of collapsing e.g. `runs list --help`
+        // into the generic `runs` usage.
+        Some("config")
+            if args
+                .iter()
+                .skip(1)
+                .any(|arg| arg == "-h" || arg == "--help") =>
+        {
+            cmd_config(&args[1..])
+        }
+        Some("runs")
+            if args
+                .iter()
+                .skip(1)
+                .any(|arg| arg == "-h" || arg == "--help") =>
+        {
+            cmd_runs(&args[1..])
+        }
+        Some(cmd)
+            if args
+                .iter()
+                .skip(1)
+                .any(|arg| arg == "-h" || arg == "--help") =>
+        {
+            cmd_help(cmd)
+        }
         Some("run") => cmd_run(&args[1..]),
         Some("plan") => cmd_plan(&args[1..]),
         Some("graph") => cmd_graph(&args[1..]),
@@ -107,7 +144,7 @@ fn main() {
             println!("sfh {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        Some("-h") | Some("--help") | Some("help") | None => {
+        Some("-h") | Some("--help") | None => {
             print!("{HELP}");
             0
         }
@@ -122,8 +159,8 @@ fn main() {
 
 fn cmd_help(command: &str) -> i32 {
     let usage = match command {
-        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--detach] [--resume dir|--resume-latest] [--force-resume] [--no-partial-emit] [--dry-run] [-v|-q]",
-        "plan" => "sfh plan <flow.yaml> [--var k=v] [-v|-q]\nResolves every command in an isolated temporary directory and executes nothing.",
+        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--run-dir d] [--detach] [--resume dir|--resume-latest] [--force-resume] [--no-partial-emit] [--dry-run] [-v|-q]\nCommand steps can read their fully rendered prompt from {{prompt_file}}.",
+        "plan" => "sfh plan <flow.yaml> [--var k=v]\nResolves every command in an isolated temporary directory and executes nothing.",
         "graph" => "sfh graph <flow.yaml> [--mermaid]",
         "config" => "sfh config show <flow.yaml> [--show-secrets]",
         "validate" => "sfh validate <flow.yaml> [--var k=v] [--strict] [--json]",
@@ -274,12 +311,7 @@ fn cmd_plan(rest: &[String]) -> i32 {
                 }
                 i += 1;
             }
-            "-v" | "--verbose" | "-q" | "--quiet" => {}
-            flag if flag.starts_with('-') => {
-                return usage_err(&format!(
-                    "sfh plan does not accept run-only option '{flag}'"
-                ))
-            }
+            flag if flag.starts_with('-') => return usage_err(&format!("unknown flag '{flag}'")),
             _ => {
                 flow_files += 1;
                 if flow_files > 1 {
@@ -376,7 +408,7 @@ fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
                         .map_err(|_| "--interval needs seconds".to_string())
                 })
                 .map(|v| interval = v),
-            "-q" | "--quiet" => {
+            "-q" | "--quiet" if is_wait => {
                 quiet = true;
                 Ok(())
             }
@@ -520,20 +552,17 @@ fn cmd_runs(rest: &[String]) -> i32 {
     let mut as_json = false;
     let mut target: Option<PathBuf> = None;
     let sub = rest.first().map(String::as_str).unwrap_or("list");
-    if rest
-        .iter()
-        .skip(1)
-        .any(|arg| arg == "-h" || arg == "--help")
-    {
+    if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
         let usage = match sub {
             "list" => "sfh runs list [--runs-dir d] [-n N] [--json]",
             "show" => "sfh runs show <run-dir> [--json]",
             "why" => "sfh runs why <run-dir> [--json]",
             "clean" => "sfh runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]",
+            "-h" | "--help" => "sfh runs list|show|why|clean [options]",
             _ => "sfh runs list|show|why|clean [options]",
         };
         println!("{usage}");
-        return if matches!(sub, "list" | "show" | "why" | "clean") {
+        return if matches!(sub, "list" | "show" | "why" | "clean" | "-h" | "--help") {
             0
         } else {
             2
@@ -545,12 +574,16 @@ fn cmd_runs(rest: &[String]) -> i32 {
             "--runs-dir" if sub == "list" || sub == "clean" => {
                 need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v))
             }
-            "-n" | "--limit" if sub == "list" => need(rest, &mut i, "-n")
-                .and_then(|v| v.parse().map_err(|_| "-n needs a number".to_string()))
-                .map(|v| limit = v),
+            flag @ ("-n" | "--limit") if sub == "list" => {
+                let label = flag.to_string();
+                need(rest, &mut i, &label)
+                    .and_then(|v| v.parse().map_err(|_| format!("{label} needs a number")))
+                    .map(|v| limit = v)
+            }
             "--older-than" if sub == "clean" => need(rest, &mut i, "--older-than")
                 .and_then(|v| {
-                    v.trim_end_matches('d')
+                    v.strip_suffix('d')
+                        .unwrap_or(v)
                         .parse()
                         .map_err(|_| "--older-than needs days".to_string())
                 })
@@ -603,7 +636,7 @@ fn cmd_runs(rest: &[String]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{cmd_config, cmd_init, cmd_plan, cmd_runs, GUIDE};
+    use super::{cmd_config, cmd_init, cmd_plan, cmd_runs, cmd_watch, Watch, GUIDE};
 
     #[test]
     fn guide_fits_one_screen() {
@@ -741,6 +774,20 @@ steps:
             2,
             "plan must reject run-only options instead of silently changing semantics"
         );
+        for flag in ["-q", "--quiet", "-v", "--verbose"] {
+            assert_eq!(
+                cmd_plan(&["flow.yaml".into(), flag.into()]),
+                2,
+                "plan must reject accepted-looking output flag {flag}"
+            );
+        }
+        for mode in [Watch::Status, Watch::Stop] {
+            assert_eq!(
+                cmd_watch(&["-q".into()], mode),
+                2,
+                "status and stop must reject a quiet flag they do not implement"
+            );
+        }
         assert_eq!(
             super::cmd_run(&[
                 "flow.yaml".into(),

@@ -21,14 +21,29 @@ AI CLI(codex / claude / opencode / grok / agy / pi / cursor / 任意コマンド
 
 ## インストール / Install
 
-[Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest) からバイナリを落として、PATHの通った場所に置くだけ。
+[Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest) からバイナリを取得し、
+チェックサムを確認してPATHの通った場所に置く。
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-windows-x64.zip -OutFile sfh.zip
-Expand-Archive sfh.zip -DestinationPath sfh-bin -Force ; Remove-Item sfh.zip
-.\sfh-bin\sfh.exe --version
+$asset = "sfh-windows-x64.zip"
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\sfh"
+irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset" -OutFile $asset
+irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset.sha256" -OutFile "$asset.sha256"
+$expected = ((Get-Content "$asset.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "SHA-256 mismatch: expected $expected, got $actual" }
+New-Item -ItemType Directory -Force $installDir | Out-Null
+Expand-Archive $asset -DestinationPath $installDir -Force
+$userPath = [string][Environment]::GetEnvironmentVariable("Path", "User")
+if (-not (($userPath -split ';') -contains $installDir)) {
+  $newUserPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $installDir } else { "$userPath;$installDir" }
+  [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+}
+$env:Path = "$installDir;$env:Path"
+sfh --version
+Remove-Item $asset, "$asset.sha256"
 ```
 
 SmartScreenに止められたら「詳細情報 → 実行」。
@@ -36,20 +51,36 @@ SmartScreenに止められたら「詳細情報 → 実行」。
 **Linux (x64) / macOS (Apple Silicon):**
 
 ```bash
-curl -fsSL https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-linux-x64.tar.gz | tar xz sfh
+asset=sfh-linux-x64.tar.gz
 # macOS arm64: sfh-macos-arm64.tar.gz / Intel Mac: sfh-macos-x64.tar.gz / Linux arm64: sfh-linux-arm64.tar.gz
-./sfh --version
+base=https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download
+curl -fLO "$base/$asset"
+curl -fLO "$base/$asset.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "$asset.sha256"
+else
+  shasum -a 256 -c "$asset.sha256"
+fi
+mkdir -p "$HOME/.local/bin"
+tar xzf "$asset" -C "$HOME/.local/bin" sfh
+chmod +x "$HOME/.local/bin/sfh"
+export PATH="$HOME/.local/bin:$PATH" # 次回以降も使うなら同じ行をshell profileへ
+sfh --version
+rm "$asset" "$asset.sha256"
 ```
 
-各アセットには`.sha256`が併置してある。macOSで**ブラウザから**落とした場合は `xattr -dr com.apple.quarantine ./sfh` が必要(curlなら不要)。
+macOSで**ブラウザから**落とした場合は
+`xattr -dr com.apple.quarantine "$HOME/.local/bin/sfh"` が必要(curlなら不要)。
 
 **Rustがあるなら:**
 
 ```bash
-cargo install --git https://github.com/Aero123421/SimpleFlowHarness
+cargo install --git https://github.com/Aero123421/SimpleFlowHarness --tag v1.1.3 --locked
 ```
 
 ソースからは `cargo build --release` → `target/release/sfh(.exe)`。
+更新時は同じ手順で上書きする。古い実行ファイルが先に見つかる場合は、
+PowerShellでは`Get-Command sfh -All`、Unixでは`type -a sfh`でPATH上の候補を確認する。
 
 ## クイックスタート
 
@@ -88,12 +119,14 @@ sfh config show <flow.yaml>            global profile込みの実効設定（env
 sfh config show <flow.yaml> --show-secrets  env値も明示表示（機密出力）
 sfh init [file] [--force]              例のフローファイルを生成
 sfh guide                              AI向けの短いフロー記法ガイド
+sfh help [command]                     全体またはcommand別の使い方を表示
 sfh runs list|show|why|clean [...]     過去の実行を一覧/詳細/因果説明/掃除
 
 run options:
   --var key=value     フロー変数の上書き(複数可)
   --emit <step-id>    最後にstdoutへ出すステップを指定(既定: 最後に実行されたステップ)
   --runs-dir <dir>    成果物の保存先(既定: .sfh/runs)
+  --run-dir <dir>     run dirを固定(高度なCI/入れ子実行向け。新規または空のパスを使う)
   --detach            バックグラウンドで実行し、run dirだけ出して即終了。
                       呼び出したシェルやその親が死んでも実行は続く
   --resume <run-dir>  途中で落ちた実行を再開(完了済みステップは再課金しない)
@@ -130,6 +163,8 @@ exit code: 0=成功 / 1=フロー失敗 / 2=設定・使い方エラー / 4=stuc
 ```
 
 失敗しても**その時点で最後に成功したステップの出力はstdoutに出る**(`--no-partial-emit`で抑制可)。呼び出し元エージェントが「何が取れて何が残っているか」を判断できるようにするため。exit 4(stuck)でも同じ部分出力が出る。
+`sfh wait`が成功した場合もstdoutは結果本文だけで、完了メッセージは後置しない。
+人間向け`sfh status`は順序を保った1つのstdout文書であり、スクリプトでは`status --json`を使う。
 
 ## フローファイル全体像
 
@@ -252,6 +287,10 @@ steps:
 ```
 
 集約は `{{steps.verify.outputs}}`。件数上限100。
+`split: json` は入力全体が配列ならそのまま使い、説明文を含む場合は最後の完全で
+parse可能なJSON配列を採用する。引用番号`[1]`と後続の結果配列を誤結合しない。
+文字列要素はその文字列を、数値・配列・オブジェクト要素はcompact JSONテキストを
+各`{{item}}`へ渡す。
 
 失敗した leaf の途中出力を `on_error: continue` で後段へ渡す場合、sfh は
 `exit` / `timed_out` を含む `[sfh: ... did not complete ...]` バナーを
@@ -604,7 +643,8 @@ Ctrl+C、`sfh stop`、timeout、捕捉可能な終了signalでは、**起動済�
 | `{{steps.ID.stderr_file}}` | 標準エラー出力ファイルのパス |
 | `{{item}}` `{{item_index}}` | foreach内のみ |
 | `{{notes}}` | 共有ノートの現在内容 |
-| `{{run_dir}}` `{{flow_dir}}` `{{step_id}}` `{{visit}}` `{{os}}` `{{prompt_file}}` | 実行環境 |
+| `{{run_dir}}` `{{flow_dir}}` `{{step_id}}` `{{visit}}` `{{os}}` | 実行環境 |
+| `{{prompt_file}}` | 現在のStepでレンダリング済みpromptを保存したファイル。長文を`cmd:`へ引用符なしで渡す |
 | `{{budget.spent_usd}}` `{{budget.elapsed_sec}}` | 報告済みコスト(小数4桁)とrun累積経過秒。resume前の経過も含む |
 | `{{budget.remaining_usd}}` `{{budget.remaining_sec}}` | 上限(`max_cost_usd` / `wall_clock_sec`)までの残り。**上限未設定の軸は文字列 `unlimited`**(0 でも空でもない)。reserve ではなく上限までの残りを出す |
 | `{{raw}}...{{endraw}}` | 中身をそのまま出す。**テンプレートの話をするプロンプト**(「このHandlebarsを直して: `{{user.name}}`」)はこれで囲む。囲まないと未定義キーとして実行前にエラーになる |
@@ -1099,7 +1139,7 @@ grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。
 - **AIステップが空の最終メッセージを返したら失敗扱い**(既定)。空文字が下流のプロンプトに流れ込む事故を防ぐため。意図的なら `allow_empty: true`。
 - **エディタ補完**: フロー先頭に次の1行を足すとVS Code等でスキーマ補完が効く。
-  `# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.2/schema/flow.schema.json`
+  `# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.3/schema/flow.schema.json`
 
 公開形式: [flow](schema/flow.schema.json) /
 [log event](schema/log-event.schema.json) /

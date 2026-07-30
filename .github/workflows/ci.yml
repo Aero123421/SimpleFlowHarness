@@ -76,12 +76,50 @@ jobs:
       - name: Build and package the way release.yml does
         shell: bash
         run: |
+          set -euo pipefail
           cargo build --release --locked
           mkdir pkg && cp target/release/sfh README.md README.en.md LICENSE pkg/
           tar czf sfh-test.tar.gz -C pkg sfh README.md README.en.md LICENSE
+          shasum -a 256 sfh-test.tar.gz > sfh-test.tar.gz.sha256
       - name: Extract exactly like the README says
         shell: bash
         run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c sfh-test.tar.gz.sha256
+          else
+            shasum -a 256 -c sfh-test.tar.gz.sha256
+          fi
           mkdir extract && cd extract
           tar xzf ../sfh-test.tar.gz sfh
           ./sfh --version
+
+  install-docs-windows:
+    # Keep the PowerShell checksum, extraction, PATH, and invocation sequence
+    # executable rather than leaving the most common install path as prose.
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and package the way release.yml does
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item target/release/sfh.exe pkg/
+          Copy-Item README.md, README.en.md, LICENSE pkg/
+          Compress-Archive -Path pkg/* -DestinationPath sfh-test.zip -Force
+          $hash = (Get-FileHash sfh-test.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  sfh-test.zip`n" | Out-File -Encoding ascii -NoNewline sfh-test.zip.sha256
+      - name: Install exactly like the README says
+        shell: pwsh
+        run: |
+          $asset = "sfh-test.zip"
+          $installDir = Join-Path $PWD "installed"
+          $expected = ((Get-Content "$asset.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "SHA-256 mismatch: expected $expected, got $actual" }
+          New-Item -ItemType Directory -Force $installDir | Out-Null
+          Expand-Archive $asset -DestinationPath $installDir -Force
+          $env:Path = "$installDir;$env:Path"
+          sfh --version

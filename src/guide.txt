@@ -16,6 +16,7 @@ steps:
 ```
 This is the only form with exactly the same behavior on Windows, macOS, and Linux.
 Use `sh -c` only to join multiple commands; on Windows it requires Git Bash.
+For long command input, pass the rendered prompt as `{{prompt_file}}` instead of shell quoting it.
 AI GOAL VERDICT — require exactly one final-line token and fail closed:
 ```yaml
 api_version: 1
