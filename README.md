@@ -49,14 +49,7 @@ OS・CPUに合うバイナリの選択、SHA-256検証、展開、ユーザーPA
 brew install Aero123421/tap/sfh
 ```
 
-**WinGet（Windows）**
-
-```powershell
-winget install --id Aero123421.SimpleFlowHarness --exact
-```
-
-更新は公式インストーラーを再実行するか、`brew upgrade sfh` /
-`winget upgrade --id Aero123421.SimpleFlowHarness --exact`。
+更新は公式インストーラーを再実行するか、Homebrewでは`brew upgrade sfh`。
 手動・オフライン導入用のバイナリと個別SHA-256は
 [Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)にある。
 ソースからは`cargo build --release`、または

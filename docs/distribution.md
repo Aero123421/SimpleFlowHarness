@@ -1,8 +1,8 @@
 # Distribution channels
 
 GitHub Releases are the source of truth for every sfh installation channel.
-Homebrew and WinGet must point to immutable, version-specific Release URLs;
-neither channel builds a different binary.
+Homebrew must point to immutable, version-specific Release URLs; it does not
+build a different binary.
 
 ## Release outputs
 
@@ -11,13 +11,11 @@ gate, it publishes:
 
 - five platform archives and their SHA-256 sidecars;
 - `sfh-installer.sh` and `sfh-installer.ps1`, with sidecars;
-- `sfh.rb`, rendered with all four Unix archive hashes, with a sidecar; and
-- `sfh-winget-manifests.zip`, rendered with the Windows archive hash, with a
-  sidecar.
+- `sfh.rb`, rendered with all four Unix archive hashes, with a sidecar.
 
 `scripts/render_distribution.py` is the only code that transfers binary hashes
-into package-manager metadata. Do not maintain another handwritten Formula or
-WinGet manifest in this repository.
+into package-manager metadata. Do not maintain another handwritten Formula in
+this repository.
 
 ## Before tagging
 
@@ -51,26 +49,3 @@ brew test Aero123421/tap/sfh
 Commit and push only after the Formula installs the released version on each
 available macOS/Linux architecture. The Tap may automate copying `sfh.rb` from
 the latest Release, but its test must still execute before committing.
-
-## WinGet
-
-After a Release succeeds, extract `sfh-winget-manifests.zip` into a fresh fork
-of `microsoft/winget-pkgs`. It already contains the required path:
-
-```text
-manifests/a/Aero123421/SimpleFlowHarness/X.Y.Z/
-```
-
-Before opening the one-version manifest PR, run on Windows:
-
-```powershell
-winget validate --manifest manifests\a\Aero123421\SimpleFlowHarness\X.Y.Z
-winget settings --enable LocalManifestFiles
-winget install --manifest manifests\a\Aero123421\SimpleFlowHarness\X.Y.Z
-sfh --version
-winget uninstall --id Aero123421.SimpleFlowHarness --exact
-```
-
-The WinGet catalog is moderated. A GitHub Release is complete before the
-corresponding catalog entry is approved, so keep the version-specific asset
-available permanently.

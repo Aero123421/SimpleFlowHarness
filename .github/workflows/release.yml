@@ -121,7 +121,7 @@ jobs:
             --release-assets-dir release-assets
           (
             cd release-assets
-            for asset in sfh-installer.sh sfh-installer.ps1 sfh.rb sfh-winget-manifests.zip; do
+            for asset in sfh-installer.sh sfh-installer.ps1 sfh.rb; do
               shasum -a 256 "$asset" > "$asset.sha256"
             done
           )
