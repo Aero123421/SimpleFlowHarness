@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.3/schema/status.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.4/schema/status.schema.json",
   "title": "sfh run status",
   "description": "The atomic status.json snapshot in an sfh run directory. Readers must ignore unknown properties for forward compatibility.",
   "type": "object",

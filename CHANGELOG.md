@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.1.4 — 2026-07-30
+
+### 1コマンド導入
+
+- macOS / Linux向け`sfh-installer.sh`とWindows向け`sfh-installer.ps1`を
+  Release assetとして追加した。OS・CPUと最新assetを自動選択し、同梱SHA-256を
+  照合してからユーザー領域へatomicに導入する。既定ではPATHも設定し、再実行による
+  更新、`SFH_VERSION`でのversion固定、`SFH_INSTALL_DIR`、
+  `SFH_NO_MODIFY_PATH`にも対応する。
+- Windows installerは検証済みファイルのMark-of-the-Webを解除し、arm64環境では
+  Windowsのx64互換実行を明示して既存x64 buildを選ぶ。Unix installerは
+  Linux/macOSのx64/arm64を判定し、bash/zsh/fishを含むPATH永続化を扱う。
+- 日英READMEの入口を公式ワンライナー、Homebrew、WinGetへ整理した。手動・
+  オフライン用のbinary/checksumとGit source buildは代替経路として維持する。
+
+### パッケージマネージャとリリース契約
+
+- 5 platformのRelease checksumを唯一の入力として、Homebrew Formulaと
+  WinGet 1.12 multi-file manifestを生成する決定的なrendererを追加した。
+  version、download URL、hashの手書き転記をなくした。
+- Release workflowはbinary build完了後にinstaller、Formula、WinGet manifest bundleと
+  各checksumを生成し、binaryと同じGitHub Releaseへまとめて公開する。
+- CIは3 OSで公式installerを実際のrelease形式に対して実行し、PATHから起動できることと、
+  1 byteでも改変されたarchiveをSHA-256不一致として拒否することを検証する。
+  FormulaのRuby構文、WinGet YAML、欠損・不正checksum、version path traversalも検査する。
+
 ## v1.1.3 — 2026-07-30
 
 ### CLI と出力契約
