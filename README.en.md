@@ -56,14 +56,8 @@ changes.
 brew install Aero123421/tap/sfh
 ```
 
-**WinGet (Windows)**
-
-```powershell
-winget install --id Aero123421.SimpleFlowHarness --exact
-```
-
-Update by rerunning the official installer, or with `brew upgrade sfh` /
-`winget upgrade --id Aero123421.SimpleFlowHarness --exact`. Binaries and
+Update by rerunning the official installer, or with `brew upgrade sfh`.
+Binaries and
 individual SHA-256 files for manual or offline installation remain available
 from [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest).
 To build from source, use `cargo build --release` or

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Render Homebrew and WinGet metadata from one release checksum set."""
+"""Render Homebrew metadata from one release checksum set."""
 
 from __future__ import annotations
 
 import argparse
 import re
 import shutil
-import zipfile
 from pathlib import Path
 
 
@@ -16,7 +15,6 @@ VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][0-9A-Za-z.-]+)?$")
 PLACEHOLDER_RE = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 
 CHECKSUM_ASSETS = {
-    "WINDOWS_X64_SHA256": "sfh-windows-x64.zip",
     "MACOS_ARM64_SHA256": "sfh-macos-arm64.tar.gz",
     "MACOS_X64_SHA256": "sfh-macos-x64.tar.gz",
     "LINUX_ARM64_SHA256": "sfh-linux-arm64.tar.gz",
@@ -55,7 +53,7 @@ def render(template: Path, destination: Path, values: dict[str, str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Render Homebrew and WinGet metadata for an sfh release."
+        description="Render Homebrew metadata for an sfh release."
     )
     parser.add_argument("--version", required=True, help="release version without v")
     parser.add_argument(
@@ -68,12 +66,12 @@ def main() -> None:
         "--output-dir",
         required=True,
         type=Path,
-        help="directory to receive homebrew/ and winget/ trees",
+        help="directory to receive the homebrew/ tree",
     )
     parser.add_argument(
         "--release-assets-dir",
         type=Path,
-        help="also stage sfh.rb and a WinGet manifest zip for GitHub Releases",
+        help="also stage sfh.rb for GitHub Releases",
     )
     args = parser.parse_args()
 
@@ -95,29 +93,9 @@ def main() -> None:
         values,
     )
 
-    winget_root = args.output_dir / "winget"
-    winget_destination = (
-        winget_root
-        / "manifests/a/Aero123421/SimpleFlowHarness"
-        / args.version
-    )
-    for template in sorted((ROOT / "packaging/winget").glob("*.template")):
-        render(
-            template,
-            winget_destination / template.name.removesuffix(".template"),
-            values,
-        )
-
     if args.release_assets_dir:
         args.release_assets_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(formula, args.release_assets_dir / "sfh.rb")
-        archive = args.release_assets_dir / "sfh-winget-manifests.zip"
-        with zipfile.ZipFile(
-            archive, mode="w", compression=zipfile.ZIP_DEFLATED
-        ) as bundle:
-            for manifest in sorted(winget_root.rglob("*.yaml")):
-                bundle.write(manifest, manifest.relative_to(winget_root))
-        print(archive)
 
 
 if __name__ == "__main__":

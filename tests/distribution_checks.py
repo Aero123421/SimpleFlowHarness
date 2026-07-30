@@ -8,14 +8,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 RENDERER = ROOT / "scripts/render_distribution.py"
 ASSETS = [
-    "sfh-windows-x64.zip",
     "sfh-macos-arm64.tar.gz",
     "sfh-macos-x64.tar.gz",
     "sfh-linux-arm64.tar.gz",
@@ -61,7 +59,7 @@ class DistributionChecks(unittest.TestCase):
             capture_output=True,
         )
 
-    def test_renders_complete_homebrew_and_winget_sets(self) -> None:
+    def test_renders_complete_homebrew_set(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             checksums_dir = work / "checksums"
@@ -76,21 +74,9 @@ class DistributionChecks(unittest.TestCase):
             formula = output / "homebrew/Formula/sfh.rb"
             formula_text = formula.read_text(encoding="utf-8")
             self.assertIn('version "9.8.7"', formula_text)
-            for asset in ASSETS[1:]:
+            for asset in ASSETS:
                 self.assertIn(checksums[asset], formula_text)
             self.assertNotIn("{{", formula_text)
-
-            manifest_dir = (
-                output
-                / "winget/manifests/a/Aero123421/SimpleFlowHarness/9.8.7"
-            )
-            manifests = sorted(manifest_dir.glob("*.yaml"))
-            self.assertEqual(len(manifests), 3)
-            for manifest in manifests:
-                text = manifest.read_text(encoding="utf-8")
-                self.assertIn("PackageVersion: 9.8.7", text)
-                self.assertIn("ManifestVersion: 1.12.0", text)
-                self.assertNotIn("{{", text)
 
             ruby = shutil.which("ruby")
             if ruby:
@@ -101,47 +87,15 @@ class DistributionChecks(unittest.TestCase):
                     capture_output=True,
                 )
                 self.assertEqual(syntax.returncode, 0, syntax.stderr)
-                for manifest in manifests:
-                    yaml_parse = subprocess.run(
-                        [
-                            ruby,
-                            "-e",
-                            "require 'yaml'; YAML.safe_load_file(ARGV.fetch(0))",
-                            str(manifest),
-                        ],
-                        check=False,
-                        text=True,
-                        capture_output=True,
-                    )
-                    self.assertEqual(
-                        yaml_parse.returncode, 0, yaml_parse.stderr
-                    )
-
-            installer = (
-                manifest_dir
-                / "Aero123421.SimpleFlowHarness.installer.yaml"
-            ).read_text(encoding="utf-8")
-            self.assertIn(checksums["sfh-windows-x64.zip"], installer)
-            self.assertIn(
-                "/releases/download/v9.8.7/sfh-windows-x64.zip", installer
-            )
 
             self.assertEqual(
                 (release_assets / "sfh.rb").read_text(encoding="utf-8"),
                 formula_text,
             )
-            with zipfile.ZipFile(
-                release_assets / "sfh-winget-manifests.zip"
-            ) as bundle:
-                self.assertEqual(
-                    sorted(bundle.namelist()),
-                    sorted(
-                        str(path.relative_to(output / "winget")).replace(
-                            "\\", "/"
-                        )
-                        for path in manifests
-                    ),
-                )
+            self.assertEqual(
+                {path.name for path in release_assets.iterdir()},
+                {"sfh.rb"},
+            )
 
     def test_rejects_mismatched_checksum_filename(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -149,7 +103,7 @@ class DistributionChecks(unittest.TestCase):
             checksums_dir = work / "checksums"
             checksums_dir.mkdir()
             write_checksums(checksums_dir)
-            bad = checksums_dir / "sfh-windows-x64.zip.sha256"
+            bad = checksums_dir / "sfh-macos-arm64.tar.gz.sha256"
             bad.write_text(f"{'a' * 64}  another.zip\n", encoding="ascii")
 
             result = self.run_renderer(
