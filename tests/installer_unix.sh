@@ -44,12 +44,12 @@ INSTALL_DIR="$TEST_ROOT/installed"
 mkdir -p "$PACKAGE_DIR" "$ASSET_DIR"
 cp "$BINARY" \
   "$REPO_ROOT/README.md" \
-  "$REPO_ROOT/README.en.md" \
+  "$REPO_ROOT/README.ja.md" \
   "$REPO_ROOT/LICENSE" \
   "$PACKAGE_DIR/"
 
 tar czf "$ASSET_DIR/$ASSET" \
-  -C "$PACKAGE_DIR" sfh README.md README.en.md LICENSE
+  -C "$PACKAGE_DIR" sfh README.md README.ja.md LICENSE
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$ASSET_DIR" && sha256sum "$ASSET" >"$ASSET.sha256")
 else

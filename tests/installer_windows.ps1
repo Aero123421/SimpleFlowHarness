@@ -25,7 +25,7 @@ try {
     Copy-Item -LiteralPath $ResolvedBinary -Destination $PackageDir
     Copy-Item -LiteralPath @(
         (Join-Path $RepoRoot "README.md"),
-        (Join-Path $RepoRoot "README.en.md"),
+        (Join-Path $RepoRoot "README.ja.md"),
         (Join-Path $RepoRoot "LICENSE")
     ) -Destination $PackageDir
 
