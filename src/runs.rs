@@ -309,7 +309,12 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
         .take(limit)
         .map(|d| details(&d))
         .collect();
-    let total_cost_usd: f64 = selected.iter().map(|r| r.summary.cost_usd).sum();
+    // `f64::sum()` uses the additive identity -0.0 for an empty iterator on
+    // supported Rust versions, which surfaced as the nonsensical `$-0.0000`
+    // when no runs existed. Start the fold from an explicit positive zero.
+    let total_cost_usd = selected
+        .iter()
+        .fold(0.0_f64, |total, run| total + run.summary.cost_usd);
 
     if as_json {
         let runs: Vec<&RunSummary> = selected.iter().map(|r| &r.summary).collect();
@@ -325,7 +330,7 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
     }
 
     if selected.is_empty() {
-        eprintln!("no runs under {}", root.display());
+        println!("no runs under {}", root.display());
     } else {
         println!(
             "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>10}  RUN DIR",
@@ -575,7 +580,7 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
 pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
     let dirs = run_dirs(root);
     if dirs.len() <= keep {
-        eprintln!("nothing to clean ({} runs, keeping {keep})", dirs.len());
+        println!("nothing to clean ({} runs, keeping {keep})", dirs.len());
         return 0;
     }
     let now = std::time::SystemTime::now();
@@ -622,7 +627,7 @@ pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
         }
         removed += 1;
     }
-    eprintln!(
+    println!(
         "{} {removed} run dir(s) older than {days}d (kept newest {keep})",
         if dry { "would remove" } else { "removed" }
     );

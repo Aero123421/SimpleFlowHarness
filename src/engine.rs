@@ -1732,6 +1732,9 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
     if opts.verbose {
         args.push("--verbose".into());
     }
+    if opts.quiet {
+        args.push("--quiet".into());
+    }
     // --resume-latest is pinned to a concrete directory here, so a run started
     // in between cannot become the child's target.
     if is_resume {
@@ -1817,6 +1820,9 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
         let _ = execute::kill_pid_tree(d.pid);
         return Err(e);
     }
+    // stdout gets the run dir and nothing else, so a caller can capture it.
+    println!("{}", run_dir.display());
+    let _ = std::io::stdout().flush();
     if !opts.quiet {
         eprintln!(
             "sfh: detached (pid {}). poll with: sfh status {}",
@@ -1824,8 +1830,6 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
             execute::shell_quote(&run_dir.display().to_string())
         );
     }
-    // stdout gets the run dir and nothing else, so a caller can capture it.
-    println!("{}", run_dir.display());
     Ok(0)
 }
 
@@ -2225,6 +2229,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
         }
     };
+    if !opts.dry_run && !opts.quiet {
+        for warning in flow::runtime_warnings(&flow) {
+            eprintln!("sfh: warning: {warning}");
+        }
+    }
     let effective_config = flow.effective_config_json()?;
     let effective_config_fp = fingerprint(&effective_config);
     let mut vars = flow.vars_string_map()?;
@@ -4763,6 +4772,56 @@ fn prepare_compact(
     })
 }
 
+/// Balanced top-level bracket spans in prose, in source order. Brackets inside
+/// JSON strings and nested arrays stay inside the outer candidate. This is
+/// deliberately a small extractor rather than a permissive JSON parser: every
+/// candidate still has to parse as an actual JSON array before it can fan out.
+fn json_array_spans(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in text.char_indices() {
+        if depth == 0 {
+            if ch == '[' {
+                start = Some(index);
+                depth = 1;
+                in_string = false;
+                escaped = false;
+            }
+            continue;
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '[' => depth = depth.saturating_add(1),
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(begin) = start.take() {
+                        spans.push(&text[begin..index + ch.len_utf8()]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
 fn split_items(s: &str, mode: Option<&str>) -> Result<Vec<String>, String> {
     match mode.unwrap_or("lines") {
         "lines" => Ok(s
@@ -4777,16 +4836,36 @@ fn split_items(s: &str, mode: Option<&str>) -> Result<Vec<String>, String> {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(t);
             let v = match parsed {
                 Ok(v) => v,
-                Err(_) => {
-                    let start = t.find('[').ok_or("foreach: no JSON array found in input")?;
-                    let end = t
-                        .rfind(']')
-                        .ok_or("foreach: no JSON array found in input")?;
-                    if end <= start {
-                        return Err("foreach: no JSON array found in input".into());
+                Err(whole_error) => {
+                    // AI output often puts a citation such as `[1]` before its
+                    // final array. Taking first `[` through last `]` joins the
+                    // citation and array into invalid JSON. Walk complete
+                    // balanced candidates from the end and use the last one
+                    // that is genuinely an array; "final structured answer
+                    // wins" is deterministic and keeps nested arrays intact.
+                    let spans = json_array_spans(t);
+                    let mut candidate_error = None;
+                    let mut selected = None;
+                    for candidate in spans.iter().rev() {
+                        match serde_json::from_str::<serde_json::Value>(candidate) {
+                            Ok(value) if value.is_array() => {
+                                selected = Some(value);
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(error) => candidate_error = Some(error),
+                        }
                     }
-                    serde_json::from_str(&t[start..=end])
-                        .map_err(|e| format!("foreach: invalid JSON array: {e}"))?
+                    selected.ok_or_else(|| {
+                        if spans.is_empty() {
+                            "foreach: no JSON array found in input".to_string()
+                        } else {
+                            format!(
+                                "foreach: invalid JSON array: {}",
+                                candidate_error.unwrap_or(whole_error)
+                            )
+                        }
+                    })?
                 }
             };
             let arr = v.as_array().ok_or("foreach: JSON must be an array")?;
@@ -6711,6 +6790,29 @@ mod tests {
         assert_eq!(
             split_items("prose [\"x\", \"y\"] trailing", Some("json")).unwrap(),
             vec!["x", "y"]
+        );
+        assert_eq!(
+            split_items(
+                "See reference [1]. Final answer: [\"x\", \"y\"]",
+                Some("json")
+            )
+            .unwrap(),
+            vec!["x", "y"],
+            "a citation before the final array must not be joined to it"
+        );
+        assert_eq!(
+            split_items(
+                "draft [\"old\"]\nfinal [[\"new\", 1], {\"ok\": true}]",
+                Some("json")
+            )
+            .unwrap(),
+            vec!["[\"new\",1]", "{\"ok\":true}"],
+            "the last complete array wins and nested arrays stay intact"
+        );
+        assert_eq!(
+            split_items("[\"literal ] and [ text\", \"z\"]", Some("json")).unwrap(),
+            vec!["literal ] and [ text", "z"],
+            "brackets inside JSON strings do not end a candidate"
         );
         assert_eq!(split_items("[1, 2]", Some("json")).unwrap(), vec!["1", "2"]);
         assert_eq!(

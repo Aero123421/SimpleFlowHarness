@@ -27,28 +27,63 @@ work; sfh records facts and follows the routes you declared.
 
 ## Install
 
-Download a binary from [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest).
-Each archive has a matching SHA-256 file.
+Download a binary from [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest),
+verify its matching SHA-256 file, and install it on `PATH`.
 
 ```powershell
 # Windows x64
-irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-windows-x64.zip -OutFile sfh.zip
-Expand-Archive sfh.zip -DestinationPath sfh-bin -Force
-.\sfh-bin\sfh.exe --version
+$asset = "sfh-windows-x64.zip"
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\sfh"
+irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset" -OutFile $asset
+irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset.sha256" -OutFile "$asset.sha256"
+$expected = ((Get-Content "$asset.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "SHA-256 mismatch: expected $expected, got $actual" }
+New-Item -ItemType Directory -Force $installDir | Out-Null
+Expand-Archive $asset -DestinationPath $installDir -Force
+$userPath = [string][Environment]::GetEnvironmentVariable("Path", "User")
+if (-not (($userPath -split ';') -contains $installDir)) {
+  $newUserPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $installDir } else { "$userPath;$installDir" }
+  [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+}
+$env:Path = "$installDir;$env:Path"
+sfh --version
+Remove-Item $asset, "$asset.sha256"
 ```
+
+If SmartScreen blocks the downloaded binary, choose **More info → Run anyway**.
 
 ```bash
 # Linux x64; substitute the macOS or Linux arm64 asset when needed
-curl -fsSL https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-linux-x64.tar.gz |
-  tar xz sfh
-./sfh --version
+asset=sfh-linux-x64.tar.gz
+base=https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download
+curl -fLO "$base/$asset"
+curl -fLO "$base/$asset.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "$asset.sha256"
+else
+  shasum -a 256 -c "$asset.sha256"
+fi
+mkdir -p "$HOME/.local/bin"
+tar xzf "$asset" -C "$HOME/.local/bin" sfh
+chmod +x "$HOME/.local/bin/sfh"
+export PATH="$HOME/.local/bin:$PATH" # add this line to your shell profile for future shells
+sfh --version
+rm "$asset" "$asset.sha256"
 ```
+
+For a browser-downloaded macOS binary, remove its quarantine attribute with
+`xattr -dr com.apple.quarantine "$HOME/.local/bin/sfh"` (not needed for `curl`).
 
 With Rust:
 
 ```bash
-cargo install --git https://github.com/Aero123421/SimpleFlowHarness
+cargo install --git https://github.com/Aero123421/SimpleFlowHarness --tag v1.1.3 --locked
 ```
+
+Rerun the same procedure to update. If an older executable still wins, inspect
+all `PATH` matches with `Get-Command sfh -All` in PowerShell or `type -a sfh`
+on Unix.
 
 ## Quick start
 
@@ -85,6 +120,16 @@ steps:
 
 Array-form `cmd` is spawned directly and is the portable default. String-form
 commands use `cmd /C` on Windows and `sh -c` on Unix.
+Use `{{prompt_file}}` when a command should read the fully rendered, possibly
+multiline prompt without putting it through shell quoting:
+
+```yaml
+- id: analyze
+  cmd: ["python", "analyze.py", "{{prompt_file}}"]
+  prompt: |
+    Analyze this input:
+    {{steps.gather.output}}
+```
 
 ## Complex-flow primitives
 
@@ -113,6 +158,12 @@ steps:
 Use `parallel` for heterogeneous workers and `foreach` for data-driven fan-out.
 `when_members` counts only members that exited successfully and ended with the
 exact requested line.
+
+With `foreach.split: json`, a clean JSON array is preferred. If prose surrounds
+the data, sfh selects the last complete, parseable JSON array. This handles
+citation text such as `[1]` before the final array without joining unrelated
+brackets. String elements become their text; numbers, arrays, and objects
+become compact JSON text in each `{{item}}`.
 
 ```yaml
 api_version: 1
@@ -151,21 +202,42 @@ sfh plan flow.yaml                         # isolated, side-effect-free dry run
 sfh graph flow.yaml [--mermaid]
 sfh config show flow.yaml                  # merged profiles; env values redacted
 sfh config show flow.yaml --show-secrets   # explicit sensitive output
-sfh run flow.yaml [--detach] [--resume DIR]
+sfh run flow.yaml [--detach] [--resume DIR] [--run-dir DIR]
 sfh status [RUN] [--json]
 sfh wait [RUN] [--timeout SEC]
 sfh stop [RUN]
+sfh help [COMMAND]
 sfh runs list|show|why|clean ...
 ```
+
+`--run-dir` pins a deterministic artifact directory for advanced CI or nested
+flows. Use a new or empty path; normal runs should prefer `--runs-dir`.
 
 `sfh status` includes active fan-out members and completed/total counts.
 `sfh runs why` reconstructs the last durable position, unfinished leaves, and
 what a resume will rerun.
 
+Human-readable `sfh status` is one ordered stdout document. Scripts should use
+`status --json`. A successful `sfh wait` writes only the flow result to stdout;
+it does not append a completion footer that could corrupt a pipeline.
+
 `sfh config show` prints the fully merged effective configuration but redacts
 every environment value by default. Use `--show-secrets` only when the actual
 values are required for local diagnosis; that output is sensitive and must not
 be pasted into public issue reports.
+
+### Exit codes
+
+| Command | Code | Meaning |
+|---|---:|---|
+| `run` / `status` / `wait` | 0 | Flow completed successfully; status observed `done` |
+| `run` / `status` / `wait` | 1 | Flow failed, or status observed `failed` / `dead` / `stopped` |
+| any command | 2 | Configuration or CLI usage error |
+| `status` / timed `wait` | 3 | Still running; a wait timeout never cancels the run |
+| `run` / `status` / `wait` | 4 | Flow routed to `stuck`; work is saved and needs a human |
+
+Use exit 4 separately from an infrastructure failure when CI should hand saved
+work to a reviewer.
 
 ## Resume and durability contract
 

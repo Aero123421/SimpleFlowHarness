@@ -1062,9 +1062,6 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             }
         }
     }
-    for warning in branch_fallthrough_warnings(flow) {
-        eprintln!("sfh: warning: {warning}");
-    }
     validate_session_dominance(flow)?;
     Ok(())
 }
@@ -1178,7 +1175,11 @@ fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
     Ok(())
 }
 
-fn branch_fallthrough_warnings(flow: &Flow) -> Vec<String> {
+/// Warnings that matter when a flow is executed, rather than only under
+/// `validate --strict`. Callers decide whether their output mode should show
+/// them; validation itself stays side-effect free so `run -q` can actually be
+/// quiet and machine-readable commands are not polluted on stderr.
+pub fn runtime_warnings(flow: &Flow) -> Vec<String> {
     let indices: std::collections::HashMap<&str, usize> = flow
         .steps
         .iter()
@@ -1223,7 +1224,7 @@ fn branch_fallthrough_warnings(flow: &Flow) -> Vec<String> {
 }
 
 pub fn strict_warnings(flow: &Flow) -> Vec<String> {
-    let mut warnings = branch_fallthrough_warnings(flow);
+    let mut warnings = runtime_warnings(flow);
     if flow.api_version.is_none() {
         warnings.push(
             "api_version is omitted; add `api_version: 1` so future format migrations are explicit"
@@ -2735,7 +2736,7 @@ mod tests {
             "steps:\n  - id: choose\n    cmd: echo verdict\n    route:\n      - {when_last_line_is: MET, goto: met}\n      - {when_last_line_is: UNMET, goto: unmet}\n      - {when_last_line_is: UNCLEAR, goto: unclear}\n  - id: met\n    cmd: echo met\n  - id: unmet\n    cmd: echo unmet\n    route: [{goto: end}]\n  - id: unclear\n    cmd: echo unclear\n",
         )
         .unwrap();
-        let warnings = branch_fallthrough_warnings(&flow);
+        let warnings = runtime_warnings(&flow);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("step 'met'"), "{warnings:?}");
         assert!(warnings[0].contains("step 'unmet'"), "{warnings:?}");

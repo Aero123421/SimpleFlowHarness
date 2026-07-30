@@ -1,5 +1,43 @@
 # Changelog
 
+## v1.1.3 — 2026-07-30
+
+### CLI と出力契約
+
+- `sfh help <command>` と、引数の後ろに置いた `--help` を一貫して扱い、
+  `run --help` から高度な `--run-dir` と `{{prompt_file}}` を発見できるようにした。
+  `runs list --help` などの二段subcommandは固有のusageを維持する。
+- `sfh plan -q/-v`、`sfh status -q`、`sfh stop -q` のように、受理しても動作を
+  変えなかったoptionを黙って無視せず、通常のunknown flagとして拒否する。
+- 人向けの`status`と成功した`stop`は、要約と次の操作を一つの順序付きstdout文書へ
+  まとめた。成功した`wait`はフロー結果だけをstdoutへ返し、完了footerを別streamへ
+  後置しない。自動処理向けの`status --json`契約は変更しない。
+- detachはrun dirをflushしてから診断を出し、quiet設定をbackground childへも引き継ぐ。
+  空の`runs list`が`$-0.0000`を表示する問題、`--limit`のエラーが`-n`を名乗る問題、
+  `--older-than 30dd`を30日として受理する問題も修正した。成功した`runs list/clean`の
+  人向けレポートもstdout内で完結する。
+
+### 複雑フローの一貫性
+
+- `foreach.split: json`は入力全体のJSONを優先し、説明文を含む場合は最後の完全で
+  parse可能な配列を採用する。引用番号`[1]`、旧draft、JSON文字列内の括弧、
+  nested array/objectを壊さず、最終構造化回答を決定的にfan-outする。
+- 連続分岐のfallthrough警告をvalidationの副作用から分離し、通常runでは一度だけ、
+  quiet runでは出さないようにした。`validate` / `validate --strict`は従来どおり
+  問題を可視化・厳格化できる。
+- 同梱`research.yaml`は調査・計画をread、成果物作成をwriteへ最小化し、
+  verdictを完全一致で分岐する。反復上限では不完全な要約へ進まず`stuck`で人へ返す。
+
+### インストールとOSS品質
+
+- Release assetと同梱SHA-256を検証し、WindowsはユーザーPATH、Unixは
+  `~/.local/bin`へ導入する手順を日英READMEへ追加した。Rust経由の導入もrelease tagへ
+  pinし、古い`sfh`がPATHで優先される場合の確認方法を明記した。
+- 英語READMEに終了コード、machine-readable status、waitのstdout契約を追加し、
+  日本語READMEと利用者向けの運用情報を揃えた。
+- CIでLinux/macOSのchecksum付き展開に加え、Windows PowerShellのchecksum・展開・
+  PATH経由起動も実行する。公開Schemaと同梱例のversion URLをv1.1.3へ更新した。
+
 ## v1.1.2 — 2026-07-30
 
 ### 複雑フローの安全性

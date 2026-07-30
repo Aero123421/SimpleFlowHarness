@@ -199,6 +199,35 @@ fi
 "$SFH" guide unexpected > guide-args.out 2>&1
 check "guide rejects arguments" 2 $?
 
+# --- CLI help and option contracts -------------------------------------------
+"$SFH" --help > cli-help.out 2> cli-help.err
+check "top-level help succeeds" 0 $?
+contains "top-level help discovers prompt_file" "{{prompt_file}}" cli-help.out
+contains "top-level help discovers command-specific help" "sfh help [command]" cli-help.out
+"$SFH" help run > run-help.out 2> run-help.err
+check "help <command> succeeds" 0 $?
+contains "run help discovers the deterministic run directory" "--run-dir" run-help.out
+contains "run help discovers rendered prompt files" "{{prompt_file}}" run-help.out
+"$SFH" help run ignored > help-extra.out 2> help-extra.err
+check "help rejects silently ignored extra arguments" 2 $?
+contains "help explains its accepted shape" "usage: sfh help [command]" help-extra.err
+"$SFH" runs list --help > runs-list-help.out 2> runs-list-help.err
+check "nested runs help keeps its specific usage" 0 $?
+contains "runs list help names its limit option" "-n N" runs-list-help.out
+
+"$SFH" plan missing-flow.yaml -q > plan-quiet.out 2> plan-quiet.err
+check "plan rejects a quiet flag it does not implement" 2 $?
+contains "plan's error is a normal unknown flag" "unknown flag '-q'" plan-quiet.err
+"$SFH" plan missing-flow.yaml -v > plan-verbose.out 2> plan-verbose.err
+check "plan rejects a verbose flag it does not implement" 2 $?
+contains "verbose is not mislabeled as a run-only concept" "unknown flag '-v'" plan-verbose.err
+"$SFH" status -q > status-quiet.out 2> status-quiet.err
+check "status rejects a quiet flag it does not implement" 2 $?
+contains "status explains the rejected flag" "unknown flag '-q'" status-quiet.err
+"$SFH" stop --quiet > stop-quiet.out 2> stop-quiet.err
+check "stop rejects a quiet flag it does not implement" 2 $?
+contains "stop explains the rejected flag" "unknown flag '--quiet'" stop-quiet.err
+
 # --- routing, foreach fan-out and filters ------------------------------------
 cat > basic.yaml <<'YAML'
 name: basic
@@ -240,6 +269,28 @@ else
   echo "FAIL - aggregate hash did not match plain output AAA\\\\n\\\\nBBB"
   fail=$((fail + 1))
 fi
+
+# JSON fan-out accepts AI prose but deterministically uses the final complete
+# array. A citation or draft array before it must not be glued to the answer.
+cat > foreach-json.yaml <<'YAML'
+api_version: 1
+name: foreach-json
+vars:
+  payload: |
+    See source [1].
+    Draft: ["old"]
+    Final: ["alpha", ["beta", 2], {"ok": true}]
+steps:
+  - id: each
+    foreach: {from: "{{vars.payload}}", split: json}
+    cmd: ["sh", "-c", "printf '%s\n' \"$1\"", "foreach-json", "{{item}}"]
+YAML
+"$SFH" run foreach-json.yaml -q > foreach-json.out 2> foreach-json.err
+check "foreach split=json accepts prose around a final array" 0 $?
+contains "foreach keeps scalar items" "alpha" foreach-json.out
+contains "foreach keeps nested arrays intact" '["beta",2]' foreach-json.out
+contains "foreach keeps object items intact" '{"ok":true}' foreach-json.out
+not_contains "foreach ignores an earlier draft array" "old" foreach-json.out
 
 # --- verdict trailer routing --------------------------------------------------
 cat > verdict.yaml <<'YAML'
@@ -307,6 +358,12 @@ YAML
 check "unterminated consecutive branches are a warning, not an error" 0 $?
 contains "the first leaking branch is named" "step 'met'" branch-fallthrough.out
 contains "the next branch it leaks into is named" "step 'unmet'" branch-fallthrough.out
+"$SFH" run branch-fallthrough.yaml -q > branch-fallthrough-quiet.out 2> branch-fallthrough-quiet.err
+check "quiet run with a branch warning still succeeds" 0 $?
+not_contains "quiet suppresses runtime branch warnings" "consecutive branch destination" branch-fallthrough-quiet.err
+"$SFH" run branch-fallthrough.yaml > branch-fallthrough-run.out 2> branch-fallthrough-run.err
+check "non-quiet run with a branch warning still succeeds" 0 $?
+contains "non-quiet run explains the suspicious fallthrough" "consecutive branch destination" branch-fallthrough-run.err
 
 # --- overlapping contains verdicts are rejected ------------------------------
 cat > overlapping-verdicts.yaml <<'YAML'
@@ -994,6 +1051,7 @@ contains "status --json is machine readable" '"state": "running"' st1.json
 "$SFH" wait "$RUN_DIR" > w.out 2>w.err
 check "wait blocks until the run finishes" 0 $?
 contains "wait prints the flow result" "DETACHED:SLOW-STEP-DONE" w.out
+not_contains "successful wait does not append a diagnostic footer" "sfh: done." w.err
 
 "$SFH" status "$RUN_DIR" > st2.out 2>&1
 check "status reports a finished run as done" 0 $?
@@ -1175,9 +1233,10 @@ YAML
 rm -f ticks.txt
 RUN_DIR3="$("$SFH" run longrun.yaml --detach -q 2>/dev/null)"
 sleep 3
-"$SFH" stop "$RUN_DIR3" > stop.out 2>&1
+"$SFH" stop "$RUN_DIR3" > stop.out 2> stop.err
 check "stop reports success" 0 $?
 contains "stop says what it killed" "killed pid" stop.out
+not_contains "successful stop does not split its report across streams" "killed pid" stop.err
 TICK_AT_STOP="$(cat ticks.txt 2>/dev/null || echo none)"
 sleep 3
 TICK_LATER="$(cat ticks.txt 2>/dev/null || echo none)"
@@ -1437,6 +1496,22 @@ contains "runs show reports per-step visits" '"step": "loop"' runs-show.json
 contains "runs show reports per-step repeats" '"repeat": 1' runs-show.json
 "$SFH" runs clean --older-than 3650 --keep 1 --dry-run > clean.out 2>&1
 check "runs clean --dry-run works" 0 $?
+"$SFH" runs list --limit nope > bad-limit.out 2>&1
+check "runs list rejects a non-numeric long limit" 2 $?
+contains "the long limit error names the flag the user typed" "--limit needs a number" bad-limit.out
+"$SFH" runs clean --older-than 30dd --dry-run > bad-age.out 2>&1
+check "runs clean rejects repeated day suffixes" 2 $?
+contains "the age error explains the expected value" "--older-than needs days" bad-age.out
+mkdir -p empty-runs
+"$SFH" runs list --runs-dir empty-runs > empty-runs.out 2> empty-runs.err
+check "runs list handles an empty directory" 0 $?
+contains "an empty run list describes itself on stdout" "no runs under" empty-runs.out
+not_contains "an empty run list never reports negative zero cost" '$-0.0000' empty-runs.out
+not_contains "a successful empty run list does not split its report" "no runs under" empty-runs.err
+"$SFH" runs clean --runs-dir empty-runs --dry-run > empty-clean.out 2> empty-clean.err
+check "runs clean handles an empty directory" 0 $?
+contains "a no-op clean report stays on stdout" "nothing to clean" empty-clean.out
+not_contains "a no-op clean does not split its report" "nothing to clean" empty-clean.err
 
 # --- a blocking human gate can use a run-local answer file -------------------
 cat > human-gate.yaml <<'YAML'
@@ -1618,7 +1693,7 @@ cat > s12-run/status.json <<JSON
 }
 JSON
 "$SFH" stop s12-run > s12.out 2>s12.err
-if grep -qF "killed pid" s12.err; then
+if grep -qF "killed pid" s12.out || grep -qF "killed pid" s12.err; then
   echo "FAIL - S1-2: sfh stop killed a process from a fake run dir"
   fail=$((fail + 1))
 else
@@ -2749,7 +2824,8 @@ for _ in 1 2 3; do
 done
 check "R-3: a real nonce-less sfh run is stopped successfully" 0 "$r3c_rc"
 contains "R-3: the legacy warning is printed for a real sfh run" "older sfh" r3c.err
-contains "R-3: the kill of the real sfh run is reported" "killed pid" r3c.err
+contains "R-3: the kill of the real sfh run is reported" "killed pid" r3c.out
+not_contains "R-3: the successful stop report is not split" "killed pid" r3c.err
 
 # --- R-5: narrowing args pass; only widening args are refused -----------------
 cat > r5-narrow.yaml <<'YAML'
@@ -2839,7 +2915,8 @@ YAML
 check "R-6: a spaced-name run completes" 0 $?
 R6L_DIR="$(dirname "$(find r6live-runs -type f -name 'log.jsonl' -print -quit)")"
 "$SFH" status "$R6L_DIR" > r6l-status.out 2>r6l-status.err
-contains "R-6: the status hint quotes a run dir with spaces" 'sfh wait "' r6l-status.err
+contains "R-6: the status hint quotes a run dir with spaces" 'sfh wait "' r6l-status.out
+not_contains "R-6: successful human status stays in one stream" 'sfh wait "' r6l-status.err
 
 # --- R-7: an existing --runs-dir keeps its permissions ------------------------
 case "$(uname 2>/dev/null)" in
@@ -2881,7 +2958,8 @@ R1_DIR="$("$SFH" run r1-long.yaml --detach -q 2>/dev/null)"
 sleep 2
 "$SFH" stop "$R1_DIR" > r1.out 2>r1.err
 check "R-1: sfh stop succeeds on this OS (ownership verified)" 0 $?
-contains "R-1: the kill is reported" "killed pid" r1.err
+contains "R-1: the kill is reported" "killed pid" r1.out
+not_contains "R-1: the successful stop report is not split" "killed pid" r1.err
 "$SFH" status "$R1_DIR" > r1-status.out 2>&1
 contains "R-1: the run is recorded as stopped" "stopped" r1-status.out
 
@@ -2945,7 +3023,8 @@ YAML
     "$SFH" stop "$RH_DIR" > rh.out 2>rh.err
     check "sfh stop works on a stale-heartbeat run whose pid is alive" 0 $?
     contains "stop says why it is acting on a 'dead' run" "but process" rh.err
-    contains "the wedged run's kill is reported" "killed pid" rh.err
+    contains "the wedged run's kill is reported" "killed pid" rh.out
+    not_contains "the wedged run's successful stop report is not split" "killed pid" rh.err
     kill -CONT "$RH_PID" 2>/dev/null
     kill -9 "$RH_PID" 2>/dev/null
     ;;
