@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Documentation
+
+- 英語版を標準の`README.md`、日本語版を`README.ja.md`へ整理した。
+  初見利用者向けの導入・最小フロー・主要概念に絞り、詳細仕様はCLIヘルプ、
+  `sfh guide`、examples、公開Schemaへ段階的に案内する構成へ短縮した。
+
 ## v1.1.4 — 2026-07-30
 
 ### 1コマンド導入

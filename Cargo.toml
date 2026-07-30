@@ -8,7 +8,7 @@ license = "MIT"
 authors = ["Aero123421"]
 repository = "https://github.com/Aero123421/SimpleFlowHarness"
 homepage = "https://github.com/Aero123421/SimpleFlowHarness"
-readme = "README.en.md"
+readme = "README.md"
 keywords = ["ai", "cli", "workflow", "orchestration", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 
