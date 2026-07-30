@@ -27,63 +27,49 @@ work; sfh records facts and follows the routes you declared.
 
 ## Install
 
-Download a binary from [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest),
-verify its matching SHA-256 file, and install it on `PATH`.
+**Official installer (no package manager required)**
+
+macOS / Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.sh | sh
+```
+
+Windows PowerShell:
 
 ```powershell
-# Windows x64
-$asset = "sfh-windows-x64.zip"
-$installDir = Join-Path $env:LOCALAPPDATA "Programs\sfh"
-irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset" -OutFile $asset
-irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset.sha256" -OutFile "$asset.sha256"
-$expected = ((Get-Content "$asset.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
-$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actual -ne $expected) { throw "SHA-256 mismatch: expected $expected, got $actual" }
-New-Item -ItemType Directory -Force $installDir | Out-Null
-Expand-Archive $asset -DestinationPath $installDir -Force
-$userPath = [string][Environment]::GetEnvironmentVariable("Path", "User")
-if (-not (($userPath -split ';') -contains $installDir)) {
-  $newUserPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $installDir } else { "$userPath;$installDir" }
-  [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
-}
-$env:Path = "$installDir;$env:Path"
-sfh --version
-Remove-Item $asset, "$asset.sha256"
+irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1 | iex
 ```
 
-If SmartScreen blocks the downloaded binary, choose **More info → Run anyway**.
+The installer selects the correct OS and CPU asset, verifies its SHA-256,
+extracts it, and configures the user `PATH`. You can inspect the
+[Shell](installers/sfh-installer.sh) and
+[PowerShell](installers/sfh-installer.ps1) sources before running them.
+Set `SFH_VERSION=1.1.4` to pin a version, `SFH_INSTALL_DIR` to choose a
+destination, or `SFH_NO_MODIFY_PATH=1` to avoid persistent profile/`PATH`
+changes.
+
+**Homebrew (macOS / Linux)**
 
 ```bash
-# Linux x64; substitute the macOS or Linux arm64 asset when needed
-asset=sfh-linux-x64.tar.gz
-base=https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download
-curl -fLO "$base/$asset"
-curl -fLO "$base/$asset.sha256"
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum -c "$asset.sha256"
-else
-  shasum -a 256 -c "$asset.sha256"
-fi
-mkdir -p "$HOME/.local/bin"
-tar xzf "$asset" -C "$HOME/.local/bin" sfh
-chmod +x "$HOME/.local/bin/sfh"
-export PATH="$HOME/.local/bin:$PATH" # add this line to your shell profile for future shells
-sfh --version
-rm "$asset" "$asset.sha256"
+brew install Aero123421/tap/sfh
 ```
 
-For a browser-downloaded macOS binary, remove its quarantine attribute with
-`xattr -dr com.apple.quarantine "$HOME/.local/bin/sfh"` (not needed for `curl`).
+**WinGet (Windows)**
 
-With Rust:
-
-```bash
-cargo install --git https://github.com/Aero123421/SimpleFlowHarness --tag v1.1.3 --locked
+```powershell
+winget install --id Aero123421.SimpleFlowHarness --exact
 ```
 
-Rerun the same procedure to update. If an older executable still wins, inspect
-all `PATH` matches with `Get-Command sfh -All` in PowerShell or `type -a sfh`
-on Unix.
+Update by rerunning the official installer, or with `brew upgrade sfh` /
+`winget upgrade --id Aero123421.SimpleFlowHarness --exact`. Binaries and
+individual SHA-256 files for manual or offline installation remain available
+from [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest).
+To build from source, use `cargo build --release` or
+`cargo install --git https://github.com/Aero123421/SimpleFlowHarness --tag v1.1.4 --locked`.
+If an older executable still wins, inspect all `PATH` matches with
+`Get-Command sfh -All` in PowerShell or `type -a sfh` on Unix.
 
 ## Quick start
 

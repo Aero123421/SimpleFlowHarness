@@ -21,66 +21,48 @@ AI CLI(codex / claude / opencode / grok / agy / pi / cursor / 任意コマンド
 
 ## インストール / Install
 
-[Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest) からバイナリを取得し、
-チェックサムを確認してPATHの通った場所に置く。
+**公式インストーラー（パッケージマネージャ不要）**
 
-**Windows (PowerShell):**
+macOS / Linux:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.sh | sh
+```
+
+Windows PowerShell:
 
 ```powershell
-$asset = "sfh-windows-x64.zip"
-$installDir = Join-Path $env:LOCALAPPDATA "Programs\sfh"
-irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset" -OutFile $asset
-irm "https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/$asset.sha256" -OutFile "$asset.sha256"
-$expected = ((Get-Content "$asset.sha256" -Raw) -split '\s+')[0].ToLowerInvariant()
-$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actual -ne $expected) { throw "SHA-256 mismatch: expected $expected, got $actual" }
-New-Item -ItemType Directory -Force $installDir | Out-Null
-Expand-Archive $asset -DestinationPath $installDir -Force
-$userPath = [string][Environment]::GetEnvironmentVariable("Path", "User")
-if (-not (($userPath -split ';') -contains $installDir)) {
-  $newUserPath = if ([string]::IsNullOrWhiteSpace($userPath)) { $installDir } else { "$userPath;$installDir" }
-  [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
-}
-$env:Path = "$installDir;$env:Path"
-sfh --version
-Remove-Item $asset, "$asset.sha256"
+irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1 | iex
 ```
 
-SmartScreenに止められたら「詳細情報 → 実行」。
+OS・CPUに合うバイナリの選択、SHA-256検証、展開、ユーザーPATH設定まで自動で行う。
+スクリプトは実行前に
+[Shell版](installers/sfh-installer.sh) /
+[PowerShell版](installers/sfh-installer.ps1)を確認できる。
+`SFH_VERSION=1.1.4`でversion固定、`SFH_INSTALL_DIR`で配置先変更、
+`SFH_NO_MODIFY_PATH=1`でprofile/PATHの永続変更を止められる。
 
-**Linux (x64) / macOS (Apple Silicon):**
+**Homebrew（macOS / Linux）**
 
 ```bash
-asset=sfh-linux-x64.tar.gz
-# macOS arm64: sfh-macos-arm64.tar.gz / Intel Mac: sfh-macos-x64.tar.gz / Linux arm64: sfh-linux-arm64.tar.gz
-base=https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download
-curl -fLO "$base/$asset"
-curl -fLO "$base/$asset.sha256"
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum -c "$asset.sha256"
-else
-  shasum -a 256 -c "$asset.sha256"
-fi
-mkdir -p "$HOME/.local/bin"
-tar xzf "$asset" -C "$HOME/.local/bin" sfh
-chmod +x "$HOME/.local/bin/sfh"
-export PATH="$HOME/.local/bin:$PATH" # 次回以降も使うなら同じ行をshell profileへ
-sfh --version
-rm "$asset" "$asset.sha256"
+brew install Aero123421/tap/sfh
 ```
 
-macOSで**ブラウザから**落とした場合は
-`xattr -dr com.apple.quarantine "$HOME/.local/bin/sfh"` が必要(curlなら不要)。
+**WinGet（Windows）**
 
-**Rustがあるなら:**
-
-```bash
-cargo install --git https://github.com/Aero123421/SimpleFlowHarness --tag v1.1.3 --locked
+```powershell
+winget install --id Aero123421.SimpleFlowHarness --exact
 ```
 
-ソースからは `cargo build --release` → `target/release/sfh(.exe)`。
-更新時は同じ手順で上書きする。古い実行ファイルが先に見つかる場合は、
-PowerShellでは`Get-Command sfh -All`、Unixでは`type -a sfh`でPATH上の候補を確認する。
+更新は公式インストーラーを再実行するか、`brew upgrade sfh` /
+`winget upgrade --id Aero123421.SimpleFlowHarness --exact`。
+手動・オフライン導入用のバイナリと個別SHA-256は
+[Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)にある。
+ソースからは`cargo build --release`、または
+`cargo install --git https://github.com/Aero123421/SimpleFlowHarness --tag v1.1.4 --locked`。
+古い実行ファイルが先に見つかる場合は、PowerShellでは`Get-Command sfh -All`、
+Unixでは`type -a sfh`でPATH上の候補を確認する。
 
 ## クイックスタート
 
@@ -1139,7 +1121,7 @@ grep '"event":"position"' log.jsonl | jq -r '[.after,.via,(.rule|tostring),.next
 - **agyのexit codeは信用しない**(正常完了でexit 1がありうる)。sfhは常にJSONエンベロープの`status`で補正する。
 - **AIステップが空の最終メッセージを返したら失敗扱い**(既定)。空文字が下流のプロンプトに流れ込む事故を防ぐため。意図的なら `allow_empty: true`。
 - **エディタ補完**: フロー先頭に次の1行を足すとVS Code等でスキーマ補完が効く。
-  `# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.3/schema/flow.schema.json`
+  `# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.4/schema/flow.schema.json`
 
 公開形式: [flow](schema/flow.schema.json) /
 [log event](schema/log-event.schema.json) /
@@ -1161,7 +1143,11 @@ bash tests/independent_checks.sh ./target/release/sfh
 sfhをビルドしたのと同じRustツールチェーンが要る。スタブはcargoのターゲットではない
 (`tests/` 直下に置くと統合テストとして拾われてしまうのでサブディレクトリに置いてある)。
 
-CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+READMEのインストール手順そのものを実行して検証する。**トリガーは全ブランチへの push**(main だけにしていた頃、作業ブランチが最後まで push されず、Linux と macOS でコンパイルの通らない v1.0.0 が出た。誰も到達しない 3 OS ランナーはゲートではない)。手元で先回りしたいときは [examples/cross-os-gate.yaml](examples/cross-os-gate.yaml) を使う。
+CIは3OS(Linux/macOS/Windows)でテスト+スモークフロー+公式installerによる導入を実行し、
+checksum不一致も拒否する。**トリガーは全ブランチへの push**(main だけにしていた頃、
+作業ブランチが最後まで push されず、Linux と macOS でコンパイルの通らない v1.0.0が
+出た。誰も到達しない3 OS runnerはゲートではない)。手元で先回りしたいときは
+[examples/cross-os-gate.yaml](examples/cross-os-gate.yaml)を使う。
 
 貢献方法は [CONTRIBUTING.md](CONTRIBUTING.md)、脆弱性報告は
 [SECURITY.md](SECURITY.md)、利用上の問い合わせ範囲は [SUPPORT.md](SUPPORT.md)。
