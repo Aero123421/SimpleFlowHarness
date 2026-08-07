@@ -1,10 +1,14 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.5/schema/log-event.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.0/schema/log-event.schema.json",
   "title": "sfh durable log event",
   "description": "One JSON object from a run directory's append-only log.jsonl. Readers must ignore unknown properties for forward compatibility.",
   "type": "object",
-  "required": ["schema_version", "ts", "event"],
+  "required": [
+    "schema_version",
+    "ts",
+    "event"
+  ],
   "additionalProperties": true,
   "properties": {
     "schema_version": {
@@ -36,33 +40,138 @@
         "run_end"
       ]
     },
-    "step": { "type": "string" },
-    "parent": { "type": ["string", "null"] },
-    "visit": { "type": "integer", "minimum": 0 },
-    "next_fallback": { "type": ["string", "null"] },
-    "postprocess_pending": { "type": "boolean" },
-    "items_total": { "type": "integer", "minimum": 0 },
-    "items_hash": { "type": "string", "minLength": 1 },
-    "precompact_file": { "type": "string", "minLength": 1 },
-    "chain_file": { "type": ["string", "null"] },
-    "out_file": { "type": ["string", "null"] },
+    "step": {
+      "type": "string"
+    },
+    "parent": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "visit": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_fallback": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "postprocess_pending": {
+      "type": "boolean"
+    },
+    "items_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "items_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "precompact_file": {
+      "type": "string",
+      "minLength": 1
+    },
+    "chain_file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "out_file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "output_hash": {
       "type": "string",
       "pattern": "^(?:[0-9a-f]{16}|[0-9a-f]{64})$"
     },
-    "marker": { "type": "string", "minLength": 1 },
-    "exit": { "type": "integer" },
-    "cost_usd": { "type": ["number", "null"], "minimum": 0 },
-    "error": { "type": ["string", "null"] },
+    "marker": {
+      "type": "string",
+      "minLength": 1
+    },
+    "exit": {
+      "type": "integer"
+    },
+    "cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "harness_diagnostic": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "maxLength": 503,
       "description": "Bounded sfh-generated diagnosis for a leaf failure; never copied from tool-controlled stderr."
+    },
+    "protocol_expected": {
+      "type": "string",
+      "enum": [
+        "stdout",
+        "codex-jsonl",
+        "claude-json",
+        "opencode-ndjson",
+        "grok-json",
+        "agy-json",
+        "pi-jsonl",
+        "cursor-json"
+      ],
+      "description": "step_start: the machine-readable protocol this step's tool was asked for. `stdout` is a custom cmd: step, whose plain output is the contract. Added in v1.2.0; absent from older logs."
+    },
+    "protocol_state": {
+      "type": "string",
+      "enum": [
+        "plain",
+        "valid",
+        "missing_terminal",
+        "invalid"
+      ],
+      "description": "step_end: whether the structured protocol held end to end. `valid` means the tool's documented terminal record arrived; `missing_terminal` that the stream stopped before it; `invalid` that the output was not the documented shape. Only `plain` and `valid` may accompany a successful step. Added in v1.2.0; absent from older logs."
+    },
+    "terminal_seen": {
+      "type": "boolean",
+      "description": "step_end: the adapter's documented terminal record was present. Added in v1.2.0."
+    },
+    "terminal_success": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "step_end: the verdict the terminal record itself carried, or null when the adapter's terminal record carries none. Added in v1.2.0."
+    },
+    "final_message_seen": {
+      "type": "boolean",
+      "description": "step_end: a final assistant message was present in the protocol (or its side file). Added in v1.2.0."
+    },
+    "malformed_records": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "step_end: records in the structured stream that the adapter could not parse. Added in v1.2.0."
     }
   },
   "allOf": [
     {
-      "if": { "properties": { "event": { "const": "run_start" } } },
+      "if": {
+        "properties": {
+          "event": {
+            "const": "run_start"
+          }
+        }
+      },
       "then": {
         "required": [
           "sfh_version",
@@ -73,11 +182,29 @@
       }
     },
     {
-      "if": { "properties": { "event": { "const": "step_start" } } },
-      "then": { "required": ["step", "visit", "cmd"] }
+      "if": {
+        "properties": {
+          "event": {
+            "const": "step_start"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "cmd"
+        ]
+      }
     },
     {
-      "if": { "properties": { "event": { "const": "step_end" } } },
+      "if": {
+        "properties": {
+          "event": {
+            "const": "step_end"
+          }
+        }
+      },
       "then": {
         "required": [
           "step",
@@ -91,33 +218,82 @@
       }
     },
     {
-      "if": { "properties": { "event": { "const": "foreach_start" } } },
-      "then": {
-        "required": ["step", "visit", "items_hash", "items_total"]
-      }
-    },
-    {
       "if": {
         "properties": {
-          "event": { "enum": ["group_start", "foreach_start", "aggregate_end"] }
+          "event": {
+            "const": "foreach_start"
+          }
         }
       },
-      "then": { "required": ["step", "visit"] }
-    },
-    {
-      "if": { "properties": { "event": { "const": "position" } } },
-      "then": { "required": ["after", "next", "via"] }
-    },
-    {
-      "if": { "properties": { "event": { "const": "compact_start" } } },
       "then": {
-        "required": ["step", "visit", "precompact_file"]
+        "required": [
+          "step",
+          "visit",
+          "items_hash",
+          "items_total"
+        ]
       }
     },
     {
       "if": {
         "properties": {
-          "event": { "enum": ["compact_end", "compact_failed"] }
+          "event": {
+            "enum": [
+              "group_start",
+              "foreach_start",
+              "aggregate_end"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "position"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "after",
+          "next",
+          "via"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "compact_start"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "precompact_file"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "compact_end",
+              "compact_failed"
+            ]
+          }
         }
       },
       "then": {
@@ -131,18 +307,53 @@
       }
     },
     {
-      "if": { "properties": { "event": { "const": "notes_end" } } },
-      "then": { "required": ["step", "visit", "marker"] }
-    },
-    {
-      "if": { "properties": { "event": { "const": "persistence_failure" } } },
+      "if": {
+        "properties": {
+          "event": {
+            "const": "notes_end"
+          }
+        }
+      },
       "then": {
-        "required": ["step", "visit", "error", "cost_usd"]
+        "required": [
+          "step",
+          "visit",
+          "marker"
+        ]
       }
     },
     {
-      "if": { "properties": { "event": { "const": "run_end" } } },
-      "then": { "required": ["status", "leaf_runs", "cost_usd"] }
+      "if": {
+        "properties": {
+          "event": {
+            "const": "persistence_failure"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "error",
+          "cost_usd"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "run_end"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "leaf_runs",
+          "cost_usd"
+        ]
+      }
     }
   ]
 }

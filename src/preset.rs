@@ -286,6 +286,188 @@ pub fn fork_warmup_pays(tool: &str) -> bool {
     tool == "claude"
 }
 
+/// How much of a run's spend the adapter can actually account for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Coverage {
+    /// The tool reports a cost in its own currency terms.
+    Cost,
+    /// Token counts only; a cost ceiling cannot be enforced from them.
+    TokensOnly,
+}
+
+impl Coverage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Coverage::Cost => "cost",
+            Coverage::TokensOnly => "tokens-only",
+        }
+    }
+}
+
+/// How far `access:` can actually be enforced for a tool, per level. sfh's
+/// `access:` is a request to the CLI's own permission system, never an OS
+/// sandbox, and the four answers below are the honest range of what a CLI does
+/// with that request.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Enforcement {
+    /// The tool has a real sandbox for this level.
+    Sandboxed,
+    /// The tool enforces it in-process (permission config, tool allowlist).
+    Enforced,
+    /// Requested, but the tool's own defaults or config can widen it.
+    BestEffort,
+    /// The tool has no such level; sfh refuses the combination.
+    Unsupported,
+}
+
+impl Enforcement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Enforcement::Sandboxed => "sandboxed",
+            Enforcement::Enforced => "enforced",
+            Enforcement::BestEffort => "best-effort",
+            Enforcement::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// What sfh knows about one adapter without running a model.
+///
+/// `minimum_version` is deliberately `None` for every adapter. The spec asks
+/// for it to be re-confirmed against each CLI's official documentation and a
+/// live probe before being pinned, and pinning a number from memory would let
+/// `preflight` report a confident-looking floor sfh never verified. `preflight`
+/// therefore prints the installed version and says the required floor is
+/// unknown, which is a true statement a user can act on.
+#[derive(Clone, Debug)]
+pub struct AdapterInfo {
+    pub tool: &'static str,
+    pub default_program: String,
+    /// When this adapter's command line was last checked against the real CLI.
+    pub last_verified: &'static str,
+    pub minimum_version: Option<&'static str>,
+    /// The structured protocol its output must complete.
+    pub protocol: &'static str,
+    pub supports_resume: bool,
+    pub supports_fork: bool,
+    pub cost_coverage: Coverage,
+    /// Enforcement for read / write / full, in that order.
+    pub policy_coverage: [Enforcement; 3],
+    /// Flags this adapter's command line depends on. `preflight` looks for
+    /// these in the CLI's own `--help` so a renamed or removed flag surfaces
+    /// before a paid run instead of halfway through one.
+    pub required_flags: &'static [&'static str],
+    /// Known, documented gaps between what `access:` asks for and what the tool
+    /// will actually hold to.
+    pub known_gaps: &'static [&'static str],
+}
+
+impl AdapterInfo {
+    pub fn enforcement(&self, access: Access) -> Enforcement {
+        self.policy_coverage[match access {
+            Access::Read => 0,
+            Access::Write => 1,
+            Access::Full => 2,
+        }]
+    }
+}
+
+/// The date the header of this module records as its live-verification point.
+pub const LAST_VERIFIED: &str = "2026-07-27";
+
+/// Metadata for one preset, or `None` for a name that is not a preset.
+pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
+    use Enforcement::*;
+    let (protocol, cost, policy, flags, gaps): (
+        &'static str,
+        Coverage,
+        [Enforcement; 3],
+        &'static [&'static str],
+        &'static [&'static str],
+    ) = match tool {
+        "codex" => (
+            "codex-jsonl",
+            Coverage::TokensOnly,
+            // codex is the one preset with a real OS sandbox behind -s.
+            [Sandboxed, Sandboxed, BestEffort],
+            &["exec", "--json", "--output-last-message", "-s", "-c"],
+            &["access: full disables the sandbox entirely (--dangerously-bypass-approvals-and-sandbox)"],
+        ),
+        "claude" => (
+            "claude-json",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["-p", "--output-format", "--permission-mode", "--session-id"],
+            &[
+                "plan mode is advisory, so read is enforced by an explicit --tools allowlist rather than by a sandbox",
+                "user- and project-level settings, MCP servers, hooks and skills are not visible to sfh",
+            ],
+        ),
+        "opencode" => (
+            "opencode-ndjson",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["run", "--format", "--agent", "--auto"],
+            &[
+                "read/write are enforced through OPENCODE_CONFIG_CONTENT, which merges with the user's own config",
+                "there is no OS sandbox, so write denies bash outright",
+            ],
+        ),
+        "grok" => (
+            "grok-json",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["--output-format", "--prompt-file", "--session-id"],
+            &["no OS sandbox; read is a permission-mode plus explicit denies"],
+        ),
+        "agy" => (
+            "agy-json",
+            Coverage::TokensOnly,
+            [Enforced, Enforced, BestEffort],
+            &["--output-format", "--mode", "--print-timeout", "-p"],
+            &[
+                "exit codes are unreliable; sfh trusts the envelope's status field",
+                "no fork: a branch of an existing conversation is not available headlessly",
+            ],
+        ),
+        "pi" => (
+            "pi-jsonl",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["--mode", "--offline", "--session-id", "--tools"],
+            &[
+                "no sandbox at all: access is expressed purely as a --tools allowlist, and write therefore excludes bash",
+                "--session-id CREATES a session when the id is not found in this cwd, so a resume is only trustworthy with the session marker",
+            ],
+        ),
+        "cursor" => (
+            "cursor-json",
+            Coverage::TokensOnly,
+            // Headless cursor has exactly two tiers; there is no write.
+            [Enforced, Unsupported, BestEffort],
+            &["-p", "--output-format", "--trust", "--disable-project-configs"],
+            &[
+                "headless permissions are binary: deny-all without --force, approve-all with it, so access: write is refused rather than silently promoted",
+                "--resume creates a chat when the id is unknown, so sfh verifies the chat store on disk",
+            ],
+        ),
+        _ => return None,
+    };
+    Some(AdapterInfo {
+        tool: crate::flow::TOOLS.iter().find(|t| **t == tool)?,
+        default_program: default_program(tool),
+        last_verified: LAST_VERIFIED,
+        minimum_version: None,
+        protocol,
+        supports_resume: true,
+        supports_fork: supports_fork(tool),
+        cost_coverage: cost,
+        policy_coverage: policy,
+        required_flags: flags,
+        known_gaps: gaps,
+    })
+}
+
 /// pi has no sandbox and no permission prompts: the only real lever is which
 /// tools get registered. Bare `pi` already has read+bash+edit+write.
 fn pi_tools(access: Access) -> &'static str {
@@ -871,30 +1053,35 @@ fn opencode_agent(a: &mut Vec<String>, inp: &PresetInput) -> String {
     }
 }
 
+/// The enforcement config opencode receives, built as a JSON *value* and then
+/// serialized (spec P0-03).
+///
+/// The agent name is user-controlled (`agent:` on a step, a profile, or a
+/// `--var`-rendered value). Interpolating it into a JSON string literal with
+/// `format!` meant a name containing a quote or a backslash produced either
+/// invalid JSON - in which case opencode ignores the layer and the deny rules
+/// silently vanish - or, worse, valid JSON with an attacker-chosen structure.
+/// `serde_json` escapes the key for us, so no name can do either.
 fn opencode_env(agent_name: &str, access: Access) -> Vec<(String, String)> {
-    match access {
+    let config = match access {
         // The stock plan agent denies edits but NOT bash (1.18.3), so a read step
         // could still write via shell redirection. OPENCODE_CONFIG_CONTENT is the
         // highest-precedence config layer and merges with the user's config.
-        Access::Read => vec![(
-            "OPENCODE_CONFIG_CONTENT".to_string(),
-            format!(
-                "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"edit\":\"deny\",\"bash\":\"deny\"}}}}}}}}"
-            ),
-        )],
+        Access::Read => serde_json::json!({
+            "agent": { agent_name: { "permission": { "edit": "deny", "bash": "deny" } } }
+        }),
         // --auto auto-approves whatever is not explicitly denied, so write denies
         // two things: bash (opencode has no OS sandbox - an auto-approved shell
         // would make write == full, the same rule pi/claude/grok follow) and
         // out-of-tree writes. Agent-scoped so a user-selected agent cannot
         // inherit looser defaults.
-        Access::Write => vec![(
-            "OPENCODE_CONFIG_CONTENT".to_string(),
-            format!(
-                "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"bash\":\"deny\"}}}}}},\"permission\":{{\"external_directory\":\"deny\"}}}}"
-            ),
-        )],
-        Access::Full => Vec::new(),
-    }
+        Access::Write => serde_json::json!({
+            "agent": { agent_name: { "permission": { "bash": "deny" } } },
+            "permission": { "external_directory": "deny" }
+        }),
+        Access::Full => return Vec::new(),
+    };
+    vec![("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string())]
 }
 
 /// Build the command line for a fresh (non-resumed) preset run.
@@ -2257,5 +2444,76 @@ mod tests {
         // The old message told users to reach for access: full - the exact
         // wrong direction. The fix is to remove or narrow the arg.
         assert!(!msg.contains("use access: full"), "{msg}");
+    }
+
+    /// P0-03. The agent name is flow data, so it can hold a quote, a backslash
+    /// or a control character. Building the permission config by pasting it
+    /// into a JSON string literal produced either invalid JSON - which opencode
+    /// discards, silently dropping the deny rules - or attacker-chosen
+    /// structure. Every name must come back as valid JSON whose deny rules sit
+    /// under exactly one agent key holding exactly the requested name.
+    #[test]
+    fn opencode_enforcement_config_is_valid_json_for_any_agent_name() {
+        let hostile = [
+            "plain",
+            "with\"quote",
+            "with\\backslash",
+            "with\u{0007}control\u{0000}nul",
+            "with\nnewline",
+            // The shape a string-concatenating builder would let escape: close
+            // the key, close the objects, and append a permission of one's own.
+            r#"x":{"permission":{"bash":"allow"}}},"a":{"y"#,
+            r#"}}},"permission":{"external_directory":"allow"},"junk":{"#,
+            "日本語のエージェント",
+        ];
+        for name in hostile {
+            for (access, denied) in [
+                (Access::Read, vec!["edit", "bash"]),
+                (Access::Write, vec!["bash"]),
+            ] {
+                let env = opencode_env(name, access);
+                let (key, raw) = env.first().expect("read/write must set the config layer");
+                assert_eq!(key, "OPENCODE_CONFIG_CONTENT");
+                let v: serde_json::Value = serde_json::from_str(raw)
+                    .unwrap_or_else(|e| panic!("agent {name:?} produced invalid JSON: {e}\n{raw}"));
+                let agents = v
+                    .get("agent")
+                    .and_then(|a| a.as_object())
+                    .unwrap_or_else(|| panic!("agent {name:?}: no agent map in {raw}"));
+                assert_eq!(
+                    agents.len(),
+                    1,
+                    "agent {name:?} injected extra agent keys: {raw}"
+                );
+                let perms = agents
+                    .get(name)
+                    .and_then(|a| a.get("permission"))
+                    .and_then(|p| p.as_object())
+                    .unwrap_or_else(|| panic!("agent {name:?}: name is not the key in {raw}"));
+                for d in &denied {
+                    assert_eq!(
+                        perms.get(*d).and_then(|x| x.as_str()),
+                        Some("deny"),
+                        "agent {name:?}: {d} must stay denied in {raw}"
+                    );
+                }
+                assert!(
+                    !perms.values().any(|x| x.as_str() == Some("allow")),
+                    "agent {name:?} smuggled an allow into {raw}"
+                );
+                if access == Access::Write {
+                    assert_eq!(
+                        v.pointer("/permission/external_directory")
+                            .and_then(|x| x.as_str()),
+                        Some("deny"),
+                        "agent {name:?}: out-of-tree writes must stay denied in {raw}"
+                    );
+                }
+            }
+            assert!(
+                opencode_env(name, Access::Full).is_empty(),
+                "full access sets no enforcement layer"
+            );
+        }
     }
 }

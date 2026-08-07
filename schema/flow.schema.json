@@ -1,10 +1,12 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.5/schema/flow.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.0/schema/flow.schema.json",
   "title": "sfh flow",
   "description": "A SimpleFlowHarness flow: staged AI CLI invocations with routing, parallelism and session continuation.",
   "type": "object",
-  "required": ["steps"],
+  "required": [
+    "steps"
+  ],
   "additionalProperties": false,
   "properties": {
     "api_version": {
@@ -17,37 +19,80 @@
       "minLength": 1,
       "not": {
         "anyOf": [
-          { "const": "." },
-          { "const": ".." },
-          { "pattern": "[/\\\\\\x00-\\x1f\\x7f<>:\"|?*]" },
-          { "pattern": "[ .]$" }
+          {
+            "const": "."
+          },
+          {
+            "const": ".."
+          },
+          {
+            "pattern": "[/\\\\\\x00-\\x1f\\x7f<>:\"|?*]"
+          },
+          {
+            "pattern": "[ .]$"
+          }
         ]
       }
     },
     "vars": {
       "type": "object",
       "description": "Flow variables, referenced as {{vars.NAME}} and overridable with --var NAME=value.",
-      "additionalProperties": { "type": ["string", "number", "boolean", "null"] }
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean",
+          "null"
+        ]
+      }
     },
-    "defaults": { "$ref": "#/definitions/defaults" },
+    "defaults": {
+      "$ref": "#/definitions/defaults"
+    },
     "profiles": {
       "type": "object",
       "description": "Named tool settings referenced by steps via use:. ~/.sfh/profiles.yaml is merged in (flow wins).",
-      "additionalProperties": { "$ref": "#/definitions/profile" }
+      "additionalProperties": {
+        "$ref": "#/definitions/profile"
+      }
     },
     "steps": {
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "#/definitions/step" }
+      "items": {
+        "$ref": "#/definitions/step"
+      }
+    },
+    "workspace": {
+      "$ref": "#/definitions/workspace"
+    },
+    "contexts": {
+      "type": "object",
+      "description": "Named context sources a step pulls in by name. Added in v1.2.0.",
+      "additionalProperties": {
+        "$ref": "#/definitions/contextSource"
+      }
     }
   },
   "definitions": {
     "tool": {
-      "enum": ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"],
+      "enum": [
+        "codex",
+        "claude",
+        "opencode",
+        "grok",
+        "agy",
+        "pi",
+        "cursor"
+      ],
       "description": "Preset AI CLI. Omit and use cmd: for anything else."
     },
     "access": {
-      "enum": ["read", "write", "full"],
+      "enum": [
+        "read",
+        "write",
+        "full"
+      ],
       "description": "read = no writes, write = workspace edits (never an auto-approved shell), full = auto-approve everything. Mandatory for AI steps (on the step, its profile, or defaults); there is no implicit default. cursor supports only read and full."
     },
     "action": {
@@ -57,43 +102,148 @@
     },
     "retry": {
       "type": "object",
-      "required": ["max"],
+      "required": [
+        "max"
+      ],
       "additionalProperties": false,
       "properties": {
-        "max": { "type": "integer", "minimum": 0, "description": "Extra attempts after the first." },
-        "backoff_sec": { "type": "integer", "minimum": 0, "default": 5, "description": "Doubles each attempt." }
+        "max": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Extra attempts after the first."
+        },
+        "backoff_sec": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Doubles each attempt."
+        }
       }
     },
     "defaults": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "tool": { "$ref": "#/definitions/tool" },
-        "model": { "type": "string" },
-        "effort": { "type": "string", "description": "codex: none..ultra / claude: low..max / grok,agy: low|medium|high / pi: off..max / opencode: --variant" },
-        "access": { "$ref": "#/definitions/access" },
-        "cwd": { "type": "string" },
-        "timeout_sec": { "type": "integer", "minimum": 1 },
-        "max_visits": { "type": "integer", "minimum": 1, "default": 5 },
-        "max_total_steps": { "type": "integer", "minimum": 1, "default": 100 },
-        "max_parallel": { "type": "integer", "minimum": 1, "default": 4 },
+        "tool": {
+          "$ref": "#/definitions/tool"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string",
+          "description": "codex: none..ultra / claude: low..max / grok,agy: low|medium|high / pi: off..max / opencode: --variant"
+        },
+        "access": {
+          "$ref": "#/definitions/access"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_visits": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5
+        },
+        "max_total_steps": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 100
+        },
+        "max_parallel": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 4
+        },
         "tool_max_parallel": {
           "type": "object",
           "description": "Per-tool concurrency ceiling across a fan-out, e.g. {opencode: 1}.",
-          "propertyNames": { "enum": ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"] },
-          "additionalProperties": { "type": "integer", "minimum": 1 }
+          "propertyNames": {
+            "enum": [
+              "codex",
+              "claude",
+              "opencode",
+              "grok",
+              "agy",
+              "pi",
+              "cursor"
+            ]
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
         },
-        "max_prompt_chars": { "type": "integer", "minimum": 1 },
-        "max_emit_chars": { "type": "integer", "minimum": 1, "default": 200000 },
-        "max_cost_usd": { "type": "number", "minimum": 0, "description": "Abort once provider CLIs have reported this much completed-attempt spend. This is a soft accounting guard, not a provider-side hard billing cap; tools that report no cost cannot be bounded by it." },
-        "wall_clock_sec": { "type": "integer", "minimum": 1 },
-        "on_budget": { "type": "string", "pattern": "^goto:", "description": "Where to jump ONCE per run when spend or elapsed time reaches ceiling minus budget_reserve, instead of failing at the ceiling. goto:<step-id>, or goto:end / goto:fail / goto:stuck. Needs max_cost_usd and/or wall_clock_sec, and a NON-ZERO budget_reserve on each ceiling declared: with a reserve of 0 the landing fires on the ceiling itself and the ceiling ends the run before the landing chain runs a step (validate refuses it)." },
-        "budget_reserve": { "$ref": "#/definitions/budget_reserve" },
-        "retry": { "$ref": "#/definitions/retry" },
-        "retry_on": { "enum": ["transient", "any", "never"], "default": "transient" },
-        "hang_after_sec": { "type": "integer", "minimum": 0, "default": 300, "description": "Silence after which a timeout counts as a hang rather than honest overrun, so retry_on: transient retries it. Measured across stdout AND stderr." },
-        "fork_warmup": { "enum": ["auto", "always", "never"], "default": "auto", "description": "Stagger forks of one parent so the provider prompt cache warms first. auto = only where it measurably pays (claude)." },
-        "env": { "type": "object", "additionalProperties": { "type": "string" } }
+        "max_prompt_chars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_emit_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 200000
+        },
+        "max_cost_usd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Abort once provider CLIs have reported this much completed-attempt spend. This is a soft accounting guard, not a provider-side hard billing cap; tools that report no cost cannot be bounded by it."
+        },
+        "wall_clock_sec": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "on_budget": {
+          "type": "string",
+          "pattern": "^goto:",
+          "description": "Where to jump ONCE per run when spend or elapsed time reaches ceiling minus budget_reserve, instead of failing at the ceiling. goto:<step-id>, or goto:end / goto:fail / goto:stuck. Needs max_cost_usd and/or wall_clock_sec, and a NON-ZERO budget_reserve on each ceiling declared: with a reserve of 0 the landing fires on the ceiling itself and the ceiling ends the run before the landing chain runs a step (validate refuses it)."
+        },
+        "budget_reserve": {
+          "$ref": "#/definitions/budget_reserve"
+        },
+        "retry": {
+          "$ref": "#/definitions/retry"
+        },
+        "retry_on": {
+          "enum": [
+            "transient",
+            "any",
+            "never"
+          ],
+          "default": "transient"
+        },
+        "hang_after_sec": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Silence after which a timeout counts as a hang rather than honest overrun, so retry_on: transient retries it. Measured across stdout AND stderr."
+        },
+        "fork_warmup": {
+          "enum": [
+            "auto",
+            "always",
+            "never"
+          ],
+          "default": "auto",
+          "description": "Stagger forks of one parent so the provider prompt cache warms first. auto = only where it measurably pays (claude)."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "replay": {
+          "$ref": "#/definitions/replay"
+        },
+        "max_context_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Refuse to spawn when a step's assembled context bundle is larger. Checked before anything is launched; sfh never summarizes or drops sources to fit."
+        }
       }
     },
     "budget_reserve": {
@@ -101,109 +251,263 @@
       "additionalProperties": false,
       "description": "Headroom kept back from each ceiling for the on_budget landing chain to spend. Requires on_budget, and on_budget requires it: every ceiling declared needs a reserve above 0. The axes are independent: threshold = ceiling - reserve, per axis.",
       "properties": {
-        "cost_usd": { "type": "number", "minimum": 0, "description": "USD held back from max_cost_usd. Required (above 0) when max_cost_usd and on_budget are both set." },
-        "wall_clock_sec": { "type": "integer", "minimum": 0, "description": "Seconds held back from wall_clock_sec. Required (above 0) when wall_clock_sec and on_budget are both set. Budget for the longest single step plus the whole landing chain." }
+        "cost_usd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "USD held back from max_cost_usd. Required (above 0) when max_cost_usd and on_budget are both set."
+        },
+        "wall_clock_sec": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds held back from wall_clock_sec. Required (above 0) when wall_clock_sec and on_budget are both set. Budget for the longest single step plus the whole landing chain."
+        }
       }
     },
     "profile": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "tool": { "$ref": "#/definitions/tool" },
-        "bin": { "type": "string", "description": "Executable path override." },
-        "model": { "type": "string" },
-        "effort": { "type": "string" },
-        "access": { "$ref": "#/definitions/access" },
-        "agent": { "type": "string" },
-        "args": { "type": "array", "items": { "type": "string" } },
-        "cwd": { "type": "string" },
-        "timeout_sec": { "type": "integer", "minimum": 1 },
-        "env": { "type": "object", "additionalProperties": { "type": "string" } }
+        "tool": {
+          "$ref": "#/definitions/tool"
+        },
+        "bin": {
+          "type": "string",
+          "description": "Executable path override."
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string"
+        },
+        "access": {
+          "$ref": "#/definitions/access"
+        },
+        "agent": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
       }
     },
     "route": {
       "type": "object",
-      "required": ["goto"],
+      "required": [
+        "goto"
+      ],
       "additionalProperties": false,
       "description": "Conditions are ANDed; the first matching rule wins. No condition = always.",
       "properties": {
-        "when_contains": { "type": "string" },
-        "when_matches": { "type": "string", "description": "Rust regex over the whole output." },
-        "when_last_line_contains": { "type": "string", "description": "Deterministic verdict trailer check." },
-        "when_last_line_is": { "type": "string", "description": "Exact match against the trimmed last non-empty line." },
-        "when_last_line_matches": { "type": "string" },
-        "when_exit": { "type": "integer", "description": "Equality against this step's own normalized exit code ({{steps.<id>.exit}}). A fan-out group compares against the composite: 1 when the group hard-failed, else 0." },
-        "when_stderr_matches": { "type": "string", "description": "Rust regex over this step's cleaned stderr (<id>.err.txt), read from the file in live and resumed runs alike. A missing stderr file never matches." },
+        "when_contains": {
+          "type": "string"
+        },
+        "when_matches": {
+          "type": "string",
+          "description": "Rust regex over the whole output."
+        },
+        "when_last_line_contains": {
+          "type": "string",
+          "description": "Deterministic verdict trailer check."
+        },
+        "when_last_line_is": {
+          "type": "string",
+          "description": "Exact match against the trimmed last non-empty line."
+        },
+        "when_last_line_matches": {
+          "type": "string"
+        },
+        "when_exit": {
+          "type": "integer",
+          "description": "Equality against this step's own normalized exit code ({{steps.<id>.exit}}). A fan-out group compares against the composite: 1 when the group hard-failed, else 0."
+        },
+        "when_stderr_matches": {
+          "type": "string",
+          "description": "Rust regex over this step's cleaned stderr (<id>.err.txt), read from the file in live and resumed runs alike. A missing stderr file never matches."
+        },
         "when_members": {
           "type": "object",
-          "required": ["last_line_is"],
+          "required": [
+            "last_line_is"
+          ],
           "additionalProperties": false,
           "description": "Count the fan-out members that ended cleanly AND signed off with this exact line. Only on a parallel:/foreach: step, and only alone in its rule.",
           "properties": {
-            "last_line_is": { "type": "string", "description": "The exact line a member must end on to be counted." },
-            "at_least": { "type": "integer", "minimum": 1, "description": "Match when at least this many members voted." },
-            "all": { "const": true, "description": "Match when every member voted. Never matches an empty fan-out." }
+            "last_line_is": {
+              "type": "string",
+              "description": "The exact line a member must end on to be counted."
+            },
+            "at_least": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Match when at least this many members voted."
+            },
+            "all": {
+              "const": true,
+              "description": "Match when every member voted. Never matches an empty fan-out."
+            }
           },
-          "oneOf": [{ "required": ["at_least"] }, { "required": ["all"] }]
+          "oneOf": [
+            {
+              "required": [
+                "at_least"
+              ]
+            },
+            {
+              "required": [
+                "all"
+              ]
+            }
+          ]
         },
-        "goto": { "type": "string", "description": "step id | end (exit 0) | fail (exit 1) | stuck (exit 4: work saved, needs a human)" }
+        "goto": {
+          "type": "string",
+          "description": "step id | end (exit 0) | fail (exit 1) | stuck (exit 4: work saved, needs a human)"
+        }
       }
     },
     "compact": {
       "type": "object",
-      "required": ["when_over"],
+      "required": [
+        "when_over"
+      ],
       "additionalProperties": false,
       "properties": {
-        "when_over": { "type": "integer", "minimum": 1 },
-        "use": { "type": "string", "description": "Profile for the summarizer." },
-        "tool": { "$ref": "#/definitions/tool" },
-        "bin": { "type": "string" },
-        "model": { "type": "string" },
-        "effort": { "type": "string" },
-        "instruction": { "type": "string" },
-        "target_chars": { "type": "integer", "minimum": 1 },
-        "max_input_chars": { "type": "integer", "minimum": 1, "default": 120000 },
-        "timeout_sec": { "type": "integer", "minimum": 1 }
+        "when_over": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "use": {
+          "type": "string",
+          "description": "Profile for the summarizer."
+        },
+        "tool": {
+          "$ref": "#/definitions/tool"
+        },
+        "bin": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string"
+        },
+        "instruction": {
+          "type": "string"
+        },
+        "target_chars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_input_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 120000
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "foreach": {
       "type": "object",
       "description": "Derives an ordered fan-out at runtime. One expansion is limited to 100 items; larger inputs fail before any member starts.",
-      "required": ["from"],
+      "required": [
+        "from"
+      ],
       "additionalProperties": false,
       "properties": {
-        "from": { "type": "string", "description": "Template rendered then split into items." },
-        "split": { "type": "string", "pattern": "^(lines|json|separator:.+)$", "default": "lines" }
+        "from": {
+          "type": "string",
+          "description": "Template rendered then split into items."
+        },
+        "split": {
+          "type": "string",
+          "pattern": "^(lines|json|separator:.+)$",
+          "default": "lines"
+        }
       }
     },
     "step": {
       "type": "object",
-      "required": ["id"],
+      "required": [
+        "id"
+      ],
       "additionalProperties": false,
       "properties": {
         "id": {
           "type": "string",
           "pattern": "^[A-Za-z0-9_-]+$",
-          "not": { "pattern": "^(?:[Ee][Nn][Dd]|[Ff][Aa][Ii][Ll]|[Ss][Tt][Uu][Cc][Kk])$" },
+          "not": {
+            "pattern": "^(?:[Ee][Nn][Dd]|[Ff][Aa][Ii][Ll]|[Ss][Tt][Uu][Cc][Kk])$"
+          },
           "description": "Unique ignoring case. end, fail and stuck are reserved goto terminals, not step names."
         },
-        "use": { "type": "string", "description": "Profile name." },
-        "tool": { "$ref": "#/definitions/tool" },
-        "bin": { "type": "string" },
-        "model": { "type": "string" },
-        "effort": { "type": "string" },
-        "access": { "$ref": "#/definitions/access" },
+        "use": {
+          "type": "string",
+          "description": "Profile name."
+        },
+        "tool": {
+          "$ref": "#/definitions/tool"
+        },
+        "bin": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string"
+        },
+        "access": {
+          "$ref": "#/definitions/access"
+        },
         "allow_access_override": {
           "type": "boolean",
           "default": false,
           "description": "Explicit escape hatch: accept args: that override the declared access level, and continue_from/fork_from at a higher access than the original session. Both are refused by default (fail-closed)."
         },
-        "agent": { "type": "string" },
-        "args": { "type": "array", "items": { "type": "string" } },
+        "agent": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "cmd": {
           "oneOf": [
-            { "type": "string", "description": "Run via cmd /C | sh -c. Template expansion is disabled by default (refused at validation); set unsafe_shell_template: true to allow it, in which case substituted values may not contain shell metacharacters." },
-            { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Spawned directly, no shell (recommended). Templates expand per argument; a substituted value stays one argument, but is still an argument to the target program. argv[0] is executed-privileged and refuses run-derived templates (see allow_dynamic_exec_paths). An array that wraps a shell ([\"sh\",\"-c\",...]) applies the string-form shell-template rules to its shell text." }
+            {
+              "type": "string",
+              "description": "Run via cmd /C | sh -c. Template expansion is disabled by default (refused at validation); set unsafe_shell_template: true to allow it, in which case substituted values may not contain shell metacharacters."
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "description": "Spawned directly, no shell (recommended). Templates expand per argument; a substituted value stays one argument, but is still an argument to the target program. argv[0] is executed-privileged and refuses run-derived templates (see allow_dynamic_exec_paths). An array that wraps a shell ([\"sh\",\"-c\",...]) applies the string-form shell-template rules to its shell text."
+            }
           ]
         },
         "unsafe_shell_template": {
@@ -216,38 +520,233 @@
           "default": false,
           "description": "Explicit escape hatch: allow run-derived templates (step output, notes, foreach items, vars restored from a resumed run dir) in executed-privileged fields: bin, cwd and argv[0] of a custom cmd. Off by default because those fields run with sfh's own OS rights and untrusted values there select an arbitrary binary or working directory."
         },
-        "prompt": { "type": "string" },
-        "stdin": { "enum": ["prompt", "none"], "description": "cmd: steps only." },
-        "cwd": { "type": "string" },
-        "timeout_sec": { "type": "integer", "minimum": 1 },
-        "max_visits": { "type": "integer", "minimum": 1 },
-        "on_error": { "$ref": "#/definitions/action" },
-        "on_max_visits": { "$ref": "#/definitions/action" },
-        "route": { "type": "array", "items": { "$ref": "#/definitions/route" } },
+        "prompt": {
+          "type": "string"
+        },
+        "stdin": {
+          "enum": [
+            "prompt",
+            "none"
+          ],
+          "description": "cmd: steps only."
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "timeout_sec": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_visits": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "on_error": {
+          "$ref": "#/definitions/action"
+        },
+        "on_max_visits": {
+          "$ref": "#/definitions/action"
+        },
+        "route": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/route"
+          }
+        },
         "parallel": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/definitions/step" },
+          "items": {
+            "$ref": "#/definitions/step"
+          },
           "description": "Children run concurrently; the group's output is their aggregate."
         },
-        "foreach": { "$ref": "#/definitions/foreach" },
-        "max_parallel": { "type": "integer", "minimum": 1 },
-        "notes": { "const": "append" },
-        "max_prompt_chars": { "type": "integer", "minimum": 1 },
-        "compact": { "$ref": "#/definitions/compact" },
-        "continue_from": { "type": "string", "description": "Resume that step's tool session instead of starting fresh." },
-        "fork_from": { "type": "string", "description": "Branch that step's session: inherit its context but write to a new session. claude/opencode/grok/pi only; several steps may fork the same parent." },
-        "retry": { "$ref": "#/definitions/retry" },
-        "retry_on": { "enum": ["transient", "any", "never"] },
-        "hang_after_sec": { "type": "integer", "minimum": 0, "description": "Silence after which this step's timeout counts as a hang (default 300, or defaults.hang_after_sec)." },
+        "foreach": {
+          "$ref": "#/definitions/foreach"
+        },
+        "max_parallel": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "notes": {
+          "const": "append"
+        },
+        "max_prompt_chars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "compact": {
+          "$ref": "#/definitions/compact"
+        },
+        "continue_from": {
+          "type": "string",
+          "description": "Resume that step's tool session instead of starting fresh."
+        },
+        "fork_from": {
+          "type": "string",
+          "description": "Branch that step's session: inherit its context but write to a new session. claude/opencode/grok/pi only; several steps may fork the same parent."
+        },
+        "retry": {
+          "$ref": "#/definitions/retry"
+        },
+        "retry_on": {
+          "enum": [
+            "transient",
+            "any",
+            "never"
+          ]
+        },
+        "hang_after_sec": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Silence after which this step's timeout counts as a hang (default 300, or defaults.hang_after_sec)."
+        },
         "fallback": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Profiles tried in order after retries are exhausted."
         },
-        "allow_empty": { "type": "boolean", "description": "Accept an empty final message (default: true for cmd:, false for preset tools)." },
-        "env": { "type": "object", "additionalProperties": { "type": "string" } },
-        "env_remove": { "type": "array", "items": { "type": "string" } }
+        "allow_empty": {
+          "type": "boolean",
+          "description": "Accept an empty final message (default: true for cmd:, false for preset tools)."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "env_remove": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "effects": {
+          "$ref": "#/definitions/effects"
+        },
+        "context": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names from the flow's contexts: map, in the order they should appear in the bundle. Added in v1.2.0."
+        },
+        "context_delivery": {
+          "enum": [
+            "prepend",
+            "file"
+          ],
+          "default": "prepend",
+          "description": "prepend: sfh puts a deterministic delimited bundle in front of the prompt. file: the prompt is untouched and should point at {{context_file}}. Both modes expose {{context}} and {{context_file}}."
+        },
+        "replay": {
+          "$ref": "#/definitions/replay"
+        }
+      }
+    },
+    "effects": {
+      "enum": [
+        "read",
+        "workspace",
+        "external",
+        "unknown"
+      ],
+      "description": "What this step touches, declared by the flow author - sfh never infers it from the prompt or the command text. Omitted, it is read/workspace from the step's access: for a preset step, and `unknown` for a custom cmd:, which is treated as a potential writer. Decides workspace selection, static warnings and replay policy, nothing else."
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What a resume does with work that started but never recorded a durable end. NOT retry (another attempt at the same invocation), NOT fallback (a different profile), NOT a route revisit, and NOT reuse of a completed step's result.",
+      "properties": {
+        "unfinished": {
+          "enum": [
+            "rerun",
+            "stuck",
+            "fail"
+          ],
+          "default": "rerun",
+          "description": "rerun (default, and the behaviour of every release before 1.2.0): run it again. stuck: stop with exit 4, launching nothing and keeping the workspace and partial artifacts for a human. fail: stop with exit 1, launching nothing."
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where this run's side effects belong. Omit the whole key and sfh creates nothing: every step runs in the caller's cwd, or in whatever cwd: resolves to, exactly as before 1.2.0.",
+      "properties": {
+        "mode": {
+          "enum": [
+            "current",
+            "directory",
+            "git-worktree",
+            "auto"
+          ],
+          "default": "current",
+          "description": "current: the caller's cwd. directory: a directory you name in root: - sfh neither creates nor removes it. git-worktree: a worktree sfh creates, owns and may clean up, outside the repository it branches from. auto: decide from the flow's declared effects alone - all-read resolves to current, any potential writer to ONE git worktree for the whole run."
+        },
+        "root": {
+          "type": "string",
+          "description": "Source directory or repository, relative to the flow file. Required for mode: directory."
+        },
+        "base": {
+          "type": "string",
+          "description": "git-worktree only: the ref to branch from. Omitted, the repository's HEAD when the run starts. Resolved to a commit at run start and pinned in the execution closure."
+        },
+        "cleanup": {
+          "enum": [
+            "auto",
+            "keep"
+          ],
+          "default": "auto",
+          "description": "auto: remove an sfh-owned worktree after a run that finished cleanly and has nothing uncommitted. A dirty, failed, stuck, stopped or dead workspace is always kept, and the branch is never deleted. keep: keep it whatever happened."
+        },
+        "allow_concurrent_writers": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow a fan-out that puts more than one potential writer into the same workspace at once. Refused by default, because sfh cannot tell their changes apart. Recorded as an unsafe override in the plan, the closure and the run's meta."
+        },
+        "verify_on_resume": {
+          "type": "boolean",
+          "default": true,
+          "description": "Compare the workspace against its last durable checkpoint when resuming, and refuse a difference no unfinished step explains."
+        }
+      }
+    },
+    "contextSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One named context. Exactly one of file/inline/template must be set: a source with two origins has no single answer to 'where did this text come from', which is the point of naming it. sfh does not interpret what a context MEANS - the names are yours.",
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "A path, relative to the flow file unless absolute. Read no-follow and contained to the flow directory and the resolved workspace unless allow_external is set."
+        },
+        "inline": {
+          "type": "string",
+          "description": "Literal text written in the flow."
+        },
+        "template": {
+          "type": "string",
+          "description": "A template rendered with the same variables a prompt sees."
+        },
+        "max_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Refuse this source if it is larger. sfh never summarizes or truncates context to fit."
+        },
+        "allow_external": {
+          "type": "boolean",
+          "default": false,
+          "description": "Permit reading outside the flow directory and the workspace, including through a symlink. Recorded as an unsafe override wherever it is used."
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false,
+          "description": "Tolerate a missing file instead of failing the step."
+        }
       }
     }
   }

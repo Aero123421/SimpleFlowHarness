@@ -50,7 +50,14 @@ jobs:
           ./target/release/sfh --version
           ./target/release/sfh run examples/smoke.yaml -q
           ./target/release/sfh run examples/smoke-parallel.yaml -q
+          # Top-level example YAML files are flows. examples/profiles/ holds
+          # --profiles overlay files, which are not flows and are not validated
+          # as such.
           for f in examples/*.yaml; do ./target/release/sfh validate "$f"; done
+          # The overlay must still parse, and must still apply cleanly to the
+          # flow that documents it.
+          ./target/release/sfh validate examples/managed-loop.yaml --profiles examples/profiles/local.yaml
+          ./target/release/sfh preflight --json > /dev/null
       - name: Engine behaviour (fake tools, no AI calls)
         shell: bash
         run: bash tests/engine_behaviour.sh ./target/release/sfh

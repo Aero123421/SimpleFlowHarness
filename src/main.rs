@@ -1,16 +1,23 @@
+mod closure;
 mod contain;
+mod context;
 mod doctor;
 mod engine;
 mod execute;
 mod flow;
 mod leaf;
+mod machine;
+mod preflight;
 mod preset;
+mod protocol;
 mod runs;
 mod sha256;
+mod state;
 mod template;
 mod watch;
+mod workspace;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const EXAMPLE: &str = include_str!("../examples/research.yaml");
 const GUIDE: &str = include_str!("guide.txt");
@@ -30,8 +37,10 @@ USAGE:
   sfh config show <flow.yaml>             Show merged config (env values redacted)
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
   sfh guide                              Show the compact AI-oriented flow guide
+  sfh preflight [flow.yaml] [--json]     Local capability check; makes NO model calls
   sfh help [command]                     Show overall or command-specific usage
   sfh runs list|show|why|clean [...]     Browse, explain or prune past runs
+  sfh workspaces list|show|clean|remove  Inspect or prune managed workspaces
 
 RUN OPTIONS:
   --var key=value     Override a flow variable (repeatable)
@@ -41,9 +50,21 @@ RUN OPTIONS:
   --detach            Run in the background, print the run dir, and exit at once.
                       The run survives this shell and its parent; poll it with
                       `sfh status` and collect it with `sfh wait`.
+  --state-dir <dir>   Root for runs/workspaces/plans/doctor (or SFH_STATE_DIR).
+                      Required for a managed workspace unless the platform
+                      user-state dir can be determined. --runs-dir still wins
+                      for run artifacts, and without either, runs stay in
+                      .sfh/runs.
+  --profiles <file>   Profile overlay file (repeatable; later files win)
+  --json              Answer with a machine envelope. stdout carries JSON and
+                      nothing else; progress goes to stderr.
   --resume <run-dir>  Continue a previous run, reusing its finished steps
   --resume-latest     Same, picking the newest run dir
-  --force-resume      Resume even though the flow file changed
+  --force-resume      Resume even though the flow file or the execution closure
+                      changed (profile overlays, context files, tool versions)
+  --adopt-workspace   Resume even though the managed workspace changed, taking
+                      its current contents as the new baseline. A DIFFERENT
+                      question from --force-resume; neither implies the other.
   --no-partial-emit   On failure, do not print the best available output
   --dry-run           Render prompts/commands without executing anything
   -v, --verbose       Print full command lines
@@ -58,8 +79,15 @@ STATUS / WAIT / STOP OPTIONS:
   wait exits with the flow's own code (0/1/4), or 3 if --timeout elapsed first
   (a wait timeout does NOT cancel the run - use `sfh stop` for that)
 
+PREFLIGHT OPTIONS:
+  preflight [flow.yaml] [--profiles file] [--state-dir d] [--json]
+  Free and offline: which binaries are installed, at what version, whether the
+  flags each adapter depends on are still in their --help, which protocol they
+  speak, what access it can actually enforce, and what workspace and context
+  this flow would build. Makes NO model calls - `sfh doctor` is that check.
+
 DOCTOR OPTIONS:
-  doctor [flow.yaml] [--runs-dir d] [--timeout SEC]
+  doctor [flow.yaml] [--runs-dir d] [--state-dir d] [--timeout SEC]
   Sends a one-token prompt to each tool and checks sfh can still parse the
   answer, so preset drift surfaces here instead of halfway through a paid run.
   This makes REAL calls. With a flow file it checks exactly that flow's tools
@@ -71,6 +99,14 @@ RUNS OPTIONS:
   runs show <run-dir> [--json]
   runs why  <run-dir> [--json]
   runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]
+
+WORKSPACE OPTIONS:
+  workspaces list [--runs-dir d] [--state-dir d] [--json]
+  workspaces show <run-dir> [--json]
+  workspaces clean [--older-than DAYS] [--dry-run] [--json]
+  workspaces remove <run-dir> [--discard] [--json]
+  sfh removes only a workspace it created (ownership marker + run nonce), and
+  never discards uncommitted work without --discard.
 
 EXIT CODES:
   0 = flow succeeded    1 = flow failed    2 = config/usage error
@@ -84,9 +120,15 @@ FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the sc
   {{step_id}} {{visit}} {{os}}
   {{budget.spent_usd}} {{budget.elapsed_sec}} {{budget.remaining_usd}} {{budget.remaining_sec}}
   (remaining_* is the string `unlimited` when that axis has no ceiling)
+  {{context}} {{context_file}} (when the step names a context)
   Filters: | head:N | tail:N | truncate:N | lines:A-B | trim | optional | default:text
   Preset tools: codex, claude, opencode, grok, agy, pi, cursor.
   Custom cmd: array form = spawned directly; string form = via cmd /C | sh -c.
+  Opt-in since v1.2 (omit them all and nothing changes):
+    workspace:  mode: current|directory|git-worktree|auto - where side effects go
+    contexts:   named file/inline/template sources, hashed and recorded
+    effects:    read|workspace|external|unknown, per step
+    replay:     unfinished: rerun|stuck|fail - what a crash-resume may re-run
 ";
 
 fn main() {
@@ -120,6 +162,14 @@ fn main() {
         {
             cmd_runs(&args[1..])
         }
+        Some("workspaces")
+            if args
+                .iter()
+                .skip(1)
+                .any(|arg| arg == "-h" || arg == "--help") =>
+        {
+            cmd_workspaces(&args[1..])
+        }
         Some(cmd)
             if args
                 .iter()
@@ -130,6 +180,8 @@ fn main() {
         }
         Some("run") => cmd_run(&args[1..]),
         Some("plan") => cmd_plan(&args[1..]),
+        Some("preflight") => cmd_preflight(&args[1..]),
+        Some("workspaces") => cmd_workspaces(&args[1..]),
         Some("graph") => cmd_graph(&args[1..]),
         Some("config") => cmd_config(&args[1..]),
         Some("status") => cmd_watch(&args[1..], Watch::Status),
@@ -159,18 +211,20 @@ fn main() {
 
 fn cmd_help(command: &str) -> i32 {
     let usage = match command {
-        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--run-dir d] [--detach] [--resume dir|--resume-latest] [--force-resume] [--no-partial-emit] [--dry-run] [-v|-q]\nCommand steps can read their fully rendered prompt from {{prompt_file}}.",
-        "plan" => "sfh plan <flow.yaml> [--var k=v]\nResolves every command in an isolated temporary directory and executes nothing.",
+        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--state-dir d] [--profiles file] [--run-dir d] [--detach] [--json] [--resume dir|--resume-latest] [--force-resume] [--adopt-workspace] [--no-partial-emit] [--dry-run] [-v|-q]\nCommand steps can read their fully rendered prompt from {{prompt_file}}.\n--force-resume waives the flow/closure check; --adopt-workspace waives the workspace check. They are separate.",
+        "plan" => "sfh plan <flow.yaml> [--var k=v] [--profiles file] [--state-dir d] [--save [dir]] [--json]\nResolves every command in an isolated temporary directory and executes nothing.\n--save keeps the rendered prompts, context bundles and machine plan for review.",
         "graph" => "sfh graph <flow.yaml> [--mermaid]",
-        "config" => "sfh config show <flow.yaml> [--show-secrets]",
-        "validate" => "sfh validate <flow.yaml> [--var k=v] [--strict] [--json]",
-        "status" => "sfh status [run-dir] [--runs-dir d] [--json]",
-        "wait" => "sfh wait [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]",
-        "stop" => "sfh stop [run-dir] [--runs-dir d]",
-        "doctor" => "sfh doctor [flow.yaml] [--runs-dir d] [--timeout SEC]",
+        "config" => "sfh config show <flow.yaml> [--profiles file] [--show-secrets]",
+        "validate" => "sfh validate <flow.yaml> [--var k=v] [--profiles file] [--strict] [--json]",
+        "status" => "sfh status [run-dir] [--runs-dir d] [--state-dir d] [--json]",
+        "wait" => "sfh wait [run-dir] [--runs-dir d] [--state-dir d] [--timeout SEC] [--interval SEC] [-q] [--json]",
+        "stop" => "sfh stop [run-dir] [--runs-dir d] [--state-dir d] [--json]",
+        "doctor" => "sfh doctor [flow.yaml] [--runs-dir d] [--state-dir d] [--timeout SEC]\nMakes REAL model calls, from an isolated scratch directory. `sfh preflight` is the free check.",
         "init" => "sfh init [file] [--force]",
         "guide" => "sfh guide",
         "runs" => "sfh runs list|show|why|clean [options]",
+        "preflight" => "sfh preflight [flow.yaml] [--profiles file] [--state-dir d] [--json]\nLocal capability check. Makes NO model calls - `sfh doctor` does that.",
+        "workspaces" => "sfh workspaces list|show|clean|remove [options]",
         _ => {
             print!("{HELP}");
             return 2;
@@ -205,21 +259,7 @@ fn parse_vars_flag(
 
 fn cmd_run(rest: &[String]) -> i32 {
     let mut flow_path: Option<PathBuf> = None;
-    let mut opts = engine::RunOpts {
-        flow_path: PathBuf::new(),
-        vars: Vec::new(),
-        emit: None,
-        runs_dir: None,
-        dry_run: false,
-        verbose: false,
-        quiet: false,
-        resume: None,
-        resume_latest: false,
-        force_resume: false,
-        no_partial_emit: false,
-        detach: false,
-        run_dir: None,
-    };
+    let mut opts = engine::RunOpts::default();
     let mut i = 0;
     while i < rest.len() {
         let r = match rest[i].as_str() {
@@ -227,6 +267,34 @@ fn cmd_run(rest: &[String]) -> i32 {
             "--emit" => need(rest, &mut i, "--emit").map(|v| opts.emit = Some(v.clone())),
             "--runs-dir" => {
                 need(rest, &mut i, "--runs-dir").map(|v| opts.runs_dir = Some(PathBuf::from(v)))
+            }
+            "--state-dir" => {
+                need(rest, &mut i, "--state-dir").map(|v| opts.state_dir = Some(PathBuf::from(v)))
+            }
+            "--profiles" => {
+                need(rest, &mut i, "--profiles").map(|v| opts.profiles.push(PathBuf::from(v)))
+            }
+            "--json" => {
+                opts.as_json = true;
+                Ok(())
+            }
+            // Optional value: `--save` alone puts the plan under the state
+            // root, `--save <dir>` puts it exactly where the caller says.
+            "--save" => {
+                let next = rest.get(i + 1);
+                let dir = match next {
+                    Some(v) if !v.starts_with('-') => {
+                        i += 1;
+                        Some(PathBuf::from(v))
+                    }
+                    _ => None,
+                };
+                opts.save_plan = Some(dir);
+                Ok(())
+            }
+            "--adopt-workspace" => {
+                opts.adopt_workspace = true;
+                Ok(())
             }
             "--resume" => {
                 need(rest, &mut i, "--resume").map(|v| opts.resume = Some(PathBuf::from(v)))
@@ -289,8 +357,14 @@ fn cmd_run(rest: &[String]) -> i32 {
     if opts.force_resume && opts.resume.is_none() && !opts.resume_latest {
         return usage_err("--force-resume requires --resume or --resume-latest");
     }
+    if opts.adopt_workspace && opts.resume.is_none() && !opts.resume_latest {
+        return usage_err("--adopt-workspace requires --resume or --resume-latest");
+    }
     if opts.verbose && opts.quiet {
         return usage_err("--verbose and --quiet are mutually exclusive");
+    }
+    if opts.as_json && opts.verbose {
+        return usage_err("--json and --verbose are mutually exclusive (JSON mode keeps stdout to the envelope alone)");
     }
     if opts.detach && opts.dry_run {
         return usage_err(
@@ -305,11 +379,20 @@ fn cmd_plan(rest: &[String]) -> i32 {
     let mut i = 0usize;
     while i < rest.len() {
         match rest[i].as_str() {
-            "--var" => {
+            // Options plan accepts and passes through to the shared run path.
+            // Everything else run-only is still rejected, so `plan --detach`
+            // cannot quietly become something plan does not mean.
+            "--var" | "--profiles" | "--state-dir" | "--runs-dir" => {
                 if i + 1 >= rest.len() {
-                    return usage_err("--var needs key=value");
+                    return usage_err(&format!("{} needs a value", rest[i]));
                 }
                 i += 1;
+            }
+            "--json" => {}
+            "--save" => {
+                if rest.get(i + 1).is_some_and(|v| !v.starts_with('-')) {
+                    i += 1;
+                }
             }
             flag if flag.starts_with('-') => return usage_err(&format!("unknown flag '{flag}'")),
             _ => {
@@ -324,6 +407,139 @@ fn cmd_plan(rest: &[String]) -> i32 {
     let mut args = rest.to_vec();
     args.push("--dry-run".into());
     cmd_run(&args)
+}
+
+fn cmd_preflight(rest: &[String]) -> i32 {
+    let mut flow_path: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
+    let mut profiles: Vec<PathBuf> = Vec::new();
+    let mut as_json = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let r: Result<(), String> = match rest[i].as_str() {
+            "--state-dir" => {
+                need(rest, &mut i, "--state-dir").map(|v| state_dir = Some(PathBuf::from(v)))
+            }
+            "--profiles" => {
+                need(rest, &mut i, "--profiles").map(|v| profiles.push(PathBuf::from(v)))
+            }
+            "--json" => {
+                as_json = true;
+                Ok(())
+            }
+            s if s.starts_with('-') => Err(format!("unknown flag '{s}'")),
+            s => {
+                if flow_path.is_some() {
+                    Err("more than one flow file given".into())
+                } else {
+                    flow_path = Some(PathBuf::from(s));
+                    Ok(())
+                }
+            }
+        };
+        if let Err(e) = r {
+            return usage_err(&e);
+        }
+        i += 1;
+    }
+    if !profiles.is_empty() && flow_path.is_none() {
+        return usage_err("--profiles needs a flow file to apply the overlay to");
+    }
+    let root = state::StateRoot::resolve(state_dir.as_deref(), None);
+    preflight::run(flow_path.as_deref(), &root, &profiles, as_json)
+}
+
+fn cmd_workspaces(rest: &[String]) -> i32 {
+    let sub = rest.first().map(String::as_str).unwrap_or("list");
+    if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
+        let usage = match sub {
+            "list" => "sfh workspaces list [--runs-dir d] [--state-dir d] [--json]",
+            "show" => "sfh workspaces show <run-dir> [--json]",
+            "clean" => {
+                "sfh workspaces clean [--runs-dir d] [--older-than DAYS] [--dry-run] [--json]"
+            }
+            "remove" => "sfh workspaces remove <run-dir> [--discard] [--json]",
+            _ => "sfh workspaces list|show|clean|remove [options]",
+        };
+        println!("{usage}");
+        return if matches!(sub, "list" | "show" | "clean" | "remove" | "-h" | "--help") {
+            0
+        } else {
+            2
+        };
+    }
+    let mut runs_dir: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
+    let mut target: Option<PathBuf> = None;
+    let mut as_json = false;
+    let mut dry_run = false;
+    let mut discard = false;
+    let mut days: Option<u64> = None;
+    let mut i = 1;
+    while i < rest.len() {
+        let r: Result<(), String> = match rest[i].as_str() {
+            "--runs-dir" => {
+                need(rest, &mut i, "--runs-dir").map(|v| runs_dir = Some(PathBuf::from(v)))
+            }
+            "--state-dir" => {
+                need(rest, &mut i, "--state-dir").map(|v| state_dir = Some(PathBuf::from(v)))
+            }
+            "--json" => {
+                as_json = true;
+                Ok(())
+            }
+            "--dry-run" if sub == "clean" => {
+                dry_run = true;
+                Ok(())
+            }
+            // The only way an sfh command discards uncommitted work, and a
+            // human has to type it.
+            "--discard" if sub == "remove" => {
+                discard = true;
+                Ok(())
+            }
+            "--older-than" if sub == "clean" => need(rest, &mut i, "--older-than")
+                .and_then(|v| {
+                    v.strip_suffix('d')
+                        .unwrap_or(v)
+                        .parse()
+                        .map_err(|_| "--older-than needs days".to_string())
+                })
+                .map(|v| days = Some(v)),
+            s if s.starts_with('-') => Err(format!("unknown flag '{s}'")),
+            s if sub == "show" || sub == "remove" => {
+                if target.is_some() {
+                    Err("more than one run dir given".into())
+                } else {
+                    target = Some(PathBuf::from(s));
+                    Ok(())
+                }
+            }
+            s => Err(format!(
+                "workspaces {sub} does not accept positional argument '{s}'"
+            )),
+        };
+        if let Err(e) = r {
+            return usage_err(&e);
+        }
+        i += 1;
+    }
+    let root = state::StateRoot::resolve(state_dir.as_deref(), runs_dir.as_deref());
+    match sub {
+        "list" => runs::workspaces_list(&root.runs_dir(), as_json),
+        "show" => match target {
+            Some(d) => runs::workspaces_show(&d, as_json),
+            None => usage_err("usage: sfh workspaces show <run-dir>"),
+        },
+        "clean" => runs::workspaces_clean(&root.runs_dir(), days, dry_run, as_json),
+        "remove" => match target {
+            Some(d) => runs::workspaces_remove(&d, discard, as_json),
+            None => usage_err("usage: sfh workspaces remove <run-dir> [--discard]"),
+        },
+        other => usage_err(&format!(
+            "unknown workspaces subcommand '{other}' (list/show/clean/remove)"
+        )),
+    }
 }
 
 fn cmd_graph(rest: &[String]) -> i32 {
@@ -347,7 +563,7 @@ fn cmd_graph(rest: &[String]) -> i32 {
 
 fn cmd_config(rest: &[String]) -> i32 {
     if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
-        println!("sfh config show <flow.yaml> [--show-secrets]");
+        println!("sfh config show <flow.yaml> [--profiles file] [--show-secrets]");
         return 0;
     }
     if rest.first().map(String::as_str) != Some("show") {
@@ -355,15 +571,22 @@ fn cmd_config(rest: &[String]) -> i32 {
     }
     let mut path: Option<PathBuf> = None;
     let mut show_secrets = false;
-    for arg in &rest[1..] {
-        match arg.as_str() {
+    let mut profiles: Vec<PathBuf> = Vec::new();
+    let mut i = 1;
+    while i < rest.len() {
+        match rest[i].as_str() {
             "--show-secrets" => show_secrets = true,
+            "--profiles" => match need(rest, &mut i, "--profiles") {
+                Ok(v) => profiles.push(PathBuf::from(v)),
+                Err(e) => return usage_err(&e),
+            },
             flag if flag.starts_with('-') => return usage_err(&format!("unknown flag '{flag}'")),
             value if path.is_some() => {
                 return usage_err(&format!("more than one flow file given (extra: '{value}')"))
             }
             value => path = Some(PathBuf::from(value)),
         }
+        i += 1;
     }
     let Some(path) = path else {
         return usage_err("usage: sfh config show <flow.yaml> [--show-secrets]");
@@ -373,7 +596,7 @@ fn cmd_config(rest: &[String]) -> i32 {
             "sfh: warning: --show-secrets prints environment values; treat stdout as sensitive"
         );
     }
-    engine::show_config(&path, show_secrets)
+    engine::show_config(&path, show_secrets, &profiles)
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -395,7 +618,9 @@ fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
     while i < rest.len() {
         let r: Result<(), String> = match rest[i].as_str() {
             "--runs-dir" => need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v)),
-            "--json" if mode == Watch::Status => {
+            "--state-dir" => need(rest, &mut i, "--state-dir")
+                .map(|v| runs_dir = state::StateRoot::resolve(Some(Path::new(v)), None).runs_dir()),
+            "--json" => {
                 as_json = true;
                 Ok(())
             }
@@ -427,21 +652,37 @@ fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
         }
         i += 1;
     }
+    if as_json && quiet {
+        return usage_err("--json and --quiet are mutually exclusive (JSON mode already keeps stdout to the envelope alone)");
+    }
     match mode {
-        Watch::Wait => watch::wait(target.as_deref(), &runs_dir, timeout, interval, quiet),
-        Watch::Stop => watch::stop(target.as_deref(), &runs_dir),
+        Watch::Wait => watch::wait(
+            target.as_deref(),
+            &runs_dir,
+            timeout,
+            interval,
+            quiet || as_json,
+            as_json,
+        ),
+        Watch::Stop => watch::stop(target.as_deref(), &runs_dir, as_json),
         Watch::Status => watch::status(target.as_deref(), &runs_dir, as_json),
     }
 }
 
 fn cmd_doctor(rest: &[String]) -> i32 {
     let mut flow_path: Option<PathBuf> = None;
-    let mut runs_dir = PathBuf::from(".sfh").join("runs");
+    let mut runs_dir: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
     let mut timeout = 120u64;
     let mut i = 0;
     while i < rest.len() {
         let r: Result<(), String> = match rest[i].as_str() {
-            "--runs-dir" => need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v)),
+            "--runs-dir" => {
+                need(rest, &mut i, "--runs-dir").map(|v| runs_dir = Some(PathBuf::from(v)))
+            }
+            "--state-dir" => {
+                need(rest, &mut i, "--state-dir").map(|v| state_dir = Some(PathBuf::from(v)))
+            }
             "--timeout" => need(rest, &mut i, "--timeout")
                 .and_then(|v| v.parse().map_err(|_| "--timeout needs seconds".to_string()))
                 .map(|v| timeout = v),
@@ -460,7 +701,8 @@ fn cmd_doctor(rest: &[String]) -> i32 {
         }
         i += 1;
     }
-    let work = doctor::default_work_dir(&runs_dir);
+    let root = state::StateRoot::resolve(state_dir.as_deref(), runs_dir.as_deref());
+    let work = doctor::default_work_dir(&root.runs_dir(), &root);
     doctor::run(flow_path.as_deref(), timeout, &work)
 }
 
@@ -469,6 +711,7 @@ fn cmd_validate(rest: &[String]) -> i32 {
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut strict = false;
     let mut as_json = false;
+    let mut profiles: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -477,6 +720,10 @@ fn cmd_validate(rest: &[String]) -> i32 {
                     return usage_err(&e);
                 }
             }
+            "--profiles" => match need(rest, &mut i, "--profiles") {
+                Ok(v) => profiles.push(PathBuf::from(v)),
+                Err(e) => return usage_err(&e),
+            },
             "--strict" => strict = true,
             "--json" => as_json = true,
             s if s.starts_with('-') => return usage_err(&format!("unknown flag '{s}'")),
@@ -492,8 +739,8 @@ fn cmd_validate(rest: &[String]) -> i32 {
     let Some(fp) = flow_path else {
         return usage_err("usage: sfh validate <flow.yaml> [--var k=v]...");
     };
-    if strict || as_json {
-        engine::validate_with_options(&fp, &vars, strict, as_json)
+    if strict || as_json || !profiles.is_empty() {
+        engine::validate_with_options(&fp, &vars, strict, as_json, &profiles)
     } else {
         engine::validate(&fp, &vars)
     }
@@ -641,8 +888,12 @@ mod tests {
     #[test]
     fn guide_fits_one_screen() {
         assert!(
-            GUIDE.lines().count() <= 80,
-            "guide is {} lines; maximum is 80",
+            // Raised from 80 in v1.2.0: the guide is what an AI caller reads
+            // to drive sfh, and v1.2 added the machine interface and the
+            // workspace/context/replay keys it most needs to know about. Still
+            // a budget, not a licence - anything added here has to earn a line.
+            GUIDE.lines().count() <= 110,
+            "guide is {} lines; maximum is 110",
             GUIDE.lines().count()
         );
     }
@@ -675,6 +926,7 @@ mod tests {
                 no_partial_emit: false,
                 detach: false,
                 run_dir: None,
+                ..Default::default()
             });
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_dir_all(&runs_dir);
@@ -731,6 +983,7 @@ steps:
             no_partial_emit: false,
             detach: false,
             run_dir: None,
+            ..Default::default()
         });
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(runs_dir);

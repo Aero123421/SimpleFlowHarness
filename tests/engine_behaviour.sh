@@ -9,6 +9,18 @@ SFH="$(cd "$(dirname "$SFH")" && pwd)/$(basename "$SFH")"
 # this script and everything after the cd is relative to a temp dir.
 SUITE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d)"
+# sfh is a NATIVE binary, so under msys it cannot resolve the /tmp/... paths
+# bash hands out - it needs the drive-letter form. Any path this suite writes
+# into a flow, a manifest or an argument therefore goes through here first.
+# A no-op on real Unix, where the two spellings are the same thing.
+native_path() {
+  if command -v cygpath > /dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+WORK_NATIVE="$(native_path "$WORK")"
 # Windows holds a directory busy while any process still has a handle inside
 # it, and this suite deliberately starts DETACHED runs that outlive it - that
 # is the feature under test, not a leak. A cleanup that loses the race used to
@@ -84,7 +96,7 @@ fnv1a64() {
 }
 
 # --- session-reporting stub CLI (T-0 / B-15) ---------------------------------
-# `bin: "echo"` cannot report a session id, so every test that stands echo in
+# `bin: "$STUB_BIN"` cannot report a session id, so every test that stands echo in
 # for claude fails F-11's "resume unverified" check and can only prove that a
 # guard did NOT fire. tests/stub/session_stub.rs speaks the shape sfh parses
 # (`claude -p --output-format json`: one envelope with .result/.session_id/
@@ -245,22 +257,30 @@ else
   pass=$((pass + 1))
 fi
 # Negative control. The same flow with the old stand-in must still fail, or the
-# check above proves nothing about the stub: echo reports no session id, so
-# F-11 cannot tell a resume from a fresh session and refuses.
+# check above proves nothing about the stub. Since 1.2 it fails EARLIER than it
+# used to: echo never prints claude's documented result envelope, so the
+# structured protocol is refused before session identity is even considered.
+# (Before 1.2 the parser handed echo's raw stdout back as the answer and the
+# step got as far as F-11's "resume unverified" - a weaker guarantee, since a
+# fresh step with the same stand-in passed.)
 sed "s#$STUB_BIN#echo#g" stub-session.yaml > stub-session-echo.yaml
 "$SFH" run stub-session-echo.yaml -q > stub-session-echo.out 2> stub-session-echo.err
 check "the same flow with bin: echo still cannot verify the resume" 1 $?
-contains "echo fails for the session reason, not another one" "resume unverified" stub-session-echo.err
+contains "echo fails for the protocol reason, not another one" "not its documented machine-readable output" stub-session-echo.err
+not_contains "echo's stdout is never handed on as the answer" "sfh-stub" stub-session-echo.out
 
 # --- built-in AI guide -------------------------------------------------------
 "$SFH" guide > guide.out 2> guide.err
 check "guide prints without arguments" 0 $?
+# Raised from 80 in v1.2.0, deliberately: the guide is what an AI caller reads
+# to drive sfh, and v1.2 added the machine interface and the
+# workspace/context/replay keys it most needs. Still a budget, not a licence.
 GUIDE_LINES="$(awk 'END { print NR }' guide.out)"
-if [ "$GUIDE_LINES" -le 80 ]; then
-  echo "ok   - guide stays within 80 lines"
+if [ "$GUIDE_LINES" -le 110 ]; then
+  echo "ok   - guide stays within 110 lines"
   pass=$((pass + 1))
 else
-  echo "FAIL - guide is $GUIDE_LINES lines (maximum 80)"
+  echo "FAIL - guide is $GUIDE_LINES lines (maximum 110)"
   fail=$((fail + 1))
 fi
 "$SFH" guide unexpected > guide-args.out 2>&1
@@ -558,7 +578,7 @@ fi
 # --- compact instruction rendering + pre-compact notes -----------------------
 # `echo` stands in for codex: it exits successfully without calling an AI, while
 # sfh still writes the exact compact prompt and replaces the chain output.
-cat > compact.yaml <<'YAML'
+cat > compact.yaml <<YAML
 name: compact
 vars:
   topic: "rendered-topic"
@@ -569,7 +589,7 @@ steps:
     compact:
       when_over: 10
       tool: codex
-      bin: "echo"
+      bin: "$STUB_BIN"
       instruction: "INSTRUCTION={{vars.topic}}"
   - id: after
     cmd: ["echo", "compact-finished"]
@@ -692,13 +712,13 @@ fi
 # max_total_steps covers every engine-scheduled leaf run, including recovery
 # and summarization paths. Those two paths used to increment the count without
 # checking it, so a limit of one still executed a second external command.
-cat > max-total-fallback.yaml <<'YAML'
+cat > max-total-fallback.yaml <<YAML
 name: max-total-fallback
 defaults:
   max_total_steps: 1
 profiles:
   broken: { tool: codex, bin: "false", access: read }
-  works:  { tool: codex, bin: "echo", access: read }
+  works:  { tool: codex, bin: "$STUB_BIN", access: read }
 steps:
   - id: primary
     use: broken
@@ -729,7 +749,7 @@ MAX_TOTAL_PRIMARY_STARTS="$(
 check "the max_total resume does not rebill the checkpointed primary" \
   1 "$MAX_TOTAL_PRIMARY_STARTS"
 
-cat > max-total-compact.yaml <<'YAML'
+cat > max-total-compact.yaml <<YAML
 name: max-total-compact
 defaults:
   max_total_steps: 1
@@ -739,7 +759,7 @@ steps:
     compact:
       when_over: 1
       tool: codex
-      bin: "echo"
+      bin: "$STUB_BIN"
 YAML
 "$SFH" run max-total-compact.yaml --runs-dir max-total-compact-runs -q \
   > max-total-compact.out 2> max-total-compact.err
@@ -1144,11 +1164,11 @@ fi
 # It used to be honoured only on plain leaves: a parallel child could declare
 # fallback and silently not have it. Fake tools, so no AI is called - `false`
 # always fails, `echo` always succeeds and codex's parser falls back to stdout.
-cat > fb.yaml <<'YAML'
+cat > fb.yaml <<YAML
 name: fb
 profiles:
   broken: { tool: codex, bin: "false", access: read }
-  works:  { tool: codex, bin: "echo", access: read }
+  works:  { tool: codex, bin: "$STUB_BIN", access: read }
 steps:
   - id: plain
     use: broken
@@ -1218,12 +1238,12 @@ check "parallel fallback resume does not rebill the member primary" \
 contains "parallel fallback resume continues beyond the group" \
   "fanout-survived" fb-fan-resume.out
 
-cat > fb-foreach.yaml <<'YAML'
+cat > fb-foreach.yaml <<YAML
 api_version: 1
 name: fb-foreach
 profiles:
   broken: {tool: codex, bin: "false", access: read}
-  works: {tool: codex, bin: "echo", access: read}
+  works: {tool: codex, bin: "$STUB_BIN", access: read}
 steps:
   - id: source
     cmd: ["echo", "one-item"]
@@ -2021,20 +2041,20 @@ check "S2-3: a flag injected by an upstream output is refused before spawn" 1 $?
 contains "S2-3: the runtime error names the escape hatch" "allow_access_override" s23-runtime.err
 
 # --- S2-4: a session cannot be resumed at a higher access level ---------------
-# bin: "echo" stands in for claude: it exits 0 without calling an AI, and sfh
+# bin: "$STUB_BIN" stands in for claude: it exits 0 without calling an AI, and sfh
 # pre-assigns the session id itself, so a session gets recorded - with the
 # access level it was created under.
-cat > s24.yaml <<'YAML'
+cat > s24.yaml <<YAML
 name: s24
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: high
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     continue_from: low
     prompt: "y"
@@ -2045,24 +2065,24 @@ contains "S2-4: the error names both levels" "access read" s24.err
 contains "S2-4: the error names the escape hatch" "allow_access_override" s24.err
 S24_LOG="$(find s24-runs -type f -name 'log.jsonl' -print -quit)"
 contains "S2-4: the session records the access it was created under" '"access":"read"' "$S24_LOG"
-cat > s24-override.yaml <<'YAML'
+cat > s24-override.yaml <<YAML
 name: s24-override
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: high
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     allow_access_override: true
     continue_from: low
     prompt: "y"
 YAML
 "$SFH" run s24-override.yaml -q > s24-override.out 2> s24-override.err
-# Judged by the refusal MESSAGE, not the exit code. `bin: "echo"` reports no
+# Judged by the refusal MESSAGE, not the exit code. `bin: "$STUB_BIN"` reports no
 # session id, so F-11's "resume unverified" check now fails every one of these
 # runs on its own - real claude does report one, so that guard is correct and
 # the stub simply cannot satisfy it. An exit-code assertion here would be
@@ -2074,17 +2094,17 @@ else
   echo "ok   - S2-4: allow_access_override permits the escalation"
   pass=$((pass + 1))
 fi
-cat > s24-same.yaml <<'YAML'
+cat > s24-same.yaml <<YAML
 name: s24-same
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: again
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     continue_from: low
     prompt: "y"
@@ -2097,17 +2117,17 @@ else
   echo "ok   - S2-4: resuming at the same access level is allowed"
   pass=$((pass + 1))
 fi
-cat > s24-fork.yaml <<'YAML'
+cat > s24-fork.yaml <<YAML
 name: s24-fork
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: branch
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     fork_from: low
     prompt: "y"
@@ -2169,14 +2189,14 @@ touch EVIL-PROBE-RAN
 echo evil 1.0
 SH
 chmod +x evil-probe.sh
-cat > s32.yaml <<'YAML'
+cat > s32.yaml <<YAML
 name: s32
 profiles:
   aaa-unused: { tool: codex, bin: "./evil-probe.sh" }
 steps:
   - id: real
     tool: codex
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
 YAML
@@ -2191,7 +2211,7 @@ else
   pass=$((pass + 1))
 fi
 S32_META="$(dirname "$(find s32-runs -type f -name 'log.jsonl' -print -quit)")/meta.json"
-contains "S3-2: provenance records the resolved bin" '"bin": "echo"' "$S32_META"
+contains "S3-2: provenance records the resolved bin" "\"bin\": \"$STUB_BIN\"" "$S32_META"
 if grep -qF "evil-probe" "$S32_META"; then
   echo "FAIL - S3-2: the unused profile leaked into provenance"
   fail=$((fail + 1))
@@ -2203,7 +2223,7 @@ contains "S3-4: meta records the fingerprint algorithm" '"flow_fingerprint_algo"
 # doctor resolves the same way and must not launch the unused bin either.
 rm -f EVIL-PROBE-RAN
 "$SFH" doctor s32.yaml --runs-dir s32-doctor > s32-doctor.out 2>&1
-check "S3-2: doctor probes the resolved bin (echo stands in)" 0 $?
+check "S3-2: doctor probes the resolved bin (the stub stands in)" 0 $?
 if [ -f EVIL-PROBE-RAN ]; then
   echo "FAIL - S3-2: doctor executed the unused profile's bin"
   fail=$((fail + 1))
@@ -2211,20 +2231,20 @@ else
   echo "ok   - S3-2: doctor never executed the unused profile's bin"
   pass=$((pass + 1))
 fi
-contains "S3-2: doctor names the resolved program" "echo" s32-doctor.out
+contains "S3-2: doctor names the resolved program" "$STUB_NAME" s32-doctor.out
 
 # --- S3-3: run artifacts are owner-only and gitignore is verified -------------
 # An AI step, not a cmd: step. The prompt file is the most sensitive artifact
 # a run writes, and only a step with a prompt: produces one - the old fixture
 # asserted 0600 on a file it never created, so `stat` returned nothing and the
-# check could not have failed for the right reason either. bin: "echo" stands
+# check could not have failed for the right reason either. bin: "$STUB_BIN" stands
 # in for the CLI.
-cat > s33.yaml <<'YAML'
+cat > s33.yaml <<YAML
 name: s33
 steps:
   - id: a
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "secret-output"
 YAML
@@ -3200,17 +3220,17 @@ fi
 # --- S2-4 extended: missing recorded access is fail-closed --------------------
 # A run dir whose log has no "access" field in the session must refuse a
 # higher-access resume unless allow_access_override is set.
-cat > s24-missing.yaml <<'YAML'
+cat > s24-missing.yaml <<YAML
 name: s24-missing
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: high
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     continue_from: low
     prompt: "y"
@@ -3525,19 +3545,19 @@ else
 fi
 
 # --- F4: step_start records the session it attached to ------------------------
-# bin: "echo" stands in for claude exactly as the S2-4 block uses it: sfh
+# bin: "$STUB_BIN" stands in for claude exactly as the S2-4 block uses it: sfh
 # pre-assigns the session id, so continue_from/fork_from resolve without an AI.
-cat > f4sess.yaml <<'YAML'
+cat > f4sess.yaml <<YAML
 name: f4sess
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: again
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     continue_from: low
     prompt: "y"
@@ -3569,17 +3589,17 @@ else
   echo "FAIL - F4: a step with no session parent did not record null"
   fail=$((fail + 1))
 fi
-cat > f4fork.yaml <<'YAML'
+cat > f4fork.yaml <<YAML
 name: f4fork
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: branch
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     fork_from: low
     prompt: "y"
@@ -3601,25 +3621,25 @@ fi
 # use of fork_from, and the two tests above only cover top-level leaves. Without
 # this one, session_parent could be (and was) recorded for every case except the
 # one the key was added for.
-cat > f4fanp.yaml <<'YAML'
+cat > f4fanp.yaml <<YAML
 name: f4fanp
 steps:
   - id: plan
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: fan
     parallel:
       - id: br_a
         tool: claude
-        bin: "echo"
+        bin: "$STUB_BIN"
         access: read
         fork_from: plan
         prompt: "a"
       - id: br_b
         tool: claude
-        bin: "echo"
+        bin: "$STUB_BIN"
         access: read
         fork_from: plan
         prompt: "b"
@@ -4990,6 +5010,612 @@ check "F1: a foreach quantifier over its run-time size passes validate" 0 $?
 "$SFH" run f1-v-fe.yaml --runs-dir f1vf-runs -q > f1vfr.out 2> f1vfr.err
 check "F1: and the run it cannot satisfy still finishes" 0 $?
 contains "F1: an unsatisfiable foreach quantifier falls to the catch-all" "NO-CONSENSUS" f1vfr.out
+
+# ============================================================================
+# v1.2: workspace, context, closure, replay, machine JSON
+#
+# The compatibility rule these all sit under: a flow that uses NONE of the new
+# keys must behave exactly as it did in 1.1. Each block below therefore checks
+# both halves - the new behaviour, and that it stays switched off by default.
+# ============================================================================
+
+# --- a flow with no new keys creates nothing and runs where it always did ----
+cat > compat.yaml <<'YAML'
+name: compat
+steps:
+  - id: here
+    cmd: ["sh", "-c", "pwd"]
+YAML
+"$SFH" run compat.yaml --runs-dir compat-runs -q > compat.out 2> compat.err
+check "v1.2 compat: a flow with no new keys runs" 0 $?
+# msys' `pwd` and a native Windows binary's spell the same directory
+# differently (/tmp/tmp.X vs C:/Users/.../Temp/tmp.X), so compare the leaf name:
+# it is stable everywhere, and a managed workspace would end in `primary`
+# instead - which is the difference this is actually checking for.
+COMPAT_CWD="$(cat compat.out)"
+COMPAT_LEAF="$(basename "$COMPAT_CWD" | tr -d '\r')"
+if [ "$COMPAT_LEAF" = "$(basename "$(pwd)")" ]; then
+  echo "ok   - v1.2 compat: it still runs in the caller's cwd"
+  pass=$((pass + 1))
+else
+  echo "FAIL - v1.2 compat: cwd moved to '$COMPAT_CWD' (expected to stay in $(pwd))"
+  fail=$((fail + 1))
+fi
+COMPAT_DIR="$(dirname "$(find compat-runs -type f -name 'log.jsonl' -print -quit)")"
+if [ -f "$COMPAT_DIR/workspace.json" ]; then
+  echo "FAIL - v1.2 compat: a flow that asked for no workspace got one"
+  fail=$((fail + 1))
+else
+  echo "ok   - v1.2 compat: no workspace manifest is written"
+  pass=$((pass + 1))
+fi
+# The runs root default is untouched.
+"$SFH" run compat.yaml -q > /dev/null 2>&1
+if [ -d ".sfh/runs" ]; then
+  echo "ok   - v1.2 compat: the default runs root is still .sfh/runs"
+  pass=$((pass + 1))
+else
+  echo "FAIL - v1.2 compat: .sfh/runs is no longer the default"
+  fail=$((fail + 1))
+fi
+
+# --- a run dir written before v1.2 still resumes ------------------------------
+# Upgrading sfh must not, by itself, orphan every run dir on disk. The
+# effective-config fingerprint is a serialization of the flow struct, so every
+# key v1.2 added is skipped when unused; this checks the consequence rather than
+# the mechanism, by hand-writing a run dir that carries no v1.2 artifacts at all.
+cat > legacy.yaml <<'YAML'
+name: legacy
+steps:
+  - id: a
+    cmd: ["echo", "first"]
+  - id: gate
+    cmd: ["sh", "-c", "if [ -f legacy-trip ]; then echo ok; else touch legacy-trip; exit 5; fi"]
+  - id: last
+    cmd: ["echo", "legacy-finished"]
+YAML
+rm -f legacy-trip
+"$SFH" run legacy.yaml --runs-dir legacy-runs -q > legacy.out 2>&1
+check "legacy: the first attempt stops at the gate" 1 $?
+LEGACY_DIR="$(dirname "$(find legacy-runs -type f -name 'log.jsonl' -print -quit)")"
+# Strip everything v1.2 writes, so the dir looks exactly like one a 1.1 binary
+# left behind: no closure, no workspace manifest, and no new meta keys.
+rm -f "$LEGACY_DIR/execution-closure.json" "$LEGACY_DIR/workspace.json"
+python3 - "$LEGACY_DIR" <<'PY'
+import json, sys
+d = sys.argv[1]
+m = json.load(open(d + "/meta.json"))
+for k in ["execution_closure_fingerprint", "execution_closure_algo", "workspace",
+          "unsafe_overrides", "profile_overlays"]:
+    m.pop(k, None)
+m["sfh_version"] = "1.1.5"
+json.dump(m, open(d + "/meta.json", "w"), indent=2)
+PY
+"$SFH" run legacy.yaml --resume "$LEGACY_DIR" -q > legacy2.out 2> legacy2.err
+check "legacy: a run dir with no v1.2 artifacts still resumes" 0 $?
+contains "legacy: and finishes the flow" "legacy-finished" legacy2.out
+"$SFH" runs why "$LEGACY_DIR" --json > legacy-why.json 2>&1
+check "legacy: runs why reads a pre-1.2 log" 0 $?
+contains "legacy: a missing protocol_state reads as null, not as a failure" '"protocol_failure": null' legacy-why.json
+
+# --- managed workspace: one per run, whatever the step and visit count -------
+if command -v git > /dev/null 2>&1; then
+  rm -rf wsrepo && mkdir wsrepo && (
+    cd wsrepo || exit
+    git init -q . && git config user.email t@t && git config user.name t
+    echo seed > seed.txt && git add -A && git commit -qm init
+  )
+  cat > "$WORK/wsrepo/ws.yaml" <<'YAML'
+name: ws
+workspace:
+  mode: auto
+steps:
+  - id: write
+    effects: workspace
+    cmd: ["sh", "-c", "echo made >> made.txt; pwd"]
+  - id: read_back
+    effects: read
+    cmd: ["sh", "-c", "cat made.txt"]
+  - id: again
+    effects: workspace
+    cmd: ["sh", "-c", "echo more >> made.txt"]
+YAML
+  ( cd wsrepo && "$SFH" run ws.yaml --state-dir "$WORK/wsstate" --emit read_back -q > ../ws.out 2> ../ws.err )
+  check "workspace: an auto flow with writers runs" 0 $?
+  WS_TREES="$( ( cd wsrepo && git worktree list ) | wc -l | tr -d ' ')"
+  check "workspace: exactly one managed worktree for the whole run" 2 "$WS_TREES"
+  contains "workspace: a read step sees the writer's file" "made" ws.out
+  WS_MANIFEST="$(find "$WORK/wsstate/runs" -name 'workspace.json' -print -quit)"
+  if [ -n "$WS_MANIFEST" ]; then
+    echo "ok   - workspace: the run records a workspace manifest"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - workspace: no workspace.json was written"
+    fail=$((fail + 1))
+  fi
+  contains "workspace: the manifest records sfh ownership" '"created_by_sfh": true' "$WS_MANIFEST"
+  # The caller's own checkout is untouched.
+  WS_DIRTY="$( ( cd wsrepo && git status --porcelain ) | grep -c 'made.txt' || true)"
+  check "workspace: the user's own checkout has no new files" 0 "$WS_DIRTY"
+  # Uncommitted work is never discarded, so the workspace survives the run.
+  WS_PATH="$(sed -n 's/.*"path": "\(.*\)",*/\1/p' "$WS_MANIFEST" | head -1)"
+  if [ -d "$WS_PATH" ]; then
+    echo "ok   - workspace: a dirty workspace is kept after a successful run"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - workspace: uncommitted work was discarded by cleanup"
+    fail=$((fail + 1))
+  fi
+  contains "workspace: cleanup says why it kept it" '"event":"workspace_cleanup"' "$(dirname "$WS_MANIFEST")/log.jsonl"
+  # A read-only auto flow creates NO worktree at all.
+  cat > "$WORK/wsrepo/ws-read.yaml" <<'YAML'
+name: ws-read
+workspace:
+  mode: auto
+steps:
+  - id: look
+    effects: read
+    cmd: ["sh", "-c", "pwd"]
+YAML
+  ( cd wsrepo && "$SFH" run ws-read.yaml --state-dir "$WORK/wsstate2" -q > ../wsr.out 2>&1 )
+  check "workspace: a read-only auto flow runs" 0 $?
+  WSR_TREES="$( ( cd wsrepo && git worktree list ) | wc -l | tr -d ' ')"
+  check "workspace: a read-only auto flow creates no worktree" 2 "$WSR_TREES"
+  # sfh refuses to remove a directory it did not create.
+  mkdir -p not-ours fake-run && printf 'x' > not-ours/keep.txt
+  printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"/nope","path":"%s","created_by_sfh":true,"ownership_nonce":"forged","cleanup":"auto"}\n' \
+    "$WORK_NATIVE/not-ours" > fake-run/workspace.json
+  printf '{"schema_version":1,"state":"done"}\n' > fake-run/status.json
+  printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > fake-run/log.jsonl
+  "$SFH" workspaces remove fake-run > wsrm.out 2> wsrm.err
+  check "workspace: removing an unowned directory is refused" 1 $?
+  if [ -f not-ours/keep.txt ]; then
+    echo "ok   - workspace: the unowned directory was not touched"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - workspace: sfh deleted a directory it did not create"
+    fail=$((fail + 1))
+  fi
+else
+  echo "SKIP - workspace tests need git on PATH"
+fi
+
+# --- named context: deterministic bundle, manifest, containment --------------
+printf 'the task\n' > TASK.md
+cat > ctxflow.yaml <<'YAML'
+name: ctxflow
+contexts:
+  task:
+    file: ./TASK.md
+  rules:
+    inline: "be brief"
+steps:
+  - id: use
+    context: [task, rules]
+    cmd: ["sh", "-c", "cat -"]
+    stdin: prompt
+    prompt: "do it"
+YAML
+"$SFH" run ctxflow.yaml --runs-dir ctx-runs -q > ctx.out 2> ctx.err
+check "context: a flow with named context runs" 0 $?
+CTX_DIR="$(dirname "$(find ctx-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "context: the bundle is saved as an artifact" "the task" "$CTX_DIR/use.context.txt"
+contains "context: sources appear in declared order" '<sfh-context name="task">' "$CTX_DIR/use.context.txt"
+contains "context: the manifest records each source hash" '"kind": "file"' "$CTX_DIR/use.context.json"
+contains "context: the prompt carries the bundle then the prompt" "<sfh-prompt>" "$CTX_DIR/use.prompt.txt"
+if grep -q "the task" "$CTX_DIR/log.jsonl"; then
+  echo "FAIL - context: the durable log carries the context content"
+  fail=$((fail + 1))
+else
+  echo "ok   - context: the log records the hash, never the content"
+  pass=$((pass + 1))
+fi
+contains "context: step_start records the bundle hash" '"context_hash"' "$CTX_DIR/log.jsonl"
+# A path that escapes the flow directory is refused.
+mkdir -p outside && printf 'SECRET\n' > outside/secret.txt
+mkdir -p inside
+cp ctxflow.yaml inside/esc.yaml
+sed -i.bak 's#file: ./TASK.md#file: ../outside/secret.txt#' inside/esc.yaml 2>/dev/null || \
+  sed 's#file: ./TASK.md#file: ../outside/secret.txt#' ctxflow.yaml > inside/esc.yaml
+"$SFH" run inside/esc.yaml --runs-dir esc-runs -q > esc.out 2> esc.err
+check "context: a path outside the flow directory is refused" 1 $?
+contains "context: the refusal names the escape hatch" "allow_external" esc.err
+if grep -q "SECRET" esc.out; then
+  echo "FAIL - context: the out-of-tree file was read anyway"
+  fail=$((fail + 1))
+else
+  echo "ok   - context: nothing outside the flow directory was read"
+  pass=$((pass + 1))
+fi
+# An over-budget bundle fails BEFORE anything is spawned.
+cat > budget.yaml <<'YAML'
+name: budget
+defaults:
+  max_context_chars: 5
+contexts:
+  big:
+    inline: "0123456789ABCDEF"
+steps:
+  - id: use
+    context: [big]
+    cmd: ["sh", "-c", "echo SPAWNED > spawned.marker"]
+YAML
+rm -f spawned.marker
+"$SFH" run budget.yaml --runs-dir budget-runs -q > budget.out 2> budget.err
+check "context: an over-budget bundle fails the run" 1 $?
+contains "context: the refusal names the budget" "max_context_chars" budget.err
+if [ -f spawned.marker ]; then
+  echo "FAIL - context: the step was spawned despite the budget failure"
+  fail=$((fail + 1))
+else
+  echo "ok   - context: nothing was spawned"
+  pass=$((pass + 1))
+fi
+
+# --- adversarial: deletion and context containment ---------------------------
+# sfh deletes only what it created, and a context file cannot be used to read
+# something the flow was not allowed to name.
+if have_symlinks; then
+  mkdir -p victim && printf 'precious\n' > victim/data.txt
+  # A marker whose nonce MATCHES, planted in the directory an attacker wants
+  # deleted, reached through a symlink the manifest names.
+  printf '{"schema_version":1,"created_by":"sfh","run_id":"r","ownership_nonce":"N1"}\n' \
+    > victim/.sfh-workspace
+  MSYS=winsymlinks:nativestrict ln -s "$WORK/victim" linkdir
+  mkdir -p link-run
+  printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"%s","path":"%s","created_by_sfh":true,"ownership_nonce":"N1","cleanup":"auto"}\n' \
+    "$WORK_NATIVE" "$WORK_NATIVE/linkdir" > link-run/workspace.json
+  printf '{"schema_version":1,"state":"done"}\n' > link-run/status.json
+  printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > link-run/log.jsonl
+  "$SFH" workspaces remove link-run --discard > linkrm.out 2> linkrm.err
+  check "adversarial: removing through a symlink is refused" 1 $?
+  # Which guard fires depends on the platform: on Unix the path resolves and the
+  # symlink check refuses it; under msys a native binary cannot resolve the link
+  # at all and the ownership check refuses it first. Both are refusals to touch
+  # anything, and both say so - assert THAT, not which one won the race.
+  contains "adversarial: the refusal is explicit about not removing" "refusing to remove" linkrm.err
+  if [ -f victim/data.txt ]; then
+    echo "ok   - adversarial: the linked directory was not touched"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - adversarial: sfh deleted through a symlink"
+    fail=$((fail + 1))
+  fi
+  # A marker that is itself a symlink proves nothing about the directory.
+  mkdir -p linkmarker && MSYS=winsymlinks:nativestrict ln -s "$WORK/victim/.sfh-workspace" linkmarker/.sfh-workspace
+  mkdir -p lm-run
+  printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"%s","path":"%s","created_by_sfh":true,"ownership_nonce":"N1","cleanup":"auto"}\n' \
+    "$WORK_NATIVE" "$WORK_NATIVE/linkmarker" > lm-run/workspace.json
+  printf '{"schema_version":1,"state":"done"}\n' > lm-run/status.json
+  printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > lm-run/log.jsonl
+  "$SFH" workspaces remove lm-run --discard > lmrm.out 2> lmrm.err
+  check "adversarial: a symlinked ownership marker proves nothing" 1 $?
+else
+  echo "SKIP - adversarial symlink deletion tests need native symlinks"
+fi
+# An ABSOLUTE context path is contained the same way a relative one is.
+# The target is a file this test creates, NOT one the OS happens to provide:
+# /etc/hostname does not exist on macOS, so pointing at it made the step fail
+# for "no such file" while the assertion claimed containment had refused it -
+# a test passing for the wrong reason, which is worse than no test.
+mkdir -p absdir
+printf 'ABSOLUTE-SECRET\n' > abs-secret.txt
+cat > absdir/abs-ctx.yaml <<YAML
+name: absctx
+contexts:
+  leak:
+    file: "$WORK_NATIVE/abs-secret.txt"
+steps:
+  - id: a
+    context: [leak]
+    cmd: ["sh", "-c", "cat -"]
+    stdin: prompt
+    prompt: "x"
+YAML
+"$SFH" run absdir/abs-ctx.yaml --runs-dir absctx-runs -q > absctx.out 2> absctx.err
+check "adversarial: an absolute context path outside the flow dir is refused" 1 $?
+contains "adversarial: the absolute-path refusal explains itself" "outside the flow directory" absctx.err
+if grep -q "ABSOLUTE-SECRET" absctx.out absctx.err 2>/dev/null; then
+  echo "FAIL - adversarial: the out-of-tree file was read through an absolute path"
+  fail=$((fail + 1))
+else
+  echo "ok   - adversarial: nothing outside the flow dir was read via an absolute path"
+  pass=$((pass + 1))
+fi
+# A template context renders TEXT. It never opens a path, so run data cannot
+# become a file read however it is shaped.
+cat > tmpl-ctx.yaml <<'YAML'
+name: tmplctx
+contexts:
+  fromstep:
+    template: "{{steps.pick.output}}"
+steps:
+  - id: pick
+    cmd: ["echo", "/etc/hostname"]
+  - id: use
+    context: [fromstep]
+    cmd: ["sh", "-c", "cat -"]
+    stdin: prompt
+    prompt: "x"
+YAML
+"$SFH" run tmpl-ctx.yaml --runs-dir tmplctx-runs -q > tmplctx.out 2>&1
+check "adversarial: a template context runs" 0 $?
+contains "adversarial: a template context carries the text, not the file" "/etc/hostname" tmplctx.out
+TMPL_DIR="$(dirname "$(find tmplctx-runs -type f -name 'log.jsonl' -print -quit)")"
+if grep -qi "localhost" "$TMPL_DIR/use.context.txt" 2>/dev/null; then
+  echo "FAIL - adversarial: a template context opened the path it rendered"
+  fail=$((fail + 1))
+else
+  echo "ok   - adversarial: a template context never opened the path it rendered"
+  pass=$((pass + 1))
+fi
+
+# --- execution closure: a changed input blocks resume ------------------------
+cat > closure.yaml <<'YAML'
+name: closure
+contexts:
+  task:
+    file: ./CTASK.md
+steps:
+  - id: one
+    context: [task]
+    cmd: ["echo", "first"]
+  - id: gate
+    cmd: ["sh", "-c", "if [ -f ctrip ]; then echo ok; else touch ctrip; exit 5; fi"]
+YAML
+printf 'original\n' > CTASK.md
+rm -f ctrip
+"$SFH" run closure.yaml --runs-dir cl-runs -q > cl.out 2> cl.err
+check "closure: the first attempt stops at the gate" 1 $?
+CL_DIR="$(dirname "$(find cl-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "closure: a fingerprint is recorded in meta" '"execution_closure_fingerprint"' "$CL_DIR/meta.json"
+contains "closure: the closure file is written" '"algo": "sha256-canonical-json"' "$CL_DIR/execution-closure.json"
+# Unchanged inputs resume normally (and complete the run, which is why the
+# changed-input cases below each get a run dir of their own).
+"$SFH" run closure.yaml --resume "$CL_DIR" -q > cl2.out 2> cl2.err
+check "closure: an unchanged closure resumes" 0 $?
+
+# A changed context file blocks resume.
+rm -f ctrip
+"$SFH" run closure.yaml --runs-dir cl2-runs -q > cl2a.out 2>&1
+CL2_DIR="$(dirname "$(find cl2-runs -type f -name 'log.jsonl' -print -quit)")"
+# The gate's tripwire stays in place, so once the closure question is settled
+# the resume can actually finish and the exit code means what it says.
+printf 'edited\n' > CTASK.md
+"$SFH" run closure.yaml --resume "$CL2_DIR" -q > cl3.out 2> cl3.err
+check "closure: an edited context file blocks resume" 2 $?
+contains "closure: the refusal uses the stable code" "SFH_EXECUTION_CLOSURE_CHANGED" cl3.err
+contains "closure: the refusal names what moved" "context.task" cl3.err
+"$SFH" run closure.yaml --resume "$CL2_DIR" --force-resume -q > cl4.out 2> cl4.err
+check "closure: --force-resume accepts it deliberately" 0 $?
+contains "closure: the override is recorded in the log" '"event":"force_resume"' "$CL2_DIR/log.jsonl"
+
+# A changed profile overlay blocks resume the same way: the flow is untouched,
+# but the tools it resolves to are not.
+rm -f ctrip
+printf 'original\n' > CTASK.md
+cat > cl-over.yaml <<'YAML'
+profiles:
+  unused-here:
+    model: first
+YAML
+"$SFH" run closure.yaml --runs-dir cl3-runs --profiles cl-over.yaml -q > cl5.out 2>&1
+CL3_DIR="$(dirname "$(find cl3-runs -type f -name 'log.jsonl' -print -quit)")"
+cat > cl-over.yaml <<'YAML'
+profiles:
+  unused-here:
+    model: second
+YAML
+rm -f ctrip
+"$SFH" run closure.yaml --resume "$CL3_DIR" --profiles cl-over.yaml -q > cl6.out 2> cl6.err
+check "closure: an edited profile overlay blocks resume too" 2 $?
+contains "closure: the overlay is named as what moved" "profile_overlay" cl6.err
+
+# --- replay policy -----------------------------------------------------------
+cat > replay.yaml <<'YAML'
+name: replay
+steps:
+  - id: risky
+    effects: external
+    replay:
+      unfinished: stuck
+    cmd: ["echo", "did it"]
+  - id: after
+    cmd: ["echo", "after"]
+YAML
+"$SFH" run replay.yaml --runs-dir rp-runs -q > rp.out 2>&1
+check "replay: the flow runs normally" 0 $?
+RP_DIR="$(dirname "$(find rp-runs -type f -name 'log.jsonl' -print -quit)")"
+# Simulate a crash between step_start and step_end, which is the ONLY situation
+# a replay policy is about.
+awk '{ print } /"event":"step_start"/ { exit }' "$RP_DIR/log.jsonl" > "$RP_DIR/l.tmp"
+mv "$RP_DIR/l.tmp" "$RP_DIR/log.jsonl"
+printf '{"schema_version":1,"state":"dead","pid":0}' > "$RP_DIR/status.json"
+"$SFH" run replay.yaml --resume "$RP_DIR" -q > rp2.out 2> rp2.err
+check "replay: an unfinished external step refuses to re-run (exit 4)" 4 $?
+contains "replay: the refusal names the policy" "replay.unfinished: stuck" rp2.err
+RP_STARTS="$(grep -c '"event":"step_start"' "$RP_DIR/log.jsonl")"
+check "replay: nothing was launched a second time" 1 "$RP_STARTS"
+# The default is unchanged: rerun.
+cat > replay-default.yaml <<'YAML'
+name: replay-default
+steps:
+  - id: plain
+    cmd: ["echo", "hi"]
+  - id: after
+    cmd: ["echo", "after"]
+YAML
+"$SFH" run replay-default.yaml --runs-dir rpd-runs -q > rpd.out 2>&1
+RPD_DIR="$(dirname "$(find rpd-runs -type f -name 'log.jsonl' -print -quit)")"
+awk '{ print } /"event":"step_start"/ { exit }' "$RPD_DIR/log.jsonl" > "$RPD_DIR/l.tmp"
+mv "$RPD_DIR/l.tmp" "$RPD_DIR/log.jsonl"
+printf '{"schema_version":1,"state":"dead","pid":0}' > "$RPD_DIR/status.json"
+"$SFH" run replay-default.yaml --resume "$RPD_DIR" -q > rpd2.out 2> rpd2.err
+check "replay: the default still re-runs an unfinished step" 0 $?
+
+# --- machine JSON ------------------------------------------------------------
+"$SFH" run compat.yaml --runs-dir mj-runs --json > mj.json 2> mj.err
+check "machine: run --json exits 0" 0 $?
+if python3 -c "import json,sys; json.load(open('mj.json'))" 2>/dev/null; then
+  echo "ok   - machine: run --json stdout is parseable JSON and nothing else"
+  pass=$((pass + 1))
+else
+  echo "FAIL - machine: run --json stdout was not pure JSON"
+  sed -n '1,5p' mj.json
+  fail=$((fail + 1))
+fi
+contains "machine: the envelope carries the common header" '"schema_version": 1' mj.json
+contains "machine: the envelope names the command" '"command": "run"' mj.json
+contains "machine: the envelope reports the run dir" '"run_dir"' mj.json
+contains "machine: the envelope carries the result" '"result"' mj.json
+# A config error is an envelope too - the case a caller most needs to parse.
+"$SFH" run does-not-exist.yaml --json > mjerr.json 2> mjerr.err
+check "machine: a config error exits 2" 2 $?
+if python3 -c "import json,sys; json.load(open('mjerr.json'))" 2>/dev/null; then
+  echo "ok   - machine: a config error still answers with JSON"
+  pass=$((pass + 1))
+else
+  echo "FAIL - machine: a config error printed prose to stdout"
+  fail=$((fail + 1))
+fi
+contains "machine: the error carries a stable code" '"code": "SFH_' mjerr.json
+# status --json keeps every field it had, and adds the new ones.
+MJ_DIR="$(dirname "$(find mj-runs -type f -name 'log.jsonl' -print -quit)")"
+"$SFH" status "$MJ_DIR" --json > mjs.json 2>/dev/null
+contains "machine: status --json keeps its original fields" '"cost_usd"' mjs.json
+contains "machine: status --json keeps current_step" '"current_step"' mjs.json
+contains "machine: status --json says whether the target was implicit" '"implicit_target": false' mjs.json
+"$SFH" status --runs-dir mj-runs --json > mjs2.json 2>/dev/null
+contains "machine: an omitted run dir is reported as implicit" '"implicit_target": true' mjs2.json
+"$SFH" wait "$MJ_DIR" --json > mjw.json 2>/dev/null
+check "machine: wait --json exits with the flow's code" 0 $?
+if python3 -c "import json,sys; json.load(open('mjw.json'))" 2>/dev/null; then
+  echo "ok   - machine: wait --json stdout is pure JSON"
+  pass=$((pass + 1))
+else
+  echo "FAIL - machine: wait --json stdout was not pure JSON"
+  fail=$((fail + 1))
+fi
+# plan --json renders without starting anything.
+rm -f plan-spawn.marker
+cat > planj.yaml <<'YAML'
+name: planj
+steps:
+  - id: never
+    cmd: ["sh", "-c", "echo RAN > plan-spawn.marker"]
+YAML
+"$SFH" plan planj.yaml --json > mjp.json 2> mjp.err
+check "machine: plan --json exits 0" 0 $?
+if python3 -c "import json,sys; json.load(open('mjp.json'))" 2>/dev/null; then
+  echo "ok   - machine: plan --json stdout is pure JSON"
+  pass=$((pass + 1))
+else
+  echo "FAIL - machine: plan --json stdout was not pure JSON"
+  sed -n '1,5p' mjp.json
+  fail=$((fail + 1))
+fi
+if [ -f plan-spawn.marker ]; then
+  echo "FAIL - machine: plan executed a command"
+  fail=$((fail + 1))
+else
+  echo "ok   - machine: plan still starts no process"
+  pass=$((pass + 1))
+fi
+contains "machine: plan reports the workspace decision" '"managed_workspaces"' mjp.json
+contains "machine: plan reports the execution closure" '"execution_closure"' mjp.json
+
+# --- preflight: local capability, no model calls -----------------------------
+"$SFH" preflight --json > pf.json 2> pf.err
+check "preflight: a flowless survey exits 0" 0 $?
+if python3 -c "import json,sys; json.load(open('pf.json'))" 2>/dev/null; then
+  echo "ok   - preflight: --json stdout is pure JSON"
+  pass=$((pass + 1))
+else
+  echo "FAIL - preflight: --json stdout was not pure JSON"
+  fail=$((fail + 1))
+fi
+contains "preflight: every preset is reported" '"tool": "codex"' pf.json
+contains "preflight: an unverified version floor is reported as null" '"minimum_version": null' pf.json
+# It must not launch a flow's binaries as a model call. A hostile bin: is only
+# ever inspected with --version/--help, never asked to answer a prompt.
+# The stub stands in for the tool here too: it is a native binary (so a native
+# sfh can actually launch it on Windows), its path is already cygpath-converted,
+# and it answers --version/--help before doing anything else. SFH_STUB_MKDIR
+# makes a REAL invocation create a directory, so "preflight never asked the tool
+# to answer anything" is a fact on disk rather than an assumption.
+cat > pfflow.yaml <<YAML
+name: pf
+steps:
+  - id: a
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    prompt: "x"
+YAML
+rm -rf PREFLIGHT-CALLED-MODEL
+SFH_STUB_MKDIR="$WORK_NATIVE/PREFLIGHT-CALLED-MODEL" "$SFH" preflight pfflow.yaml > pf2.out 2> pf2.err
+check "preflight: a flow preflight exits 0 when its tool is present" 0 $?
+if [ -d PREFLIGHT-CALLED-MODEL ]; then
+  echo "FAIL - preflight: it actually invoked the tool"
+  fail=$((fail + 1))
+else
+  echo "ok   - preflight: no model call was made"
+  pass=$((pass + 1))
+fi
+contains "preflight: it names the resolved binary" "$STUB_NAME" pf2.out
+contains "preflight: it reports the version it read" "sfh-session-stub 1.0.0" pf2.out
+
+# --- profile overlays --------------------------------------------------------
+cat > ov-flow.yaml <<'YAML'
+name: ov
+profiles:
+  worker:
+    tool: claude
+    access: read
+    args: ["--keep-me"]
+steps:
+  - id: a
+    use: worker
+    prompt: "x"
+YAML
+cat > ov-a.yaml <<'YAML'
+profiles:
+  worker:
+    model: from-a
+YAML
+cat > ov-b.yaml <<'YAML'
+profiles:
+  worker:
+    model: from-b
+YAML
+"$SFH" config show ov-flow.yaml --profiles ov-a.yaml --profiles ov-b.yaml > ov.json 2> ov.err
+check "overlay: config show accepts repeated --profiles" 0 $?
+contains "overlay: the last file wins" '"model": "from-b"' ov.json
+contains "overlay: an unmentioned field is preserved" '"--keep-me"' ov.json
+contains "overlay: the flow's own tool survives" '"tool": "claude"' ov.json
+"$SFH" validate ov-flow.yaml --profiles ov-a.yaml > ovv.out 2> ovv.err
+check "overlay: validate accepts --profiles" 0 $?
+
+# --- state root --------------------------------------------------------------
+"$SFH" run compat.yaml --state-dir "$WORK/explicit-state" -q > sr.out 2>&1
+check "state root: a run with --state-dir succeeds" 0 $?
+if [ -d "$WORK/explicit-state/runs" ]; then
+  echo "ok   - state root: runs land under <state>/runs"
+  pass=$((pass + 1))
+else
+  echo "FAIL - state root: <state>/runs was not created"
+  fail=$((fail + 1))
+fi
+# --runs-dir still moves runs and only runs.
+"$SFH" run compat.yaml --state-dir "$WORK/explicit-state2" --runs-dir "$WORK/pinned-runs" -q > sr2.out 2>&1
+check "state root: --runs-dir wins for run artifacts" 0 $?
+if [ -d "$WORK/pinned-runs" ] && [ ! -d "$WORK/explicit-state2/runs" ]; then
+  echo "ok   - state root: --runs-dir overrides only the runs location"
+  pass=$((pass + 1))
+else
+  echo "FAIL - state root: --runs-dir did not take precedence"
+  fail=$((fail + 1))
+fi
 
 echo
 echo "engine behaviour: $pass passed, $fail failed"

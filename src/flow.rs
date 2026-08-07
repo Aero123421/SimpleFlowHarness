@@ -17,6 +17,23 @@ pub struct Flow {
     /// Named bundles of tool settings referenced by steps via `use:`.
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Where this run's side effects belong. Omitted (the default) keeps the
+    /// long-standing behaviour exactly: every step runs in the caller's cwd, or
+    /// in whatever `cwd:` resolves to, and sfh creates nothing.
+    ///
+    /// Every v1.2 key added to this file is `skip_serializing_if`-guarded. The
+    /// effective-config fingerprint is a serialization of this struct, and it
+    /// is what `--resume` compares; without the guard, merely UPGRADING sfh
+    /// would change the fingerprint of every flow ever written and make every
+    /// existing run dir unresumable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceConfig>,
+    /// Named context sources a step can pull in by name. sfh does not interpret
+    /// what a context MEANS - `task`, `review_rules`, `sources` are the flow
+    /// author's words - it only pins where each one came from, in what order,
+    /// and at what hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub contexts: BTreeMap<String, ContextSource>,
     pub steps: Vec<Step>,
     /// Set only by `load_lenient`, never by the YAML - it is the loader saying
     /// "this flow was accepted under the pre-1.0 rules so a 0.x run could be
@@ -72,6 +89,300 @@ pub struct Defaults {
     /// first one alone so the provider's prompt cache is warm before the rest
     /// start. auto (default: only where it measurably pays) | always | never.
     pub fork_warmup: Option<String>,
+    /// What a resume does with work that started but never recorded a durable
+    /// end. Omitted keeps the historical behaviour (`rerun`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Replay>,
+    /// Refuse to spawn when a step's assembled context bundle exceeds this many
+    /// characters. sfh never summarizes or silently drops context to fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_chars: Option<u64>,
+}
+
+/// How to treat a step whose effects may have happened even though sfh never
+/// recorded that it finished.
+///
+/// This is NOT retry (another attempt at the same invocation), NOT fallback
+/// (a different profile), NOT a route revisit, and NOT the reuse of a completed
+/// step's durable result. It is the narrower question a crash leaves behind:
+/// the step started, something may have happened out in the world, and no
+/// record says what.
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Replay {
+    /// rerun (default) | stuck | fail
+    pub unfinished: Option<ReplayPolicy>,
+}
+
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayPolicy {
+    /// Run it again. Correct for a pure computation; a gamble for anything that
+    /// touched the world, which is why `validate --strict` says so.
+    #[default]
+    Rerun,
+    /// Stop with exit 4, keeping the workspace and partial artifacts, so a
+    /// human can decide. Nothing is launched.
+    Stuck,
+    /// Stop with exit 1. Nothing is launched.
+    Fail,
+}
+
+impl ReplayPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplayPolicy::Rerun => "rerun",
+            ReplayPolicy::Stuck => "stuck",
+            ReplayPolicy::Fail => "fail",
+        }
+    }
+}
+
+/// What a step is declared to touch. A user declaration, not an inference sfh
+/// makes about the work: it decides workspace selection, warnings and replay
+/// policy, and nothing else.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Effects {
+    /// Reads only. Safe to re-run, and needs no workspace of its own.
+    Read,
+    /// Writes inside the workspace.
+    Workspace,
+    /// Touches something outside it - a deploy, an API call, a message sent.
+    External,
+    /// Not declared and not inferable (the default for a custom `cmd:`).
+    Unknown,
+}
+
+impl Effects {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effects::Read => "read",
+            Effects::Workspace => "workspace",
+            Effects::External => "external",
+            Effects::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this step might change the workspace or the world. `unknown`
+    /// counts: an undeclared custom command is treated as a potential writer,
+    /// because assuming otherwise is the assumption that loses work.
+    pub fn is_potential_writer(self) -> bool {
+        !matches!(self, Effects::Read)
+    }
+}
+
+/// Where a run's side effects live.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    /// current (default) | directory | git-worktree | auto
+    pub mode: Option<WorkspaceMode>,
+    /// The source directory or repository, resolved against the flow file.
+    /// Omitted, a `git-worktree` workspace branches the repository the CALLER
+    /// is standing in - which is where every step ran before v1.2 - and a
+    /// `directory` workspace requires this key outright.
+    pub root: Option<String>,
+    /// git-worktree only: the ref to branch from. Omitted means the repository's
+    /// HEAD at the moment the run starts.
+    pub base: Option<String>,
+    /// auto (default) | keep
+    pub cleanup: Option<WorkspaceCleanup>,
+    /// Allow a flow whose static shape lets two potential writers into the same
+    /// workspace at once. Off by default, and recorded as an unsafe override.
+    pub allow_concurrent_writers: Option<bool>,
+    /// Compare the workspace against its last durable checkpoint on resume.
+    /// Defaults to true.
+    pub verify_on_resume: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceMode {
+    /// The caller's cwd, exactly as every release before 1.2.
+    #[default]
+    Current,
+    /// A directory the user names. sfh does not create or delete it.
+    Directory,
+    /// A Git worktree sfh creates, owns and may clean up.
+    GitWorktree,
+    /// Decide from the flow's static shape alone (see `workspace_plan`).
+    Auto,
+}
+
+impl WorkspaceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceMode::Current => "current",
+            WorkspaceMode::Directory => "directory",
+            WorkspaceMode::GitWorktree => "git-worktree",
+            WorkspaceMode::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceCleanup {
+    /// Remove an sfh-owned worktree after a clean, successful run. Never
+    /// discards uncommitted work, and never deletes the branch.
+    #[default]
+    Auto,
+    /// Keep it whatever happened.
+    Keep,
+}
+
+impl WorkspaceCleanup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceCleanup::Auto => "auto",
+            WorkspaceCleanup::Keep => "keep",
+        }
+    }
+}
+
+impl WorkspaceConfig {
+    pub fn mode(&self) -> WorkspaceMode {
+        self.mode.unwrap_or_default()
+    }
+    pub fn cleanup(&self) -> WorkspaceCleanup {
+        self.cleanup.unwrap_or_default()
+    }
+    pub fn allow_concurrent_writers(&self) -> bool {
+        self.allow_concurrent_writers.unwrap_or(false)
+    }
+    pub fn verify_on_resume(&self) -> bool {
+        self.verify_on_resume.unwrap_or(true)
+    }
+}
+
+/// One named context. Exactly one of `file`, `inline` or `template` must be
+/// set: a source with two origins has no single answer to "where did this text
+/// come from", which is the whole point of naming it.
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSource {
+    /// A path, relative to the flow file unless absolute.
+    pub file: Option<String>,
+    /// Literal text written in the flow.
+    pub inline: Option<String>,
+    /// A template rendered with the same variables a prompt sees.
+    pub template: Option<String>,
+    /// Refuse this source if it exceeds this many characters.
+    pub max_chars: Option<u64>,
+    /// Explicit opt-in to reading a file outside the flow directory and the
+    /// resolved workspace. Recorded as an unsafe override wherever it is used.
+    pub allow_external: Option<bool>,
+    /// Tolerate a missing file instead of failing the step.
+    pub optional: Option<bool>,
+}
+
+impl ContextSource {
+    /// `Err` when the source is not exactly one thing.
+    pub fn kind(&self) -> Result<&'static str, String> {
+        match (
+            self.file.is_some(),
+            self.inline.is_some(),
+            self.template.is_some(),
+        ) {
+            (true, false, false) => Ok("file"),
+            (false, true, false) => Ok("inline"),
+            (false, false, true) => Ok("template"),
+            (false, false, false) => {
+                Err("needs exactly one of file:, inline: or template: (it has none)".into())
+            }
+            _ => Err(
+                "needs exactly one of file:, inline: or template: (it has more than one)".into(),
+            ),
+        }
+    }
+}
+
+/// How a step's assembled context reaches the tool.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextDelivery {
+    /// sfh puts a deterministic, delimited bundle in front of the prompt.
+    #[default]
+    Prepend,
+    /// The prompt is untouched; the bundle is a file the prompt can point at
+    /// with `{{context_file}}`.
+    File,
+}
+
+impl ContextDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextDelivery::Prepend => "prepend",
+            ContextDelivery::File => "file",
+        }
+    }
+}
+
+/// What `workspace:` resolves to for a given flow, decided without running
+/// anything. `plan`, `preflight` and the engine all read the same answer.
+#[derive(Clone, Debug)]
+pub struct WorkspacePlan {
+    /// What the flow asked for, before `auto` was resolved.
+    pub declared: WorkspaceMode,
+    /// What it resolved to.
+    pub resolved: WorkspaceMode,
+    pub root: Option<String>,
+    pub base: Option<String>,
+    pub cleanup: WorkspaceCleanup,
+    pub verify_on_resume: bool,
+    pub allow_concurrent_writers: bool,
+    /// True when a state root is required, because sfh would create something.
+    pub needs_state_root: bool,
+    pub potential_writers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl WorkspacePlan {
+    /// How many workspaces sfh will create for the whole run. One per run at
+    /// most in v1.2 - not one per step, and not one per visit.
+    pub fn managed_count(&self) -> u32 {
+        u32::from(self.resolved == WorkspaceMode::GitWorktree)
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "declared_mode": self.declared.as_str(),
+            "mode": self.resolved.as_str(),
+            "root": self.root,
+            "base": self.base,
+            "cleanup": self.cleanup.as_str(),
+            "verify_on_resume": self.verify_on_resume,
+            "allow_concurrent_writers": self.allow_concurrent_writers,
+            "managed_workspaces": self.managed_count(),
+            "potential_writers": self.potential_writers,
+            "warnings": self.warnings,
+        })
+    }
+}
+
+/// What each step would be handed, before anything runs.
+#[derive(Clone, Debug, Default)]
+pub struct ContextPlan {
+    /// (step id, context names, delivery)
+    pub steps: Vec<(String, Vec<String>, ContextDelivery)>,
+    /// (name, kind, source description, static size if knowable)
+    pub sources: Vec<(String, String, String, Option<u64>)>,
+    pub max_context_chars: Option<u64>,
+}
+
+impl ContextPlan {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "max_context_chars": self.max_context_chars,
+            "sources": self.sources.iter().map(|(name, kind, source, chars)| serde_json::json!({
+                "name": name, "kind": kind, "source": source, "chars": chars,
+            })).collect::<Vec<_>>(),
+            "steps": self.steps.iter().map(|(id, names, delivery)| serde_json::json!({
+                "step": id, "context": names, "context_delivery": delivery.as_str(),
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// How much of each ceiling `on_budget` keeps back for the landing chain. The
@@ -219,10 +530,71 @@ pub struct Step {
     pub fallback: Vec<String>,
     /// Accept an empty final message instead of failing the step.
     pub allow_empty: Option<bool>,
+    /// What this step touches: read | workspace | external | unknown. Omitted,
+    /// it is inferred from `access:` for a preset step and is `unknown` for a
+    /// custom `cmd:` - the conservative direction, since an undeclared command
+    /// may well write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Effects>,
+    /// Names from the flow's `contexts:` map, in the order they should appear.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    /// prepend (default) | file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_delivery: Option<ContextDelivery>,
+    /// Overrides `defaults.replay` for this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Replay>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub env_remove: Vec<String>,
+}
+
+impl Step {
+    /// The declared effects, or the inference the spec fixes for an omitted
+    /// declaration. sfh never guesses from the prompt or the command text -
+    /// only from what the flow already says.
+    pub fn effects(&self, flow: &Flow) -> Effects {
+        if let Some(e) = self.effects {
+            return e;
+        }
+        // A group is exactly as effectful as its most effectful member.
+        if let Some(children) = &self.parallel {
+            return children
+                .iter()
+                .map(|c| c.effects(flow))
+                .max_by_key(|e| match e {
+                    Effects::Read => 0,
+                    Effects::Workspace => 1,
+                    Effects::External => 2,
+                    Effects::Unknown => 3,
+                })
+                .unwrap_or(Effects::Read);
+        }
+        if self.cmd.is_some() {
+            // An undeclared command is a potential writer. Assuming otherwise
+            // is the assumption that silently loses somebody's work.
+            return Effects::Unknown;
+        }
+        match crate::leaf::effective(flow, self).map(|e| e.access) {
+            Ok(crate::preset::Access::Read) => Effects::Read,
+            Ok(_) => Effects::Workspace,
+            Err(_) => Effects::Unknown,
+        }
+    }
+
+    /// The replay policy in force for this step.
+    pub fn replay_policy(&self, flow: &Flow) -> ReplayPolicy {
+        self.replay
+            .and_then(|r| r.unfinished)
+            .or_else(|| flow.defaults.replay.and_then(|r| r.unfinished))
+            .unwrap_or_default()
+    }
+
+    pub fn context_delivery(&self) -> ContextDelivery {
+        self.context_delivery.unwrap_or_default()
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -355,6 +727,13 @@ pub const TERMINALS: [&str; 3] = ["end", "fail", "stuck"];
 
 pub const TOOLS: [&str; 7] = ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"];
 
+/// Concurrency ceiling for a fan-out when neither the step nor defaults says.
+/// Mirrors the value the engine applies; kept here so static analysis and
+/// execution cannot drift apart about how many writers can be in flight.
+pub const DEFAULT_MAX_PARALLEL: u32 = 4;
+/// Times one step may be entered when neither the step nor defaults says.
+pub const DEFAULT_MAX_VISITS: u32 = 5;
+
 /// One concrete way a flow can launch a preset tool, as collected by
 /// `Flow::resolved_tools`. Ordered so a BTreeSet dedupes and sorts it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -363,15 +742,112 @@ pub struct ResolvedTool {
     pub bin: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The access level this launch asks for. Part of the identity because the
+    /// same tool at read and at full is two different things to report on, and
+    /// preflight has to name both.
+    pub access: Vec<String>,
 }
 
 pub fn load(path: &Path) -> Result<Flow, String> {
+    load_with_overlays(path, &[])
+}
+
+/// One profile as an overlay file writes it.
+///
+/// This is NOT `Profile`. An overlay has to distinguish "the file did not
+/// mention args" from "the file set args to the empty list", and a `Vec` with
+/// `#[serde(default)]` cannot: both deserialize to `vec![]`, so an overlay that
+/// said nothing about `args` would silently erase the flow's own. Every field
+/// here is an `Option`, and only the ones actually present are applied.
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileOverlay {
+    pub tool: Option<String>,
+    pub bin: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub access: Option<String>,
+    pub agent: Option<String>,
+    /// Present: replaces the profile's args entirely. Absent: keeps them.
+    pub args: Option<Vec<String>>,
+    pub cwd: Option<String>,
+    pub timeout_sec: Option<u64>,
+    /// Merged key by key. Removing a key is out of scope for v1.2.
+    pub env: Option<BTreeMap<String, String>>,
+}
+
+impl ProfileOverlay {
+    fn apply_to(&self, p: &mut Profile) {
+        macro_rules! scalar {
+            ($($f:ident),*) => { $( if let Some(v) = &self.$f { p.$f = Some(v.clone()); } )* };
+        }
+        scalar!(tool, bin, model, effort, access, agent, cwd);
+        if let Some(v) = self.timeout_sec {
+            p.timeout_sec = Some(v);
+        }
+        if let Some(args) = &self.args {
+            p.args = args.clone();
+        }
+        if let Some(env) = &self.env {
+            for (k, v) in env {
+                p.env.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// Load a flow, then apply profile overlay files in order.
+///
+/// The point is a flow that stays portable: a shared flow says `use: judge`,
+/// and whoever runs it decides which CLI and which model a `judge` is, without
+/// editing (and therefore re-fingerprinting) the flow. Writing `tool:` straight
+/// into a step keeps working exactly as before - an overlay file is never
+/// required.
+///
+/// Precedence, highest first:
+///
+/// ```text
+/// step field  >  --profiles overlay  >  flow inline profile  >  ~/.sfh/profiles.yaml  >  defaults
+/// ```
+///
+/// Later `--profiles` files win over earlier ones, so a caller can layer a
+/// machine-local file on top of a team-shared one.
+pub fn load_with_overlays(path: &Path, overlays: &[std::path::PathBuf]) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     merge_global_profiles(&mut flow)?;
+    apply_profile_overlays(&mut flow, overlays)?;
     validate(&flow, false)?;
     Ok(flow)
+}
+
+/// Read and apply overlay files. An overlay naming a profile the flow does not
+/// have creates it: that is how a flow can declare `use: judge` with no inline
+/// definition at all and let the caller supply one.
+pub fn apply_profile_overlays(
+    flow: &mut Flow,
+    overlays: &[std::path::PathBuf],
+) -> Result<(), String> {
+    for file in overlays {
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| format!("cannot read profile overlay {}: {e}", file.display()))?;
+        let parsed = yaml::from_str::<OverlayFile>(&text)
+            .map_err(|e| format!("{}: invalid profile overlay: {e}", file.display()))?;
+        for (name, overlay) in parsed.profiles {
+            overlay.apply_to(flow.profiles.entry(name).or_default());
+        }
+    }
+    Ok(())
+}
+
+/// An overlay file. `profiles:` may be the top level or nested under a
+/// `profiles:` key, because both spellings are what people actually write.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OverlayFile {
+    #[serde(default)]
+    profiles: BTreeMap<String, ProfileOverlay>,
 }
 
 /// Load a flow for a --resume of an UNCHANGED run created by sfh 0.x, which
@@ -524,6 +1000,308 @@ impl Flow {
         Ok(out)
     }
 
+    /// The workspace decision, made from the flow's static shape alone.
+    ///
+    /// `auto` never reasons about what the work MEANS. It counts declared
+    /// effects: a flow whose every step only reads needs no workspace of its
+    /// own, and a flow with any potential writer gets exactly one managed
+    /// worktree for the whole run - not one per step, not one per visit.
+    pub fn workspace_plan(&self) -> Result<WorkspacePlan, String> {
+        let cfg = self.workspace.as_ref();
+        let declared = cfg.map(|c| c.mode()).unwrap_or(WorkspaceMode::Current);
+        let mut warnings = Vec::new();
+        let writers = self.potential_writers();
+        let resolved = match declared {
+            WorkspaceMode::Auto => {
+                if writers.is_empty() {
+                    // Nothing can write, so nothing needs isolating.
+                    WorkspaceMode::Current
+                } else {
+                    WorkspaceMode::GitWorktree
+                }
+            }
+            other => other,
+        };
+        // Two potential writers that can be in flight at once share one
+        // workspace, and sfh has no way to reconcile what they each did. The
+        // default is to refuse rather than to interleave them and hope.
+        //
+        // ONLY for a flow that opted into a workspace. A flow with no
+        // `workspace:` key gets no workspace from sfh at all - every step runs
+        // in the caller's cwd exactly as it did before v1.2 - so sfh has no
+        // basis to start refusing flows that have always worked. Introducing a
+        // new refusal for existing files is precisely what the compatibility
+        // rule forbids.
+        let concurrent = if cfg.is_some() {
+            self.concurrent_writer_groups()
+        } else {
+            Vec::new()
+        };
+        let allow_concurrent = cfg.map(|c| c.allow_concurrent_writers()).unwrap_or(false);
+        if !concurrent.is_empty() {
+            if allow_concurrent {
+                warnings.push(format!(
+                    "workspace.allow_concurrent_writers is set: {} run potential writers concurrently in ONE workspace, and sfh cannot tell their changes apart",
+                    concurrent.join(", ")
+                ));
+            } else {
+                return Err(format!(
+                    "step(s) {} fan out potential writers that would share one workspace at the same time. Declare `effects: read` on the members that only read, split the writers into sequential steps, or set `workspace.allow_concurrent_writers: true` to accept that sfh cannot separate their changes.",
+                    concurrent.join(", ")
+                ));
+            }
+        }
+        if resolved == WorkspaceMode::Directory && cfg.and_then(|c| c.root.as_ref()).is_none() {
+            return Err(
+                "workspace.mode: directory needs workspace.root to say which directory".into(),
+            );
+        }
+        if declared == WorkspaceMode::Auto && !writers.is_empty() {
+            warnings.push(format!(
+                "workspace.mode: auto resolved to one managed git worktree because {} may write",
+                writers.join(", ")
+            ));
+        }
+        Ok(WorkspacePlan {
+            declared,
+            resolved,
+            root: cfg.and_then(|c| c.root.clone()),
+            base: cfg.and_then(|c| c.base.clone()),
+            cleanup: cfg.map(|c| c.cleanup()).unwrap_or_default(),
+            verify_on_resume: cfg.map(|c| c.verify_on_resume()).unwrap_or(true),
+            allow_concurrent_writers: allow_concurrent,
+            needs_state_root: resolved == WorkspaceMode::GitWorktree,
+            potential_writers: writers,
+            warnings,
+        })
+    }
+
+    /// What every step's context resolves to, without reading a single byte of
+    /// a step's OUTPUT: only sources that are statically knowable are sized
+    /// here, so `plan` and `preflight` stay side-effect free.
+    pub fn context_plan(&self, flow_path: &Path) -> Result<ContextPlan, String> {
+        let flow_dir = flow_path.parent().unwrap_or(Path::new("."));
+        let mut plan = ContextPlan {
+            max_context_chars: self.defaults.max_context_chars,
+            ..Default::default()
+        };
+        for (name, source) in &self.contexts {
+            let kind = source
+                .kind()
+                .map_err(|e| format!("contexts.{name}: {e}"))?
+                .to_string();
+            let (described, chars) = match kind.as_str() {
+                "file" => {
+                    let raw = source.file.clone().unwrap_or_default();
+                    let resolved = crate::context::resolve_source_path(flow_dir, &raw);
+                    let size = std::fs::metadata(&resolved).ok().map(|m| m.len());
+                    (raw, size)
+                }
+                "inline" => (
+                    "<inline>".to_string(),
+                    source.inline.as_ref().map(|t| t.chars().count() as u64),
+                ),
+                // A template's size depends on run data that does not exist yet.
+                _ => ("<template>".to_string(), None),
+            };
+            plan.sources.push((name.clone(), kind, described, chars));
+        }
+        let mut record = |s: &Step| -> Result<(), String> {
+            for name in &s.context {
+                if !self.contexts.contains_key(name) {
+                    return Err(format!(
+                        "step '{}' asks for context '{name}', which is not defined in contexts:",
+                        s.id
+                    ));
+                }
+            }
+            if !s.context.is_empty() || s.context_delivery.is_some() {
+                plan.steps
+                    .push((s.id.clone(), s.context.clone(), s.context_delivery()));
+            }
+            Ok(())
+        };
+        for s in &self.steps {
+            record(s)?;
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    record(c)?;
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Step ids that may change the workspace or the world.
+    pub fn potential_writers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in &self.steps {
+            match &s.parallel {
+                Some(children) => {
+                    for c in children {
+                        if c.effects(self).is_potential_writer() {
+                            out.push(format!("{}.{}", s.id, c.id));
+                        }
+                    }
+                }
+                None => {
+                    if s.effects(self).is_potential_writer() {
+                        out.push(s.id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Fan-out steps that would put more than one potential writer in flight at
+    /// once. A `foreach:` over a writing body counts whenever its concurrency
+    /// ceiling is above one, because the item list is not known statically.
+    fn concurrent_writer_groups(&self) -> Vec<String> {
+        let cap = |s: &Step| {
+            s.max_parallel
+                .or(self.defaults.max_parallel)
+                .unwrap_or(DEFAULT_MAX_PARALLEL)
+        };
+        let mut out = Vec::new();
+        for s in &self.steps {
+            if let Some(children) = &s.parallel {
+                let writers = children
+                    .iter()
+                    .filter(|c| c.effects(self).is_potential_writer())
+                    .count();
+                if writers > 1 && cap(s) > 1 {
+                    out.push(s.id.clone());
+                }
+            } else if s.foreach.is_some() && s.effects(self).is_potential_writer() && cap(s) > 1 {
+                out.push(s.id.clone());
+            }
+        }
+        out
+    }
+
+    /// A per-step view of the replay policy, plus the cases `validate --strict`
+    /// and `plan` should point at: an effect that reaches outside the workspace
+    /// (or is not declared at all) is the one where re-running after a crash is
+    /// a real decision rather than a formality.
+    pub fn replay_summary(&self) -> serde_json::Value {
+        let mut steps = Vec::new();
+        for s in &self.steps {
+            let effects = s.effects(self);
+            let policy = s.replay_policy(self);
+            steps.push(serde_json::json!({
+                "step": s.id,
+                "effects": effects.as_str(),
+                "unfinished": policy.as_str(),
+                "risky": policy == ReplayPolicy::Rerun
+                    && matches!(effects, Effects::External | Effects::Unknown),
+            }));
+        }
+        serde_json::json!({
+            "default": self
+                .defaults
+                .replay
+                .and_then(|r| r.unfinished)
+                .unwrap_or_default()
+                .as_str(),
+            "steps": steps,
+        })
+    }
+
+    /// Warnings `validate --strict` emits about replay choices. Each names a
+    /// step whose unfinished work would be re-run even though the flow says it
+    /// may have already reached outside the workspace.
+    pub fn replay_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in &self.steps {
+            let effects = s.effects(self);
+            if s.replay_policy(self) == ReplayPolicy::Rerun
+                && matches!(effects, Effects::External | Effects::Unknown)
+            {
+                out.push(format!(
+                    "step '{}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. Set replay.unfinished: stuck (or fail) if that is not safe.",
+                    s.id,
+                    effects.as_str()
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every explicitly accepted risk in this flow, by name. Recorded in the
+    /// plan, the execution closure and the run's meta so "we turned that off on
+    /// purpose" is visible after the fact.
+    pub fn unsafe_overrides(&self) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        if self
+            .workspace
+            .as_ref()
+            .map(|w| w.allow_concurrent_writers())
+            .unwrap_or(false)
+        {
+            out.insert("workspace.allow_concurrent_writers".to_string());
+        }
+        for (name, c) in &self.contexts {
+            if c.allow_external.unwrap_or(false) {
+                out.insert(format!("contexts.{name}.allow_external"));
+            }
+        }
+        let mut note = |s: &Step| {
+            if s.unsafe_shell_template.unwrap_or(false) {
+                out.insert(format!("steps.{}.unsafe_shell_template", s.id));
+            }
+            if s.allow_dynamic_exec_paths.unwrap_or(false) {
+                out.insert(format!("steps.{}.allow_dynamic_exec_paths", s.id));
+            }
+            if s.allow_access_override.unwrap_or(false) {
+                out.insert(format!("steps.{}.allow_access_override", s.id));
+            }
+        };
+        for s in &self.steps {
+            note(s);
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    note(c);
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// An upper bound on leaves this flow can execute, from its static shape.
+    ///
+    /// Deliberately a BOUND, not a prediction: a `foreach:` list is data, not
+    /// structure, so its item count is unknown here and is reported as such by
+    /// the `foreach_unbounded` flag rather than guessed at.
+    pub fn static_max_leaves(&self) -> serde_json::Value {
+        let visits = self.defaults.max_visits.unwrap_or(DEFAULT_MAX_VISITS);
+        let mut leaves_per_visit = 0u64;
+        let mut unbounded = Vec::new();
+        for s in &self.steps {
+            let per = match (&s.parallel, &s.foreach) {
+                (Some(children), _) => children.len() as u64,
+                (None, Some(_)) => {
+                    unbounded.push(s.id.clone());
+                    1
+                }
+                _ => 1,
+            };
+            // Each step may be revisited up to its own ceiling.
+            let step_visits = s.max_visits.unwrap_or(visits) as u64;
+            leaves_per_visit = leaves_per_visit.saturating_add(per.saturating_mul(step_visits));
+        }
+        serde_json::json!({
+            "max_leaves": self
+                .defaults
+                .max_total_steps
+                .map(u64::from)
+                .unwrap_or(leaves_per_visit)
+                .min(leaves_per_visit),
+            "bounded_by_max_total_steps": self.defaults.max_total_steps,
+            "foreach_unbounded": unbounded,
+        })
+    }
+
     /// All ids addressable from templates: top-level steps plus parallel children.
     pub fn step_ids(&self) -> HashSet<String> {
         let mut ids = HashSet::new();
@@ -595,6 +1373,7 @@ impl Flow {
                             bin: e.bin,
                             model: e.model,
                             effort: e.effort,
+                            access: vec![e.access.as_str().to_string()],
                         });
                     }
                 }
@@ -606,6 +1385,7 @@ impl Flow {
                                 bin: e.bin,
                                 model: e.model,
                                 effort: e.effort,
+                                access: vec![e.access.as_str().to_string()],
                             });
                         }
                     }
@@ -627,6 +1407,9 @@ impl Flow {
                             .clone()
                             .or_else(|| prof.and_then(|p| p.effort.clone())),
                         tool,
+                        // A compact summarizer only reads the text it was
+                        // handed; it never runs at a step's access level.
+                        access: vec![crate::preset::Access::Read.as_str().to_string()],
                     });
                 }
             }
@@ -2670,18 +3453,21 @@ mod tests {
             bin: Some("/opt/claude".into()),
             model: Some("m1".into()),
             effort: Some("high".into()),
+            access: vec!["write".into()],
         }));
         assert!(r.contains(&ResolvedTool {
             tool: "grok".to_string(),
             bin: Some("/opt/grok".into()),
             model: None,
             effort: None,
+            access: vec!["write".into()],
         }));
         assert!(r.contains(&ResolvedTool {
             tool: "codex".to_string(),
             bin: None,
             model: None,
             effort: None,
+            access: vec!["read".into()],
         }));
         // A compact summarizer is a real launch even on a cmd: step.
         assert!(r.contains(&ResolvedTool {
@@ -2689,8 +3475,49 @@ mod tests {
             bin: Some("/opt/oc".into()),
             model: None,
             effort: None,
+            // A compact summarizer only ever reads the text it was handed.
+            access: vec!["read".into()],
         }));
         assert_eq!(r.len(), 4, "{r:?}");
+    }
+
+    /// Upgrading sfh must not, by itself, make every existing run dir
+    /// unresumable.
+    ///
+    /// `--resume` compares an effective-config fingerprint that is a
+    /// serialization of `Flow`. Every field added in v1.2 is therefore
+    /// `skip_serializing_if`-guarded, so a flow that uses none of them
+    /// serializes to exactly the bytes 1.1 produced. This test pins the
+    /// property rather than the bytes: no v1.2 key may appear in the projection
+    /// of a flow that does not use it.
+    #[test]
+    fn a_flow_using_no_v1_2_keys_serializes_as_it_did_before_v1_2() {
+        let f: Flow = yaml::from_str(
+            "name: legacy\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
+        )
+        .unwrap();
+        let json = f.effective_config_json().unwrap();
+        for key in [
+            "\"workspace\"",
+            "\"contexts\"",
+            "\"effects\"",
+            "\"context\"",
+            "\"context_delivery\"",
+            "\"replay\"",
+            "\"max_context_chars\"",
+        ] {
+            assert!(
+                !json.contains(key),
+                "{key} leaked into the fingerprint of a flow that never used it: {json}"
+            );
+        }
+        // And a flow that DOES use them is a different configuration, which is
+        // the whole point of the fingerprint.
+        let with: Flow = yaml::from_str(
+            "name: legacy\nworkspace: {mode: auto}\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
+        )
+        .unwrap();
+        assert_ne!(json, with.effective_config_json().unwrap());
     }
 
     #[test]

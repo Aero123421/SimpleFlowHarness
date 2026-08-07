@@ -21,6 +21,8 @@
 - **バックグラウンド実行**: 長時間フローを切り離して実行 (`--detach`)。進捗確認 (`sfh status`)、結果回収 (`sfh wait`)、安全停止 (`sfh stop`) を独立して実行可能。
 - **並列処理と再開機能**: 異種ツールの並列実行 (`parallel`) や動的ループ (`foreach`) に対応。中断・クラッシュした実行を完了済みステップを再実行せずに再開 (`--resume`)。
 - **安全制御と予算制限**: ツールが報告したコストのソフト上限 (`max_cost_usd`)、実行時間上限 (`wall_clock_sec`)、明示的なアクセス権限 (`access: read | write | full`) による安全運用。
+- **プロトコルのfail-closed**: preset toolは必ず、そのCLIが文書化しているmachine-readable protocolを完了しなければなりません。エラーを表示して終了したCLIや、出力形式が変わってしまったCLIは、その文字列を回答として下流へ渡さず、stepの失敗になります。
+- **機械向けインターフェース**: `run` / `plan` / `wait` / `stop` / `status` / `preflight` / `workspaces` に `--json`。JSONモードのstdoutはenvelopeのみで、失敗には分岐可能な安定コード `SFH_*` が付きます。
 
 ---
 
@@ -42,7 +44,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、展開、`PATH` 設定までを行います。
 実行前に [Shell版](installers/sfh-installer.sh) および [PowerShell版](installers/sfh-installer.ps1) の内容を確認できます。
 バージョン固定や設定変更オプション:
-- `SFH_VERSION=1.1.5`: 特定のバージョンに固定。
+- `SFH_VERSION=1.2.0`: 特定のバージョンに固定。
 - `SFH_INSTALL_DIR=/path/to/bin`: インストール先ディレクトリの指定。
 - `SFH_NO_MODIFY_PATH=1`: 永続的な `PATH` 変更を無効化。
 
@@ -175,6 +177,156 @@ sfh run flow.yaml --resume-latest
 ```
 `sfh` はフロー定義と設定の整合性を検証し、完了済みステップをスキップして再開します。
 
+v1.2 からは、この検証が **execution closure**（実行の閉包）全体に及びます。flow file の外側にあって実行内容を決めるもの、すなわち profile overlay、context file の中身、解決された tool version、workspace の mode と base commit、そして明示的に受け入れたリスクの一覧です。これらは run 開始時に `execution-closure.json` へ hash として固定されます。どれかが動いていれば resume は拒否され、変わった項目が名指しで示されます。
+
+```text
+SFH_EXECUTION_CLOSURE_CHANGED: the execution closure changed since this run started
+  context.task: sha256:9bc86fb26f3c -> sha256:d1811c82b034
+```
+
+`--force-resume` はこれを意図的に受け入れ、`force_resume` event を記録します。後述の `--adopt-workspace` とは別の問いであり、片方がもう片方を免除することはありません。
+
+---
+
+## Workspace・Context・Replay（v1.2）
+
+いずれも opt-in の3機構です。**どれも書かなければ何も変わりません**。flow は呼び出し元の作業ディレクトリで動き、`.sfh/runs` へ書き、1.1 と同じように resume します。
+
+### managed workspace
+
+`workspace:` は、その run の副作用がどこに属するかを宣言します。
+
+```yaml
+workspace:
+  mode: auto        # current | directory | git-worktree | auto
+  cleanup: auto     # auto | keep
+```
+
+`auto` は flow が宣言した `effects:` だけから決めます。prompt の内容を推測することはありません。全 step が `effects: read` なら workspace は作られません。書き得る step が1つでもあれば、run 全体で **ちょうど1個** の Git worktree を持ちます。step が何個あっても、loop が何周しても1個です。後続の step が先行 step の変更を見られるのは、同じディレクトリだからです。
+
+worktree は、branch 元のリポジトリの外側（`--state-dir` 配下、または platform の user-state ディレクトリ）に `sfh/<flow>/<run-id>` という branch で作られます。あなた自身の checkout は変更されません。
+
+次の2点は絶対です。
+
+- **sfh は自分が作ったものしか削除しません。** 削除にはディレクトリ内の ownership marker と run manifest の nonce の一致が必要で、しかも削除直前に再確認します。どちらかが合わない path は warning を残して保持され、削除されることはありません。
+- **未コミットの変更は自動的に破棄されません。** run の結果に関わらず dirty な workspace は残り、branch も削除されません。変更を捨てる経路は `sfh workspaces remove <run-dir> --discard` だけで、これは人間が打つコマンドです。
+
+failed / stuck / stopped / dead で終わった run は常に workspace を保持します。そこに調査対象が残っているからです。
+
+```bash
+sfh workspaces list --state-dir ~/.local/state/sfh
+sfh workspaces show <run-dir> --json
+sfh workspaces clean --older-than 30 --dry-run
+```
+
+resume 時には workspace の fingerprint（HEAD、index と working tree の差分、untracked file を全件 hash、submodule 状態）を最後の durable checkpoint と比較します。未完了 step で説明できない差分は「run の外側が編集した」ことを意味するため拒否されます。`--adopt-workspace` は現在の内容を新しい基準として採用し、`workspace_adopted` event を記録します。
+
+### `effects:` — その step が何に触るか
+
+```yaml
+- id: deploy
+  effects: external      # read | workspace | external | unknown
+```
+
+sfh が推測するものではなく、利用者の宣言です。省略時は preset step では `access:` から導かれ、custom `cmd:` では `unknown`、つまり潜在的な writer として扱われます。そうでないと仮定することが、誰かの作業を失う仮定だからです。この宣言が決めるのは workspace の選択、静的 warning、replay policy だけです。
+
+### named context
+
+`contexts:` は、step に何を渡したかを固定します。どの source を、どの順で、どの hash で渡したかです。
+
+```yaml
+contexts:
+  task:          {file: ./TASK.md}
+  house_rules:   {inline: "既存設計を優先する"}
+  latest_review: {template: "{{steps.review.output | optional}}"}
+
+steps:
+  - id: implement
+    context: [task, house_rules, latest_review]
+    context_delivery: prepend        # prepend（既定）| file
+```
+
+組み立てられた bundle は `<tag>.context.txt` に、各 source の出所・hash・サイズを記録した manifest は `<tag>.context.json` に保存されます。durable log には hash だけが載り、内容は載りません。`{{context}}` と `{{context_file}}` はどちらの delivery mode でも使えます。
+
+context file は no-follow で読まれ、flow directory または workspace の内側に解決される必要があります。外を指す symlink は拒否されます。唯一の逃げ道は source ごとの `allow_external: true` で、使った事実は unsafe override として記録されます。`defaults.max_context_chars` を超える bundle は **何も起動する前に** 失敗します。sfh は要約もしませんし、収まるように source を落とすこともしません。何を落とすかは利用者の判断であり、template filter、`max_chars`、上流の `compact:` で表明してください。
+
+### replay policy
+
+step が開始されたのに終了を記録しなかった場合、resume が何をすべきか。sfh が「もう実行されたのか」を本当に知り得ない唯一のケースです。
+
+```yaml
+defaults:
+  replay: {unfinished: rerun}    # rerun（既定）| stuck | fail
+
+steps:
+  - id: deploy
+    effects: external
+    replay: {unfinished: stuck}
+```
+
+`rerun` が既定で、これまでの release と同じ挙動です。`stuck`（exit 4）と `fail`（exit 1）は何も起動せず、workspace と部分成果物をそのまま残し、`SFH_REPLAY_REFUSED` を返します。
+
+これは retry（同じ invocation の再試行）でも、fallback（別 profile）でも、route による再入場でも、完了済み step の結果の再利用でもありません。sfh は外部副作用について exactly-once を約束しません。約束するのは、黙って再実行しないことと、不確かな結果を成功と偽らないことです。
+
+### 再利用可能な flow: `--profiles`
+
+共有 flow は tool ではなく役割名を書き、実行する人が中身を決められます。
+
+```yaml
+steps:
+  - id: review
+    use: judge          # flow には tool も model も binary も書かない
+```
+
+```bash
+sfh run flow.yaml --profiles team.yaml --profiles my-machine.yaml
+```
+
+繰り返し指定でき、後のものが勝ちます。overlay は書かれた field だけを置き換えます。`args` は指定があれば置換、なければ維持。`env` は key 単位で merge。優先順位は step field > `--profiles` overlay > flow inline profile > `~/.sfh/profiles.yaml` > defaults です。step に直接 `tool:` を書く従来の書き方はそのまま有効で、overlay file は必須ではありません。
+
+### state root
+
+```bash
+sfh run flow.yaml --state-dir ~/.local/state/sfh     # または SFH_STATE_DIR
+```
+
+`runs` / `workspaces` / `plans` / `doctor` を1つのディレクトリ配下に置きます。`--runs-dir` は従来どおり run artifacts だけを移し、どちらも指定しなければ run は今までどおり `.sfh/runs` に落ちます。state root のない managed workspace は platform の user-state ディレクトリ（`$XDG_STATE_HOME/sfh`、`$HOME/.local/state/sfh`、`%LOCALAPPDATA%\sfh`）へ fallback し、それも決められない場合はリポジトリ内へ書く代わりに error になります。
+
+---
+
+## プログラムから sfh を動かす
+
+`--json` を付けると stdout は envelope だけになります。進捗と warning は stderr へ回り、設定エラーであっても prose ではなく envelope が返ります。
+
+```bash
+sfh preflight flow.yaml --json          # 無料: model 呼び出しなし
+sfh plan      flow.yaml --json --save   # 何が動くか。何も起動しない
+sfh run       flow.yaml --json --detach # handle と next_actions を返す
+sfh wait <run-dir> --json               # 完了までブロックし、結果を返す
+```
+
+失敗には v1.2.x の全期間で意味が固定された code が付きます。message は改善され得るので、code で分岐してください。
+
+`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`
+
+**run directory は必ず明示してください。** path を省略したコマンドは最新の run を選び、`"implicit_target": true` を返します。agent が望む挙動であることは稀です。
+
+`result` は `max_emit_chars` に従います。`result_file` には常に全文の path が入ります。detached run は `"terminal": false` と、答えを待つための argv を返します。
+
+### `preflight` と `doctor`
+
+```text
+sfh preflight  — 無料。binary はあるか、version は、必要な flag は --help に残っているか。
+                 protocol、session 対応、cost coverage、access の穴は。
+                 この flow はどんな workspace と context を組み立てるか。
+sfh doctor     — 有料。実際に 1 token の prompt を送り、sfh がまだ回答を parse できるかを確認。
+                 protocol drift を捕まえられる唯一の方法。
+```
+
+`doctor` は隔離した scratch ディレクトリから実行されるため、実行した場所に置かれている instruction file ではなく adapter そのものを報告します。
+
+sfh はどの adapter についても **minimum version を固定していません**。各 CLI の公式文書と live probe で確認していない下限を主張する代わりに、`preflight` はインストールされている version を表示し、要件は不明であると述べます。
+
 ### 終了コード
 
 | 終了コード | 意味 |
@@ -190,9 +342,12 @@ sfh run flow.yaml --resume-latest
 ## 成果物と公開スキーマ
 
 すべての実行において `.sfh/runs/<run-id>/` 以下に耐久ログが保存されます:
-- `log.jsonl`: 構造化イベントストリーム（ステップ開始・完了・トークン・コスト）
+- `log.jsonl`: 構造化イベントストリーム（ステップ開始・完了・トークン・コスト・protocol evidence・workspace checkpoint）
 - `<step_id>.out.txt` & `<step_id>.err.txt`: サイズ制限付きのraw標準出力・標準エラー出力。32 MiBを超えるstreamは省略marker付きで先頭と末尾を保持し、構造化された最終回答とusage/costは完全なstreamから独立して処理します。
 - `status.json`: リアルタイムステータススナップショット
+- `execution-closure.json`: この run が固定された入力の hash
+- `workspace.json`: managed workspace（flow が要求した場合）
+- `<step_id>.context.txt` & `<step_id>.context.json`: 組み立てられた context とその manifest（step が context を指定した場合）
 
 コマンドの長い出力をAI promptへ渡す場合は、`{{steps.verify.output | tail:80 | truncate:8000}}`のように明示的に制限してください。全文artifactは`{{steps.verify.output_file}}`から参照できます。
 
