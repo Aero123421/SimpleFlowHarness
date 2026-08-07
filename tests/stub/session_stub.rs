@@ -59,6 +59,11 @@
 //! stub into a `cmd:` leaf that can still sleep, talk on stderr, and choose its
 //! exit code - none of which `echo` or `printf` can do.
 //!
+//! `--version` and `--help` are answered first, before any option is parsed and
+//! before any side effect, so a caller that only INSPECTS the binary (`sfh
+//! preflight`, or the provenance probe every run makes) gets an answer without
+//! the stub doing any of the work a real invocation would.
+//!
 //! # Protocols
 //!
 //! Since sfh 1.2 a preset step must complete its tool's documented machine
@@ -386,8 +391,37 @@ fn work(cfg: &Config) {
     }
 }
 
+/// What a real CLI answers `--version` and `--help` with.
+///
+/// Answered BEFORE anything else, and before any of the stub's side effects, so
+/// that a caller which only inspects the binary - `sfh preflight`, or the
+/// provenance probe every run makes - is answered without the stub doing any of
+/// the work a real invocation would. The flag list is the union of what sfh's
+/// adapters look for, so this one binary can stand in for whichever preset a
+/// test points it at.
+const STUB_HELP: &str = "\
+usage: sfh-session-stub [options]
+  exec --json --output-last-message -s -c
+  -p --output-format --permission-mode --session-id
+  run --format --agent --auto
+  --prompt-file
+  --mode --print-timeout
+  --offline --tools
+  --trust --disable-project-configs
+";
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Before parse_config: --version and --help must not create the fail-once
+    // marker, make a directory, or sleep. Inspecting a binary is not running it.
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("sfh-session-stub 1.0.0");
+        return;
+    }
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{STUB_HELP}");
+        return;
+    }
     let cfg = parse_config(&argv);
 
     // Drain the prompt the way a real CLI does. sfh closes the pipe after

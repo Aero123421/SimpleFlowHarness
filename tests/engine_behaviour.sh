@@ -5016,12 +5016,17 @@ steps:
 YAML
 "$SFH" run compat.yaml --runs-dir compat-runs -q > compat.out 2> compat.err
 check "v1.2 compat: a flow with no new keys runs" 0 $?
+# msys' `pwd` and a native Windows binary's spell the same directory
+# differently (/tmp/tmp.X vs C:/Users/.../Temp/tmp.X), so compare the leaf name:
+# it is stable everywhere, and a managed workspace would end in `primary`
+# instead - which is the difference this is actually checking for.
 COMPAT_CWD="$(cat compat.out)"
-if [ "$COMPAT_CWD" = "$(pwd)" ]; then
+COMPAT_LEAF="$(basename "$COMPAT_CWD" | tr -d '\r')"
+if [ "$COMPAT_LEAF" = "$(basename "$(pwd)")" ]; then
   echo "ok   - v1.2 compat: it still runs in the caller's cwd"
   pass=$((pass + 1))
 else
-  echo "FAIL - v1.2 compat: cwd moved to '$COMPAT_CWD' (expected $(pwd))"
+  echo "FAIL - v1.2 compat: cwd moved to '$COMPAT_CWD' (expected to stay in $(pwd))"
   fail=$((fail + 1))
 fi
 COMPAT_DIR="$(dirname "$(find compat-runs -type f -name 'log.jsonl' -print -quit)")"
@@ -5252,7 +5257,11 @@ if have_symlinks; then
   printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > link-run/log.jsonl
   "$SFH" workspaces remove link-run --discard > linkrm.out 2> linkrm.err
   check "adversarial: removing through a symlink is refused" 1 $?
-  contains "adversarial: the refusal names the symlink" "is a symlink" linkrm.err
+  # Which guard fires depends on the platform: on Unix the path resolves and the
+  # symlink check refuses it; under msys a native binary cannot resolve the link
+  # at all and the ownership check refuses it first. Both are refusals to touch
+  # anything, and both say so - assert THAT, not which one won the race.
+  contains "adversarial: the refusal is explicit about not removing" "refusing to remove" linkrm.err
   if [ -f victim/data.txt ]; then
     echo "ok   - adversarial: the linked directory was not touched"
     pass=$((pass + 1))
@@ -5273,11 +5282,17 @@ else
   echo "SKIP - adversarial symlink deletion tests need native symlinks"
 fi
 # An ABSOLUTE context path is contained the same way a relative one is.
-cat > abs-ctx.yaml <<'YAML'
+# The target is a file this test creates, NOT one the OS happens to provide:
+# /etc/hostname does not exist on macOS, so pointing at it made the step fail
+# for "no such file" while the assertion claimed containment had refused it -
+# a test passing for the wrong reason, which is worse than no test.
+mkdir -p absdir
+printf 'ABSOLUTE-SECRET\n' > abs-secret.txt
+cat > absdir/abs-ctx.yaml <<YAML
 name: absctx
 contexts:
   leak:
-    file: /etc/hostname
+    file: "$WORK/abs-secret.txt"
 steps:
   - id: a
     context: [leak]
@@ -5285,9 +5300,16 @@ steps:
     stdin: prompt
     prompt: "x"
 YAML
-"$SFH" run abs-ctx.yaml --runs-dir absctx-runs -q > absctx.out 2> absctx.err
+"$SFH" run absdir/abs-ctx.yaml --runs-dir absctx-runs -q > absctx.out 2> absctx.err
 check "adversarial: an absolute context path outside the flow dir is refused" 1 $?
 contains "adversarial: the absolute-path refusal explains itself" "outside the flow directory" absctx.err
+if grep -q "ABSOLUTE-SECRET" absctx.out absctx.err 2>/dev/null; then
+  echo "FAIL - adversarial: the out-of-tree file was read through an absolute path"
+  fail=$((fail + 1))
+else
+  echo "ok   - adversarial: nothing outside the flow dir was read via an absolute path"
+  pass=$((pass + 1))
+fi
 # A template context renders TEXT. It never opens a path, so run data cannot
 # become a file read however it is shaped.
 cat > tmpl-ctx.yaml <<'YAML'
@@ -5504,36 +5526,32 @@ contains "preflight: every preset is reported" '"tool": "codex"' pf.json
 contains "preflight: an unverified version floor is reported as null" '"minimum_version": null' pf.json
 # It must not launch a flow's binaries as a model call. A hostile bin: is only
 # ever inspected with --version/--help, never asked to answer a prompt.
-cat > pfprobe.sh <<'SH'
-#!/bin/sh
-case "$1" in
-  --version) echo "fake 1.0"; exit 0 ;;
-  --help) echo "-p --output-format --permission-mode --session-id"; exit 0 ;;
-esac
-touch PREFLIGHT-CALLED-MODEL
-echo "should not happen"
-SH
-chmod +x pfprobe.sh
+# The stub stands in for the tool here too: it is a native binary (so a native
+# sfh can actually launch it on Windows), its path is already cygpath-converted,
+# and it answers --version/--help before doing anything else. SFH_STUB_MKDIR
+# makes a REAL invocation create a directory, so "preflight never asked the tool
+# to answer anything" is a fact on disk rather than an assumption.
 cat > pfflow.yaml <<YAML
 name: pf
 steps:
   - id: a
     tool: claude
-    bin: "$WORK/pfprobe.sh"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
 YAML
-rm -f PREFLIGHT-CALLED-MODEL
-"$SFH" preflight pfflow.yaml > pf2.out 2> pf2.err
+rm -rf PREFLIGHT-CALLED-MODEL
+SFH_STUB_MKDIR="$WORK/PREFLIGHT-CALLED-MODEL" "$SFH" preflight pfflow.yaml > pf2.out 2> pf2.err
 check "preflight: a flow preflight exits 0 when its tool is present" 0 $?
-if [ -f PREFLIGHT-CALLED-MODEL ]; then
-  echo "FAIL - preflight: it sent a prompt to the tool"
+if [ -d PREFLIGHT-CALLED-MODEL ]; then
+  echo "FAIL - preflight: it actually invoked the tool"
   fail=$((fail + 1))
 else
   echo "ok   - preflight: no model call was made"
   pass=$((pass + 1))
 fi
-contains "preflight: it names the resolved binary" "pfprobe.sh" pf2.out
+contains "preflight: it names the resolved binary" "$STUB_NAME" pf2.out
+contains "preflight: it reports the version it read" "sfh-session-stub 1.0.0" pf2.out
 
 # --- profile overlays --------------------------------------------------------
 cat > ov-flow.yaml <<'YAML'
