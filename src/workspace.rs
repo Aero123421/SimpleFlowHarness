@@ -491,19 +491,30 @@ pub fn cleanup_auto(ws: &Workspace, run_state: &str) -> Cleanup {
 /// be swapped, and this is the last moment at which that is detectable.
 pub fn remove_worktree(ws: &Workspace) -> Result<(), String> {
     verify_ownership(ws)?;
+    // The recorded path must BE a directory, not a link to one. Everything sfh
+    // knows about this workspace - the ownership marker, the dirty check, the
+    // fingerprint - was read through `ws.path`, and a link means every one of
+    // those answers came from somewhere else. Refusing here is cheap; deleting
+    // through a link is not undoable.
+    match ws.path.symlink_metadata() {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(format!(
+                "{} is a symlink, not a directory; refusing to remove anything through it",
+                ws.path.display()
+            ))
+        }
+        Ok(md) if !md.is_dir() => return Err(format!("{} is not a directory", ws.path.display())),
+        Ok(_) => {}
+        Err(e) => return Err(format!("cannot stat {}: {e}", ws.path.display())),
+    }
     let path = ws
         .path
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", ws.path.display()))?;
-    // The canonical path must still be the one the manifest names. A symlink
-    // swapped in after the manifest was written would otherwise let a removal
-    // land somewhere else entirely.
-    if !contain::is_under(&ws.path, &path) {
-        return Err(format!(
-            "{} no longer resolves to itself; refusing to remove it",
-            ws.path.display()
-        ));
-    }
+    // Hand git the RESOLVED path, so a link swapped in after this point cannot
+    // redirect the removal. git itself refuses a path that is not a registered
+    // worktree of this repository, which is the last of the three independent
+    // checks between here and a deletion.
     git(
         &ws.source_root,
         &["worktree", "remove", "--force", &path.to_string_lossy()],

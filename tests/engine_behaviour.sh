@@ -5235,6 +5235,87 @@ else
   pass=$((pass + 1))
 fi
 
+# --- adversarial: deletion and context containment ---------------------------
+# sfh deletes only what it created, and a context file cannot be used to read
+# something the flow was not allowed to name.
+if have_symlinks; then
+  mkdir -p victim && printf 'precious\n' > victim/data.txt
+  # A marker whose nonce MATCHES, planted in the directory an attacker wants
+  # deleted, reached through a symlink the manifest names.
+  printf '{"schema_version":1,"created_by":"sfh","run_id":"r","ownership_nonce":"N1"}\n' \
+    > victim/.sfh-workspace
+  MSYS=winsymlinks:nativestrict ln -s "$WORK/victim" linkdir
+  mkdir -p link-run
+  printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"%s","path":"%s","created_by_sfh":true,"ownership_nonce":"N1","cleanup":"auto"}\n' \
+    "$WORK" "$WORK/linkdir" > link-run/workspace.json
+  printf '{"schema_version":1,"state":"done"}\n' > link-run/status.json
+  printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > link-run/log.jsonl
+  "$SFH" workspaces remove link-run --discard > linkrm.out 2> linkrm.err
+  check "adversarial: removing through a symlink is refused" 1 $?
+  contains "adversarial: the refusal names the symlink" "is a symlink" linkrm.err
+  if [ -f victim/data.txt ]; then
+    echo "ok   - adversarial: the linked directory was not touched"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - adversarial: sfh deleted through a symlink"
+    fail=$((fail + 1))
+  fi
+  # A marker that is itself a symlink proves nothing about the directory.
+  mkdir -p linkmarker && MSYS=winsymlinks:nativestrict ln -s "$WORK/victim/.sfh-workspace" linkmarker/.sfh-workspace
+  mkdir -p lm-run
+  printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"%s","path":"%s","created_by_sfh":true,"ownership_nonce":"N1","cleanup":"auto"}\n' \
+    "$WORK" "$WORK/linkmarker" > lm-run/workspace.json
+  printf '{"schema_version":1,"state":"done"}\n' > lm-run/status.json
+  printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > lm-run/log.jsonl
+  "$SFH" workspaces remove lm-run --discard > lmrm.out 2> lmrm.err
+  check "adversarial: a symlinked ownership marker proves nothing" 1 $?
+else
+  echo "SKIP - adversarial symlink deletion tests need native symlinks"
+fi
+# An ABSOLUTE context path is contained the same way a relative one is.
+cat > abs-ctx.yaml <<'YAML'
+name: absctx
+contexts:
+  leak:
+    file: /etc/hostname
+steps:
+  - id: a
+    context: [leak]
+    cmd: ["sh", "-c", "cat -"]
+    stdin: prompt
+    prompt: "x"
+YAML
+"$SFH" run abs-ctx.yaml --runs-dir absctx-runs -q > absctx.out 2> absctx.err
+check "adversarial: an absolute context path outside the flow dir is refused" 1 $?
+contains "adversarial: the absolute-path refusal explains itself" "outside the flow directory" absctx.err
+# A template context renders TEXT. It never opens a path, so run data cannot
+# become a file read however it is shaped.
+cat > tmpl-ctx.yaml <<'YAML'
+name: tmplctx
+contexts:
+  fromstep:
+    template: "{{steps.pick.output}}"
+steps:
+  - id: pick
+    cmd: ["echo", "/etc/hostname"]
+  - id: use
+    context: [fromstep]
+    cmd: ["sh", "-c", "cat -"]
+    stdin: prompt
+    prompt: "x"
+YAML
+"$SFH" run tmpl-ctx.yaml --runs-dir tmplctx-runs -q > tmplctx.out 2>&1
+check "adversarial: a template context runs" 0 $?
+contains "adversarial: a template context carries the text, not the file" "/etc/hostname" tmplctx.out
+TMPL_DIR="$(dirname "$(find tmplctx-runs -type f -name 'log.jsonl' -print -quit)")"
+if grep -qi "localhost" "$TMPL_DIR/use.context.txt" 2>/dev/null; then
+  echo "FAIL - adversarial: a template context opened the path it rendered"
+  fail=$((fail + 1))
+else
+  echo "ok   - adversarial: a template context never opened the path it rendered"
+  pass=$((pass + 1))
+fi
+
 # --- execution closure: a changed input blocks resume ------------------------
 cat > closure.yaml <<'YAML'
 name: closure
