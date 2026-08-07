@@ -84,7 +84,7 @@ fnv1a64() {
 }
 
 # --- session-reporting stub CLI (T-0 / B-15) ---------------------------------
-# `bin: "echo"` cannot report a session id, so every test that stands echo in
+# `bin: "$STUB_BIN"` cannot report a session id, so every test that stands echo in
 # for claude fails F-11's "resume unverified" check and can only prove that a
 # guard did NOT fire. tests/stub/session_stub.rs speaks the shape sfh parses
 # (`claude -p --output-format json`: one envelope with .result/.session_id/
@@ -245,12 +245,17 @@ else
   pass=$((pass + 1))
 fi
 # Negative control. The same flow with the old stand-in must still fail, or the
-# check above proves nothing about the stub: echo reports no session id, so
-# F-11 cannot tell a resume from a fresh session and refuses.
+# check above proves nothing about the stub. Since 1.2 it fails EARLIER than it
+# used to: echo never prints claude's documented result envelope, so the
+# structured protocol is refused before session identity is even considered.
+# (Before 1.2 the parser handed echo's raw stdout back as the answer and the
+# step got as far as F-11's "resume unverified" - a weaker guarantee, since a
+# fresh step with the same stand-in passed.)
 sed "s#$STUB_BIN#echo#g" stub-session.yaml > stub-session-echo.yaml
 "$SFH" run stub-session-echo.yaml -q > stub-session-echo.out 2> stub-session-echo.err
 check "the same flow with bin: echo still cannot verify the resume" 1 $?
-contains "echo fails for the session reason, not another one" "resume unverified" stub-session-echo.err
+contains "echo fails for the protocol reason, not another one" "not its documented machine-readable output" stub-session-echo.err
+not_contains "echo's stdout is never handed on as the answer" "sfh-stub" stub-session-echo.out
 
 # --- built-in AI guide -------------------------------------------------------
 "$SFH" guide > guide.out 2> guide.err
@@ -558,7 +563,7 @@ fi
 # --- compact instruction rendering + pre-compact notes -----------------------
 # `echo` stands in for codex: it exits successfully without calling an AI, while
 # sfh still writes the exact compact prompt and replaces the chain output.
-cat > compact.yaml <<'YAML'
+cat > compact.yaml <<YAML
 name: compact
 vars:
   topic: "rendered-topic"
@@ -569,7 +574,7 @@ steps:
     compact:
       when_over: 10
       tool: codex
-      bin: "echo"
+      bin: "$STUB_BIN"
       instruction: "INSTRUCTION={{vars.topic}}"
   - id: after
     cmd: ["echo", "compact-finished"]
@@ -692,13 +697,13 @@ fi
 # max_total_steps covers every engine-scheduled leaf run, including recovery
 # and summarization paths. Those two paths used to increment the count without
 # checking it, so a limit of one still executed a second external command.
-cat > max-total-fallback.yaml <<'YAML'
+cat > max-total-fallback.yaml <<YAML
 name: max-total-fallback
 defaults:
   max_total_steps: 1
 profiles:
   broken: { tool: codex, bin: "false", access: read }
-  works:  { tool: codex, bin: "echo", access: read }
+  works:  { tool: codex, bin: "$STUB_BIN", access: read }
 steps:
   - id: primary
     use: broken
@@ -729,7 +734,7 @@ MAX_TOTAL_PRIMARY_STARTS="$(
 check "the max_total resume does not rebill the checkpointed primary" \
   1 "$MAX_TOTAL_PRIMARY_STARTS"
 
-cat > max-total-compact.yaml <<'YAML'
+cat > max-total-compact.yaml <<YAML
 name: max-total-compact
 defaults:
   max_total_steps: 1
@@ -739,7 +744,7 @@ steps:
     compact:
       when_over: 1
       tool: codex
-      bin: "echo"
+      bin: "$STUB_BIN"
 YAML
 "$SFH" run max-total-compact.yaml --runs-dir max-total-compact-runs -q \
   > max-total-compact.out 2> max-total-compact.err
@@ -1144,11 +1149,11 @@ fi
 # It used to be honoured only on plain leaves: a parallel child could declare
 # fallback and silently not have it. Fake tools, so no AI is called - `false`
 # always fails, `echo` always succeeds and codex's parser falls back to stdout.
-cat > fb.yaml <<'YAML'
+cat > fb.yaml <<YAML
 name: fb
 profiles:
   broken: { tool: codex, bin: "false", access: read }
-  works:  { tool: codex, bin: "echo", access: read }
+  works:  { tool: codex, bin: "$STUB_BIN", access: read }
 steps:
   - id: plain
     use: broken
@@ -1218,12 +1223,12 @@ check "parallel fallback resume does not rebill the member primary" \
 contains "parallel fallback resume continues beyond the group" \
   "fanout-survived" fb-fan-resume.out
 
-cat > fb-foreach.yaml <<'YAML'
+cat > fb-foreach.yaml <<YAML
 api_version: 1
 name: fb-foreach
 profiles:
   broken: {tool: codex, bin: "false", access: read}
-  works: {tool: codex, bin: "echo", access: read}
+  works: {tool: codex, bin: "$STUB_BIN", access: read}
 steps:
   - id: source
     cmd: ["echo", "one-item"]
@@ -2021,20 +2026,20 @@ check "S2-3: a flag injected by an upstream output is refused before spawn" 1 $?
 contains "S2-3: the runtime error names the escape hatch" "allow_access_override" s23-runtime.err
 
 # --- S2-4: a session cannot be resumed at a higher access level ---------------
-# bin: "echo" stands in for claude: it exits 0 without calling an AI, and sfh
+# bin: "$STUB_BIN" stands in for claude: it exits 0 without calling an AI, and sfh
 # pre-assigns the session id itself, so a session gets recorded - with the
 # access level it was created under.
-cat > s24.yaml <<'YAML'
+cat > s24.yaml <<YAML
 name: s24
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: high
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     continue_from: low
     prompt: "y"
@@ -2045,24 +2050,24 @@ contains "S2-4: the error names both levels" "access read" s24.err
 contains "S2-4: the error names the escape hatch" "allow_access_override" s24.err
 S24_LOG="$(find s24-runs -type f -name 'log.jsonl' -print -quit)"
 contains "S2-4: the session records the access it was created under" '"access":"read"' "$S24_LOG"
-cat > s24-override.yaml <<'YAML'
+cat > s24-override.yaml <<YAML
 name: s24-override
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: high
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     allow_access_override: true
     continue_from: low
     prompt: "y"
 YAML
 "$SFH" run s24-override.yaml -q > s24-override.out 2> s24-override.err
-# Judged by the refusal MESSAGE, not the exit code. `bin: "echo"` reports no
+# Judged by the refusal MESSAGE, not the exit code. `bin: "$STUB_BIN"` reports no
 # session id, so F-11's "resume unverified" check now fails every one of these
 # runs on its own - real claude does report one, so that guard is correct and
 # the stub simply cannot satisfy it. An exit-code assertion here would be
@@ -2074,17 +2079,17 @@ else
   echo "ok   - S2-4: allow_access_override permits the escalation"
   pass=$((pass + 1))
 fi
-cat > s24-same.yaml <<'YAML'
+cat > s24-same.yaml <<YAML
 name: s24-same
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: again
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     continue_from: low
     prompt: "y"
@@ -2097,17 +2102,17 @@ else
   echo "ok   - S2-4: resuming at the same access level is allowed"
   pass=$((pass + 1))
 fi
-cat > s24-fork.yaml <<'YAML'
+cat > s24-fork.yaml <<YAML
 name: s24-fork
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: branch
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     fork_from: low
     prompt: "y"
@@ -2169,14 +2174,14 @@ touch EVIL-PROBE-RAN
 echo evil 1.0
 SH
 chmod +x evil-probe.sh
-cat > s32.yaml <<'YAML'
+cat > s32.yaml <<YAML
 name: s32
 profiles:
   aaa-unused: { tool: codex, bin: "./evil-probe.sh" }
 steps:
   - id: real
     tool: codex
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
 YAML
@@ -2191,7 +2196,7 @@ else
   pass=$((pass + 1))
 fi
 S32_META="$(dirname "$(find s32-runs -type f -name 'log.jsonl' -print -quit)")/meta.json"
-contains "S3-2: provenance records the resolved bin" '"bin": "echo"' "$S32_META"
+contains "S3-2: provenance records the resolved bin" "\"bin\": \"$STUB_BIN\"" "$S32_META"
 if grep -qF "evil-probe" "$S32_META"; then
   echo "FAIL - S3-2: the unused profile leaked into provenance"
   fail=$((fail + 1))
@@ -2203,7 +2208,7 @@ contains "S3-4: meta records the fingerprint algorithm" '"flow_fingerprint_algo"
 # doctor resolves the same way and must not launch the unused bin either.
 rm -f EVIL-PROBE-RAN
 "$SFH" doctor s32.yaml --runs-dir s32-doctor > s32-doctor.out 2>&1
-check "S3-2: doctor probes the resolved bin (echo stands in)" 0 $?
+check "S3-2: doctor probes the resolved bin (the stub stands in)" 0 $?
 if [ -f EVIL-PROBE-RAN ]; then
   echo "FAIL - S3-2: doctor executed the unused profile's bin"
   fail=$((fail + 1))
@@ -2211,20 +2216,20 @@ else
   echo "ok   - S3-2: doctor never executed the unused profile's bin"
   pass=$((pass + 1))
 fi
-contains "S3-2: doctor names the resolved program" "echo" s32-doctor.out
+contains "S3-2: doctor names the resolved program" "$STUB_NAME" s32-doctor.out
 
 # --- S3-3: run artifacts are owner-only and gitignore is verified -------------
 # An AI step, not a cmd: step. The prompt file is the most sensitive artifact
 # a run writes, and only a step with a prompt: produces one - the old fixture
 # asserted 0600 on a file it never created, so `stat` returned nothing and the
-# check could not have failed for the right reason either. bin: "echo" stands
+# check could not have failed for the right reason either. bin: "$STUB_BIN" stands
 # in for the CLI.
-cat > s33.yaml <<'YAML'
+cat > s33.yaml <<YAML
 name: s33
 steps:
   - id: a
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "secret-output"
 YAML
@@ -3200,17 +3205,17 @@ fi
 # --- S2-4 extended: missing recorded access is fail-closed --------------------
 # A run dir whose log has no "access" field in the session must refuse a
 # higher-access resume unless allow_access_override is set.
-cat > s24-missing.yaml <<'YAML'
+cat > s24-missing.yaml <<YAML
 name: s24-missing
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: high
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: full
     continue_from: low
     prompt: "y"
@@ -3525,19 +3530,19 @@ else
 fi
 
 # --- F4: step_start records the session it attached to ------------------------
-# bin: "echo" stands in for claude exactly as the S2-4 block uses it: sfh
+# bin: "$STUB_BIN" stands in for claude exactly as the S2-4 block uses it: sfh
 # pre-assigns the session id, so continue_from/fork_from resolve without an AI.
-cat > f4sess.yaml <<'YAML'
+cat > f4sess.yaml <<YAML
 name: f4sess
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: again
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     continue_from: low
     prompt: "y"
@@ -3569,17 +3574,17 @@ else
   echo "FAIL - F4: a step with no session parent did not record null"
   fail=$((fail + 1))
 fi
-cat > f4fork.yaml <<'YAML'
+cat > f4fork.yaml <<YAML
 name: f4fork
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: branch
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     fork_from: low
     prompt: "y"
@@ -3601,25 +3606,25 @@ fi
 # use of fork_from, and the two tests above only cover top-level leaves. Without
 # this one, session_parent could be (and was) recorded for every case except the
 # one the key was added for.
-cat > f4fanp.yaml <<'YAML'
+cat > f4fanp.yaml <<YAML
 name: f4fanp
 steps:
   - id: plan
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: read
     prompt: "x"
   - id: fan
     parallel:
       - id: br_a
         tool: claude
-        bin: "echo"
+        bin: "$STUB_BIN"
         access: read
         fork_from: plan
         prompt: "a"
       - id: br_b
         tool: claude
-        bin: "echo"
+        bin: "$STUB_BIN"
         access: read
         fork_from: plan
         prompt: "b"

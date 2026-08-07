@@ -1,4 +1,4 @@
-use crate::{contain, execute, flow, leaf, preset, template};
+use crate::{contain, execute, flow, leaf, preset, protocol, template};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
@@ -3906,7 +3906,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
                     log_event(
                         &mut log,
-                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep)}),
+                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep), "protocol_expected": protocol::expected_kind(&prep.parse)}),
                     )?;
                     leaf::exec_leaf(prep)
                 };
@@ -5175,7 +5175,8 @@ where
             f,
             json!({"ts": utc_stamp(), "event": "step_start", "step": id, "parent": group,
                    "visit": visit, "cmd": prep.inv.describe(),
-                   "session_parent": session_parent_json(prep)}),
+                   "session_parent": session_parent_json(prep),
+                   "protocol_expected": protocol::expected_kind(&prep.parse)}),
         )?;
     }
     Ok(())
@@ -5656,6 +5657,15 @@ fn log_step_end_with_next(
             "out_file": file_name(&d.out_file),
             "cmd": d.cmd, "session": session,
             "harness_diagnostic": d.harness_diagnostic.as_deref().map(|s| one_line(s, 500)),
+            // Additive protocol evidence (spec 15.1). A reader that predates
+            // these keys sees the same event it always did; a reader that wants
+            // them can tell "the tool failed" from "sfh could not verify that
+            // the tool finished" without re-parsing the raw artifact.
+            "protocol_state": d.protocol.protocol.as_str(),
+            "terminal_seen": d.protocol.terminal_seen,
+            "terminal_success": d.protocol.terminal_success,
+            "final_message_seen": d.protocol.final_message_seen,
+            "malformed_records": d.protocol.malformed_records,
             // Which OS produced this step. A log is routinely read on a
             // different machine from the one that wrote it, and "it passes on
             // mine" is exactly the class of report this answers.

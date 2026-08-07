@@ -5,6 +5,7 @@ mod execute;
 mod flow;
 mod leaf;
 mod preset;
+mod protocol;
 mod runs;
 mod sha256;
 mod template;

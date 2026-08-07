@@ -871,30 +871,35 @@ fn opencode_agent(a: &mut Vec<String>, inp: &PresetInput) -> String {
     }
 }
 
+/// The enforcement config opencode receives, built as a JSON *value* and then
+/// serialized (spec P0-03).
+///
+/// The agent name is user-controlled (`agent:` on a step, a profile, or a
+/// `--var`-rendered value). Interpolating it into a JSON string literal with
+/// `format!` meant a name containing a quote or a backslash produced either
+/// invalid JSON - in which case opencode ignores the layer and the deny rules
+/// silently vanish - or, worse, valid JSON with an attacker-chosen structure.
+/// `serde_json` escapes the key for us, so no name can do either.
 fn opencode_env(agent_name: &str, access: Access) -> Vec<(String, String)> {
-    match access {
+    let config = match access {
         // The stock plan agent denies edits but NOT bash (1.18.3), so a read step
         // could still write via shell redirection. OPENCODE_CONFIG_CONTENT is the
         // highest-precedence config layer and merges with the user's config.
-        Access::Read => vec![(
-            "OPENCODE_CONFIG_CONTENT".to_string(),
-            format!(
-                "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"edit\":\"deny\",\"bash\":\"deny\"}}}}}}}}"
-            ),
-        )],
+        Access::Read => serde_json::json!({
+            "agent": { agent_name: { "permission": { "edit": "deny", "bash": "deny" } } }
+        }),
         // --auto auto-approves whatever is not explicitly denied, so write denies
         // two things: bash (opencode has no OS sandbox - an auto-approved shell
         // would make write == full, the same rule pi/claude/grok follow) and
         // out-of-tree writes. Agent-scoped so a user-selected agent cannot
         // inherit looser defaults.
-        Access::Write => vec![(
-            "OPENCODE_CONFIG_CONTENT".to_string(),
-            format!(
-                "{{\"agent\":{{\"{agent_name}\":{{\"permission\":{{\"bash\":\"deny\"}}}}}},\"permission\":{{\"external_directory\":\"deny\"}}}}"
-            ),
-        )],
-        Access::Full => Vec::new(),
-    }
+        Access::Write => serde_json::json!({
+            "agent": { agent_name: { "permission": { "bash": "deny" } } },
+            "permission": { "external_directory": "deny" }
+        }),
+        Access::Full => return Vec::new(),
+    };
+    vec![("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string())]
 }
 
 /// Build the command line for a fresh (non-resumed) preset run.
@@ -2257,5 +2262,76 @@ mod tests {
         // The old message told users to reach for access: full - the exact
         // wrong direction. The fix is to remove or narrow the arg.
         assert!(!msg.contains("use access: full"), "{msg}");
+    }
+
+    /// P0-03. The agent name is flow data, so it can hold a quote, a backslash
+    /// or a control character. Building the permission config by pasting it
+    /// into a JSON string literal produced either invalid JSON - which opencode
+    /// discards, silently dropping the deny rules - or attacker-chosen
+    /// structure. Every name must come back as valid JSON whose deny rules sit
+    /// under exactly one agent key holding exactly the requested name.
+    #[test]
+    fn opencode_enforcement_config_is_valid_json_for_any_agent_name() {
+        let hostile = [
+            "plain",
+            "with\"quote",
+            "with\\backslash",
+            "with\u{0007}control\u{0000}nul",
+            "with\nnewline",
+            // The shape a string-concatenating builder would let escape: close
+            // the key, close the objects, and append a permission of one's own.
+            r#"x":{"permission":{"bash":"allow"}}},"a":{"y"#,
+            r#"}}},"permission":{"external_directory":"allow"},"junk":{"#,
+            "日本語のエージェント",
+        ];
+        for name in hostile {
+            for (access, denied) in [
+                (Access::Read, vec!["edit", "bash"]),
+                (Access::Write, vec!["bash"]),
+            ] {
+                let env = opencode_env(name, access);
+                let (key, raw) = env.first().expect("read/write must set the config layer");
+                assert_eq!(key, "OPENCODE_CONFIG_CONTENT");
+                let v: serde_json::Value = serde_json::from_str(raw)
+                    .unwrap_or_else(|e| panic!("agent {name:?} produced invalid JSON: {e}\n{raw}"));
+                let agents = v
+                    .get("agent")
+                    .and_then(|a| a.as_object())
+                    .unwrap_or_else(|| panic!("agent {name:?}: no agent map in {raw}"));
+                assert_eq!(
+                    agents.len(),
+                    1,
+                    "agent {name:?} injected extra agent keys: {raw}"
+                );
+                let perms = agents
+                    .get(name)
+                    .and_then(|a| a.get("permission"))
+                    .and_then(|p| p.as_object())
+                    .unwrap_or_else(|| panic!("agent {name:?}: name is not the key in {raw}"));
+                for d in &denied {
+                    assert_eq!(
+                        perms.get(*d).and_then(|x| x.as_str()),
+                        Some("deny"),
+                        "agent {name:?}: {d} must stay denied in {raw}"
+                    );
+                }
+                assert!(
+                    !perms.values().any(|x| x.as_str() == Some("allow")),
+                    "agent {name:?} smuggled an allow into {raw}"
+                );
+                if access == Access::Write {
+                    assert_eq!(
+                        v.pointer("/permission/external_directory")
+                            .and_then(|x| x.as_str()),
+                        Some("deny"),
+                        "agent {name:?}: out-of-tree writes must stay denied in {raw}"
+                    );
+                }
+            }
+            assert!(
+                opencode_env(name, Access::Full).is_empty(),
+                "full access sets no enforcement layer"
+            );
+        }
     }
 }

@@ -531,6 +531,24 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
             .map(String::from)
     })
     .flatten();
+    // A step whose structured protocol never completed failed for a reason no
+    // amount of reading the tool's own stderr explains: sfh refused to certify
+    // a turn nobody proved had finished. Surfaced separately from the free-text
+    // diagnostic so a machine caller can branch on it (spec 15.3). Absent from
+    // logs written before v1.2, which read as `null`.
+    let protocol_failure = last_failed_step
+        .get("protocol_state")
+        .and_then(Value::as_str)
+        .filter(|s| matches!(*s, "invalid" | "missing_terminal"))
+        .map(|s| {
+            serde_json::json!({
+                "step": last_failed_step.get("step"),
+                "protocol_state": s,
+                "terminal_seen": last_failed_step.get("terminal_seen"),
+                "final_message_seen": last_failed_step.get("final_message_seen"),
+                "malformed_records": last_failed_step.get("malformed_records"),
+            })
+        });
     let explanation = if let Some(error) = &error {
         match &harness_diagnostic {
             Some(diagnostic) => format!("{error}: {diagnostic}"),
@@ -564,6 +582,7 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
         "current_step": current,
         "error": error,
         "harness_diagnostic": harness_diagnostic,
+        "protocol_failure": protocol_failure,
         "explanation": explanation,
         "last_event": last,
         "last_position": position,

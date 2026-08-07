@@ -11,20 +11,70 @@ pub enum Invocation {
     /// Spawned directly, no shell. argv[0] is resolved against PATH
     /// (on Windows also tries .exe/.cmd/.bat so npm shims work).
     Argv(Vec<String>),
+    /// The same, except that some argv elements carry payload the durable log
+    /// must not hold. Adapters that deliver the prompt through argv (agy's
+    /// `-p <prompt>`) mark those indices when they build the command line; the
+    /// child still receives the real argv, but every rendering of it - verbose
+    /// progress, `step_start.cmd`, `step_end.cmd`, spawn errors - shows a
+    /// summary instead of the text (spec P0-04).
+    ///
+    /// The prompt is flow data: it can carry a pasted file, a previous step's
+    /// output, or anything a `--var` put there, and the run directory outlives
+    /// the run.
+    ArgvWithPayload {
+        argv: Vec<String>,
+        payload_at: Vec<usize>,
+    },
     /// Run through `cmd /C` (Windows) or `sh -c` (Unix).
     Shell(String),
 }
 
 impl Invocation {
-    pub fn describe(&self) -> String {
+    /// The argv actually handed to the OS, payload included. Not for logging.
+    pub fn argv(&self) -> Option<&[String]> {
         match self {
-            Invocation::Argv(a) => a
+            Invocation::Argv(a) => Some(a),
+            Invocation::ArgvWithPayload { argv, .. } => Some(argv),
+            Invocation::Shell(_) => None,
+        }
+    }
+
+    /// Mark argv elements as payload. A no-op for a shell invocation, whose
+    /// text is the command itself and is never a prompt delivery channel.
+    pub fn redact_argv(self, payload_at: Vec<usize>) -> Invocation {
+        if payload_at.is_empty() {
+            return self;
+        }
+        match self {
+            Invocation::Argv(argv) | Invocation::ArgvWithPayload { argv, .. } => {
+                Invocation::ArgvWithPayload { argv, payload_at }
+            }
+            shell => shell,
+        }
+    }
+
+    /// How this command is written down anywhere a human or a durable artifact
+    /// can see it. Binary path, flags, model, cwd and every other diagnostic
+    /// argument survive; a marked payload becomes its length and digest, which
+    /// is enough to prove two runs used the same prompt without storing it.
+    pub fn describe(&self) -> String {
+        let quote = |s: &String| {
+            if s.contains(' ') || s.is_empty() {
+                format!("\"{s}\"")
+            } else {
+                s.clone()
+            }
+        };
+        match self {
+            Invocation::Argv(a) => a.iter().map(quote).collect::<Vec<_>>().join(" "),
+            Invocation::ArgvWithPayload { argv, payload_at } => argv
                 .iter()
-                .map(|s| {
-                    if s.contains(' ') || s.is_empty() {
-                        format!("\"{s}\"")
+                .enumerate()
+                .map(|(i, s)| {
+                    if payload_at.contains(&i) {
+                        redacted_payload(s)
                     } else {
-                        s.clone()
+                        quote(s)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -32,6 +82,15 @@ impl Invocation {
             Invocation::Shell(s) => format!("$ {s}"),
         }
     }
+}
+
+/// What replaces a payload argument in every log line.
+pub fn redacted_payload(value: &str) -> String {
+    format!(
+        "<prompt chars={} sha256={}>",
+        value.chars().count(),
+        crate::sha256::hex(value.as_bytes())
+    )
 }
 
 pub struct ExecOutcome {
@@ -869,8 +928,8 @@ pub fn run_cmd(
     if interrupted() {
         return Err("interrupted before start".into());
     }
-    let mut cmd = match inv {
-        Invocation::Argv(argv) => {
+    let mut cmd = match inv.argv() {
+        Some(argv) => {
             if argv.is_empty() {
                 return Err("empty command".into());
             }
@@ -878,7 +937,10 @@ pub fn run_cmd(
             c.args(&argv[1..]);
             c
         }
-        Invocation::Shell(line) => shell_command(line),
+        None => match inv {
+            Invocation::Shell(line) => shell_command(line),
+            _ => unreachable!("only Shell has no argv"),
+        },
     };
     if let Some(d) = cwd {
         cmd.current_dir(d);
@@ -1526,6 +1588,54 @@ mod tests {
         let a = Invocation::Argv(vec!["tool".into(), "--flag".into(), "two words".into()]);
         assert_eq!(a.describe(), "tool --flag \"two words\"");
         assert_eq!(Invocation::Shell("echo hi".into()).describe(), "$ echo hi");
+    }
+
+    /// P0-04. The prompt an argv-delivery adapter carries is flow data - a
+    /// pasted file, an upstream step's output, whatever a --var held - and
+    /// every description of the command line ends up in a durable artifact.
+    /// The diagnostics that make a command line worth logging (binary, flags,
+    /// model, access) have to survive; the payload must not.
+    #[test]
+    fn an_argv_prompt_never_reaches_a_command_description() {
+        let secret = "line one\nSSH_KEY=hunter2\nplease review the diff";
+        let inv = Invocation::Argv(vec![
+            "agy".into(),
+            "--model".into(),
+            "big-model".into(),
+            "--mode".into(),
+            "plan".into(),
+            "-p".into(),
+            secret.into(),
+        ])
+        .redact_argv(vec![6]);
+        let described = inv.describe();
+        assert!(
+            !described.contains("hunter2") && !described.contains("please review"),
+            "the prompt leaked into {described}"
+        );
+        for keep in ["agy", "--model", "big-model", "--mode", "plan", "-p"] {
+            assert!(described.contains(keep), "{keep} must stay in {described}");
+        }
+        assert!(
+            described.contains(&format!("chars={}", secret.chars().count())),
+            "the summary reports the prompt size: {described}"
+        );
+        assert!(
+            described.contains(&crate::sha256::hex(secret.as_bytes())),
+            "the summary pins the exact prompt by digest: {described}"
+        );
+        // The child still gets the real thing.
+        assert_eq!(
+            inv.argv().and_then(|a| a.last()).map(String::as_str),
+            Some(secret)
+        );
+        // Nothing marked, nothing changed.
+        assert_eq!(
+            Invocation::Argv(vec!["tool".into(), "x".into()])
+                .redact_argv(vec![])
+                .describe(),
+            "tool x"
+        );
     }
 
     #[test]
