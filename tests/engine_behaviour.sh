@@ -9,6 +9,18 @@ SFH="$(cd "$(dirname "$SFH")" && pwd)/$(basename "$SFH")"
 # this script and everything after the cd is relative to a temp dir.
 SUITE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d)"
+# sfh is a NATIVE binary, so under msys it cannot resolve the /tmp/... paths
+# bash hands out - it needs the drive-letter form. Any path this suite writes
+# into a flow, a manifest or an argument therefore goes through here first.
+# A no-op on real Unix, where the two spellings are the same thing.
+native_path() {
+  if command -v cygpath > /dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+WORK_NATIVE="$(native_path "$WORK")"
 # Windows holds a directory busy while any process still has a handle inside
 # it, and this suite deliberately starts DETACHED runs that outlive it - that
 # is the feature under test, not a leak. A cleanup that loses the race used to
@@ -5152,7 +5164,7 @@ YAML
   # sfh refuses to remove a directory it did not create.
   mkdir -p not-ours fake-run && printf 'x' > not-ours/keep.txt
   printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"/nope","path":"%s","created_by_sfh":true,"ownership_nonce":"forged","cleanup":"auto"}\n' \
-    "$WORK/not-ours" > fake-run/workspace.json
+    "$WORK_NATIVE/not-ours" > fake-run/workspace.json
   printf '{"schema_version":1,"state":"done"}\n' > fake-run/status.json
   printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > fake-run/log.jsonl
   "$SFH" workspaces remove fake-run > wsrm.out 2> wsrm.err
@@ -5252,7 +5264,7 @@ if have_symlinks; then
   MSYS=winsymlinks:nativestrict ln -s "$WORK/victim" linkdir
   mkdir -p link-run
   printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"%s","path":"%s","created_by_sfh":true,"ownership_nonce":"N1","cleanup":"auto"}\n' \
-    "$WORK" "$WORK/linkdir" > link-run/workspace.json
+    "$WORK_NATIVE" "$WORK_NATIVE/linkdir" > link-run/workspace.json
   printf '{"schema_version":1,"state":"done"}\n' > link-run/status.json
   printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > link-run/log.jsonl
   "$SFH" workspaces remove link-run --discard > linkrm.out 2> linkrm.err
@@ -5273,7 +5285,7 @@ if have_symlinks; then
   mkdir -p linkmarker && MSYS=winsymlinks:nativestrict ln -s "$WORK/victim/.sfh-workspace" linkmarker/.sfh-workspace
   mkdir -p lm-run
   printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"%s","path":"%s","created_by_sfh":true,"ownership_nonce":"N1","cleanup":"auto"}\n' \
-    "$WORK" "$WORK/linkmarker" > lm-run/workspace.json
+    "$WORK_NATIVE" "$WORK_NATIVE/linkmarker" > lm-run/workspace.json
   printf '{"schema_version":1,"state":"done"}\n' > lm-run/status.json
   printf '{"schema_version":1,"ts":"x","event":"run_start"}\n' > lm-run/log.jsonl
   "$SFH" workspaces remove lm-run --discard > lmrm.out 2> lmrm.err
@@ -5292,7 +5304,7 @@ cat > absdir/abs-ctx.yaml <<YAML
 name: absctx
 contexts:
   leak:
-    file: "$WORK/abs-secret.txt"
+    file: "$WORK_NATIVE/abs-secret.txt"
 steps:
   - id: a
     context: [leak]
@@ -5541,7 +5553,7 @@ steps:
     prompt: "x"
 YAML
 rm -rf PREFLIGHT-CALLED-MODEL
-SFH_STUB_MKDIR="$WORK/PREFLIGHT-CALLED-MODEL" "$SFH" preflight pfflow.yaml > pf2.out 2> pf2.err
+SFH_STUB_MKDIR="$WORK_NATIVE/PREFLIGHT-CALLED-MODEL" "$SFH" preflight pfflow.yaml > pf2.out 2> pf2.err
 check "preflight: a flow preflight exits 0 when its tool is present" 0 $?
 if [ -d PREFLIGHT-CALLED-MODEL ]; then
   echo "FAIL - preflight: it actually invoked the tool"
