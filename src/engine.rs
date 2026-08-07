@@ -2882,9 +2882,18 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             workspace = Some(ws);
         }
     } else if workspace_plan.resolved == flow::WorkspaceMode::GitWorktree {
+        // With no `root:`, the workspace is a worktree of the repository the
+        // CALLER is standing in - not of the repository the flow file happens
+        // to live in. A managed workspace replaces the caller's cwd, which is
+        // where every step ran before v1.2, so that is the directory it has to
+        // be about. It also makes a shared flow work: `sfh run
+        // /somewhere/else/flow.yaml` from your project operates on YOUR
+        // project. An explicit `root:` is resolved against the flow file, like
+        // every other path a flow declares.
         let source = match &workspace_plan.root {
             Some(r) => flow_dir.join(r),
-            None => flow_dir.clone(),
+            None => std::env::current_dir()
+                .map_err(|e| format!("cannot resolve the current directory: {e}"))?,
         };
         let ws = workspace::create_git_worktree(
             &source,

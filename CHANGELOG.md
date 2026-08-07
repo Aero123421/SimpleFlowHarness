@@ -2,6 +2,184 @@
 
 ## Unreleased
 
+## v1.2.0 — 2026-08-07
+
+sfhを「仕様が変わり得る外部CLI・AI CLIを、宣言された制御フロー、作業環境、入力
+文脈、権限、証拠、再開規則のもとで実行する汎用durable harness」として定義し直し、
+その定義に足りていなかった実行基盤を追加したreleaseです。
+
+新しいkeyを一つも書かなければ、既存flowの挙動は変わりません。同じcwd、同じruns
+root、同じstdout、同じroute、同じresume semanticsです。`api_version: 1`も維持します。
+
+### 構造化protocolのfail-closed（意図した厳格化）
+
+- preset toolは、そのCLIが文書化しているmachine-readable protocolを最後まで完了
+  しなければならなくなりました。terminal recordが届かなかったstreamや、文書化され
+  た形ではないstdoutは、`text`として下流へ渡されずstepの失敗になります。
+  新設の`src/protocol.rs`が`ProtocolState`（plain/valid/missing_terminal/invalid）と、
+  terminal recordの有無・verdict・final message・malformed record数をevidenceとして
+  保持し、実行層はtextではなくこのevidenceから判断します。
+- **agyの偽の成功を修正しました。** 非ゼロexitを成功へ補正する経路が「textが空で
+  なく、失敗と明示されていない」だけで発火し、agyのparserはenvelopeを解釈できない
+  ときrawなstdoutをそのtextとして返していました。この2つが噛み合うと、usage errorを
+  stdoutへ出してexit 1したinvocationが、usage messageを回答とする成功stepになり得ま
+  した。非ゼロexitを0へ補正できるのは、adapterが認識した正規のterminal success record
+  がある場合だけになりました。raw text、未知のstatus、壊れたenvelope、terminal欠落の
+  いずれもこの条件を満たしません。補正の適用範囲も、exit codeが信頼できないと文書化
+  されている唯一のadapterであるagyに限定しました。
+- 7つのpreset parser全てがterminal recordを要求します。protocolが完了しなかった理由は
+  sfh自身が生成したbounded diagnosticとしてstderr、stepのerror artifact、`step_end`、
+  `sfh runs why`に載ります。custom `cmd:`は`ProtocolState::Plain`で、従来のstdout契約の
+  ままです。
+- **1.1でraw textのまま成功していたrunは、1.2では失敗します。** これはbug fixであり、
+  互換維持の対象外です。
+
+### 権限configとpromptの漏洩
+
+- opencodeのpermission configを`format!`ではなく`serde_json`で構築するようにしました。
+  agent名はflow dataなので、quote・backslash・control characterを含み得ます。文字列
+  連結では、opencodeが破棄する不正なJSON（=deny ruleが黙って消える）か、攻撃者が選んだ
+  構造のどちらかを生み出せました。
+- argvでpromptを渡すadapterでは、そのargv要素をdurable logへ書かなくなりました。
+  子processには実物が渡り、記録には`<prompt chars=N sha256=...>`が残ります。binary
+  path、flag、model、access、cwdなど診断に必要な情報はそのままです。
+
+### AI向けmachine interface
+
+- `run` / `plan` / `wait` / `stop` / `status` / `preflight` / `workspaces` に`--json`。
+  共通envelope（`schema_version` / `command` / `ok` / `state` / `terminal` / `exit_code` /
+  `run_id` / `run_dir` / `error` / `warnings` / `next_actions`）を返します。
+- JSONモードのstdoutはenvelopeだけです。進捗・warning・plan headerはstderrへ、結果は
+  envelope内の`result` / `result_file`へ移しました。設定エラーでもprose ではなくenvelope
+  を返します。ここはmachine callerがparseできないと一番困る場面だからです。
+- 失敗には、v1.2.x内で意味が変わらないcodeが付きます: `SFH_USAGE` / `SFH_FLOW_INVALID` /
+  `SFH_PROTOCOL_INVALID` / `SFH_TERMINAL_MISSING` / `SFH_SESSION_UNVERIFIED` /
+  `SFH_EXECUTION_CLOSURE_CHANGED` / `SFH_WORKSPACE_MISSING` / `SFH_WORKSPACE_DRIFT` /
+  `SFH_WORKSPACE_BUSY` / `SFH_WORKSPACE_UNOWNED` / `SFH_REPLAY_REFUSED` /
+  `SFH_PERSISTENCE_FAILURE` / `SFH_CAPABILITY_UNAVAILABLE`。
+- detached runは`"terminal": false`のhandleと、答えを待つargvを返します。path省略で
+  最新runを選んだ場合は`"implicit_target": true`を必ず返します。
+- `status --json`は追加fieldのみで、従来のfieldと意味は変わりません。
+
+### preflight（無料の事前確認）
+
+- `sfh preflight [flow.yaml] [--profiles f] [--state-dir d] [--json]`を追加しました。
+  model呼び出しを一切行わず、flowが実際に起動するtool/bin variantだけを調べます:
+  binaryの所在とversion、adapterが依存するflagがそのCLIの`--help`に残っているか、
+  protocol、resume/fork対応、cost coverage、access levelごとの強制度
+  （sandboxed/enforced/best-effort/unsupported）、既知のgap、そしてこのflowが作る
+  workspace・contextとstatic leaf上限です。
+- adapterの`minimum_version`はどれも設定していません。各CLIの公式文書とlive probeで
+  確認していない下限を主張する代わりに、preflightはインストール済みversionを表示し、
+  要件は不明であると述べます。
+- `doctor`は従来どおりreal callを行いますが、隔離したscratch directoryから実行される
+  ようになりました。実行した場所のinstruction fileを読まず、そこへ書き込むこともあり
+  ません。外部CLIへ渡すpathは全てabsoluteになりました。
+
+### managed workspace
+
+- `workspace:`（`mode: current|directory|git-worktree|auto`、`root` / `base` /
+  `cleanup` / `allow_concurrent_writers` / `verify_on_resume`）と、stepごとの
+  `effects: read|workspace|external|unknown`を追加しました。
+- `auto`は仕事の意味を推測せず、宣言された`effects`だけから決めます。全stepがreadなら
+  workspaceを作りません。書き得るstepが1つでもあれば、run全体で**1個**のgit worktreeを
+  作ります。step数にもvisit数にも依存しません。
+- worktreeはbranch元repositoryの外側（`--state-dir`配下、またはplatformのuser-state
+  directory）に`sfh/<flow>/<run-id>` branchで作られます。呼び出し元のcheckoutは変更
+  されません。
+- **sfhは自分が作ったpathしか削除しません。** ownership markerとrun manifestのnonceが
+  一致した場合だけで、しかも削除直前に再確認します。**未コミットの変更を自動的に破棄
+  することはありません。** dirtyなworkspaceはrunの結果に関わらず保持され、branchも削除
+  されません。failed/stuck/stopped/deadのrunは常にworkspaceを残します。
+- resumeではworkspaceのfingerprint（HEAD、index差分、working tree差分、untracked file
+  全件のhash、submodule状態）を最後のdurable checkpointと比較します。未完了stepで説明
+  できない差分は拒否し、`--adopt-workspace`で明示的に採用できます。`--force-resume`とは
+  別の問いで、片方がもう片方を免除しません。
+- `sfh workspaces list|show|clean|remove`を追加しました。`remove --discard`が、sfhで
+  未コミットの変更が失われ得る唯一の経路です。
+
+### named context
+
+- top-levelの`contexts:`（`file` / `inline` / `template`、`max_chars` /
+  `allow_external` / `optional`）と、stepの`context:` / `context_delivery:`を追加。
+- 決定的な順序と区切りでbundleを組み立て、`<tag>.context.txt`と、各sourceの出所・hash・
+  サイズを記録した`<tag>.context.json`を保存します。durable logにはhashだけが載ります。
+- context fileはno-followで読まれ、flow directoryまたはworkspaceの内側に解決される必要
+  があります。外を指すsymlinkは拒否され、`allow_external: true`が唯一の逃げ道です。
+- `defaults.max_context_chars`超過は**何も起動する前に**失敗します。sfhは要約もしませんし、
+  収まるようにsourceを落とすこともしません。
+- `{{context}}`と`{{context_file}}`をbuiltinとして公開しました。
+
+### execution closure
+
+- flow本体、実効config、profile overlay、context fileの中身、tool version、workspaceの
+  modeとbase commit、unsafe overrideの集合をcanonical JSONのSHA-256で固定し、
+  `execution-closure.json`と`meta.json`へ記録します。
+- resume時に差があれば既定で拒否し、動いたentryを名指しします。`--force-resume`で明示的に
+  受け入れると`force_resume` eventが残ります。
+- fileはpathではなく**中身**で固定し、CRLFはLFへ畳みます。同じflowを別のpathや別の
+  checkoutからresumeしても同一と判定されます。flow fingerprintが元々採っていた方針と
+  同じです。
+
+### 再利用可能なflow: profile overlay
+
+- `--profiles <file>`（繰り返し可、後勝ち）を`run` / `plan` / `validate` / `preflight` /
+  `config show`に追加しました。共有flowが`use: judge`とだけ書き、実行する人がtool・model・
+  binを外から決められます。
+- overlayは書かれたfieldだけを置き換えます。`args`は指定があれば置換・なければ維持、
+  `env`はkey単位でmerge。優先順位は step field > overlay > flow inline profile >
+  `~/.sfh/profiles.yaml` > defaults。stepに直接`tool:`を書く従来の書き方はそのままです。
+
+### replay policy
+
+- `defaults.replay.unfinished`とstepごとの`replay.unfinished`（`rerun|stuck|fail`）を
+  追加しました。開始されたのに終了を記録しなかったstepを、resumeがどう扱うかの宣言です。
+- 既定は従来と同じ`rerun`です。`stuck`（exit 4）と`fail`（exit 1）は何も起動せず、
+  workspaceと部分成果物を残して`SFH_REPLAY_REFUSED`を返します。
+- `effects: external|unknown`かつ`rerun`のstepは`validate --strict`と`plan`がwarningを
+  出します。retry・fallback・visit・完了済みstepの再利用とは別物です。
+
+### state root
+
+- `--state-dir <dir>` / `SFH_STATE_DIR`を追加し、`runs` / `workspaces` / `plans` /
+  `doctor`を1つの根の下に置けるようにしました。
+- `--runs-dir`は従来どおりrun artifactsだけを移し、どちらも指定しなければrunは今までどおり
+  `.sfh/runs`に落ちます。state rootのないmanaged workspaceはplatformのuser-state directory
+  （`$XDG_STATE_HOME/sfh`、`$HOME/.local/state/sfh`、`%LOCALAPPDATA%\sfh`）へfallbackし、
+  それも決められない場合はrepository内へ黙って書く代わりにerrorになります。
+
+### 証拠とdiagnostics
+
+- `step_start`に`protocol_expected` / `context_hash` / `context_file` / `workspace_id`、
+  `step_end`に`protocol_state` / `terminal_seen` / `terminal_success` /
+  `final_message_seen` / `malformed_records`を追加しました。いずれも追加のみで、既存
+  eventの意味と型は変わりません。
+- 新event: `execution_closure` / `workspace_created` / `workspace_checkpoint` /
+  `workspace_adopted` / `workspace_cleanup` / `force_resume`。
+- `sfh runs why --json`が`protocol_failure`を構造化して返します。
+- `plan --json`がworkspace plan、context plan、execution closure、replay policy、
+  unsafe override、static leaf上限、redactedなinvocationを返します。
+  `plan --save [dir]`で、renderされたprompt・context bundle・machine planを保存して
+  実行前に確認できます。
+
+### 互換性と移行
+
+- 新しいkeyを使わない既存flowは、cwd・runs root・stdout・route・resume semanticsとも
+  従来どおりです。`api_version: 1`のままです。
+- v0.x / v1.0 / v1.1のrun fixtureは従来どおり読めます。新fieldのない古いlogでも
+  `status` / `show` / `why`は動きます。
+- `--force-resume`の既存のaccess fail-closed挙動は弱めていません。
+- 唯一意図的に壊した挙動は、上記のprotocol fail-closedです。
+
+### 非scope
+
+subflow、writerごとのworkspace自動fork、自動merge/PR/conflict解決、named resource
+semaphore、first-class secret provider、`access`のcapability lattice置換、typed JSON
+route、`await:`、replay `probe`、container/remote workspace、自動context要約、
+background GC、frozen `run --plan`、native session rollover、role予約語は
+v1.2.0のscope外です。今回のdata modelは、これらを後付けできる中立的な名前と構造に
+しています。
+
 ## v1.1.5 — 2026-08-07
 
 ### 構造化streamの完全性

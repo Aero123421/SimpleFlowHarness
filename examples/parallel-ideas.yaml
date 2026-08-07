@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.5/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.0/schema/flow.schema.json
 # 並列アイデア出し -> 統合報告
 #   sfh run examples/parallel-ideas.yaml --var theme="研究データ管理の自動化"
 # 3体が別々の観点・別々のツールで同時にアイデアを出し、全員終わったら1体が統合する。

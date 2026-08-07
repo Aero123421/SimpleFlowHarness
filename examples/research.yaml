@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.5/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.0/schema/flow.schema.json
 # sfh フロー定義の例: リサーチ・パイプライン
 #   plan(計画) -> review_plan(レビュー、NGなら差し戻し)
 #   -> execute(実行) -> review_execute(レビュー、NGなら差し戻し) -> summarize(要約)

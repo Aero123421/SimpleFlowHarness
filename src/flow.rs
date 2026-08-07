@@ -20,12 +20,19 @@ pub struct Flow {
     /// Where this run's side effects belong. Omitted (the default) keeps the
     /// long-standing behaviour exactly: every step runs in the caller's cwd, or
     /// in whatever `cwd:` resolves to, and sfh creates nothing.
+    ///
+    /// Every v1.2 key added to this file is `skip_serializing_if`-guarded. The
+    /// effective-config fingerprint is a serialization of this struct, and it
+    /// is what `--resume` compares; without the guard, merely UPGRADING sfh
+    /// would change the fingerprint of every flow ever written and make every
+    /// existing run dir unresumable.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceConfig>,
     /// Named context sources a step can pull in by name. sfh does not interpret
     /// what a context MEANS - `task`, `review_rules`, `sources` are the flow
     /// author's words - it only pins where each one came from, in what order,
     /// and at what hash.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub contexts: BTreeMap<String, ContextSource>,
     pub steps: Vec<Step>,
     /// Set only by `load_lenient`, never by the YAML - it is the loader saying
@@ -84,9 +91,11 @@ pub struct Defaults {
     pub fork_warmup: Option<String>,
     /// What a resume does with work that started but never recorded a durable
     /// end. Omitted keeps the historical behaviour (`rerun`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub replay: Option<Replay>,
     /// Refuse to spawn when a step's assembled context bundle exceeds this many
     /// characters. sfh never summarizes or silently drops context to fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_chars: Option<u64>,
 }
 
@@ -169,7 +178,10 @@ impl Effects {
 pub struct WorkspaceConfig {
     /// current (default) | directory | git-worktree | auto
     pub mode: Option<WorkspaceMode>,
-    /// The source directory or repository. Relative to the flow file.
+    /// The source directory or repository, resolved against the flow file.
+    /// Omitted, a `git-worktree` workspace branches the repository the CALLER
+    /// is standing in - which is where every step ran before v1.2 - and a
+    /// `directory` workspace requires this key outright.
     pub root: Option<String>,
     /// git-worktree only: the ref to branch from. Omitted means the repository's
     /// HEAD at the moment the run starts.
@@ -522,13 +534,16 @@ pub struct Step {
     /// it is inferred from `access:` for a preset step and is `unknown` for a
     /// custom `cmd:` - the conservative direction, since an undeclared command
     /// may well write.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effects: Option<Effects>,
     /// Names from the flow's `contexts:` map, in the order they should appear.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<String>,
     /// prepend (default) | file
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_delivery: Option<ContextDelivery>,
     /// Overrides `defaults.replay` for this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub replay: Option<Replay>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -3464,6 +3479,45 @@ mod tests {
             access: vec!["read".into()],
         }));
         assert_eq!(r.len(), 4, "{r:?}");
+    }
+
+    /// Upgrading sfh must not, by itself, make every existing run dir
+    /// unresumable.
+    ///
+    /// `--resume` compares an effective-config fingerprint that is a
+    /// serialization of `Flow`. Every field added in v1.2 is therefore
+    /// `skip_serializing_if`-guarded, so a flow that uses none of them
+    /// serializes to exactly the bytes 1.1 produced. This test pins the
+    /// property rather than the bytes: no v1.2 key may appear in the projection
+    /// of a flow that does not use it.
+    #[test]
+    fn a_flow_using_no_v1_2_keys_serializes_as_it_did_before_v1_2() {
+        let f: Flow = yaml::from_str(
+            "name: legacy\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
+        )
+        .unwrap();
+        let json = f.effective_config_json().unwrap();
+        for key in [
+            "\"workspace\"",
+            "\"contexts\"",
+            "\"effects\"",
+            "\"context\"",
+            "\"context_delivery\"",
+            "\"replay\"",
+            "\"max_context_chars\"",
+        ] {
+            assert!(
+                !json.contains(key),
+                "{key} leaked into the fingerprint of a flow that never used it: {json}"
+            );
+        }
+        // And a flow that DOES use them is a different configuration, which is
+        // the whole point of the fingerprint.
+        let with: Flow = yaml::from_str(
+            "name: legacy\nworkspace: {mode: auto}\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
+        )
+        .unwrap();
+        assert_ne!(json, with.effective_config_json().unwrap());
     }
 
     #[test]

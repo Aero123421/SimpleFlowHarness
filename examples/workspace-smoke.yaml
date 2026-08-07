@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.0/schema/flow.schema.json
+#
+# A managed workspace, end to end, with no AI and no cost. Run it from inside
+# any Git repository:
+#
+#   sfh run examples/workspace-smoke.yaml --state-dir /tmp/sfh-state
+#
+# What it demonstrates, all of which you can check afterwards:
+#
+#   - `mode: auto` sees a step declared `effects: workspace` and creates exactly
+#     ONE git worktree for the whole run, outside the repository.
+#   - the writer's change is visible to the later steps, because they share that
+#     one workspace rather than getting one each.
+#   - your own checkout is untouched: `git status` in it says nothing new.
+#   - the run finishes with uncommitted work in the workspace, so cleanup KEEPS
+#     it. sfh never discards uncommitted changes on its own.
+#
+# Afterwards:
+#
+#   sfh workspaces list --state-dir /tmp/sfh-state
+#   sfh workspaces show <run-dir> --json
+#   git worktree list          # the workspace, and the branch it is on
+#
+# Remove the whole `workspace:` block and this flow behaves exactly as it would
+# have before v1.2: no worktree, every step in the caller's own directory.
+
+api_version: 1
+name: workspace-smoke
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  what_this_is:
+    inline: |
+      A deterministic check of sfh's managed workspace. No model is called.
+
+steps:
+  - id: where
+    effects: read
+    context: [what_this_is]
+    cmd: ["sh", "-c", "pwd && git rev-parse --abbrev-ref HEAD"]
+
+  - id: change_something
+    effects: workspace
+    cmd: ["sh", "-c", "printf 'written by sfh\\n' > sfh-workspace-smoke.txt"]
+
+  - id: confirm
+    # A read step sees what the writer did, because there is one workspace for
+    # the run - not one per step.
+    effects: read
+    cmd: ["sh", "-c", "cat sfh-workspace-smoke.txt && git status --porcelain"]

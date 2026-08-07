@@ -37,8 +37,10 @@ USAGE:
   sfh config show <flow.yaml>             Show merged config (env values redacted)
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
   sfh guide                              Show the compact AI-oriented flow guide
+  sfh preflight [flow.yaml] [--json]     Local capability check; makes NO model calls
   sfh help [command]                     Show overall or command-specific usage
   sfh runs list|show|why|clean [...]     Browse, explain or prune past runs
+  sfh workspaces list|show|clean|remove  Inspect or prune managed workspaces
 
 RUN OPTIONS:
   --var key=value     Override a flow variable (repeatable)
@@ -48,9 +50,21 @@ RUN OPTIONS:
   --detach            Run in the background, print the run dir, and exit at once.
                       The run survives this shell and its parent; poll it with
                       `sfh status` and collect it with `sfh wait`.
+  --state-dir <dir>   Root for runs/workspaces/plans/doctor (or SFH_STATE_DIR).
+                      Required for a managed workspace unless the platform
+                      user-state dir can be determined. --runs-dir still wins
+                      for run artifacts, and without either, runs stay in
+                      .sfh/runs.
+  --profiles <file>   Profile overlay file (repeatable; later files win)
+  --json              Answer with a machine envelope. stdout carries JSON and
+                      nothing else; progress goes to stderr.
   --resume <run-dir>  Continue a previous run, reusing its finished steps
   --resume-latest     Same, picking the newest run dir
-  --force-resume      Resume even though the flow file changed
+  --force-resume      Resume even though the flow file or the execution closure
+                      changed (profile overlays, context files, tool versions)
+  --adopt-workspace   Resume even though the managed workspace changed, taking
+                      its current contents as the new baseline. A DIFFERENT
+                      question from --force-resume; neither implies the other.
   --no-partial-emit   On failure, do not print the best available output
   --dry-run           Render prompts/commands without executing anything
   -v, --verbose       Print full command lines
@@ -65,8 +79,15 @@ STATUS / WAIT / STOP OPTIONS:
   wait exits with the flow's own code (0/1/4), or 3 if --timeout elapsed first
   (a wait timeout does NOT cancel the run - use `sfh stop` for that)
 
+PREFLIGHT OPTIONS:
+  preflight [flow.yaml] [--profiles file] [--state-dir d] [--json]
+  Free and offline: which binaries are installed, at what version, whether the
+  flags each adapter depends on are still in their --help, which protocol they
+  speak, what access it can actually enforce, and what workspace and context
+  this flow would build. Makes NO model calls - `sfh doctor` is that check.
+
 DOCTOR OPTIONS:
-  doctor [flow.yaml] [--runs-dir d] [--timeout SEC]
+  doctor [flow.yaml] [--runs-dir d] [--state-dir d] [--timeout SEC]
   Sends a one-token prompt to each tool and checks sfh can still parse the
   answer, so preset drift surfaces here instead of halfway through a paid run.
   This makes REAL calls. With a flow file it checks exactly that flow's tools
@@ -78,6 +99,14 @@ RUNS OPTIONS:
   runs show <run-dir> [--json]
   runs why  <run-dir> [--json]
   runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]
+
+WORKSPACE OPTIONS:
+  workspaces list [--runs-dir d] [--state-dir d] [--json]
+  workspaces show <run-dir> [--json]
+  workspaces clean [--older-than DAYS] [--dry-run] [--json]
+  workspaces remove <run-dir> [--discard] [--json]
+  sfh removes only a workspace it created (ownership marker + run nonce), and
+  never discards uncommitted work without --discard.
 
 EXIT CODES:
   0 = flow succeeded    1 = flow failed    2 = config/usage error
@@ -91,9 +120,15 @@ FLOW FILE (see `sfh init` for a full example, schema/flow.schema.json for the sc
   {{step_id}} {{visit}} {{os}}
   {{budget.spent_usd}} {{budget.elapsed_sec}} {{budget.remaining_usd}} {{budget.remaining_sec}}
   (remaining_* is the string `unlimited` when that axis has no ceiling)
+  {{context}} {{context_file}} (when the step names a context)
   Filters: | head:N | tail:N | truncate:N | lines:A-B | trim | optional | default:text
   Preset tools: codex, claude, opencode, grok, agy, pi, cursor.
   Custom cmd: array form = spawned directly; string form = via cmd /C | sh -c.
+  Opt-in since v1.2 (omit them all and nothing changes):
+    workspace:  mode: current|directory|git-worktree|auto - where side effects go
+    contexts:   named file/inline/template sources, hashed and recorded
+    effects:    read|workspace|external|unknown, per step
+    replay:     unfinished: rerun|stuck|fail - what a crash-resume may re-run
 ";
 
 fn main() {
@@ -176,14 +211,14 @@ fn main() {
 
 fn cmd_help(command: &str) -> i32 {
     let usage = match command {
-        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--run-dir d] [--detach] [--resume dir|--resume-latest] [--force-resume] [--no-partial-emit] [--dry-run] [-v|-q]\nCommand steps can read their fully rendered prompt from {{prompt_file}}.",
+        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--state-dir d] [--profiles file] [--run-dir d] [--detach] [--json] [--resume dir|--resume-latest] [--force-resume] [--adopt-workspace] [--no-partial-emit] [--dry-run] [-v|-q]\nCommand steps can read their fully rendered prompt from {{prompt_file}}.\n--force-resume waives the flow/closure check; --adopt-workspace waives the workspace check. They are separate.",
         "plan" => "sfh plan <flow.yaml> [--var k=v] [--profiles file] [--state-dir d] [--save [dir]] [--json]\nResolves every command in an isolated temporary directory and executes nothing.\n--save keeps the rendered prompts, context bundles and machine plan for review.",
         "graph" => "sfh graph <flow.yaml> [--mermaid]",
         "config" => "sfh config show <flow.yaml> [--profiles file] [--show-secrets]",
         "validate" => "sfh validate <flow.yaml> [--var k=v] [--profiles file] [--strict] [--json]",
-        "status" => "sfh status [run-dir] [--runs-dir d] [--json]",
-        "wait" => "sfh wait [run-dir] [--runs-dir d] [--timeout SEC] [--interval SEC] [-q]",
-        "stop" => "sfh stop [run-dir] [--runs-dir d]",
+        "status" => "sfh status [run-dir] [--runs-dir d] [--state-dir d] [--json]",
+        "wait" => "sfh wait [run-dir] [--runs-dir d] [--state-dir d] [--timeout SEC] [--interval SEC] [-q] [--json]",
+        "stop" => "sfh stop [run-dir] [--runs-dir d] [--state-dir d] [--json]",
         "doctor" => "sfh doctor [flow.yaml] [--runs-dir d] [--state-dir d] [--timeout SEC]\nMakes REAL model calls, from an isolated scratch directory. `sfh preflight` is the free check.",
         "init" => "sfh init [file] [--force]",
         "guide" => "sfh guide",
@@ -853,8 +888,12 @@ mod tests {
     #[test]
     fn guide_fits_one_screen() {
         assert!(
-            GUIDE.lines().count() <= 80,
-            "guide is {} lines; maximum is 80",
+            // Raised from 80 in v1.2.0: the guide is what an AI caller reads
+            // to drive sfh, and v1.2 added the machine interface and the
+            // workspace/context/replay keys it most needs to know about. Still
+            // a budget, not a licence - anything added here has to earn a line.
+            GUIDE.lines().count() <= 110,
+            "guide is {} lines; maximum is 110",
             GUIDE.lines().count()
         );
     }
