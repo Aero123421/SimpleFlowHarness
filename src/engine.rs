@@ -5655,6 +5655,7 @@ fn log_step_end_with_next(
             "chain_file": file_name(&d.out_file).map(|n| n.replace(".out.txt", ".chain.txt")),
             "out_file": file_name(&d.out_file),
             "cmd": d.cmd, "session": session,
+            "harness_diagnostic": d.harness_diagnostic.as_deref().map(|s| one_line(s, 500)),
             // Which OS produced this step. A log is routinely read on a
             // different machine from the one that wrote it, and "it passes on
             // mine" is exactly the class of report this answers.

@@ -113,6 +113,29 @@ else
   STUB_BIN="$STUB"
 fi
 
+# Pi's JSON mode is an event stream rather than one result envelope. Build a
+# separate stand-in that puts the terminal answer after more than 32 MiB of
+# valid noise, proving sfh does not confuse its raw artifact cap with its
+# semantic/accounting boundary.
+PI_STUB_NAME="sfh-pi-stream-stub"
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) PI_STUB_NAME="sfh-pi-stream-stub.exe" ;;
+esac
+PI_STUB="$WORK/$PI_STUB_NAME"
+if rustc -O --edition 2021 -o "$PI_STUB" "$SUITE_DIR/stub/pi_stream_stub.rs" > pi-stub-build.log 2>&1; then
+  echo "ok   - the oversized pi stream stub builds"
+  pass=$((pass + 1))
+else
+  echo "FAIL - the oversized pi stream stub did not build"
+  sed -n '1,40p' pi-stub-build.log
+  fail=$((fail + 1))
+fi
+if command -v cygpath > /dev/null 2>&1; then
+  PI_STUB_BIN="$(cygpath -m "$PI_STUB")"
+else
+  PI_STUB_BIN="$PI_STUB"
+fi
+
 # Smoke test: the stub answers in the one shape sfh parses, echoes the session
 # id sfh assigned, and keeps its knobs independent of each other.
 "$STUB" -p --output-format json --permission-mode dontAsk --tools "Read,Grep" \
@@ -147,6 +170,50 @@ else
   echo "ok   - stderr progress stays out of stdout"
   pass=$((pass + 1))
 fi
+
+# Regression: transport output over 32 MiB must retain the final Pi answer and
+# aggregate usage on both sides of the omitted raw middle.
+cat > pi-oversized.yaml <<YAML
+api_version: 1
+name: pi-oversized-stream
+steps:
+  - id: review
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    prompt: "return a final verdict"
+    route:
+      - {when_last_line_is: "VERDICT: PASS", goto: end}
+      - {goto: fail}
+YAML
+"$SFH" run pi-oversized.yaml --runs-dir pi-oversized-runs -q > pi-oversized.result 2> pi-oversized.err
+check "pi final answer survives an oversized raw JSONL stream" 0 $?
+contains "pi oversized stream emits its terminal verdict" "VERDICT: PASS" pi-oversized.result
+PI_OVERSIZED_DIR="$(dirname "$(find pi-oversized-runs -type f -name 'log.jsonl' -print -quit)")"
+contains "pi oversized stream sums early and late input usage" '"input_tokens":30' "$PI_OVERSIZED_DIR/log.jsonl"
+contains "pi oversized stream sums early and late output usage" '"output_tokens":5' "$PI_OVERSIZED_DIR/log.jsonl"
+contains "pi oversized stream sums early and late cost" '"cost_usd":0.75' "$PI_OVERSIZED_DIR/log.jsonl"
+contains "raw artifact marks its omitted middle" "raw output middle omitted" "$PI_OVERSIZED_DIR/review.out.txt"
+contains "raw artifact retains its terminal event" "VERDICT: PASS" "$PI_OVERSIZED_DIR/review.out.txt"
+contains "semantic capture reports complete processing" "semantic observer processed the complete stream" "$PI_OVERSIZED_DIR/review.err.txt"
+
+cat > pi-oversized-line.yaml <<YAML
+api_version: 1
+name: pi-oversized-line
+steps:
+  - id: review
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    env: {SFH_PI_STUB_OVERSIZED_LINE: "1"}
+    prompt: "exercise the semantic line guard"
+YAML
+"$SFH" run pi-oversized-line.yaml --runs-dir pi-oversized-line-runs -q > pi-oversized-line.out 2> pi-oversized-line.err
+check "an unverifiable oversized Pi record fails closed" 1 $?
+PI_OVERSIZED_LINE_DIR="$(dirname "$(find pi-oversized-line-runs -type f -name 'log.jsonl' -print -quit)")"
+"$SFH" runs why "$PI_OVERSIZED_LINE_DIR" --json > pi-oversized-line-why.json
+contains "runs why exposes the harness semantic failure" "final output and accounting cannot be verified" pi-oversized-line-why.json
+contains "the durable step record carries only sfh's diagnosis" '"harness_diagnostic":"pi JSONL contained a record larger than 16 MiB' "$PI_OVERSIZED_LINE_DIR/log.jsonl"
 
 # The payoff (B-15): a session opened by the stub can actually be continued, and
 # sfh verifies the continuation instead of merely failing to object.

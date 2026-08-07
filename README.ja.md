@@ -42,7 +42,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、展開、`PATH` 設定までを行います。
 実行前に [Shell版](installers/sfh-installer.sh) および [PowerShell版](installers/sfh-installer.ps1) の内容を確認できます。
 バージョン固定や設定変更オプション:
-- `SFH_VERSION=1.1.4`: 特定のバージョンに固定。
+- `SFH_VERSION=1.1.5`: 特定のバージョンに固定。
 - `SFH_INSTALL_DIR=/path/to/bin`: インストール先ディレクトリの指定。
 - `SFH_NO_MODIFY_PATH=1`: 永続的な `PATH` 変更を無効化。
 
@@ -191,8 +191,10 @@ sfh run flow.yaml --resume-latest
 
 すべての実行において `.sfh/runs/<run-id>/` 以下に耐久ログが保存されます:
 - `log.jsonl`: 構造化イベントストリーム（ステップ開始・完了・トークン・コスト）
-- `<step_id>.out.txt` & `<step_id>.err.txt`: 各ステップの標準出力・標準エラー出力
+- `<step_id>.out.txt` & `<step_id>.err.txt`: サイズ制限付きのraw標準出力・標準エラー出力。32 MiBを超えるstreamは省略marker付きで先頭と末尾を保持し、構造化された最終回答とusage/costは完全なstreamから独立して処理します。
 - `status.json`: リアルタイムステータススナップショット
+
+コマンドの長い出力をAI promptへ渡す場合は、`{{steps.verify.output | tail:80 | truncate:8000}}`のように明示的に制限してください。全文artifactは`{{steps.verify.output_file}}`から参照できます。
 
 公開 JSON スキーマ:
 - [Flow JSON スキーマ](schema/flow.schema.json)

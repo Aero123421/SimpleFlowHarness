@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.4/schema/log-event.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.5/schema/log-event.schema.json",
   "title": "sfh durable log event",
   "description": "One JSON object from a run directory's append-only log.jsonl. Readers must ignore unknown properties for forward compatibility.",
   "type": "object",
@@ -53,7 +53,12 @@
     "marker": { "type": "string", "minLength": 1 },
     "exit": { "type": "integer" },
     "cost_usd": { "type": ["number", "null"], "minimum": 0 },
-    "error": { "type": ["string", "null"] }
+    "error": { "type": ["string", "null"] },
+    "harness_diagnostic": {
+      "type": ["string", "null"],
+      "maxLength": 503,
+      "description": "Bounded sfh-generated diagnosis for a leaf failure; never copied from tool-controlled stderr."
+    }
   },
   "allOf": [
     {

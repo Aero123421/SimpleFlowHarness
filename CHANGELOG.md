@@ -2,8 +2,28 @@
 
 ## Unreleased
 
-### Documentation
+## v1.1.5 — 2026-08-07
 
+### 構造化streamの完全性
+
+- Piの`--mode json`をpipe reader上で逐次解析し、raw transcriptが32 MiBを超えても
+  末尾のassistant最終回答、session marker、全assistant messageのtoken・costを失わないようにした。
+  transport logの大半を占める`message_update`がcapture上限へ達しても、正常なReviewerを
+  「final messageなし」と誤判定せず、予算を過少計上しない。
+- raw stdout/stderr artifactは無制限にdiskへ書かず、32 MiBを超えた場合に先頭16 MiBと
+  末尾16 MiBを省略marker付きで保持する方式へ変更した。session headerとterminal event/errorを
+  同時に調査でき、途中経過だけを残して末尾を捨てる旧挙動を廃止した。
+- 1件のPi JSONL recordが16 MiBを超えて安全に逐次解析できない場合は、最終回答・会計を
+  推測せずstepをfail-closedにする。sfh自身が生成したbounded診断を`step_end`へ記録し、
+  `sfh runs why`から具体的な停止理由を確認できるようにした。
+
+### 回帰検証とドキュメント
+
+- 34 MiB超の有効なPi streamを3 OSのengine suiteで実行し、末尾verdict、前後のusage/cost、
+  head+tail artifactをproduction経路で検証するstandalone stubを追加した。raw captureとsemantic
+  observerの単体境界、16 MiB単一recordのfail-closed診断も回帰テストに含めた。
+- 長いcommand出力をAI promptへ渡す際は`tail`/`truncate` filterで明示的に制限し、全文は
+  `output_file`から読む運用を日英READMEへ追記した。
 - 英語版を標準の`README.md`、日本語版を`README.ja.md`へ整理した。
   初見利用者向けの導入・最小フロー・主要概念に絞り、詳細仕様はCLIヘルプ、
   `sfh guide`、examples、公開Schemaへ段階的に案内する構成へ短縮した。

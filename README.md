@@ -40,7 +40,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 The installer detects your OS and architecture, verifies the SHA-256 checksum, extracts the binary, and updates your `PATH`.
 You can inspect the [Shell](installers/sfh-installer.sh) and [PowerShell](installers/sfh-installer.ps1) scripts prior to execution.
 To pin a specific version or customize installation behavior:
-- `SFH_VERSION=1.1.4`: Pin the target release version.
+- `SFH_VERSION=1.1.5`: Pin the target release version.
 - `SFH_INSTALL_DIR=/path/to/bin`: Specify a custom installation directory.
 - `SFH_NO_MODIFY_PATH=1`: Skip automatic `PATH` modifications.
 
@@ -189,8 +189,10 @@ sfh run flow.yaml --resume-latest
 
 Every run generates durable, append-only records inside `.sfh/runs/<run-id>/`:
 - `log.jsonl`: Structured event stream (step start, completion, token usage, cost).
-- `<step_id>.out.txt` & `<step_id>.err.txt`: Raw stdout and stderr per step.
+- `<step_id>.out.txt` & `<step_id>.err.txt`: Bounded raw stdout/stderr snapshots. Streams over 32 MiB retain their head and tail with an omission marker; structured final answers and accounting are processed independently from the complete stream.
 - `status.json`: Real-time status snapshot.
+
+When forwarding a command's verbose output into an AI prompt, prefer an explicit bound such as `{{steps.verify.output | tail:80 | truncate:8000}}`; the full artifact remains available through `{{steps.verify.output_file}}`.
 
 Public JSON Schemas:
 - [Flow JSON Schema](schema/flow.schema.json)

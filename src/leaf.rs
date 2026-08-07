@@ -1,3 +1,4 @@
+use crate::execute::OutputObserver;
 use crate::{contain, execute, flow, preset, template};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -142,6 +143,9 @@ pub struct LeafDone {
     pub access: Option<preset::Access>,
     pub usage: preset::Usage,
     pub cmd: String,
+    /// Bounded sfh-generated diagnosis for machine-readable `runs why` output.
+    /// Tool-controlled stderr is never copied here.
+    pub harness_diagnostic: Option<String>,
     /// A required run artifact could not be persisted. This is not an ordinary
     /// tool failure that on_error/fallback may ignore: without the artifact a
     /// later resume cannot reconstruct what happened.
@@ -1287,37 +1291,44 @@ fn parse_cursor_json(stdout: &str) -> ParsedOut {
     o
 }
 
-/// pi --mode json: JSONL. Line 1 is the session header; each turn ends with a
-/// message_end. Usage is per message, so it is summed across the run.
-fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
-    let mut o = ParsedOut::default();
-    let (mut inp, mut outp) = (0u64, 0u64);
-    let mut reported_usage = preset::Usage::default();
-    let mut saw_usage = false;
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
+/// pi --mode json is a potentially very large JSONL event stream. Keep its
+/// semantic state separately from the bounded raw transcript: the session is
+/// at the beginning, usage is spread across assistant message_end events, and
+/// the only authoritative final answer is normally at the very end.
+#[derive(Default)]
+struct PiJsonlAccumulator {
+    parsed: ParsedOut,
+    input_tokens: u64,
+    output_tokens: u64,
+    reported_usage: preset::Usage,
+    saw_usage: bool,
+}
+
+impl PiJsonlAccumulator {
+    fn push_line(&mut self, line: &[u8]) {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return;
         };
         match v.get("type").and_then(|x| x.as_str()) {
             Some("session") => {
-                o.session = v.get("id").and_then(|x| x.as_str()).map(String::from);
-                o.session_marker = v
+                self.parsed.session = v.get("id").and_then(|x| x.as_str()).map(String::from);
+                self.parsed.session_marker = v
                     .get("timestamp")
                     .and_then(|x| x.as_str())
                     .map(String::from);
-                // Present only on a forked session: the parent's file path.
-                o.session_parent = v
+                self.parsed.session_parent = v
                     .get("parentSession")
                     .and_then(|x| x.as_str())
                     .map(String::from);
             }
             Some("message_end") => {
-                let Some(m) = v.get("message") else { continue };
+                let Some(m) = v.get("message") else { return };
                 if m.get("role").and_then(|x| x.as_str()) != Some("assistant") {
-                    continue;
+                    return;
                 }
-                // Later assistant messages replace earlier ones (auto-retry).
-                o.text = m
+                // Later assistant messages replace earlier ones (tool-use
+                // turns and provider retries). Only text blocks are chain data.
+                self.parsed.text = m
                     .get("content")
                     .and_then(|c| c.as_array())
                     .map(|blocks| {
@@ -1331,38 +1342,138 @@ fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                // JSON mode exits 0 even when the model run failed.
-                match m.get("stopReason").and_then(|x| x.as_str()) {
-                    Some("error") | Some("aborted") => o.failed = true,
-                    _ => {}
+                if matches!(
+                    m.get("stopReason").and_then(|x| x.as_str()),
+                    Some("error") | Some("aborted")
+                ) {
+                    self.parsed.failed = true;
                 }
                 if let Some(u) = m.get("usage") {
-                    saw_usage = true;
-                    inp = inp.saturating_add(u.get("input").and_then(|x| x.as_u64()).unwrap_or(0));
-                    outp =
-                        outp.saturating_add(u.get("output").and_then(|x| x.as_u64()).unwrap_or(0));
+                    self.saw_usage = true;
+                    self.input_tokens = self
+                        .input_tokens
+                        .saturating_add(u.get("input").and_then(|x| x.as_u64()).unwrap_or(0));
+                    self.output_tokens = self
+                        .output_tokens
+                        .saturating_add(u.get("output").and_then(|x| x.as_u64()).unwrap_or(0));
                     if let Some(cost) = u
                         .get("cost")
                         .and_then(|c| c.get("total"))
                         .and_then(|x| x.as_f64())
                     {
-                        reported_usage.add_reported_cost(cost);
+                        self.reported_usage.add_reported_cost(cost);
                     }
                 }
             }
             _ => {}
         }
     }
-    if saw_usage {
-        o.usage.input_tokens = Some(inp);
-        o.usage.output_tokens = Some(outp);
-        if reported_usage.cost_usd.is_none() {
-            reported_usage.cost_usd = Some(0.0);
+
+    fn finish(mut self) -> ParsedOut {
+        if self.saw_usage {
+            self.parsed.usage.input_tokens = Some(self.input_tokens);
+            self.parsed.usage.output_tokens = Some(self.output_tokens);
+            if self.reported_usage.cost_usd.is_none() {
+                self.reported_usage.cost_usd = Some(0.0);
+            }
+            self.parsed.usage.cost_usd = self.reported_usage.cost_usd;
+            self.parsed.usage.invalid_cost = self.reported_usage.invalid_cost;
         }
-        o.usage.cost_usd = reported_usage.cost_usd;
-        o.usage.invalid_cost = reported_usage.invalid_cost;
+        self.parsed
     }
-    o
+}
+
+/// A single JSONL record is bounded independently of the full transcript. Real
+/// pi records are normally KiB; allowing 16 MiB covers large tool results while
+/// preventing an unterminated/malicious line from turning streaming parsing
+/// back into unbounded memory growth.
+const MAX_PI_JSONL_LINE: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct PiStreamState {
+    accumulator: PiJsonlAccumulator,
+    pending: Vec<u8>,
+    discarding_oversized_line: bool,
+    oversized_line: bool,
+}
+
+#[derive(Default)]
+struct PiStreamObserver {
+    state: Mutex<PiStreamState>,
+}
+
+impl OutputObserver for PiStreamObserver {
+    fn observe(&self, chunk: &[u8]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        for segment in chunk.split_inclusive(|b| *b == b'\n') {
+            let ends_line = segment.last() == Some(&b'\n');
+            if state.discarding_oversized_line {
+                if ends_line {
+                    state.discarding_oversized_line = false;
+                }
+                continue;
+            }
+            if state.pending.len().saturating_add(segment.len()) > MAX_PI_JSONL_LINE {
+                state.pending.clear();
+                state.oversized_line = true;
+                state.discarding_oversized_line = !ends_line;
+                continue;
+            }
+            state.pending.extend_from_slice(segment);
+            if ends_line {
+                let line = std::mem::take(&mut state.pending);
+                state.accumulator.push_line(trim_ascii_line(&line));
+            }
+        }
+    }
+}
+
+impl PiStreamObserver {
+    fn finish(&self) -> (ParsedOut, Option<String>) {
+        let Ok(mut state) = self.state.lock() else {
+            return (
+                ParsedOut {
+                    failed: true,
+                    ..Default::default()
+                },
+                Some("pi JSONL semantic observer lock was poisoned".into()),
+            );
+        };
+        if !state.pending.is_empty() && !state.discarding_oversized_line {
+            let line = std::mem::take(&mut state.pending);
+            state.accumulator.push_line(trim_ascii_line(&line));
+        }
+        let oversized = state.oversized_line || state.discarding_oversized_line;
+        let mut parsed = std::mem::take(&mut state.accumulator).finish();
+        if oversized {
+            parsed.failed = true;
+        }
+        let diagnostic = oversized.then(|| {
+            format!(
+                "pi JSONL contained a record larger than {} MiB; final output and accounting cannot be verified",
+                MAX_PI_JSONL_LINE / 1024 / 1024
+            )
+        });
+        (parsed, diagnostic)
+    }
+}
+
+fn trim_ascii_line(mut line: &[u8]) -> &[u8] {
+    while line.last().is_some_and(|b| matches!(b, b'\r' | b'\n')) {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
+/// Non-streaming parser used by doctor/tests and as a compatibility fallback.
+fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
+    let mut accumulator = PiJsonlAccumulator::default();
+    for line in stdout.lines() {
+        accumulator.push_line(line.as_bytes());
+    }
+    accumulator.finish()
 }
 
 /// Execute one prepared leaf, honouring its retry policy.
@@ -1520,6 +1631,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             access: p.access,
             usage: preset::Usage::default(),
             cmd: cmd_desc,
+            harness_diagnostic: Some(why.clone()),
             // No `step_end` may certify completion when an artifact path is
             // unsafe. The engine treats this like any other durability error
             // and aborts the run without recording a reusable completion.
@@ -1565,9 +1677,18 @@ fn exec_once(p: Prepared) -> LeafDone {
             access: p.access,
             usage: preset::Usage::default(),
             cmd: cmd_desc,
+            harness_diagnostic: Some(why.into()),
             persistence_error,
         };
     }
+    // Pi emits an unbounded JSONL event transcript. Parse its semantic records
+    // on the pipe reader thread so the raw artifact's bounded capture cannot
+    // discard the terminal answer or later usage/cost reports.
+    let pi_observer = matches!(p.parse, preset::OutputParse::PiJsonl)
+        .then(|| Arc::new(PiStreamObserver::default()));
+    let stdout_observer = pi_observer
+        .as_ref()
+        .map(|observer| Arc::clone(observer) as Arc<dyn execute::OutputObserver>);
     let outcome = match execute::run_cmd(
         &p.inv,
         p.stdin_payload,
@@ -1579,6 +1700,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             // Tee to the step's out file so a long step is observable while it
             // runs; the cleaned text replaces it once the child exits.
             tee: Some(p.out_file.clone()),
+            stdout_observer,
             run_clock: p.run_clock.clone(),
         },
     ) {
@@ -1601,7 +1723,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 idle_ms: 0,
                 attempts: 1,
                 chain_output: String::new(),
-                stderr_clean: e,
+                stderr_clean: e.clone(),
                 out_file: p.out_file,
                 session_id: None,
                 session_marker: None,
@@ -1610,12 +1732,20 @@ fn exec_once(p: Prepared) -> LeafDone {
                 access: p.access,
                 usage: preset::Usage::default(),
                 cmd: cmd_desc,
+                harness_diagnostic: Some(format!("failed to spawn tool: {e}")),
                 persistence_error,
             };
         }
     };
     let stdout_clean = clean_text(&outcome.stdout);
     let mut stderr_clean = clean_text(&outcome.stderr);
+    let pi_stream = pi_observer.as_ref().map(|observer| observer.finish());
+    let mut harness_diagnostic = pi_stream
+        .as_ref()
+        .and_then(|(_, diagnostic)| diagnostic.clone());
+    if let Some(diagnostic) = &harness_diagnostic {
+        stderr_clean.push_str(&format!("\nsfh: {diagnostic}\n"));
+    }
     let mut persistence_error = None;
     if let Err(e) = contain::write_private_atomic(&p.out_file, &stdout_clean) {
         persistence_error = Some(format!(
@@ -1632,23 +1762,28 @@ fn exec_once(p: Prepared) -> LeafDone {
         });
     }
 
-    let mut parsed = match parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)) {
-        Ok(o) => o,
-        Err(e) => {
-            // A containment violation reading the tool's artifact is a failure
-            // of this step, not empty output (rev_break #4).
-            stderr_clean.push_str(&format!("\nsfh: {e}\n"));
-            if let Err(write_err) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
-                persistence_error.get_or_insert_with(|| {
-                    format!(
-                        "cannot persist required stderr artifact {}: {write_err}",
-                        p.err_file.display()
-                    )
-                });
-            }
-            ParsedOut {
-                failed: true,
-                ..Default::default()
+    let mut parsed = if let Some((parsed, _)) = pi_stream {
+        parsed
+    } else {
+        match parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)) {
+            Ok(o) => o,
+            Err(e) => {
+                // A containment violation reading the tool's artifact is a failure
+                // of this step, not empty output (rev_break #4).
+                stderr_clean.push_str(&format!("\nsfh: {e}\n"));
+                harness_diagnostic = Some(e.clone());
+                if let Err(write_err) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+                    persistence_error.get_or_insert_with(|| {
+                        format!(
+                            "cannot persist required stderr artifact {}: {write_err}",
+                            p.err_file.display()
+                        )
+                    });
+                }
+                ParsedOut {
+                    failed: true,
+                    ..Default::default()
+                }
             }
         }
     };
@@ -1705,6 +1840,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         };
         if let Some(why) = check_session(&expect, &parsed, &chain_output) {
             exit_code = 1;
+            harness_diagnostic = Some(why.trim().trim_start_matches("sfh: ").to_string());
             if !why.starts_with("\nsfh: the tool exited successfully") {
                 session_id = None;
             }
@@ -1729,6 +1865,7 @@ fn exec_once(p: Prepared) -> LeafDone {
     }
     if let Some(e) = &persistence_error {
         exit_code = -1;
+        harness_diagnostic = Some(e.clone());
         stderr_clean.push_str(&format!("\nsfh: {e}\n"));
     }
 
@@ -1766,6 +1903,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         access: p.access,
         usage: parsed.usage,
         cmd: cmd_desc,
+        harness_diagnostic,
         persistence_error,
     }
 }
@@ -2265,6 +2403,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         access: None,
         usage: preset::Usage::default(),
         cmd: String::new(),
+        harness_diagnostic: Some("worker thread died before producing a result".into()),
         persistence_error: None,
     }
 }
@@ -2506,6 +2645,39 @@ mod tests {
         let oversized = parse_pi_jsonl(oversized);
         assert_eq!(oversized.usage.input_tokens, Some(u64::MAX));
         assert_eq!(oversized.usage.output_tokens, Some(u64::MAX));
+    }
+
+    #[test]
+    fn pi_streaming_semantics_survive_more_than_raw_capture_limit() {
+        let observer = PiStreamObserver::default();
+        observer.observe(
+            br#"{"type":"session","id":"stream-session","timestamp":"marker"}
+{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[],"usage":{"input":10,"output":2,"cost":{"total":0.25}}}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy =
+            format!("{{\"type\":\"message_update\",\"partial\":{{\"payload\":\"{payload}\"}}}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        let final_record = br#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"VERDICT: PASS"}],"usage":{"input":20,"output":3,"cost":{"total":0.5}}}}"#;
+        observer.observe(&final_record[..37]);
+        observer.observe(&final_record[37..]);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(parsed.text, "VERDICT: PASS");
+        assert_eq!(parsed.session.as_deref(), Some("stream-session"));
+        assert_eq!(parsed.session_marker.as_deref(), Some("marker"));
+        assert_eq!(parsed.usage.input_tokens, Some(30));
+        assert_eq!(parsed.usage.output_tokens, Some(5));
+        assert_eq!(parsed.usage.cost_usd, Some(0.75));
+        assert!(!parsed.failed);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -54,10 +55,21 @@ pub struct ExecOutcome {
 /// Where a child's output goes besides the capture buffer, and which run-level
 /// clock its arrival touches. Bundled so `run_cmd` keeps one "observation"
 /// parameter instead of growing one per watcher.
+/// Receives every stdout byte before the bounded diagnostic capture drops any
+/// of it. Structured presets use this to extract their final answer and usage
+/// incrementally instead of treating a raw transcript size limit as a semantic
+/// limit. Implementations must stay bounded: this callback runs on the pipe
+/// reader thread and sees untrusted tool output.
+pub trait OutputObserver: Send + Sync {
+    fn observe(&self, chunk: &[u8]);
+}
+
 #[derive(Default, Clone)]
 pub struct Observe {
     /// Mirror stdout to this file as it arrives.
     pub tee: Option<std::path::PathBuf>,
+    /// Optional bounded semantic observer for structured stdout.
+    pub stdout_observer: Option<Arc<dyn OutputObserver>>,
     /// Run-level activity clock in unix-epoch seconds, shared by every child of
     /// the run so `status.json` can report when ANY of them last said anything.
     /// 0 means nothing has been read yet.
@@ -932,14 +944,17 @@ pub fn run_cmd(
         run_clock: obs.run_clock.clone(),
     };
     let tee_enabled = Arc::new(AtomicBool::new(true));
+    let stdout_semantically_observed = obs.stdout_observer.is_some();
     let rx_out = spawn_reader(
         child.stdout.take().expect("stdout piped"),
         obs.tee,
+        obs.stdout_observer,
         Arc::clone(&tee_enabled),
         activity.clone(),
     );
     let rx_err = spawn_reader(
         child.stderr.take().expect("stderr piped"),
+        None,
         None,
         Arc::clone(&tee_enabled),
         activity.clone(),
@@ -1012,10 +1027,24 @@ pub fn run_cmd(
     };
     let (stdout, out_trunc) = recv(&rx_out);
     let (mut stderr, err_trunc) = recv(&rx_err);
-    if out_trunc || err_trunc {
+    if out_trunc {
+        let semantic = if stdout_semantically_observed {
+            "; the structured semantic observer processed the complete stream"
+        } else {
+            ""
+        };
         stderr.extend_from_slice(
             format!(
-                "\n[sfh: captured output truncated at {} MB]\n",
+                "\n[sfh: raw stdout middle omitted at {} MB capture limit{semantic}]\n",
+                MAX_CAPTURE / 1024 / 1024
+            )
+            .as_bytes(),
+        );
+    }
+    if err_trunc {
+        stderr.extend_from_slice(
+            format!(
+                "\n[sfh: raw stderr middle omitted at {} MB capture limit]\n",
                 MAX_CAPTURE / 1024 / 1024
             )
             .as_bytes(),
@@ -1053,9 +1082,74 @@ fn idle_at(death_elapsed_ms: u64, last_activity_ms: u64) -> u64 {
     death_elapsed_ms.saturating_sub(last_activity_ms.min(death_elapsed_ms))
 }
 
-/// Per-stream capture cap; the reader keeps draining past it (discarding) so
-/// the child never blocks on a full pipe.
+/// Per-stream diagnostic capture cap. The reader always drains and semantic
+/// observers still receive the complete stream. Oversized raw output retains
+/// both its beginning and end: headers/session identity tend to be at the
+/// beginning, while final answers and terminal errors are at the end.
 const MAX_CAPTURE: usize = 32 * 1024 * 1024;
+const CAPTURE_HEAD: usize = MAX_CAPTURE / 2;
+const CAPTURE_TAIL: usize = MAX_CAPTURE - CAPTURE_HEAD;
+const CAPTURE_GAP: &[u8] = b"\n[sfh: raw output middle omitted after 32 MB capture limit]\n";
+
+struct BoundedCapture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: usize,
+}
+
+impl BoundedCapture {
+    fn new() -> Self {
+        Self {
+            head: Vec::with_capacity(CAPTURE_HEAD),
+            tail: VecDeque::with_capacity(CAPTURE_TAIL),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, mut chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len());
+        if self.head.len() < CAPTURE_HEAD {
+            let take = chunk.len().min(CAPTURE_HEAD - self.head.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        if chunk.is_empty() {
+            return;
+        }
+        if chunk.len() >= CAPTURE_TAIL {
+            self.tail.clear();
+            self.tail.extend(
+                chunk[chunk.len().saturating_sub(CAPTURE_TAIL)..]
+                    .iter()
+                    .copied(),
+            );
+            return;
+        }
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(CAPTURE_TAIL);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+        }
+        self.tail.extend(chunk.iter().copied());
+    }
+
+    fn finish(self) -> (Vec<u8>, bool) {
+        let truncated = self.total > MAX_CAPTURE;
+        if !truncated {
+            let mut all = self.head;
+            all.extend(self.tail);
+            return (all, false);
+        }
+        let mut all = Vec::with_capacity(MAX_CAPTURE + CAPTURE_GAP.len());
+        all.extend(self.head);
+        all.extend_from_slice(CAPTURE_GAP);
+        all.extend(self.tail);
+        (all, true)
+    }
+}
 
 /// `tee`: mirror each chunk to this file as it arrives. Without it nothing is
 /// observable until the child exits, so a 30-minute step is indistinguishable
@@ -1064,6 +1158,7 @@ const MAX_CAPTURE: usize = 32 * 1024 * 1024;
 fn spawn_reader<R: Read + Send + 'static>(
     mut r: R,
     tee: Option<std::path::PathBuf>,
+    observer: Option<Arc<dyn OutputObserver>>,
     tee_enabled: Arc<AtomicBool>,
     activity: Activity,
 ) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
@@ -1082,44 +1177,38 @@ fn spawn_reader<R: Read + Send + 'static>(
             drop(f);
             Some(p)
         });
-        let mut buf = Vec::new();
+        let mut capture = BoundedCapture::new();
+        let mut tee_written = 0usize;
         let mut tmp = [0u8; 65536];
-        let mut truncated = false;
         loop {
             match r.read(&mut tmp) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    // Before the capture cap is consulted: a tool that has run
-                    // past 32 MB is noisy, not hung, and dropping the bytes
-                    // must not make it look silent.
+                    // Before the raw capture cap is consulted: a noisy tool is
+                    // still active, and a structured observer must see every
+                    // byte so its final answer/accounting cannot be truncated.
                     activity.touch();
-                    if buf.len() < MAX_CAPTURE {
-                        let take = n.min(MAX_CAPTURE - buf.len());
-                        if tee_enabled.load(Ordering::SeqCst) {
-                            if let Some(path) = &tee {
-                                // Same cap as the in-memory capture, so a runaway
-                                // tool cannot fill the disk through this path.
-                                // Open only for the duration of one chunk. On
-                                // Windows a reader blocked on an inherited pipe
-                                // must never hold the destination open across
-                                // the later atomic canonical replacement.
-                                if let Ok(mut f) = crate::contain::append_private(path) {
-                                    let _ = f.write_all(&tmp[..take]);
-                                    let _ = f.flush();
-                                }
+                    if let Some(observer) = &observer {
+                        observer.observe(&tmp[..n]);
+                    }
+                    if tee_written < MAX_CAPTURE && tee_enabled.load(Ordering::SeqCst) {
+                        let take = n.min(MAX_CAPTURE - tee_written);
+                        if let Some(path) = &tee {
+                            // The live tee is prefix-only and bounded. It is an
+                            // in-progress view; the canonical head+tail snapshot
+                            // atomically replaces it after the child exits.
+                            if let Ok(mut f) = crate::contain::append_private(path) {
+                                let _ = f.write_all(&tmp[..take]);
+                                let _ = f.flush();
                             }
                         }
-                        buf.extend_from_slice(&tmp[..take]);
-                        if take < n {
-                            truncated = true;
-                        }
-                    } else {
-                        truncated = true;
+                        tee_written += take;
                     }
+                    capture.push(&tmp[..n]);
                 }
             }
         }
-        let _ = tx.send((buf, truncated));
+        let _ = tx.send(capture.finish());
     });
     rx
 }
@@ -1295,6 +1384,7 @@ mod tests {
         let captured = spawn_reader(
             reader,
             Some(output.clone()),
+            None,
             Arc::clone(&tee_enabled),
             Activity {
                 start: Instant::now(),
@@ -1320,6 +1410,63 @@ mod tests {
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"canonical");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_capture_keeps_head_and_tail_while_observer_sees_every_byte() {
+        #[derive(Default)]
+        struct CountObserver {
+            seen: std::sync::Mutex<(usize, VecDeque<u8>)>,
+        }
+        impl OutputObserver for CountObserver {
+            fn observe(&self, chunk: &[u8]) {
+                let mut seen = self.seen.lock().unwrap();
+                seen.0 = seen.0.saturating_add(chunk.len());
+                for byte in chunk {
+                    if seen.1.len() == 16 {
+                        seen.1.pop_front();
+                    }
+                    seen.1.push_back(*byte);
+                }
+            }
+        }
+
+        let mut source = vec![b'x'; MAX_CAPTURE + 1024];
+        source[..5].copy_from_slice(b"BEGIN");
+        let end = source.len();
+        source[end - 5..].copy_from_slice(b"FINAL");
+        let expected_len = source.len();
+        let observer = Arc::new(CountObserver::default());
+        let tee_enabled = Arc::new(AtomicBool::new(false));
+        let captured = spawn_reader(
+            std::io::Cursor::new(source),
+            None,
+            Some(Arc::clone(&observer) as Arc<dyn OutputObserver>),
+            tee_enabled,
+            Activity {
+                start: Instant::now(),
+                last_ms: Arc::new(AtomicU64::new(0)),
+                run_clock: None,
+            },
+        )
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+
+        assert!(captured.1);
+        assert!(captured.0.starts_with(b"BEGIN"));
+        assert!(captured.0.ends_with(b"FINAL"));
+        assert!(captured
+            .0
+            .windows(CAPTURE_GAP.len())
+            .any(|window| window == CAPTURE_GAP));
+        let seen = observer.seen.lock().unwrap();
+        assert_eq!(seen.0, expected_len);
+        assert!(seen
+            .1
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .ends_with(b"FINAL"));
     }
 
     #[test]

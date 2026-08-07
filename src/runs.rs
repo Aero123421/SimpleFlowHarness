@@ -454,6 +454,7 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     };
     let mut last = Value::Null;
     let mut position = Value::Null;
+    let mut last_failed_step = Value::Null;
     let mut unfinished: BTreeMap<String, Value> = BTreeMap::new();
     let mut fanout: BTreeMap<String, Value> = BTreeMap::new();
     let mut fallbacks: BTreeMap<String, Value> = BTreeMap::new();
@@ -482,6 +483,9 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
             }
             "step_end" => {
                 unfinished.remove(&key);
+                if event.get("exit").and_then(Value::as_i64).unwrap_or(1) != 0 {
+                    last_failed_step = event.clone();
+                }
                 if event
                     .get("next_fallback")
                     .and_then(Value::as_str)
@@ -517,8 +521,21 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     let state = get(&status, "state").to_string();
     let error = opt_string(&status, "error");
     let current = opt_string(&status, "current_step");
+    let harness_diagnostic = (last_failed_step.get("step").and_then(Value::as_str)
+        == current.as_deref())
+    .then(|| {
+        last_failed_step
+            .get("harness_diagnostic")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+    .flatten();
     let explanation = if let Some(error) = &error {
-        error.clone()
+        match &harness_diagnostic {
+            Some(diagnostic) => format!("{error}: {diagnostic}"),
+            None => error.clone(),
+        }
     } else if let Some(checkpoint) = fallbacks.values().next_back() {
         format!(
             "a failed attempt durably selected fallback profile '{}'; resume will continue that profile in the same visit",
@@ -546,6 +563,7 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
         "state": state,
         "current_step": current,
         "error": error,
+        "harness_diagnostic": harness_diagnostic,
         "explanation": explanation,
         "last_event": last,
         "last_position": position,
