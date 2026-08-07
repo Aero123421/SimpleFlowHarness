@@ -671,6 +671,310 @@ pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// `sfh workspaces` - the managed working environments runs left behind.
+//
+// Every operation here is bounded by one rule: sfh removes only a path it can
+// prove it created, and it never discards uncommitted work without being told
+// to in so many words. Both checks are made immediately before the deletion,
+// not once at the start, because between a decision and its execution a path
+// can be swapped for something else entirely.
+// ---------------------------------------------------------------------------
+
+/// The workspace a run recorded, if any.
+fn workspace_of(dir: &Path) -> Option<crate::workspace::Workspace> {
+    let v = read_json(dir, crate::workspace::MANIFEST);
+    crate::workspace::Workspace::from_manifest(&v)
+}
+
+/// What a workspace looks like right now, as opposed to when it was recorded.
+fn workspace_row(dir: &Path) -> Option<Value> {
+    let ws = workspace_of(dir)?;
+    let st = status(dir);
+    let state = get(&st, "state").to_string();
+    let exists = ws.path.is_dir();
+    let dirty = exists
+        .then(|| crate::workspace::is_dirty(&ws.path).ok())
+        .flatten();
+    let owned = crate::workspace::verify_ownership(&ws);
+    Some(serde_json::json!({
+        "run_dir": dir.display().to_string(),
+        "run_state": state,
+        "workspace_id": ws.id,
+        "mode": ws.mode.as_str(),
+        "path": ws.path.display().to_string(),
+        "branch": ws.branch,
+        "base_commit": ws.base_commit,
+        "source_root": ws.source_root.display().to_string(),
+        "exists": exists,
+        "dirty": dirty,
+        "sfh_owned": owned.is_ok(),
+        "ownership": owned.err(),
+        "cleanup": ws.cleanup.as_str(),
+    }))
+}
+
+fn emit_ws(command: &str, ok: bool, body: Value, as_json: bool, human: impl FnOnce()) -> i32 {
+    if as_json {
+        crate::machine::emit(&crate::machine::envelope(
+            command,
+            ok,
+            if ok { 0 } else { 1 },
+            body,
+        ));
+    } else {
+        human();
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+pub fn workspaces_list(root: &Path, as_json: bool) -> i32 {
+    let rows: Vec<Value> = run_dirs(root)
+        .into_iter()
+        .rev()
+        .filter_map(|d| workspace_row(&d))
+        .collect();
+    let printable = rows.clone();
+    emit_ws(
+        "workspaces list",
+        true,
+        serde_json::json!({"workspaces": rows, "runs_dir": root.display().to_string()}),
+        as_json,
+        || {
+            if printable.is_empty() {
+                println!("no managed workspaces recorded under {}", root.display());
+                return;
+            }
+            for w in &printable {
+                println!(
+                    "{}  {}  {}  {}{}",
+                    get(w, "run_state"),
+                    get(w, "mode"),
+                    get(w, "path"),
+                    if w["exists"].as_bool() == Some(true) {
+                        ""
+                    } else {
+                        "(gone) "
+                    },
+                    match w["dirty"].as_bool() {
+                        Some(true) => "DIRTY",
+                        Some(false) => "clean",
+                        None => "dirty:unknown",
+                    }
+                );
+            }
+        },
+    )
+}
+
+pub fn workspaces_show(dir: &Path, as_json: bool) -> i32 {
+    match workspace_row(dir) {
+        Some(row) => {
+            let printable = row.clone();
+            emit_ws("workspaces show", true, row, as_json, || {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&printable).unwrap_or_default()
+                );
+            })
+        }
+        None => {
+            if as_json {
+                crate::machine::emit(&crate::machine::error_envelope(
+                    "workspaces show",
+                    crate::machine::ErrorCode::WorkspaceMissing,
+                    "this run recorded no managed workspace",
+                    1,
+                    serde_json::json!({"run_dir": dir.display().to_string()}),
+                ));
+            } else {
+                eprintln!("sfh: {} recorded no managed workspace", dir.display());
+            }
+            1
+        }
+    }
+}
+
+/// Remove the managed workspaces of runs that are finished and clean.
+///
+/// A workspace is a candidate only when its run reached a terminal state, its
+/// worktree has nothing uncommitted, and sfh owns it. Anything else is listed
+/// with the reason it was skipped - a `clean` that silently did nothing is
+/// indistinguishable from one that silently did too much.
+pub fn workspaces_clean(
+    root: &Path,
+    older_than_days: Option<u64>,
+    dry_run: bool,
+    as_json: bool,
+) -> i32 {
+    let cutoff = older_than_days.map(|d| {
+        std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(d * 86_400))
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+    for dir in run_dirs(root) {
+        let Some(ws) = workspace_of(&dir) else {
+            continue;
+        };
+        let path = ws.path.display().to_string();
+        if let Some(cutoff) = cutoff {
+            let modified = dir.metadata().and_then(|m| m.modified()).ok();
+            if modified.map(|m| m > cutoff).unwrap_or(true) {
+                skipped
+                    .push(serde_json::json!({"path": path, "reason": "newer than --older-than"}));
+                continue;
+            }
+        }
+        let state = get(&status(&dir), "state").to_string();
+        if !matches!(
+            state.as_str(),
+            "done" | "failed" | "stuck" | "stopped" | "dead"
+        ) {
+            skipped.push(serde_json::json!({"path": path, "reason": format!("the run is '{state}', not finished")}));
+            continue;
+        }
+        if state != "done" {
+            skipped.push(serde_json::json!({
+                "path": path,
+                "reason": format!("the run ended as '{state}'; its workspace holds the evidence and is kept")
+            }));
+            continue;
+        }
+        if !ws.path.is_dir() {
+            skipped.push(serde_json::json!({"path": path, "reason": "already gone"}));
+            continue;
+        }
+        if let Err(why) = crate::workspace::verify_ownership(&ws) {
+            skipped.push(serde_json::json!({"path": path, "reason": why}));
+            continue;
+        }
+        match crate::workspace::is_dirty(&ws.path) {
+            Ok(true) => {
+                skipped.push(serde_json::json!({
+                    "path": path,
+                    "reason": "uncommitted changes; use `sfh workspaces remove <run-dir> --discard` to drop them deliberately"
+                }));
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                skipped.push(serde_json::json!({"path": path, "reason": format!("cannot tell whether it is dirty: {e}")}));
+                continue;
+            }
+        }
+        if dry_run {
+            removed.push(serde_json::json!({"path": path, "action": "would remove"}));
+            continue;
+        }
+        match crate::workspace::remove_worktree(&ws) {
+            Ok(()) => removed.push(serde_json::json!({"path": path, "action": "removed"})),
+            Err(e) => skipped.push(serde_json::json!({"path": path, "reason": e})),
+        }
+    }
+    let (r, s) = (removed.clone(), skipped.clone());
+    emit_ws(
+        "workspaces clean",
+        true,
+        serde_json::json!({"removed": removed, "skipped": skipped, "dry_run": dry_run}),
+        as_json,
+        || {
+            for x in &r {
+                println!("{}: {}", get(x, "action"), get(x, "path"));
+            }
+            for x in &s {
+                println!("kept {}: {}", get(x, "path"), get(x, "reason"));
+            }
+            if r.is_empty() && s.is_empty() {
+                println!("no managed workspaces to clean");
+            }
+            println!("(the branch each workspace created is always kept)");
+        },
+    )
+}
+
+/// Remove one run's managed workspace. `--discard` is the only way sfh drops
+/// uncommitted work, and it still refuses a path it cannot prove it created.
+pub fn workspaces_remove(dir: &Path, discard: bool, as_json: bool) -> i32 {
+    let Some(ws) = workspace_of(dir) else {
+        if as_json {
+            crate::machine::emit(&crate::machine::error_envelope(
+                "workspaces remove",
+                crate::machine::ErrorCode::WorkspaceMissing,
+                "this run recorded no managed workspace",
+                1,
+                serde_json::json!({"run_dir": dir.display().to_string()}),
+            ));
+        } else {
+            eprintln!("sfh: {} recorded no managed workspace", dir.display());
+        }
+        return 1;
+    };
+    let fail = |code: crate::machine::ErrorCode, msg: String| -> i32 {
+        if as_json {
+            crate::machine::emit(&crate::machine::error_envelope(
+                "workspaces remove",
+                code,
+                &msg,
+                1,
+                serde_json::json!({"run_dir": dir.display().to_string()}),
+            ));
+        } else {
+            eprintln!("sfh: {msg}");
+        }
+        1
+    };
+    if let Err(why) = crate::workspace::verify_ownership(&ws) {
+        return fail(
+            crate::machine::ErrorCode::WorkspaceUnowned,
+            format!("refusing to remove {}: {why}", ws.path.display()),
+        );
+    }
+    if !discard {
+        match crate::workspace::is_dirty(&ws.path) {
+            Ok(true) => {
+                return fail(
+                    crate::machine::ErrorCode::WorkspaceDrift,
+                    format!(
+                        "{} has uncommitted changes. Commit them, or pass --discard to drop them.",
+                        ws.path.display()
+                    ),
+                )
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return fail(
+                    crate::machine::ErrorCode::WorkspaceDrift,
+                    format!("cannot tell whether {} is dirty: {e}", ws.path.display()),
+                )
+            }
+        }
+    }
+    match crate::workspace::remove_worktree(&ws) {
+        Ok(()) => {
+            let path = ws.path.display().to_string();
+            emit_ws(
+                "workspaces remove",
+                true,
+                serde_json::json!({"removed": path, "branch_kept": ws.branch}),
+                as_json,
+                || {
+                    println!("removed {path}");
+                    if let Some(b) = &ws.branch {
+                        println!("the branch {b} is kept");
+                    }
+                },
+            )
+        }
+        Err(e) => fail(crate::machine::ErrorCode::WorkspaceUnowned, e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

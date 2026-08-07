@@ -116,6 +116,11 @@ pub struct Prepared {
     /// Set when continue_from / fork_from resolved to a recorded session.
     pub session_parent: Option<SessionParent>,
     pub allow_empty: bool,
+    /// Hash of the assembled context bundle, or None when the step named none.
+    /// Recorded in `step_start` so a reader can tell two visits apart by what
+    /// they were handed, without the log carrying the content itself.
+    pub context_hash: Option<String>,
+    pub context_file: Option<PathBuf>,
     pub retry: RetryCfg,
     /// Run-level activity clock every child of this run touches when it writes
     /// anything, so `status.json` can say how long the whole run has been quiet.
@@ -360,6 +365,11 @@ pub struct PrepCtx<'a> {
     pub wall_deadline: Option<std::time::Instant>,
     /// Spend and time as of now, exposed to templates as `{{budget.*}}`.
     pub budget: BudgetVars,
+    /// The managed workspace this run's steps execute in, when the flow asked
+    /// for one. A step's own `cwd:` still wins - it is a deliberate statement
+    /// about where THAT step belongs - but everything else runs here instead of
+    /// in the caller's directory.
+    pub workspace: Option<&'a Path>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -632,7 +642,52 @@ pub fn prepare_leaf(
     profile_override: Option<&str>,
 ) -> Result<Prepared, String> {
     let prompt_file = cx.run_dir.join(format!("{tag}.prompt.txt"));
-    let builtins = make_builtins(cx, &step.id, visit, &prompt_file, extras);
+    let context_file = cx.run_dir.join(format!("{tag}.context.txt"));
+    // The context bundle is assembled BEFORE the prompt, because `{{context}}`
+    // and `{{context_file}}` are builtins a prompt may reference. A `template:`
+    // context is rendered with the same variables a prompt sees, minus those
+    // two - a context that referred to itself would have no fixed point.
+    let bundle = if step.context.is_empty() {
+        crate::context::Bundle::default()
+    } else {
+        let inner_builtins = make_builtins(cx, &step.id, visit, &prompt_file, extras);
+        let inner = template::Ctx {
+            vars: cx.vars,
+            outputs: cx.outputs,
+            step_ids: cx.step_ids,
+            builtins: inner_builtins,
+        };
+        let containment = crate::context::Containment {
+            flow_dir: cx.flow_dir,
+            workspace: cx.workspace,
+        };
+        crate::context::build(
+            cx.flow,
+            &step.context,
+            &containment,
+            cx.flow.defaults.max_context_chars,
+            &mut |t| template::render(t, &inner),
+        )
+        .map_err(|e| format!("step '{}': {e}", step.id))?
+    };
+    if !bundle.is_empty() {
+        contain::write_private(&context_file, &bundle.text)
+            .map_err(|e| format!("cannot write {}: {e}", context_file.display()))?;
+        let manifest = serde_json::to_string_pretty(&bundle.manifest(&step.id, visit))
+            .map_err(|e| format!("cannot serialize the context manifest: {e}"))?;
+        contain::write_private(&cx.run_dir.join(format!("{tag}.context.json")), manifest)
+            .map_err(|e| format!("cannot write the context manifest: {e}"))?;
+    }
+    let mut builtins = make_builtins(cx, &step.id, visit, &prompt_file, extras);
+    builtins.insert("context".into(), bundle.text.clone());
+    builtins.insert(
+        "context_file".into(),
+        if bundle.is_empty() {
+            String::new()
+        } else {
+            context_file.display().to_string()
+        },
+    );
     let ctx = template::Ctx {
         vars: cx.vars,
         outputs: cx.outputs,
@@ -646,6 +701,15 @@ pub fn prepare_leaf(
     let prompt = match &step.prompt {
         Some(p) => Some(rend("prompt", p)?),
         None => None,
+    };
+    // `prepend` puts the bundle in front of the prompt; `file` leaves the
+    // prompt exactly as written and expects it to point at {{context_file}}.
+    // A step with no context: list gets neither, byte for byte as before.
+    let prompt = match (&prompt, step.context_delivery()) {
+        (Some(p), flow::ContextDelivery::Prepend) if !bundle.is_empty() => {
+            Some(crate::context::prepend(&bundle, p))
+        }
+        _ => prompt,
     };
     if let Some(p) = &prompt {
         if p.trim().is_empty() {
@@ -698,9 +762,14 @@ pub fn prepare_leaf(
     for a in &eff.args {
         args.push(rend("args", a)?);
     }
+    // A step's own `cwd:` is an explicit statement and always wins. Otherwise a
+    // managed workspace supplies the directory, which is the whole point of
+    // having one: the run's side effects land there instead of in whatever
+    // directory the caller happened to be standing in. With no workspace this
+    // stays `None` and the child inherits sfh's cwd, exactly as before v1.2.
     let cwd = match &eff.cwd {
         Some(c) => Some(PathBuf::from(rend_exec("cwd", c)?)),
-        None => None,
+        None => cx.workspace.map(PathBuf::from),
     };
     let timeout_sec = eff.timeout_sec;
 
@@ -1093,6 +1162,8 @@ pub fn prepare_leaf(
         session_parent,
         // Custom commands may legitimately print nothing; agent steps may not.
         allow_empty: step.allow_empty.unwrap_or(!is_preset),
+        context_hash: (!bundle.is_empty()).then(|| bundle.hash.clone()),
+        context_file: (!bundle.is_empty()).then_some(context_file),
         retry: retry_cfg(cx.flow, step),
         run_clock: cx.run_clock.cloned(),
         quiet: cx.quiet,
@@ -3351,6 +3422,7 @@ mod tests {
         needed: &'a HashSet<String>,
     ) -> PrepCtx<'a> {
         PrepCtx {
+            workspace: None,
             flow,
             vars,
             outputs,
@@ -4008,6 +4080,7 @@ mod tests {
         )
         .unwrap();
         let cx = PrepCtx {
+            workspace: None,
             flow: &f,
             vars: &vars,
             outputs: &outputs,

@@ -286,6 +286,188 @@ pub fn fork_warmup_pays(tool: &str) -> bool {
     tool == "claude"
 }
 
+/// How much of a run's spend the adapter can actually account for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Coverage {
+    /// The tool reports a cost in its own currency terms.
+    Cost,
+    /// Token counts only; a cost ceiling cannot be enforced from them.
+    TokensOnly,
+}
+
+impl Coverage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Coverage::Cost => "cost",
+            Coverage::TokensOnly => "tokens-only",
+        }
+    }
+}
+
+/// How far `access:` can actually be enforced for a tool, per level. sfh's
+/// `access:` is a request to the CLI's own permission system, never an OS
+/// sandbox, and the four answers below are the honest range of what a CLI does
+/// with that request.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Enforcement {
+    /// The tool has a real sandbox for this level.
+    Sandboxed,
+    /// The tool enforces it in-process (permission config, tool allowlist).
+    Enforced,
+    /// Requested, but the tool's own defaults or config can widen it.
+    BestEffort,
+    /// The tool has no such level; sfh refuses the combination.
+    Unsupported,
+}
+
+impl Enforcement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Enforcement::Sandboxed => "sandboxed",
+            Enforcement::Enforced => "enforced",
+            Enforcement::BestEffort => "best-effort",
+            Enforcement::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// What sfh knows about one adapter without running a model.
+///
+/// `minimum_version` is deliberately `None` for every adapter. The spec asks
+/// for it to be re-confirmed against each CLI's official documentation and a
+/// live probe before being pinned, and pinning a number from memory would let
+/// `preflight` report a confident-looking floor sfh never verified. `preflight`
+/// therefore prints the installed version and says the required floor is
+/// unknown, which is a true statement a user can act on.
+#[derive(Clone, Debug)]
+pub struct AdapterInfo {
+    pub tool: &'static str,
+    pub default_program: String,
+    /// When this adapter's command line was last checked against the real CLI.
+    pub last_verified: &'static str,
+    pub minimum_version: Option<&'static str>,
+    /// The structured protocol its output must complete.
+    pub protocol: &'static str,
+    pub supports_resume: bool,
+    pub supports_fork: bool,
+    pub cost_coverage: Coverage,
+    /// Enforcement for read / write / full, in that order.
+    pub policy_coverage: [Enforcement; 3],
+    /// Flags this adapter's command line depends on. `preflight` looks for
+    /// these in the CLI's own `--help` so a renamed or removed flag surfaces
+    /// before a paid run instead of halfway through one.
+    pub required_flags: &'static [&'static str],
+    /// Known, documented gaps between what `access:` asks for and what the tool
+    /// will actually hold to.
+    pub known_gaps: &'static [&'static str],
+}
+
+impl AdapterInfo {
+    pub fn enforcement(&self, access: Access) -> Enforcement {
+        self.policy_coverage[match access {
+            Access::Read => 0,
+            Access::Write => 1,
+            Access::Full => 2,
+        }]
+    }
+}
+
+/// The date the header of this module records as its live-verification point.
+pub const LAST_VERIFIED: &str = "2026-07-27";
+
+/// Metadata for one preset, or `None` for a name that is not a preset.
+pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
+    use Enforcement::*;
+    let (protocol, cost, policy, flags, gaps): (
+        &'static str,
+        Coverage,
+        [Enforcement; 3],
+        &'static [&'static str],
+        &'static [&'static str],
+    ) = match tool {
+        "codex" => (
+            "codex-jsonl",
+            Coverage::TokensOnly,
+            // codex is the one preset with a real OS sandbox behind -s.
+            [Sandboxed, Sandboxed, BestEffort],
+            &["exec", "--json", "--output-last-message", "-s", "-c"],
+            &["access: full disables the sandbox entirely (--dangerously-bypass-approvals-and-sandbox)"],
+        ),
+        "claude" => (
+            "claude-json",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["-p", "--output-format", "--permission-mode", "--session-id"],
+            &[
+                "plan mode is advisory, so read is enforced by an explicit --tools allowlist rather than by a sandbox",
+                "user- and project-level settings, MCP servers, hooks and skills are not visible to sfh",
+            ],
+        ),
+        "opencode" => (
+            "opencode-ndjson",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["run", "--format", "--agent", "--auto"],
+            &[
+                "read/write are enforced through OPENCODE_CONFIG_CONTENT, which merges with the user's own config",
+                "there is no OS sandbox, so write denies bash outright",
+            ],
+        ),
+        "grok" => (
+            "grok-json",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["--output-format", "--prompt-file", "--session-id"],
+            &["no OS sandbox; read is a permission-mode plus explicit denies"],
+        ),
+        "agy" => (
+            "agy-json",
+            Coverage::TokensOnly,
+            [Enforced, Enforced, BestEffort],
+            &["--output-format", "--mode", "--print-timeout", "-p"],
+            &[
+                "exit codes are unreliable; sfh trusts the envelope's status field",
+                "no fork: a branch of an existing conversation is not available headlessly",
+            ],
+        ),
+        "pi" => (
+            "pi-jsonl",
+            Coverage::Cost,
+            [Enforced, Enforced, BestEffort],
+            &["--mode", "--offline", "--session-id", "--tools"],
+            &[
+                "no sandbox at all: access is expressed purely as a --tools allowlist, and write therefore excludes bash",
+                "--session-id CREATES a session when the id is not found in this cwd, so a resume is only trustworthy with the session marker",
+            ],
+        ),
+        "cursor" => (
+            "cursor-json",
+            Coverage::TokensOnly,
+            // Headless cursor has exactly two tiers; there is no write.
+            [Enforced, Unsupported, BestEffort],
+            &["-p", "--output-format", "--trust", "--disable-project-configs"],
+            &[
+                "headless permissions are binary: deny-all without --force, approve-all with it, so access: write is refused rather than silently promoted",
+                "--resume creates a chat when the id is unknown, so sfh verifies the chat store on disk",
+            ],
+        ),
+        _ => return None,
+    };
+    Some(AdapterInfo {
+        tool: crate::flow::TOOLS.iter().find(|t| **t == tool)?,
+        default_program: default_program(tool),
+        last_verified: LAST_VERIFIED,
+        minimum_version: None,
+        protocol,
+        supports_resume: true,
+        supports_fork: supports_fork(tool),
+        cost_coverage: cost,
+        policy_coverage: policy,
+        required_flags: flags,
+        known_gaps: gaps,
+    })
+}
+
 /// pi has no sandbox and no permission prompts: the only real lever is which
 /// tools get registered. Bare `pi` already has read+bash+edit+write.
 fn pi_tools(access: Access) -> &'static str {

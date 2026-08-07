@@ -1,4 +1,7 @@
-use crate::{contain, execute, flow, leaf, preset, protocol, template};
+use crate::{
+    closure, contain, context, execute, flow, leaf, machine, preset, protocol, sha256, state,
+    template, workspace,
+};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
@@ -30,20 +33,78 @@ pub struct RunOpts {
     /// Use exactly this run directory instead of a fresh timestamped one.
     /// Set by `--detach` when it hands the run off to the background copy.
     pub run_dir: Option<PathBuf>,
+    /// Root for state that is not a run artifact - above all a managed
+    /// workspace, which cannot live inside the repository it branches from.
+    pub state_dir: Option<PathBuf>,
+    /// Profile overlay files, applied in order (later wins).
+    pub profiles: Vec<PathBuf>,
+    /// Answer with a machine envelope on stdout instead of human progress.
+    pub as_json: bool,
+    /// `plan --save [dir]`: keep the rendered artifacts for review.
+    pub save_plan: Option<Option<PathBuf>>,
+    /// Accept the workspace's CURRENT contents as a new checkpoint on resume.
+    /// Deliberately separate from --force-resume: one says "the definition of
+    /// this run changed and I mean it", the other says "the working tree
+    /// changed and I mean it", and conflating them made a single flag waive
+    /// two unrelated guarantees.
+    pub adopt_workspace: bool,
+}
+
+impl Default for RunOpts {
+    fn default() -> Self {
+        RunOpts {
+            flow_path: PathBuf::new(),
+            vars: Vec::new(),
+            emit: None,
+            runs_dir: None,
+            dry_run: false,
+            verbose: false,
+            quiet: false,
+            resume: None,
+            resume_latest: false,
+            force_resume: false,
+            no_partial_emit: false,
+            detach: false,
+            run_dir: None,
+            state_dir: None,
+            profiles: Vec::new(),
+            as_json: false,
+            save_plan: None,
+            adopt_workspace: false,
+        }
+    }
 }
 
 pub fn run(opts: RunOpts) -> i32 {
     match run_inner(&opts) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("sfh: {e}");
+            // A config or usage failure is exactly the case a machine caller
+            // cannot recover from by parsing prose, and exactly the case most
+            // likely to happen when something is wrong - so JSON mode answers
+            // with an envelope here too, never with a bare message.
+            if opts.as_json {
+                machine::emit(&machine::error_envelope(
+                    if opts.dry_run { "plan" } else { "run" },
+                    run_failure_code(&e),
+                    &e,
+                    2,
+                    json!({
+                        "state": "config_error",
+                        "terminal": true,
+                        "flow": abs(&opts.flow_path).display().to_string(),
+                    }),
+                ));
+            } else {
+                eprintln!("sfh: {e}");
+            }
             2
         }
     }
 }
 
 pub fn validate(path: &Path, var_overrides: &[(String, String)]) -> i32 {
-    validate_with_options(path, var_overrides, false, false)
+    validate_with_options(path, var_overrides, false, false, &[])
 }
 
 pub fn validate_with_options(
@@ -51,15 +112,28 @@ pub fn validate_with_options(
     var_overrides: &[(String, String)],
     strict: bool,
     as_json: bool,
+    profiles: &[PathBuf],
 ) -> i32 {
     let inner = || -> Result<(flow::Flow, Vec<String>), String> {
-        let flow = flow::load(path)?;
+        let flow = flow::load_with_overlays(path, profiles)?;
         let mut vars = flow.vars_string_map()?;
         for (k, v) in var_overrides {
             vars.insert(k.clone(), v.clone());
         }
         precheck(&flow, &vars, &HashSet::new())?;
-        let warnings = flow::strict_warnings(&flow);
+        let mut warnings = flow::strict_warnings(&flow);
+        // A workspace the flow cannot resolve is a static error, not a runtime
+        // surprise: two writers sharing one workspace is refused here, before
+        // anyone has paid for a step.
+        match flow.workspace_plan() {
+            Ok(plan) => warnings.extend(plan.warnings.iter().cloned()),
+            Err(e) => return Err(e),
+        }
+        flow.context_plan(path)?;
+        // Replay is a warning rather than an error: `rerun` has always been the
+        // behaviour, and a flow that never crashes never notices. `--strict` is
+        // where a user asks to be told about the choices they did not make.
+        warnings.extend(flow.replay_warnings());
         if strict && !warnings.is_empty() {
             return Err(format!(
                 "strict validation found {} issue(s):\n  - {}",
@@ -136,8 +210,10 @@ pub fn validate_with_options(
     }
 }
 
-pub fn show_config(path: &Path, show_secrets: bool) -> i32 {
-    match flow::load(path).and_then(|flow| flow.effective_config_json_pretty(show_secrets)) {
+pub fn show_config(path: &Path, show_secrets: bool, profiles: &[PathBuf]) -> i32 {
+    match flow::load_with_overlays(path, profiles)
+        .and_then(|flow| flow.effective_config_json_pretty(show_secrets))
+    {
         Ok(config) => {
             println!("{config}");
             0
@@ -772,6 +848,11 @@ struct ResumeState {
     last_executed: Option<String>,
     last_success: Option<String>,
     completed: bool,
+    /// The last durable workspace fingerprint this run recorded. A resume
+    /// compares the workspace against it to tell "nothing moved" from "something
+    /// outside this run edited it". Absent for a run with no managed workspace,
+    /// and for every run written before v1.2.
+    workspace_checkpoint: Option<String>,
     /// True once this run has already spent its one `on_budget` landing. The
     /// log is the only record of it: without this the resumed run would arrive
     /// with the restored cost still over the threshold and land a second time,
@@ -1509,6 +1590,18 @@ fn load_resume_for_flow(
             // restored, not the trigger or the numbers: what matters on the way
             // back in is that the wrap-up chain has already been paid for once.
             "budget_landing" => st.budget_landed = true,
+            // The workspace baseline this run last committed to. Later entries
+            // replace earlier ones - the newest durable checkpoint is the one a
+            // resume compares against - and an adoption is a checkpoint too.
+            "workspace_checkpoint" | "workspace_adopted" => {
+                if let Some(fp) = v
+                    .get("fingerprint")
+                    .or_else(|| v.get("to"))
+                    .and_then(|x| x.as_str())
+                {
+                    st.workspace_checkpoint = Some(fp.to_string());
+                }
+            }
             "run_end" => {}
             _ => {}
         }
@@ -1726,6 +1819,20 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
         args.push("--runs-dir".into());
         args.push(d.display().to_string());
     }
+    // The background copy must resolve the same state root, the same overlays
+    // and the same workspace this validation pass just resolved; otherwise the
+    // detached run is a different run from the one that was checked.
+    if let Some(d) = &opts.state_dir {
+        args.push("--state-dir".into());
+        args.push(d.display().to_string());
+    }
+    for p in &opts.profiles {
+        args.push("--profiles".into());
+        args.push(p.display().to_string());
+    }
+    if opts.adopt_workspace {
+        args.push("--adopt-workspace".into());
+    }
     if opts.no_partial_emit {
         args.push("--no-partial-emit".into());
     }
@@ -1819,6 +1926,28 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
     ) {
         let _ = execute::kill_pid_tree(d.pid);
         return Err(e);
+    }
+    if opts.as_json {
+        // A detached run has no result yet, so this envelope is explicitly
+        // NON-terminal and hands back the handle plus the command that blocks
+        // for the answer. `sfh status`/`wait`/`stop` all take the same run_dir,
+        // so a caller can prove it is talking about this run and not the newest.
+        machine::emit(&machine::envelope(
+            "run",
+            true,
+            0,
+            json!({
+                "state": "running",
+                "terminal": false,
+                "detached": true,
+                "pid": d.pid,
+                "run_id": run_dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+                "run_dir": run_dir.display().to_string(),
+                "flow": abs(&opts.flow_path).display().to_string(),
+                "next_actions": next_actions_for("running", run_dir, &opts.flow_path),
+            }),
+        ));
+        return Ok(0);
     }
     // stdout gets the run dir and nothing else, so a caller can capture it.
     println!("{}", run_dir.display());
@@ -2138,6 +2267,30 @@ fn status_json(s: &Status) -> Result<String, String> {
     serde_json::to_string_pretty(&v).map_err(|e| format!("cannot serialize status: {e}"))
 }
 
+/// Stamp a terminal state onto an existing run's status.json without going
+/// through the live `Status` machinery.
+///
+/// Used by the replay policy, which refuses before the run's status thread even
+/// exists. The previous document's fields are preserved so `runs show`, `wait`
+/// and `status` still see the run's history; only the outcome is replaced.
+fn mark_terminal_status(dir: &Path, state: &str, exit: i32, error: &str) -> Result<(), String> {
+    let path = dir.join("status.json");
+    let mut v: serde_json::Value = contain::read_contained_opt(dir, "status.json")?
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({"schema_version": 1}));
+    let Some(map) = v.as_object_mut() else {
+        return Err(format!("{}: status.json is not an object", dir.display()));
+    };
+    map.insert("state".into(), json!(state));
+    map.insert("exit_code".into(), json!(exit));
+    map.insert("error".into(), json!(error));
+    map.insert("heartbeat_utc".into(), json!(utc_stamp()));
+    let text =
+        serde_json::to_string_pretty(&v).map_err(|e| format!("cannot serialize status: {e}"))?;
+    contain::write_private_atomic(&path, &text)
+        .map_err(|e| format!("cannot persist status {}: {e}", path.display()))
+}
+
 fn write_status(path: &Path, s: &Status) -> Result<(), String> {
     let text = status_json(s)?;
     // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
@@ -2179,10 +2332,11 @@ fn seed_status(path: &Path, s: &Status) -> Result<(), String> {
 }
 
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
-    let runs_root = opts
-        .runs_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
+    // `--runs-dir` keeps meaning exactly what it always meant, and with neither
+    // flag the runs root is still `.sfh/runs`: every flow, script and CI job
+    // that predates v1.2 lands in the same place.
+    let state_root = state::StateRoot::resolve(opts.state_dir.as_deref(), opts.runs_dir.as_deref());
+    let runs_root = state_root.runs_dir();
 
     // Resolve the resume target BEFORE loading the flow. The era recorded in
     // meta.json decides whether the lenient loader (which restores pre-1.0
@@ -2219,10 +2373,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .and_then(|m| m.get("sfh_version").and_then(|x| x.as_str()))
         .map(|v| v.starts_with("0."))
         .unwrap_or(false);
-    let flow = match flow::load(&opts.flow_path) {
+    let flow = match flow::load_with_overlays(&opts.flow_path, &opts.profiles) {
         Ok(f) => f,
         Err(e) => {
-            if resume_dir.is_some() && legacy_era {
+            if resume_dir.is_some() && legacy_era && opts.profiles.is_empty() {
                 flow::load_lenient(&opts.flow_path).map_err(|_| e)?
             } else {
                 return Err(e);
@@ -2386,16 +2540,80 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             ));
         }
         if let Some(u) = &resumed.unfinished_step {
-            if let Some(profile) = &u.profile {
-                eprintln!(
-                    "sfh: step '{}' selected fallback '{}' in visit {} but never recorded its end.\n     resuming that fallback directly: {}",
-                    u.step, profile, u.visit, u.cmd
-                );
-            } else {
-                eprintln!(
-                    "sfh: step '{}' started {} and never recorded an end.\n     resuming will run it again: {}",
-                    u.step, u.started, u.cmd
-                );
+            // The replay decision. A step that started and never recorded an
+            // end may have already done whatever it does out in the world, and
+            // sfh cannot look and find out. Re-running is right for a pure
+            // computation and wrong for a deploy, so the flow says which - and
+            // the refusals happen HERE, before anything is launched.
+            let policy = flow
+                .find_step(&u.step)
+                .map(|s| s.replay_policy(&flow))
+                .unwrap_or_default();
+            let effects = flow
+                .find_step(&u.step)
+                .map(|s| s.effects(&flow).as_str())
+                .unwrap_or("unknown");
+            match policy {
+                flow::ReplayPolicy::Rerun => {
+                    if let Some(profile) = &u.profile {
+                        eprintln!(
+                            "sfh: step '{}' selected fallback '{}' in visit {} but never recorded its end.\n     resuming that fallback directly: {}",
+                            u.step, profile, u.visit, u.cmd
+                        );
+                    } else {
+                        eprintln!(
+                            "sfh: step '{}' started {} and never recorded an end.\n     resuming will run it again: {}",
+                            u.step, u.started, u.cmd
+                        );
+                    }
+                }
+                flow::ReplayPolicy::Stuck | flow::ReplayPolicy::Fail => {
+                    let (code, word) = match policy {
+                        flow::ReplayPolicy::Stuck => (4, "stuck"),
+                        _ => (1, "failed"),
+                    };
+                    let why = format!(
+                        "step '{}' started {} and never recorded an end. It declares effects: {effects} with replay.unfinished: {}, so sfh will not launch it again without knowing whether its effects already happened.",
+                        u.step,
+                        u.started,
+                        policy.as_str()
+                    );
+                    // Nothing is spawned, and the workspace and every partial
+                    // artifact stay exactly where they are for a human to look
+                    // at. This is a decision handed back, not a failure.
+                    let mut log = contain::append_private(&dir.join("log.jsonl"))
+                        .map_err(|e| format!("cannot open log: {e}"))?;
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "run_end", "state": word,
+                               "exit": code, "error": why.clone(),
+                               "replay_refused": policy.as_str(), "step": u.step}),
+                    )?;
+                    mark_terminal_status(&dir, word, code, &why)?;
+                    if opts.as_json {
+                        machine::emit(&machine::error_envelope(
+                            "run",
+                            machine::ErrorCode::ReplayRefused,
+                            &why,
+                            code,
+                            json!({
+                                "run_dir": dir.display().to_string(),
+                                "state": word,
+                                "terminal": true,
+                                "step": u.step,
+                                "effects": effects,
+                                "replay_unfinished": policy.as_str(),
+                            }),
+                        ));
+                    } else {
+                        eprintln!("sfh: {why}");
+                        eprintln!(
+                            "sfh: the workspace and partial artifacts are preserved in {}",
+                            dir.display()
+                        );
+                    }
+                    return Ok(code);
+                }
             }
         }
         run_dir = dir;
@@ -2458,6 +2676,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     }
     let notes_file = run_dir.join("notes.md");
 
+    // ---- workspace ----
+    // Decided from the flow's static shape (see Flow::workspace_plan), which is
+    // why a plan and a run always agree about it. A flow with no `workspace:`
+    // key resolves to `current` and creates nothing at all.
+    let workspace_plan = flow.workspace_plan()?;
+    for w in &workspace_plan.warnings {
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: warning: {w}");
+        }
+    }
+
     if opts.dry_run {
         let result = dry_run(
             &flow,
@@ -2467,6 +2696,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             &flow_dir,
             &notes_file,
             &needed_sessions,
+            DryRunExtras {
+                flow_path: &opts.flow_path,
+                workspace: &workspace_plan,
+                state_root: &state_root,
+                profiles: &opts.profiles,
+                as_json: opts.as_json,
+                save: opts.save_plan.clone(),
+            },
         );
         if let Err(e) = std::fs::remove_dir_all(&run_dir) {
             eprintln!(
@@ -2513,6 +2750,214 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
         }
     }
+    // ---- execution closure ----
+    // The flow fingerprint has always caught an edited flow. It cannot catch a
+    // profile overlay that swapped the model, a context file that was rewritten
+    // between the crash and the resume, or a CLI that upgraded itself - each of
+    // which changes what the run does while leaving the flow byte-identical.
+    let closure_now = build_closure(
+        &flow,
+        &opts.flow_path,
+        &opts.profiles,
+        &workspace_plan,
+        (!is_resume).then_some(&tool_versions),
+    )?;
+    if is_resume {
+        let recorded = contain::read_contained_opt(&run_dir, closure::FILE)?
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .as_ref()
+            .and_then(closure::Closure::from_json);
+        if let Some(before) = recorded {
+            // The versions probed at the original run are part of the closure,
+            // and a resume does not re-probe (that would be a second cost on a
+            // path that is meant to be cheap), so compare on the entries this
+            // attempt could actually reconstruct.
+            let mut now = closure_now.clone();
+            if let Some(tools) = before.get("tools") {
+                now.set("tools", tools.clone());
+            }
+            let changes = before.diff(&now);
+            if !changes.is_empty() {
+                if opts.force_resume {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "force_resume",
+                               "reason": "execution_closure_changed", "changes": changes}),
+                    )?;
+                    if !opts.quiet && !opts.as_json {
+                        eprintln!(
+                            "sfh: warning: --force-resume accepted a changed execution closure:"
+                        );
+                        for c in &changes {
+                            eprintln!("sfh:   {c}");
+                        }
+                    }
+                } else {
+                    return Err(format!(
+                        "{}: the execution closure changed since this run started, so resuming would continue a different piece of work:\n  {}\nRe-run from scratch, restore the inputs, or pass --force-resume to accept the change.",
+                        machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                        changes.join("\n  ")
+                    ));
+                }
+            }
+        }
+    } else {
+        let text = serde_json::to_string_pretty(&closure_now.to_json())
+            .map_err(|e| format!("cannot serialize the execution closure: {e}"))?;
+        contain::write_private_atomic(&run_dir.join(closure::FILE), text)
+            .map_err(|e| format!("cannot persist the execution closure: {e}"))?;
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "execution_closure",
+                   "fingerprint": closure_now.fingerprint(), "algo": closure::ALGO}),
+        )?;
+    }
+
+    // ---- managed workspace ----
+    // At most ONE per run, whatever the step or visit count: analyze, implement,
+    // test, review and every loop revisit share it, because they are all working
+    // on the same thing and a per-step worktree would hide each step's changes
+    // from the next.
+    let mut workspace: Option<workspace::Workspace> = None;
+    if is_resume {
+        if let Some(ws) = contain::read_contained_opt(&run_dir, workspace::MANIFEST)?
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .as_ref()
+            .and_then(workspace::Workspace::from_manifest)
+        {
+            let checkpoint = resumed.workspace_checkpoint.clone();
+            let unfinished = resumed.unfinished_step.is_some();
+            if workspace_plan.verify_on_resume {
+                match workspace::detect_drift(&ws, checkpoint.as_deref(), unfinished) {
+                    workspace::Drift::None => {}
+                    workspace::Drift::Missing => {
+                        return Err(format!(
+                            "{}: the managed workspace {} no longer exists, so this run cannot continue where it left off",
+                            machine::ErrorCode::WorkspaceMissing.as_str(),
+                            ws.path.display()
+                        ))
+                    }
+                    workspace::Drift::Unknown(why) => {
+                        return Err(format!(
+                            "{}: sfh cannot fingerprint the workspace {} ({why}), so it cannot tell whether anything changed",
+                            machine::ErrorCode::WorkspaceDrift.as_str(),
+                            ws.path.display()
+                        ))
+                    }
+                    workspace::Drift::Changed { unfinished } => {
+                        if opts.adopt_workspace {
+                            let now = workspace::fingerprint(&ws.path)?;
+                            log_event(
+                                &mut log,
+                                json!({"ts": utc_stamp(), "event": "workspace_adopted",
+                                       "workspace_id": ws.id, "path": ws.path.display().to_string(),
+                                       "from": checkpoint, "to": now}),
+                            )?;
+                            if !opts.quiet && !opts.as_json {
+                                eprintln!(
+                                    "sfh: --adopt-workspace accepted the current contents of {} as the new baseline",
+                                    ws.path.display()
+                                );
+                            }
+                        } else if unfinished {
+                            // A step was in flight when the run stopped, so the
+                            // difference is explainable. The replay policy - not
+                            // this check - decides what happens to that step.
+                            if !opts.quiet && !opts.as_json {
+                                eprintln!(
+                                    "sfh: warning: {} differs from its last checkpoint, which is consistent with the step that never finished",
+                                    ws.path.display()
+                                );
+                            }
+                        } else {
+                            return Err(format!(
+                                "{}: the managed workspace {} changed since this run's last checkpoint, and no step was in flight to explain it. Something outside this run edited it.\nPass --adopt-workspace to accept the current contents as the new baseline. (--force-resume is a different question: it waives the flow/closure check, not this one.)",
+                                machine::ErrorCode::WorkspaceDrift.as_str(),
+                                ws.path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            workspace = Some(ws);
+        }
+    } else if workspace_plan.resolved == flow::WorkspaceMode::GitWorktree {
+        let source = match &workspace_plan.root {
+            Some(r) => flow_dir.join(r),
+            None => flow_dir.clone(),
+        };
+        let ws = workspace::create_git_worktree(
+            &source,
+            &state_root,
+            &name,
+            run_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.clone())
+                .as_str(),
+            workspace_plan.base.as_deref(),
+        )?;
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "workspace_created",
+                   "workspace_id": ws.id, "mode": ws.mode.as_str(),
+                   "path": ws.path.display().to_string(), "branch": ws.branch,
+                   "base_ref": ws.base_ref, "base_commit": ws.base_commit}),
+        )?;
+        if !opts.quiet && !opts.as_json {
+            eprintln!(
+                "sfh: workspace: {} (branch {})",
+                ws.path.display(),
+                ws.branch.as_deref().unwrap_or("-")
+            );
+        }
+        workspace = Some(ws);
+    } else if workspace_plan.resolved == flow::WorkspaceMode::Directory {
+        let root = workspace_plan
+            .root
+            .as_ref()
+            .expect("workspace_plan rejects directory mode without a root");
+        let path = flow_dir.join(root);
+        if !path.is_dir() {
+            return Err(format!(
+                "workspace.root {} is not a directory. sfh does not create a `directory` workspace - it is yours, and creating or removing it is not sfh's to do.",
+                path.display()
+            ));
+        }
+        workspace = Some(workspace::Workspace {
+            id: "primary".into(),
+            mode: flow::WorkspaceMode::Directory,
+            source_root: path.clone(),
+            path,
+            base_ref: None,
+            base_commit: None,
+            branch: None,
+            // NOT sfh's: no marker, no nonce, and therefore never removable.
+            created_by_sfh: false,
+            ownership_nonce: None,
+            cleanup: flow::WorkspaceCleanup::Keep,
+        });
+    }
+    let workspace_path: Option<PathBuf> = workspace.as_ref().map(|w| w.path.clone());
+    if let Some(ws) = &workspace {
+        if !is_resume {
+            let initial = (ws.mode == flow::WorkspaceMode::GitWorktree)
+                .then(|| workspace::fingerprint(&ws.path).ok())
+                .flatten();
+            let text = serde_json::to_string_pretty(&ws.to_json(initial.as_deref()))
+                .map_err(|e| format!("cannot serialize the workspace manifest: {e}"))?;
+            contain::write_private_atomic(&run_dir.join(workspace::MANIFEST), text)
+                .map_err(|e| format!("cannot persist the workspace manifest: {e}"))?;
+            if let Some(fp) = &initial {
+                log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "workspace_checkpoint",
+                           "workspace_id": ws.id, "at": "run_start", "fingerprint": fp}),
+                )?;
+            }
+        }
+    }
+
     let started = utc_stamp();
     let meta = json!({
         "schema_version": 1,
@@ -2522,6 +2967,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "flow_fingerprint_algo": FINGERPRINT_ALGO,
         "effective_config_fingerprint": effective_config_fp,
         "effective_config_fingerprint_algo": FINGERPRINT_ALGO,
+        "execution_closure_fingerprint": closure_now.fingerprint(),
+        "execution_closure_algo": closure::ALGO,
         "name": name,
         "started_utc": started,
         "os": std::env::consts::OS,
@@ -2529,6 +2976,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "tools": tool_versions,
         "resumed": is_resume,
         "elapsed_sec": elapsed_before_attempt,
+        "workspace": workspace.as_ref().map(|w| json!({
+            "mode": w.mode.as_str(),
+            "path": w.path.display().to_string(),
+            "branch": w.branch,
+            "created_by_sfh": w.created_by_sfh,
+        })),
+        "unsafe_overrides": flow.unsafe_overrides(),
+        "profile_overlays": opts.profiles.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
     });
     let meta_text = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
@@ -2740,6 +3195,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         cost_usd,
                         elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs()),
                     ),
+                    workspace: workspace_path.as_deref(),
                     quiet: opts.quiet,
                     verbose: opts.verbose,
                 };
@@ -3096,6 +3552,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             cost_usd,
                             elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs()),
                         ),
+                        workspace: workspace_path.as_deref(),
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     }
@@ -3906,7 +4363,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
                     log_event(
                         &mut log,
-                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep), "protocol_expected": protocol::expected_kind(&prep.parse)}),
+                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep), "protocol_expected": protocol::expected_kind(&prep.parse),
+                               "context_hash": prep.context_hash, "context_file": prep.context_file.as_ref().and_then(|p| file_name(p)),
+                               "workspace_id": workspace.as_ref().map(|w| w.id.clone())}),
                     )?;
                     leaf::exec_leaf(prep)
                 };
@@ -4108,6 +4567,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         tag: &gtag,
                         run_clock: &run_clock,
                         wall_deadline,
+                        workspace: workspace_path.as_deref(),
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     };
@@ -4392,6 +4852,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // Whatever finished work exists, handed back the way a failure hands it
     // back - a run the caller has to act on is exactly when it is needed.
     let emit_partial = |pick: &Option<String>| {
+        if opts.as_json {
+            return;
+        }
         if let Some(id) = pick {
             if let Some(o) = outputs.get(id) {
                 if !o.output.trim().is_empty() {
@@ -4401,6 +4864,50 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
         }
     };
+
+    // The terminal workspace checkpoint, recorded before the outcome is
+    // published: whatever happens to the workspace next - an automatic cleanup,
+    // a human poking at it - the log already says what it held when the run
+    // stopped.
+    let final_state = match &result {
+        Ok(FlowEnd::Completed) => "done",
+        Ok(FlowEnd::Stuck { .. }) => "stuck",
+        Err(_) => "failed",
+    };
+    if let Some(ws) = &workspace {
+        if ws.mode == flow::WorkspaceMode::GitWorktree {
+            match workspace::fingerprint(&ws.path) {
+                Ok(fp) => log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "workspace_checkpoint",
+                           "workspace_id": ws.id, "at": "terminal", "fingerprint": fp}),
+                )?,
+                Err(e) => log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "workspace_checkpoint",
+                           "workspace_id": ws.id, "at": "terminal", "fingerprint": serde_json::Value::Null,
+                           "error": e}),
+                )?,
+            }
+        }
+        // Cleanup can decline, and it can fail. Neither turns a successful run
+        // into a failed one: the work is done and recorded, and a worktree that
+        // could not be removed is a housekeeping note, not a result.
+        let outcome = workspace::cleanup_auto(ws, final_state);
+        if !matches!(outcome, workspace::Cleanup::NotApplicable) {
+            log_event(
+                &mut log,
+                json!({"ts": utc_stamp(), "event": "workspace_cleanup",
+                       "workspace_id": ws.id, "path": ws.path.display().to_string(),
+                       "outcome": outcome.as_json()}),
+            )?;
+            if let workspace::Cleanup::Failed(e) = &outcome {
+                if !opts.quiet && !opts.as_json {
+                    eprintln!("sfh: warning: could not remove the managed workspace: {e}");
+                }
+            }
+        }
+    }
 
     match result {
         Ok(FlowEnd::Completed) => {
@@ -4418,7 +4925,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     .unwrap_or_default();
                 // Emit first: `sfh wait` treats a terminal status.json as "the
                 // output is ready", so the status must not go terminal before it.
-                print_emit(&out, max_emit, chain_files.get(id));
+                // In JSON mode the result travels inside the envelope instead,
+                // because stdout must hold the envelope and nothing else.
+                if !opts.as_json {
+                    print_emit(&out, max_emit, chain_files.get(id));
+                }
             } else if last_executed.is_none() {
                 // Rare, but leaving status.json on "running" would make this
                 // look like a run that got killed rather than one that ended.
@@ -4426,7 +4937,26 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 return Err("no step was executed".into());
             }
             finish("done", cost_usd, 0, emit_id.as_deref(), None)?;
-            if !opts.quiet {
+            if opts.as_json {
+                emit_run_envelope(RunEnvelope {
+                    ok: true,
+                    state: "done",
+                    exit_code: 0,
+                    run_dir: &run_dir,
+                    flow: &opts.flow_path,
+                    error: None,
+                    result: emit_id
+                        .as_deref()
+                        .and_then(|id| outputs.get(id))
+                        .map(|o| o.output.as_str()),
+                    result_file: emit_id.as_deref().and_then(|id| chain_files.get(id)),
+                    result_step: emit_id.as_deref(),
+                    max_emit,
+                    workspace: workspace.as_ref(),
+                    leaf_runs: total,
+                    cost_usd,
+                });
+            } else if !opts.quiet {
                 eprintln!(
                     "sfh: done. {} leaf runs, ${cost_usd:.4} reported. run dir: {}",
                     total,
@@ -4445,6 +4975,28 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd}),
             )?;
+            if opts.as_json {
+                finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg))?;
+                emit_run_envelope(RunEnvelope {
+                    ok: false,
+                    state: "stuck",
+                    exit_code: 4,
+                    run_dir: &run_dir,
+                    flow: &opts.flow_path,
+                    error: Some((machine::ErrorCode::ReplayRefused, msg.as_str())),
+                    result: partial_pick
+                        .as_deref()
+                        .and_then(|id| outputs.get(id))
+                        .map(|o| o.output.as_str()),
+                    result_file: partial_pick.as_deref().and_then(|id| chain_files.get(id)),
+                    result_step: partial_pick.as_deref(),
+                    max_emit,
+                    workspace: workspace.as_ref(),
+                    leaf_runs: total,
+                    cost_usd,
+                });
+                return Ok(4);
+            }
             eprintln!("sfh: FLOW STUCK: {msg}");
             // Emit before the status goes terminal, for the same reason the
             // success path does: `sfh wait` reads a terminal status.json as
@@ -4460,6 +5012,28 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 &mut log,
                 json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
             )?;
+            if opts.as_json {
+                finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg))?;
+                emit_run_envelope(RunEnvelope {
+                    ok: false,
+                    state: "failed",
+                    exit_code: 1,
+                    run_dir: &run_dir,
+                    flow: &opts.flow_path,
+                    error: Some((run_failure_code(&msg), msg.as_str())),
+                    result: partial_pick
+                        .as_deref()
+                        .and_then(|id| outputs.get(id))
+                        .map(|o| o.output.as_str()),
+                    result_file: partial_pick.as_deref().and_then(|id| chain_files.get(id)),
+                    result_step: partial_pick.as_deref(),
+                    max_emit,
+                    workspace: workspace.as_ref(),
+                    leaf_runs: total,
+                    cost_usd,
+                });
+                return Ok(1);
+            }
             eprintln!("sfh: FLOW FAILED: {msg}");
             emit_partial(&partial_pick);
             finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg))?;
@@ -4468,6 +5042,141 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             Ok(1)
         }
     }
+}
+
+/// The terminal answer a `run --json` caller receives.
+struct RunEnvelope<'a> {
+    ok: bool,
+    state: &'static str,
+    exit_code: i32,
+    run_dir: &'a Path,
+    flow: &'a Path,
+    error: Option<(machine::ErrorCode, &'a str)>,
+    /// The emitted text, subject to the same `max_emit_chars` ceiling the human
+    /// path applies. `result_file` always names the complete text on disk, so a
+    /// caller that needs all of it never has to raise the ceiling.
+    result: Option<&'a str>,
+    result_file: Option<&'a PathBuf>,
+    result_step: Option<&'a str>,
+    max_emit: usize,
+    workspace: Option<&'a workspace::Workspace>,
+    leaf_runs: u32,
+    cost_usd: f64,
+}
+
+/// Which stable code a flow failure maps to.
+///
+/// The engine's failure messages are prose that is allowed to improve, so the
+/// mapping keys off the markers sfh itself writes. Anything unrecognised stays
+/// a plain flow failure rather than being forced into a code that would tell a
+/// caller something specific and wrong.
+fn run_failure_code(msg: &str) -> machine::ErrorCode {
+    for code in [
+        machine::ErrorCode::ExecutionClosureChanged,
+        machine::ErrorCode::WorkspaceMissing,
+        machine::ErrorCode::WorkspaceDrift,
+        machine::ErrorCode::WorkspaceUnowned,
+        machine::ErrorCode::WorkspaceBusy,
+        machine::ErrorCode::ReplayRefused,
+        machine::ErrorCode::PersistenceFailure,
+    ] {
+        if msg.contains(code.as_str()) {
+            return code;
+        }
+    }
+    if msg.contains("did not match its documented machine-readable format")
+        || msg.contains("not its documented machine-readable output")
+    {
+        return machine::ErrorCode::ProtocolInvalid;
+    }
+    if msg.contains("documented terminal record") || msg.contains("result envelope") {
+        return machine::ErrorCode::TerminalMissing;
+    }
+    if msg.contains("resume unverified") || msg.contains("resume mismatch") {
+        return machine::ErrorCode::SessionUnverified;
+    }
+    if msg.contains("persist") {
+        return machine::ErrorCode::PersistenceFailure;
+    }
+    machine::ErrorCode::FlowInvalid
+}
+
+fn emit_run_envelope(e: RunEnvelope<'_>) {
+    let truncated = e.result.map(|r| {
+        let n = r.chars().count();
+        if n > e.max_emit {
+            r.chars().take(e.max_emit).collect::<String>()
+        } else {
+            r.to_string()
+        }
+    });
+    let body = json!({
+        "state": e.state,
+        "terminal": true,
+        "run_id": e.run_dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+        "run_dir": e.run_dir.display().to_string(),
+        "flow": abs(e.flow).display().to_string(),
+        "result": truncated,
+        "result_step": e.result_step,
+        "result_file": e.result_file.map(|p| p.display().to_string()),
+        "result_truncated": e.result.map(|r| r.chars().count() > e.max_emit),
+        "leaf_runs": e.leaf_runs,
+        "cost_usd": e.cost_usd,
+        "workspace": e.workspace.map(|w| json!({
+            "path": w.path.display().to_string(),
+            "mode": w.mode.as_str(),
+            "branch": w.branch,
+        })),
+        "next_actions": next_actions_for(e.state, e.run_dir, e.flow),
+    });
+    match e.error {
+        Some((code, msg)) => machine::emit(&machine::error_envelope(
+            "run",
+            code,
+            msg,
+            e.exit_code,
+            body,
+        )),
+        None => machine::emit(&machine::envelope("run", e.ok, e.exit_code, body)),
+    }
+}
+
+/// Runnable follow-ups, as argv rather than prose, so a caller can act without
+/// parsing an instruction.
+fn next_actions_for(state: &str, run_dir: &Path, flow: &Path) -> Vec<serde_json::Value> {
+    let rd = run_dir.display().to_string();
+    let mut out = vec![machine::next_action(
+        "why",
+        vec![
+            "sfh".into(),
+            "runs".into(),
+            "why".into(),
+            rd.clone(),
+            "--json".into(),
+        ],
+    )];
+    match state {
+        "running" => out.insert(
+            0,
+            machine::next_action(
+                "wait",
+                vec!["sfh".into(), "wait".into(), rd.clone(), "--json".into()],
+            ),
+        ),
+        "failed" | "stuck" => out.push(machine::next_action(
+            "resume",
+            vec![
+                "sfh".into(),
+                "run".into(),
+                flow.display().to_string(),
+                "--resume".into(),
+                rd,
+                "--json".into(),
+            ],
+        )),
+        _ => {}
+    }
+    out
 }
 
 /// `chain` must be the file the emitted step's LAST visit wrote, not a path
@@ -4627,6 +5336,9 @@ struct CompactRun<'a, 'ctx> {
     /// counts as the run being alive.
     run_clock: &'a Arc<AtomicU64>,
     wall_deadline: Option<Instant>,
+    /// The summarizer runs where the rest of the run runs, so a compaction that
+    /// shells out sees the same working tree its step did.
+    workspace: Option<&'a Path>,
     quiet: bool,
     verbose: bool,
 }
@@ -4676,6 +5388,7 @@ fn prepare_compact(
         tag,
         run_clock,
         wall_deadline,
+        workspace: _,
         quiet,
         verbose,
     } = run;
@@ -4746,7 +5459,12 @@ fn prepare_compact(
         inv: execute::Invocation::Argv(argv),
         parse: built.parse,
         stdin_payload,
-        cwd: None,
+        // A compact summarizer only reads the text it was handed. It still runs
+        // in the run's workspace so a `cmd`-shaped summarizer sees the same
+        // tree, but it names no context of its own.
+        context_hash: None,
+        context_file: None,
+        cwd: run.workspace.map(PathBuf::from),
         timeout: timeout_sec.map(Duration::from_secs),
         wall_deadline: *wall_deadline,
         preassigned_session: None,
@@ -4901,6 +5619,32 @@ fn one_line(s: &str, max: usize) -> String {
     out
 }
 
+/// What `plan` needs beyond the rendering itself: the structural decisions this
+/// flow would make, which is most of what a reviewer is actually checking.
+pub struct DryRunExtras<'a> {
+    pub flow_path: &'a Path,
+    pub workspace: &'a flow::WorkspacePlan,
+    pub state_root: &'a state::StateRoot,
+    pub profiles: &'a [PathBuf],
+    pub as_json: bool,
+    /// `plan --save`: where to keep the rendered prompts, context bundles and
+    /// machine plan so a human can read exactly what would be sent before
+    /// anyone pays for it. `Some(None)` means "save, and pick the default
+    /// location under the state root".
+    pub save: Option<Option<PathBuf>>,
+}
+
+impl DryRunExtras<'_> {
+    /// A short label for the saved plan directory.
+    fn workspace_name(&self) -> &str {
+        self.flow_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plan")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dry_run(
     flow: &flow::Flow,
     vars: &BTreeMap<String, String>,
@@ -4909,6 +5653,7 @@ fn dry_run(
     flow_dir: &Path,
     notes_file: &Path,
     needed_sessions: &HashSet<String>,
+    extras: DryRunExtras,
 ) -> Result<i32, String> {
     let step_ids = flow.step_ids();
     // `plan` has no real upstream results, but rendering them as empty made a
@@ -4963,6 +5708,24 @@ fn dry_run(
             }
         }
     }
+    // In JSON mode stdout carries the envelope and nothing else, so the header
+    // a human wants goes to stderr instead of being printed and then having to
+    // be stripped by every caller.
+    if extras.as_json {
+        return dry_run_json(
+            flow,
+            vars,
+            tainted_vars,
+            run_dir,
+            flow_dir,
+            notes_file,
+            needed_sessions,
+            &extras,
+            &outputs,
+            &sessions,
+            &step_ids,
+        );
+    }
     println!("execution plan: commands are resolved but no process is started");
     println!(
         "temporary render dir (removed after this command): {}",
@@ -4972,6 +5735,13 @@ fn dry_run(
     for warning in flow::strict_warnings(flow) {
         println!("warning: {warning}");
     }
+    for warning in flow.replay_warnings() {
+        println!("warning: {warning}");
+    }
+    println!(
+        "workspace: {}",
+        serde_json::to_string(&extras.workspace.to_json()).unwrap_or_default()
+    );
     // The one goto that never appears in any step's route:, so a reader of the
     // flow cannot see it by following the steps. Print it where the jump is
     // declared - at the top, with the flow, not against any step.
@@ -5010,6 +5780,10 @@ fn dry_run(
         // the whole declared budget - which is what a prompt reviewer wants to
         // see, and it exercises the `unlimited` spelling for undeclared axes.
         budget: leaf::BudgetVars::new(&flow.defaults, 0.0, 0),
+        // A plan renders what the flow WOULD do; it never creates a workspace,
+        // so leaves render against the caller's cwd exactly as `plan` always
+        // has. The workspace the run would use is reported separately above.
+        workspace: None,
         quiet: true,
         verbose: false,
     };
@@ -5083,6 +5857,7 @@ fn dry_run(
                 tag: &s.id,
                 run_clock: &plan_clock,
                 wall_deadline: None,
+                workspace: None,
                 quiet: true,
                 verbose: false,
             };
@@ -5133,7 +5908,256 @@ fn dry_run(
         }
         println!();
     }
+    if let Some(explicit) = &extras.save {
+        let dir = save_plan(run_dir, explicit.as_deref(), &extras)?;
+        println!("plan saved to {}", dir.display());
+    }
     Ok(0)
+}
+
+/// Copy a plan's rendered artifacts out of the temporary render directory.
+///
+/// That directory is removed the moment `plan` returns, so `--save` is what
+/// turns a plan into something a human can actually read line by line - the
+/// full prompts, the assembled context bundles and their manifests, and the
+/// machine plan - and then approve, or not.
+fn save_plan(
+    render_dir: &Path,
+    explicit: Option<&Path>,
+    extras: &DryRunExtras,
+) -> Result<PathBuf, String> {
+    let dir = match explicit {
+        Some(d) => d.to_path_buf(),
+        None => extras.state_root.plans_dir().ok_or_else(|| {
+            "plan --save needs a directory, or a --state-dir (SFH_STATE_DIR) to put one under"
+                .to_string()
+        })?,
+    };
+    let dir = dir.join(format!(
+        "{}-{}",
+        utc_stamp(),
+        crate::workspace::sanitize(extras.workspace_name())
+    ));
+    contain::mkdir_private(&dir)
+        .map_err(|e| format!("cannot create the plan directory {}: {e}", dir.display()))?;
+    let entries = std::fs::read_dir(render_dir)
+        .map_err(|e| format!("cannot read the render dir {}: {e}", render_dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Regular files only, and no recursion: everything a plan renders is a
+        // flat artifact sfh itself just wrote.
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(name) = path.file_name() {
+            std::fs::copy(&path, dir.join(name))
+                .map_err(|e| format!("cannot save {}: {e}", path.display()))?;
+        }
+    }
+    Ok(dir)
+}
+
+/// `plan --json`: the same resolution the human plan does, as one envelope.
+///
+/// Still spawns nothing and still creates no workspace. Every invocation it
+/// reports is the REDACTED form, so a plan can be pasted into an issue without
+/// carrying the prompt - which is exactly the text most likely to be sensitive.
+#[allow(clippy::too_many_arguments)]
+fn dry_run_json(
+    flow: &flow::Flow,
+    vars: &BTreeMap<String, String>,
+    tainted_vars: &HashSet<String>,
+    run_dir: &Path,
+    flow_dir: &Path,
+    notes_file: &Path,
+    needed_sessions: &HashSet<String>,
+    extras: &DryRunExtras,
+    outputs: &BTreeMap<String, template::StepOutput>,
+    sessions: &HashMap<String, leaf::SessionInfo>,
+    step_ids: &HashSet<String>,
+) -> Result<i32, String> {
+    let cx = leaf::PrepCtx {
+        flow,
+        vars,
+        outputs,
+        step_ids,
+        run_dir,
+        flow_dir,
+        notes_file,
+        sessions,
+        needed_sessions,
+        tainted_vars,
+        run_clock: None,
+        wall_deadline: None,
+        budget: leaf::BudgetVars::new(&flow.defaults, 0.0, 0),
+        workspace: None,
+        quiet: true,
+        verbose: false,
+    };
+    let mut steps = Vec::new();
+    for s in &flow.steps {
+        let mut invocations = Vec::new();
+        let mut push = |label: String, p: &leaf::Prepared| {
+            invocations.push(json!({
+                "label": label,
+                "cmd": p.inv.describe(),
+                "tool": p.tool,
+                "access": p.access.map(|a| a.as_str()),
+                "protocol": protocol::expected_kind(&p.parse),
+                "cwd": p.cwd.as_ref().map(|c| c.display().to_string()),
+                "context_hash": p.context_hash,
+            }));
+        };
+        match (&s.parallel, &s.foreach) {
+            (Some(children), _) => {
+                for c in children {
+                    let p = leaf::prepare_leaf(&cx, c, 1, &c.id, &[], None)?;
+                    push(format!("member:{}", c.id), &p);
+                }
+            }
+            (None, Some(_)) => {
+                let p = leaf::prepare_leaf(
+                    &cx,
+                    s,
+                    1,
+                    &format!("{}.i0", s.id),
+                    &[
+                        ("item", "<item>".to_string()),
+                        ("item_index", "0".to_string()),
+                    ],
+                    None,
+                )?;
+                push("per-item".into(), &p);
+            }
+            _ => {
+                let p = leaf::prepare_leaf(&cx, s, 1, &s.id, &[], None)?;
+                push("main".into(), &p);
+            }
+        }
+        for fb in &s.fallback {
+            let p = leaf::prepare_leaf(&cx, s, 1, &format!("{}.fb-{fb}", s.id), &[], Some(fb))?;
+            push(format!("fallback:{fb}"), &p);
+        }
+        steps.push(json!({
+            "step": s.id,
+            "kind": describe_kind(flow, s),
+            "effects": s.effects(flow).as_str(),
+            "replay_unfinished": s.replay_policy(flow).as_str(),
+            "context": s.context,
+            "context_delivery": s.context_delivery().as_str(),
+            "invocations": invocations,
+            "route": s.route.iter().map(|r| json!({"goto": r.goto})).collect::<Vec<_>>(),
+        }));
+    }
+    // The closure a real run would pin, built the same way, so `plan --json`
+    // answers "would resuming this run still be the same run" before there is
+    // a run at all.
+    let cl = build_closure(
+        flow,
+        extras.flow_path,
+        extras.profiles,
+        extras.workspace,
+        None,
+    )?;
+    let mut warnings = flow::strict_warnings(flow);
+    warnings.extend(flow.replay_warnings());
+    warnings.extend(extras.workspace.warnings.iter().cloned());
+    let body = json!({
+        "flow": abs(extras.flow_path).display().to_string(),
+        "flow_name": flow.name,
+        "state_dir": extras.state_root.explicit().map(|p| p.display().to_string()),
+        "runs_dir": extras.state_root.runs_dir().display().to_string(),
+        "profile_overlays": extras.profiles.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "workspace": extras.workspace.to_json(),
+        "contexts": flow.context_plan(extras.flow_path)?.to_json(),
+        "execution_closure": cl.to_json(),
+        "replay": flow.replay_summary(),
+        "unsafe_overrides": flow.unsafe_overrides(),
+        "static_max_leaves": flow.static_max_leaves(),
+        "vars": vars,
+        "steps": steps,
+        "warnings": warnings,
+    });
+    let saved = match &extras.save {
+        Some(explicit) => Some(save_plan(run_dir, explicit.as_deref(), extras)?),
+        None => None,
+    };
+    let mut body = body;
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "saved_to".into(),
+            json!(saved.as_ref().map(|p| p.display().to_string())),
+        );
+    }
+    machine::emit(&machine::envelope("plan", true, 0, body));
+    Ok(0)
+}
+
+/// Everything outside the flow file that decides what this run does.
+///
+/// `tool_versions` is passed in when a real run has already probed them, and
+/// omitted by `plan`, which must not spawn anything: a plan therefore pins the
+/// same inputs minus the versions it is not allowed to go and look up.
+fn build_closure(
+    flow: &flow::Flow,
+    flow_path: &Path,
+    profiles: &[PathBuf],
+    workspace: &flow::WorkspacePlan,
+    tool_versions: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<closure::Closure, String> {
+    let mut cl = closure::Closure::new();
+    cl.set("sfh_version", json!(VERSION));
+    cl.set_file("flow", flow_path);
+    // The merged configuration is pinned by DIGEST, not embedded: the full
+    // document is several kilobytes of JSON that would drown the closure file
+    // a human is meant to read when a resume is refused, and the digest answers
+    // the only question the closure asks - did it change.
+    cl.set(
+        "effective_config",
+        json!({ "sha256": sha256::hex(flow.effective_config_json()?.as_bytes()) }),
+    );
+    for (i, p) in profiles.iter().enumerate() {
+        cl.set_file(&format!("profile_overlay.{i}"), p);
+    }
+    // Context files are pinned by CONTENT: an edited TASK.md changes what the
+    // run means, while leaving the flow byte-identical.
+    let flow_dir = flow_path.parent().unwrap_or(Path::new("."));
+    for (name, source) in &flow.contexts {
+        match source.kind() {
+            Ok("file") => {
+                let raw = source.file.clone().unwrap_or_default();
+                cl.set_file(
+                    &format!("context.{name}"),
+                    &context::resolve_source_path(flow_dir, &raw),
+                );
+            }
+            // An inline or template context is already part of the flow's
+            // bytes, but pinning it by name keeps the closure readable and
+            // survives a future where a template can reach outside the file.
+            Ok(kind) => {
+                cl.set(
+                    &format!("context.{name}"),
+                    json!({"kind": kind, "sha256": sha256::hex(
+                        source.inline.as_deref().or(source.template.as_deref()).unwrap_or("").as_bytes()
+                    )}),
+                );
+            }
+            Err(e) => return Err(format!("contexts.{name}: {e}")),
+        }
+    }
+    cl.set(
+        "workspace",
+        json!({
+            "mode": workspace.resolved.as_str(),
+            "root": workspace.root,
+            "base": workspace.base,
+        }),
+    );
+    cl.set("unsafe_overrides", json!(flow.unsafe_overrides()));
+    if let Some(tools) = tool_versions {
+        cl.set("tools", serde_json::Value::Object(tools.clone()));
+    }
+    Ok(cl)
 }
 
 fn log_event(f: &mut std::fs::File, mut v: serde_json::Value) -> Result<(), String> {
@@ -5176,7 +6200,9 @@ where
             json!({"ts": utc_stamp(), "event": "step_start", "step": id, "parent": group,
                    "visit": visit, "cmd": prep.inv.describe(),
                    "session_parent": session_parent_json(prep),
-                   "protocol_expected": protocol::expected_kind(&prep.parse)}),
+                   "protocol_expected": protocol::expected_kind(&prep.parse),
+                   "context_hash": prep.context_hash,
+                   "context_file": prep.context_file.as_ref().and_then(|p| file_name(p))}),
         )?;
     }
     Ok(())

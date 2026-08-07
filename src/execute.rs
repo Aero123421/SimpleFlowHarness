@@ -1275,6 +1275,34 @@ fn spawn_reader<R: Read + Send + 'static>(
     rx
 }
 
+/// Where a program name resolves on this machine, or `None` when it does not.
+///
+/// Deliberately does NOT spawn anything: preflight has to be able to say "that
+/// binary is not installed" without running a stranger's executable to find
+/// out. A name that already carries a path separator or an extension is taken
+/// as a path and only checked for existence.
+pub fn which(name: &str) -> Option<String> {
+    let direct = Path::new(name);
+    if name.contains('/') || name.contains('\\') {
+        return direct.is_file().then(|| name.to_string());
+    }
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        for ext in exts {
+            let cand = dir.join(format!("{name}{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 /// Capture `<program> --version` (no AI call) for the run's provenance record.
 /// Best-effort `--version` for the provenance record. Bounded: a CLI that
 /// hangs on --version (an auth prompt, a stuck update check) must not stop the
