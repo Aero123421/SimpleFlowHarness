@@ -44,7 +44,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、展開、`PATH` 設定までを行います。
 実行前に [Shell版](installers/sfh-installer.sh) および [PowerShell版](installers/sfh-installer.ps1) の内容を確認できます。
 バージョン固定や設定変更オプション:
-- `SFH_VERSION=1.2.1`: 特定のバージョンに固定。
+- `SFH_VERSION=1.3.0`: 特定のバージョンに固定。
 - `SFH_INSTALL_DIR=/path/to/bin`: インストール先ディレクトリの指定。
 - `SFH_NO_MODIFY_PATH=1`: 永続的な `PATH` 変更を無効化。
 
@@ -267,6 +267,37 @@ steps:
 `rerun` が既定で、これまでの release と同じ挙動です。`stuck`（exit 4）と `fail`（exit 1）は何も起動せず、workspace と部分成果物をそのまま残し、`SFH_REPLAY_REFUSED` を返します。
 
 これは retry（同じ invocation の再試行）でも、fallback（別 profile）でも、route による再入場でも、完了済み step の結果の再利用でもありません。sfh は外部副作用について exactly-once を約束しません。約束するのは、黙って再実行しないことと、不確かな結果を成功と偽らないことです。
+
+### `--carry-budget-from` — flow 自体が間違っていたとき（v1.3.0）
+
+resume が答えるのは「run が中断された、続けろ」です。flow と execution closure が変わっていないことを要求しますが、それは正しい。完了済み step の再利用は、それを生んだ定義がまだ有効なときにしか意味を持たないからです。
+
+だから resume では扱えない2つ目のケースがあります。run が止まり、証拠を読み、結論が「**flow** が間違っていた」だった場合 — 上限の値、別の binary を指していた command、絶対に発火しない route。直すのが正しい対応で、直せば closure が変わるので `--resume` は拒否します。残るのは新しい run を始めることだけで、その counter はすべてゼロから始まります。すでに使った予算は消え、辻褄を合わせる手段は flow の上限を手で書き換えることだけでした。手計算は会計ではありません。検証できず、数え間違えた瞬間に壊れ、2回目の試行が1回目の続きだったという記録もどこにも残りません。
+
+```bash
+sfh run corrected-flow.yaml --carry-budget-from .sfh/runs/20260808-021925-loop
+```
+
+先行 run の支出を持った**新しい** run を開始します:
+
+| 引き継ぐもの | 効く上限 |
+|---|---|
+| leaf run 数 | `max_total_steps` |
+| **step ごとの**訪問回数の最大値 | `max_visits` — 残り4周の loop は本当に残り4周 |
+| 報告済み cost | `max_cost_usd` |
+| active run 時間 | `wall_clock_sec` |
+
+**counter だけです。** step output、session、routing 位置、workspace はすべて置いていきます。それらを作った flow は、これから走る flow ではないからです。`--resume` と `--carry-budget-from` は別の診断に対する別の答えなので、同時指定は usage error です。
+
+**合成します**: 引き継いだ run からさらに引き継いでも、最初の run の支出は残ります。2回目の修正で1回目の試行が黙って消えるのは、この機能が人手から取り上げようとしているまさにその算術です。
+
+**記録が残ります**: `budget_carried` durable event、`meta.json` の `carried_budget`、stderr の1行（`--dry-run` でも出ます）。corrected flow がもう定義していない step id は「適用できなかった」と名指しで報告し、黙って落としません。
+
+**二重計上しません**: 引き継いだ run 自身の `cost_usd` は先行 run の支出を含みます（`max_cost_usd` はその値で判定されるので当然です）が、先行 run の行にも同じ金額が載っています。`sfh runs list` は各 run の `carried_cost_usd` を差し引いてから合計するので、修正を重ねても実際に払った額のままです。`sfh runs show` は引き継いだ分を1行で明示します。
+
+**まだ走っている run からの引き継ぎは拒否します。** 支出が確定していないので、取った瞬間にそのスナップショットは古くなります。拒否メッセージは `sfh wait` と `sfh stop` を示します。heartbeat が止まっていても記録された process が本当にその run のものであるケース（wedged）も「まだ走っている」として扱います。
+
+止まった run の JSON envelope は `resume` と `carry_budget` の**両方**を next action に出します。flow が悪かったのか世界が悪かったのかを知っているのは読み手だけだからです。
 
 ### `exit_conflict:` — exit code と protocol が食い違うとき（v1.2.1）
 

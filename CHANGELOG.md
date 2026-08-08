@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+## v1.3.0 — 2026-08-08
+
+v1.2.1のすべての修正に加えて、そのv1.2.1のきっかけになった事例が残していた
+最後の穴を塞ぎます。新しいflow keyはありません。既存flowの挙動も変わりません。
+
+### `--carry-budget-from`: flowを直したあとも、使った予算を持ち越せるようになりました
+
+- **これは何が起きたか。** runが止まり、原因が「flow自体が間違っていた」だった
+  とき、flowを直すのが正しい対応です。ところが直すとeffective-config
+  fingerprintとexecution closureが変わるので、`--resume`は正しく拒否します。
+  残された手段は「新しいrunを始める」だけで、そのrunのcounterはすべてゼロから
+  始まります。つまり**すでに使った予算が消えます**。実際の運用では、flowの上限を
+  手で書き換えて（「1回消費済みなので残り9回」）辻褄を合わせることになりました。
+  手計算は会計ではありません。検証できず、数え間違えた瞬間に壊れ、2回目のrunが
+  1回目の続きだったという記録もどこにも残りません。
+- `sfh run <flow> --carry-budget-from <run-dir>` は**新しいrun**を開始し、
+  そのrunに先行runの支出を引き継がせます:
+  - `max_total_steps` に対するleaf run数
+  - `max_visits` に対する**step単位の訪問回数の最大値**（loopの残り回数がそのまま
+    残り回数として効きます）
+  - `max_cost_usd` に対する報告済みcost
+  - `wall_clock_sec` に対するactive時間
+- **引き継ぐのはcounterだけです。** step outputもsessionもrouting位置もworkspaceも
+  引き継ぎません。それらを作ったflowは、これから走るflowではないからです。
+  `--resume`が拒否した理由がまさにそれです。両者は別の問いなので、同時指定は
+  usage errorにしています。
+- **合成します。** 引き継いだrunからさらに引き継ぐと、最初のrunの支出も残ります。
+  2回目の修正で1回目の支出が黙って消えるのは、この機能が手作業から取り上げようと
+  しているまさにその算術なので、`budget_carried` eventはlog読み取り時に
+  baselineとして畳み込まれます。
+- **記録が残ります。** `budget_carried` durable event、`meta.json`の
+  `carried_budget`、そして人間向けの1行。corrected flowがもう定義していないstep id
+  は「適用できなかった」と**名指しで**報告します（黙って忘れません）。
+- 止まったrunのJSON envelopeは `resume` と `carry_budget` の**両方**をnext actionと
+  して出します。flowが悪かったのか世界が悪かったのかを知っているのは読み手だけ
+  だからです。
+- **二重計上しません。** 引き継いだrunの `cost_usd` は先行runの支出を含みます
+  （`max_cost_usd` はその値で判定されるので当然です）が、先行run自身の行にも同じ
+  金額が載っています。`sfh runs list` の `total_cost_usd` は各runの
+  `carried_cost_usd` を差し引いて合計するので、hopを重ねても実際に払った額のまま
+  です。`sfh runs show` は引き継いだ分を1行で明示します。
+- 引き継いだactive時間も `budget_carried` eventから復元できます。`status.json` は
+  detachした`--resume`で作り直されるため、そこだけを頼りにすると
+  `wall_clock_sec` の引き継ぎだけが静かにゼロに戻っていました。
+
 ## v1.2.1 — 2026-08-08
 
 v1.2.0を実運用へ投入して見つかった4件の穴を塞ぐrelease。新しいkeyを書かなければ

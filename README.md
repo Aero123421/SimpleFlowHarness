@@ -42,7 +42,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 The installer detects your OS and architecture, verifies the SHA-256 checksum, extracts the binary, and updates your `PATH`.
 You can inspect the [Shell](installers/sfh-installer.sh) and [PowerShell](installers/sfh-installer.ps1) scripts prior to execution.
 To pin a specific version or customize installation behavior:
-- `SFH_VERSION=1.2.1`: Pin the target release version.
+- `SFH_VERSION=1.3.0`: Pin the target release version.
 - `SFH_INSTALL_DIR=/path/to/bin`: Specify a custom installation directory.
 - `SFH_NO_MODIFY_PATH=1`: Skip automatic `PATH` modifications.
 
@@ -265,6 +265,37 @@ steps:
 `rerun` is the default and is what every earlier release did. `stuck` (exit 4) and `fail` (exit 1) launch nothing at all, keep the workspace and every partial artifact, and answer with `SFH_REPLAY_REFUSED`.
 
 This is not retry (another attempt at the same invocation), not fallback (a different profile), not a route revisit, and not the reuse of a completed step's result. sfh does not promise exactly-once for external effects; it promises not to silently re-run one, and not to call an uncertain outcome a success.
+
+### `--carry-budget-from` — when the flow itself was wrong (v1.3.0)
+
+A resume answers "the run was interrupted; continue it". It requires the flow and the whole execution closure to be unchanged, and that is right: reusing finished steps only means anything if the definition that produced them still holds.
+
+So there is a second case it cannot serve. A run stops, you read the evidence, and the conclusion is that **the flow** was wrong — a bad ceiling, a command pointed at the wrong binary, a route that could never fire. Fixing it is the correct response, and fixing it invalidates the closure, so `--resume` refuses. What was left was a fresh run whose counters all started at zero: the budget already spent simply vanished, and the only way to account for it was to edit the ceilings in the flow by hand. Hand arithmetic is not accounting. It is unverifiable, it is wrong the moment anyone loses count, and it leaves nothing recording that the second attempt was a continuation of the first.
+
+```bash
+sfh run corrected-flow.yaml --carry-budget-from .sfh/runs/20260808-021925-loop
+```
+
+This starts a **new** run holding the earlier one's spend:
+
+| Carried | Counted against |
+|---|---|
+| leaf runs | `max_total_steps` |
+| highest visit number, **per step id** | `max_visits` — a loop with four laps left really has four laps left |
+| reported cost | `max_cost_usd` |
+| active run time | `wall_clock_sec` |
+
+**Counters only.** Step outputs, sessions, the routing position and the workspace are all left behind, because the flow that produced them is not the flow about to run. `--resume` and `--carry-budget-from` are different answers to different diagnoses, so asking for both is a usage error.
+
+It **composes**: carrying from a run that itself carried keeps the original run's spend too. A second correction silently forgetting the first attempt is exactly the arithmetic this exists to take out of human hands.
+
+It is **on the record**: a `budget_carried` durable event, a `carried_budget` block in `meta.json`, and one line on stderr (including under `--dry-run`). A step id the corrected flow no longer defines is reported by name as not applied, never silently dropped.
+
+It is **not double-billed**: a carried run's own `cost_usd` includes its ancestor's spend, because that is the number `max_cost_usd` is judged against — but the ancestor's row reports those same dollars. `sfh runs list` therefore subtracts each run's `carried_cost_usd` before totalling, so a chain of corrections still reports what was actually paid. `sfh runs show` names the inherited portion on its own line.
+
+**Carrying from a run that is still going is refused.** Its spend is not final, so the snapshot would be wrong the instant it was taken. The refusal names `sfh wait` and `sfh stop`. A wedged run — heartbeat stale, but the recorded process really is still the one that started it — counts as still going too.
+
+A failed or stuck run's JSON envelope now offers **both** `resume` and `carry_budget` as next actions — only the reader knows whether the flow was wrong or the world was.
 
 ### `exit_conflict:` — when the exit code and the protocol disagree (v1.2.1)
 
