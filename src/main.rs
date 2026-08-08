@@ -37,7 +37,9 @@ USAGE:
   sfh config show <flow.yaml>             Show merged config (env values redacted)
   sfh init [file] [--force]              Write an example flow file (default: flow.yaml)
   sfh guide                              Show the compact AI-oriented flow guide
-  sfh preflight [flow.yaml] [--json]     Local capability check; makes NO model calls
+  sfh preflight [flow.yaml] [--json] [--probe-binaries]
+                                          Local capability check, no model calls (--probe-binaries
+                                          also RUNS a bin: override's --help/--version, not just claude/codex/etc.'s own)
   sfh help [command]                     Show overall or command-specific usage
   sfh runs list|show|why|clean [...]     Browse, explain or prune past runs
   sfh workspaces list|show|clean|remove  Inspect or prune managed workspaces
@@ -85,11 +87,17 @@ STATUS / WAIT / STOP OPTIONS:
   (a wait timeout does NOT cancel the run - use `sfh stop` for that)
 
 PREFLIGHT OPTIONS:
-  preflight [flow.yaml] [--profiles file] [--state-dir d] [--json]
+  preflight [flow.yaml] [--profiles file] [--state-dir d] [--json] [--probe-binaries]
   Free and offline: which binaries are installed, at what version, whether the
   flags each adapter depends on are still in their --help, which protocol they
   speak, what access it can actually enforce, and what workspace and context
   this flow would build. Makes NO model calls - `sfh doctor` is that check.
+  A tool's own default launcher (e.g. claude, codex) is always probed: sfh
+  ships that adapter and has verified its --help/--version are inert. A
+  bin: override names an arbitrary program the flow chose, so by default it
+  is only RESOLVED, never run - the same rule a cmd: step's program already
+  gets. Pass --probe-binaries to actually EXECUTE a bin: override's own
+  --help/--version too (needs a flow file; a flowless survey has none).
 
 DOCTOR OPTIONS:
   doctor [flow.yaml] [--runs-dir d] [--state-dir d] [--timeout SEC]
@@ -228,7 +236,7 @@ fn cmd_help(command: &str) -> i32 {
         "init" => "sfh init [file] [--force]",
         "guide" => "sfh guide",
         "runs" => "sfh runs list|show|why|clean [options]",
-        "preflight" => "sfh preflight [flow.yaml] [--profiles file] [--state-dir d] [--json]\nLocal capability check. Makes NO model calls - `sfh doctor` does that.",
+        "preflight" => "sfh preflight [flow.yaml] [--profiles file] [--state-dir d] [--json] [--probe-binaries]\nLocal capability check. Makes NO model calls - `sfh doctor` does that.\nA bin: override is resolved but never run unless --probe-binaries is given, which DOES execute its --help/--version.",
         "workspaces" => "sfh workspaces list|show|clean|remove [options]",
         _ => {
             print!("{HELP}");
@@ -426,6 +434,7 @@ fn cmd_preflight(rest: &[String]) -> i32 {
     let mut state_dir: Option<PathBuf> = None;
     let mut profiles: Vec<PathBuf> = Vec::new();
     let mut as_json = false;
+    let mut probe_binaries = false;
     let mut i = 0;
     while i < rest.len() {
         let r: Result<(), String> = match rest[i].as_str() {
@@ -437,6 +446,13 @@ fn cmd_preflight(rest: &[String]) -> i32 {
             }
             "--json" => {
                 as_json = true;
+                Ok(())
+            }
+            // P0-05: a bin: override is resolved but never run by default -
+            // this is the opt-in to actually execute its --help/--version
+            // too, same as a tool sfh ships support for already gets.
+            "--probe-binaries" => {
+                probe_binaries = true;
                 Ok(())
             }
             s if s.starts_with('-') => Err(format!("unknown flag '{s}'")),
@@ -457,8 +473,19 @@ fn cmd_preflight(rest: &[String]) -> i32 {
     if !profiles.is_empty() && flow_path.is_none() {
         return usage_err("--profiles needs a flow file to apply the overlay to");
     }
+    if probe_binaries && flow_path.is_none() {
+        return usage_err(
+            "--probe-binaries needs a flow file: a flowless survey only ever probes each adapter's own default launcher, which is already probed without it",
+        );
+    }
     let root = state::StateRoot::resolve(state_dir.as_deref(), None);
-    preflight::run(flow_path.as_deref(), &root, &profiles, as_json)
+    preflight::run(
+        flow_path.as_deref(),
+        &root,
+        &profiles,
+        as_json,
+        probe_binaries,
+    )
 }
 
 fn cmd_workspaces(rest: &[String]) -> i32 {
@@ -1072,6 +1099,11 @@ steps:
             super::cmd_run(&["flow.yaml".into(), "-q".into(), "-v".into()]),
             2,
             "opposite output modes must not be order-dependent"
+        );
+        assert_eq!(
+            super::cmd_preflight(&["--probe-binaries".into()]),
+            2,
+            "--probe-binaries without a flow file is a user error: a flowless survey has no bin: overrides to opt into probing"
         );
     }
 }

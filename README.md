@@ -148,7 +148,7 @@ steps:
 ### Sessions: Continuation & Forking
 
 - **`continue_from: step_id`**: Continues a single server-side session from a prior step.
-- **`fork_from: step_id`**: Branches an independent child session from a parent step (supported on `claude`, `opencode`, `grok`, and `pi`).
+- **`fork_from: step_id`**: Branches an independent child session from a parent step (supported on `codex`, `claude`, `opencode`, `grok`, and `pi`). codex's fork shipped after this adapter's last-verified baseline, so sfh also demands live proof from the installed binary — `codex exec --help` mentioning `fork` — before using it; an older codex is refused with a clear message rather than launched blind.
 
 ### Detached Runs & Operations
 
@@ -326,11 +326,11 @@ It **composes**: carrying from a run that itself carried keeps the original run'
 
 It is **on the record**: a `budget_carried` durable event, a `carried_budget` block in `meta.json`, and one line on stderr (including under `--dry-run`). A step id the corrected flow no longer defines is reported by name as not applied, never silently dropped.
 
-It is **not double-billed**: a carried run's own `cost_usd` includes its ancestor's spend, because that is the number `max_cost_usd` is judged against — but the ancestor's row reports those same dollars. `sfh runs list` therefore subtracts each run's `carried_cost_usd` before totalling, so a chain of corrections still reports what was actually paid. `sfh runs show` names the inherited portion on its own line.
+It is **not double-billed**: `own_cost_usd` is what a run spent itself, `carried_cost_usd` is what it inherited, and `budget_position_usd` — own plus carried, the number `max_cost_usd` is judged against — is what `cost_usd` has always meant and still does (kept as its alias, so an existing consumer of that field sees no change). `sfh runs list` totals `own_cost_usd` alone, so a chain of corrections reports what was actually paid instead of counting an inherited dollar once on the ancestor's row and again on every descendant's. `sfh runs show` breaks out the same numbers for one run, plus `lineage_cost_usd`: the full carry ancestry back to a run that carried nothing, or `null` — never a partial sum — the moment `runs clean` has removed an ancestor the chain can no longer verify. There is deliberately no lineage total across a `runs list` listing: two rows that share an ancestor would double-count it, which is the bug these four fields exist to split apart.
 
-**Carrying from a run that is still going is refused.** Its spend is not final, so the snapshot would be wrong the instant it was taken. The refusal names `sfh wait` and `sfh stop`. A wedged run — heartbeat stale, but the recorded process really is still the one that started it — counts as still going too.
+**Carrying needs positive proof the source stopped, not merely the absence of proof it didn't.** A live status still reading `running` refuses outright, and so does a wedged run — heartbeat stale, but the recorded process really is still the one that started it. Short of that, an unreadable or missing `status.json` used to read as "not running" and therefore safe to carry from; a run whose evidence went missing is not the same as one that finished, so it now also needs the log itself to prove a stop — a durable `run_end` event, or a terminal routing position from an owner confirmed dead — before the carry is allowed. The refusal names `sfh wait` and `sfh stop` either way.
 
-A failed or stuck run's JSON envelope now offers **both** `resume` and `carry_budget` as next actions — only the reader knows whether the flow was wrong or the world was.
+A failed or stuck run's JSON envelope reports **both** `resume` and `carry_budget` as next actions, each diagnosed rather than assumed: `resumable`/`carryable`, a `reason`, and `requires` for a flag that has to come first. `argv` is present only when the action can actually succeed — a run stuck on an exhausted `max_visits` refuses resume outright instead of walking back into the same wall, a workspace-drift or changed-closure failure comes back with `--adopt-workspace`/`--force-resume` already baked into the argv, and a run whose spend cannot yet be confirmed final refuses carry. Only the reader knows whether the flow was wrong or the world was; sfh only ever hands back a command it has confirmed will run.
 
 ### `exit_conflict:` — when the exit code and the protocol disagree (v1.2.1)
 
@@ -377,7 +377,7 @@ Puts `runs`, `workspaces`, `plans` and `doctor` under one directory. `--runs-dir
 
 ## Driving sfh from a program
 
-`--json` makes stdout an envelope and nothing else — progress and warnings go to stderr, and a configuration error is still an envelope rather than prose.
+`--json` on `run`, `plan`, `wait`, `stop`, `status`, `preflight` and `workspaces` makes stdout an envelope and nothing else — progress and warnings go to stderr, and a configuration error is still an envelope rather than prose. `validate --json` and `runs list|show|why --json` predate the envelope and still print their own bare JSON: no `schema_version`, no `command`, no `exit_code`, no stable error code. Check the response for `schema_version` before relying on the header fields below — its absence means you are looking at one of those four. See [docs/machine-api.md](docs/machine-api.md) for the full contract, every header field, and the exact shape the bare-JSON holdouts answer with instead.
 
 ```bash
 sfh preflight flow.yaml --json          # free: no model calls
@@ -403,7 +403,7 @@ sfh wait <run-dir> --json               # blocks, then the result
 }
 ```
 
-Failures carry a code whose meaning is fixed for all of v1.2.x — branch on the code, not on the message, which is allowed to improve:
+Failures carry a code whose meaning is fixed for as long as `schema_version` does not change (currently `1`) — branch on the code, not on the message, which is allowed to improve:
 
 `SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`.
 
@@ -414,17 +414,28 @@ Failures carry a code whose meaning is fixed for all of v1.2.x — branch on the
 ### `preflight` vs `doctor`
 
 ```text
-sfh preflight  — free. Binary present? version? required flags still in --help?
-                 which protocol, session support, cost coverage, access gaps?
+sfh preflight  — free. Binary present? For the tool's own launcher: version?
+                 required flags still in --help? (a bin: override is
+                 resolved only, unless --probe-binaries actually runs it)
+                 which protocol, session support, cost coverage, access
+                 enforcement (sandboxed/best-effort/unsupported) and gaps?
                  which binary is every cmd: step's program, by absolute path?
                  what workspace and context would this flow build?
 sfh doctor     — paid. Sends a real one-token prompt and checks sfh can still
                  parse the answer. The only way to catch protocol drift.
 ```
 
-`doctor` probes from an isolated scratch directory, so it reports on the adapter rather than on whatever instruction files happen to be in the directory you ran it from.
+Both `doctor` and preflight's own probes run from an isolated scratch directory, so what they report is about the adapter, not whatever instruction files happen to sit in the directory you ran the command from.
 
 Since v1.2.1 preflight also covers the programs your `cmd:` steps launch — the verification shell, the build, the test runner — which are usually the ones a flow leans on hardest. It **resolves** them and reports the absolute path each name lands on; it never runs them, because `--help` is safe to send to an adapter sfh ships support for and is not safe to send to an arbitrary program a flow names. A name that resolves to nothing is a blocker. On Windows, a bare `bash` that resolves to `System32\bash.exe` is refused outright: that is the WSL launcher, a different operating system that cannot read this checkout's paths or a worktree's `.git` file, so those commands fail in seconds for a reason that has nothing to do with your code. Write the shell you mean — `"C:\\Program Files\\Git\\bin\\bash.exe"` — and sfh says nothing.
+
+A preset tool's `bin:` override gets the identical treatment. sfh has verified that every shipped adapter's own launcher is inert on `--help`/`--version`, but `bin:` can point a trusted tool's name at any program a flow wants, and preflight has no way to tell "a newer claude" from "a script that deploys". Only the tool's own default launcher, resolved on PATH, is probed automatically; an override is resolved and left unrun unless you opt in:
+
+```bash
+sfh preflight flow.yaml --probe-binaries
+```
+
+which actually runs `--version`/`--help` against every override too (still from the same isolated scratch directory). Either way, the report says which happened instead of leaving a bare `null` version to be misread as "checked and clean": each tool's JSON carries `probe_state` (`probed`, `resolved_not_probed`, or `not_found`), and the top-level `probe_binaries` field records whether overrides were even allowed to run.
 
 sfh pins **no minimum version** for any adapter. Rather than assert a floor it has not verified against each CLI's documentation and a live probe, `preflight` reports the installed version and says the requirement is unknown.
 
@@ -443,19 +454,21 @@ sfh pins **no minimum version** for any adapter. Rather than assert a floor it h
 ## Artifacts & Public Schemas
 
 Every run generates durable, append-only records inside `.sfh/runs/<run-id>/`:
-- `log.jsonl`: Structured event stream (step start, completion, token usage, cost, protocol evidence, workspace checkpoints).
-- `<step_id>.out.txt` & `<step_id>.err.txt`: Bounded raw stdout/stderr snapshots. Streams over 32 MiB retain their head and tail with an omission marker; structured final answers and accounting are processed independently from the complete stream.
+- `log.jsonl`: Structured event stream (step start, completion, token usage, cost, protocol evidence, workspace checkpoints, context snapshot).
+- `<step_id>.out.txt` & `<step_id>.err.txt`: Bounded raw stdout/stderr snapshots, capped at 32 MiB. A stream over the cap keeps its head and tail with an omission marker in between. pi, codex and opencode speak line-delimited protocols that can outgrow the cap on a long turn, so each is parsed by a streaming observer that sees the complete pipe instead of the capped file — the terminal record, session id and usage survive regardless, and a single record over 16 MiB fails the step closed rather than being silently dropped. Every other adapter's envelope is a single blob well under the cap and is read back from it like a plain `cmd:` step's output.
 - `status.json`: Real-time status snapshot.
 - `execution-closure.json`: The hashed inputs this run is pinned to.
 - `workspace.json`: The managed workspace, when the flow asked for one.
+- `context-snapshot/` & `context-snapshot.json`: Every `kind: file` context, frozen once at run start (neither is written when a flow declares none) so every step reads the same bytes instead of re-opening the declared path — editing the source file mid-run cannot change what a later step receives. A resumed run keeps the original snapshot rather than capturing a new one, even under `--force-resume`.
 - `<step_id>.context.txt` & `<step_id>.context.json`: The assembled context and its manifest, when the step named any.
 
-When forwarding a command's verbose output into an AI prompt, prefer an explicit bound such as `{{steps.verify.output | tail:80 | truncate:8000}}`; the full artifact remains available through `{{steps.verify.output_file}}`.
+`{{steps.verify.output_file}}` names this same capped `.out.txt`, not a guarantee of the complete stream — sfh keeps no unbounded copy of raw stdout/stderr anywhere. When forwarding a command's verbose output into an AI prompt, prefer an explicit bound such as `{{steps.verify.output | tail:80 | truncate:8000}}` regardless. A step that needs its full output to survive past 32 MiB — a `cmd:` step wrapping a noisy build or test run, say — has to write it itself, to a file in the managed workspace or another artifact path of its own.
 
 Public JSON Schemas:
 - [Flow JSON Schema](schema/flow.schema.json)
 - [Durable Log Event JSON Schema](schema/log-event.schema.json)
 - [Status Snapshot JSON Schema](schema/status.schema.json)
+- [Machine API Reference](docs/machine-api.md): every `--json` command's envelope or bare-JSON shape, the error-code vocabulary, and the stability guarantee.
 
 ---
 

@@ -15,6 +15,8 @@
 //! workspace unless the flow says so out loud.
 
 use crate::{flow, sha256};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The delimiters a `prepend` bundle uses. Fixed, so two runs of the same flow
@@ -133,6 +135,115 @@ impl Containment<'_> {
     }
 }
 
+/// Validate and read one `kind: file` source's bytes off disk: no-follow on
+/// the final path component, canonical containment (unless `allow_external`),
+/// and `optional: true` tolerating a missing file. `Ok(None)` means "skip this
+/// source silently" - an optional source whose file is not there.
+///
+/// This is the one place sfh actually opens a context file named by the flow.
+/// `build()`, below, calls it directly whenever no run has pinned `name` to a
+/// snapshot (a bare call to `context::build`, `sfh plan`, or this module's own
+/// tests); `snapshot_file_contexts` (engine.rs, once at run start) calls it to
+/// decide what to freeze. Either caller gets the identical refusal for a
+/// symlink planted at the declared name or a path that walks out through a
+/// directory link - the checks live in exactly one place.
+pub fn read_file_source(
+    name: &str,
+    raw: &str,
+    external: bool,
+    containment: &Containment,
+    optional: bool,
+) -> Result<Option<String>, String> {
+    let path = resolve_source_path(containment.flow_dir, raw);
+    // No-follow on the final component AND canonical containment. The first
+    // refuses a link planted at the declared name; the second refuses a path
+    // that walks out through a directory link. Both are needed - either alone
+    // is bypassable.
+    match path.symlink_metadata() {
+        Ok(md) if md.file_type().is_symlink() && !external => {
+            return Err(format!(
+                "contexts.{name}: refusing to read '{raw}': it is a symlink, and a link can point anywhere. Set allow_external: true if that is intended."
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if optional {
+                return Ok(None);
+            }
+            return Err(format!(
+                "contexts.{name}: cannot read '{raw}': {e} (set optional: true to tolerate a missing file)"
+            ));
+        }
+        Err(e) => return Err(format!("contexts.{name}: cannot stat '{raw}': {e}")),
+    }
+    if !external {
+        containment
+            .check(&path)
+            .map_err(|e| format!("contexts.{name}: {e}"))?;
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("contexts.{name}: cannot read '{raw}': {e}"))?;
+    Ok(Some(text))
+}
+
+thread_local! {
+    /// The run this thread is currently preparing steps for, if any: which
+    /// `kind: file` context sources were pinned at run start, and where their
+    /// frozen bytes now live.
+    ///
+    /// A name mapped to `None` means "captured as legitimately absent" - an
+    /// `optional: true` source with no file at run start - which is itself a
+    /// pinned fact: the source stays absent for the rest of the run even if
+    /// something creates the file later. A name simply MISSING from the map
+    /// means run start never managed to pin it at all (a symlink refused, a
+    /// required file that was not there - see `snapshot_file_contexts`'s doc
+    /// comment for why that is deferred rather than fatal); `build()` falls
+    /// back to a live, re-validated read in that one case, which reproduces
+    /// exactly the error a step naming it has always produced.
+    ///
+    /// A thread-local, not a plain global: sfh does all step preparation for
+    /// one run on a single thread (a fan-out's members are separate OS
+    /// processes, not OS threads - see leaf::prepare_leaf's callers), so this
+    /// is exactly as global as a real run needs. In `cargo test`, where many
+    /// independent "runs" share a process across a thread pool, it keeps
+    /// them from ever reading each other's pins.
+    static SNAPSHOT: RefCell<Option<HashMap<String, Option<PathBuf>>>> = const { RefCell::new(None) };
+}
+
+/// Releases this thread's pin when it drops, so a thread the test pool
+/// later reuses for an unrelated case starts clean instead of inheriting a
+/// finished run's snapshot.
+pub struct SnapshotGuard(());
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        SNAPSHOT.with(|s| *s.borrow_mut() = None);
+    }
+}
+
+/// Pin this thread's `kind: file` context reads to `map` until the returned
+/// guard drops - see `SNAPSHOT` for what an entry, or its absence, means.
+/// `build()` consults this before ever touching the live filesystem for a
+/// file source, which is what makes "the bytes execution-closure.json pinned"
+/// and "the bytes a step was handed" the same bytes, by construction, instead
+/// of two separate reads that a live edit could pull apart.
+#[must_use = "context reads fall back to the live path the instant this guard drops"]
+pub fn activate_snapshot(map: HashMap<String, Option<PathBuf>>) -> SnapshotGuard {
+    SNAPSHOT.with(|s| *s.borrow_mut() = Some(map));
+    SnapshotGuard(())
+}
+
+/// `None` covers BOTH "no run has pinned anything on this thread" and "one
+/// has, but never captured this name" - collapsing those two is deliberate.
+/// A caller with no pin active (a bare `context::build`, `sfh plan`) and a
+/// step whose context failed to pin at run start both want the same thing: a
+/// fresh live read with `read_file_source`'s full guarantees, not a hard
+/// error just because SOME OTHER context on the same thread happens to be
+/// pinned.
+fn snapshot_lookup(name: &str) -> Option<Option<PathBuf>> {
+    SNAPSHOT.with(|s| s.borrow().as_ref().and_then(|map| map.get(name).cloned()))
+}
+
 /// Assemble one step's context.
 ///
 /// `render` turns a `template:` source into text using exactly the same
@@ -159,36 +270,33 @@ pub fn build(
         let (described, text) = match kind {
             "file" => {
                 let raw = source.file.clone().unwrap_or_default();
-                let path = resolve_source_path(containment.flow_dir, &raw);
-                // No-follow on the final component AND canonical containment.
-                // The first refuses a link planted at the declared name; the
-                // second refuses a path that walks out through a directory
-                // link. Both are needed - either alone is bypassable.
-                match path.symlink_metadata() {
-                    Ok(md) if md.file_type().is_symlink() && !external => {
-                        return Err(format!(
-                            "contexts.{name}: refusing to read '{raw}': it is a symlink, and a link can point anywhere. Set allow_external: true if that is intended."
-                        ))
+                // A run that pinned this name at start reads ONLY the frozen
+                // copy from here on - re-opening the live path here is
+                // exactly the bug this snapshot exists to close (a TASK.md
+                // edited between two steps of the same run must not change
+                // what either step is handed). See `snapshot_lookup` for what
+                // the two `None`s and the `Some(None)` below each mean.
+                match snapshot_lookup(name) {
+                    Some(Some(snapshot_path)) => {
+                        let text = std::fs::read_to_string(&snapshot_path).map_err(|e| {
+                            format!(
+                                "contexts.{name}: cannot read this run's pinned snapshot of '{raw}': {e}"
+                            )
+                        })?;
+                        (raw, text)
                     }
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        if source.optional.unwrap_or(false) {
-                            continue;
-                        }
-                        return Err(format!(
-                            "contexts.{name}: cannot read '{raw}': {e} (set optional: true to tolerate a missing file)"
-                        ));
-                    }
-                    Err(e) => return Err(format!("contexts.{name}: cannot stat '{raw}': {e}")),
+                    Some(None) => continue,
+                    None => match read_file_source(
+                        name,
+                        &raw,
+                        external,
+                        containment,
+                        source.optional.unwrap_or(false),
+                    )? {
+                        Some(text) => (raw, text),
+                        None => continue,
+                    },
                 }
-                if !external {
-                    containment
-                        .check(&path)
-                        .map_err(|e| format!("contexts.{name}: {e}"))?;
-                }
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("contexts.{name}: cannot read '{raw}': {e}"))?;
-                (raw, text)
             }
             "inline" => (
                 "<inline>".to_string(),
@@ -544,5 +652,167 @@ mod tests {
         // wrapped, decorated or reordered in any way.
         let empty = Bundle::default();
         assert_eq!(prepend(&empty, "just the prompt"), "just the prompt");
+    }
+
+    // ---- P0-04: the execution closure pins context files, but steps must
+    // read the SAME bytes, not the live file ----
+
+    #[test]
+    fn a_context_file_edited_between_two_steps_of_one_run_no_longer_changes_what_the_second_step_receives_and_the_closure_still_matches(
+    ) {
+        let dir = std::env::temp_dir().join(format!("sfh-ctx-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let task = dir.join("TASK.md");
+        std::fs::write(&task, "first draft").unwrap();
+        let c = Containment {
+            flow_dir: &dir,
+            workspace: None,
+        };
+
+        // What run start pins into execution-closure.json, and what it
+        // freezes into the run's snapshot, read the same bytes at the same
+        // moment - exactly what build_closure and snapshot_file_contexts do
+        // in engine.rs.
+        let mut closure_at_start = crate::closure::Closure::new();
+        closure_at_start.set_file("context.task", &task);
+        let captured = read_file_source("task", "TASK.md", false, &c, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured, "first draft");
+        let snapshot_path = dir.join("task.snapshot");
+        std::fs::write(&snapshot_path, &captured).unwrap();
+
+        let f = flow_with("  task:\n    file: \"TASK.md\"\n");
+        let mut map = HashMap::new();
+        map.insert("task".to_string(), Some(snapshot_path.clone()));
+        let _guard = activate_snapshot(map);
+        let r = nothing;
+
+        let step1 = build(&f, &["task".into()], &c, None, &mut |t| r(t)).unwrap();
+        assert!(step1.text.contains("first draft"), "{}", step1.text);
+
+        // A human, or another process, edits TASK.md between the two steps.
+        std::fs::write(&task, "second draft, written after the run started").unwrap();
+
+        let step2 = build(&f, &["task".into()], &c, None, &mut |t| r(t)).unwrap();
+        assert!(step2.text.contains("first draft"), "{}", step2.text);
+        assert!(
+            !step2.text.contains("second draft"),
+            "the live edit must not reach a step once this run has pinned a snapshot: {}",
+            step2.text
+        );
+        assert_eq!(step1.hash, step2.hash, "both steps read identical bytes");
+
+        // The closure computed against the frozen snapshot still agrees with
+        // the one computed at run start, even though the LIVE file moved on
+        // in between - the property a resume's closure check depends on.
+        let mut closure_from_snapshot = crate::closure::Closure::new();
+        closure_from_snapshot.set_file("context.task", &snapshot_path);
+        assert_eq!(
+            closure_at_start.fingerprint(),
+            closure_from_snapshot.fingerprint()
+        );
+        assert!(closure_at_start.diff(&closure_from_snapshot).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_template_context_still_sees_fresh_per_step_data_while_a_run_has_a_snapshot_active() {
+        let dir = std::env::temp_dir();
+        let c = Containment {
+            flow_dir: &dir,
+            workspace: None,
+        };
+        let f = flow_with("  live:\n    template: \"{{vars.x}}\"\n");
+        // A snapshot IS active on this thread, as it would be for every real
+        // step of a real run - proving a template is unaffected by one being
+        // active, not merely that it works when nothing is pinned at all.
+        let mut map = HashMap::new();
+        map.insert("unrelated".to_string(), None);
+        let _guard = activate_snapshot(map);
+
+        let calls = std::cell::Cell::new(0u32);
+        let mut render = |_: &str| -> Result<String, String> {
+            let n = calls.get();
+            calls.set(n + 1);
+            Ok(format!("render-{n}"))
+        };
+        let step1 = build(&f, &["live".into()], &c, None, &mut render).unwrap();
+        let step2 = build(&f, &["live".into()], &c, None, &mut render).unwrap();
+        assert!(step1.text.contains("render-0"), "{}", step1.text);
+        assert!(step2.text.contains("render-1"), "{}", step2.text);
+        assert_ne!(
+            step1.hash, step2.hash,
+            "a template's freshness must survive a run-level snapshot being active"
+        );
+    }
+
+    #[test]
+    fn optional_true_with_a_missing_file_still_skips_cleanly_pinned_or_not() {
+        let dir = std::env::temp_dir().join(format!("sfh-ctx-optional-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Containment {
+            flow_dir: &dir,
+            workspace: None,
+        };
+        let f = flow_with("  notes:\n    file: \"notes.md\"\n    optional: true\n");
+        let r = nothing;
+
+        // No run has pinned anything: today's ordinary live-read behaviour.
+        let live = build(&f, &["notes".into()], &c, None, &mut |t| r(t)).unwrap();
+        assert!(live.is_empty(), "{}", live.text);
+
+        // A run HAS pinned this context, and captured it as absent (the file
+        // was not there at snapshot time either).
+        let mut map = HashMap::new();
+        map.insert("notes".to_string(), None);
+        let _guard = activate_snapshot(map);
+        let pinned = build(&f, &["notes".into()], &c, None, &mut |t| r(t)).unwrap();
+        assert!(pinned.is_empty(), "{}", pinned.text);
+
+        // The absence stays pinned even if the file shows up later: a step
+        // later in the same run must not suddenly pick up something run
+        // start never saw.
+        std::fs::write(dir.join("notes.md"), "surprise").unwrap();
+        let still_pinned = build(&f, &["notes".into()], &c, None, &mut |t| r(t)).unwrap();
+        assert!(still_pinned.is_empty(), "{}", still_pinned.text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_context_source_is_still_refused_without_allow_external_pinned_or_not() {
+        let dir = std::env::temp_dir().join(format!("sfh-ctx-symlink-{}", std::process::id()));
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP SECRET").unwrap();
+        let inside = dir.join("inside");
+        std::fs::create_dir_all(&inside).unwrap();
+        let link = inside.join("innocent.txt");
+        std::os::unix::fs::symlink(outside.join("secret.txt"), &link).unwrap();
+        let c = Containment {
+            flow_dir: &inside,
+            workspace: None,
+        };
+        let f = flow_with("  esc:\n    file: \"innocent.txt\"\n");
+        let r = nothing;
+
+        // No snapshot active: the read_file_source refactor changed nothing
+        // about this refusal.
+        let err = build(&f, &["esc".into()], &c, None, &mut |t| r(t)).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+
+        // A run IS active, but this name never made it into the registry -
+        // exactly what snapshot_file_contexts records for a source that
+        // fails this same check at run start. The step must still get the
+        // refusal, not a silent skip or a stale success.
+        let mut map = HashMap::new();
+        map.insert("unrelated".to_string(), None);
+        let _guard = activate_snapshot(map);
+        let err = build(&f, &["esc".into()], &c, None, &mut |t| r(t)).unwrap_err();
+        assert!(err.contains("symlink"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

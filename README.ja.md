@@ -150,7 +150,7 @@ steps:
 ### セッションの継続と分岐
 
 - **`continue_from: step_id`**: 単一のサーバー側セッションを前ステップから継続。
-- **`fork_from: step_id`**: 親ステップのセッション文脈を保持したまま独立した子セッションへ分岐 (`claude`, `opencode`, `grok`, `pi` で対応)。
+- **`fork_from: step_id`**: 親ステップのセッション文脈を保持したまま独立した子セッションへ分岐 (`codex`, `claude`, `opencode`, `grok`, `pi` で対応)。codex の fork はこの adapter の last-verified 基準日より後に追加された機能なので、sfh は使う前に installed binary からも証拠を取ります — `codex exec --help` が `fork` に言及しているかどうかです。古い codex は起動を試みず、その場で拒否されます。
 
 ### バックグラウンド実行と運用操作
 
@@ -328,11 +328,11 @@ sfh run corrected-flow.yaml --carry-budget-from .sfh/runs/20260808-021925-loop
 
 **記録が残ります**: `budget_carried` durable event、`meta.json` の `carried_budget`、stderr の1行（`--dry-run` でも出ます）。corrected flow がもう定義していない step id は「適用できなかった」と名指しで報告し、黙って落としません。
 
-**二重計上しません**: 引き継いだ run 自身の `cost_usd` は先行 run の支出を含みます（`max_cost_usd` はその値で判定されるので当然です）が、先行 run の行にも同じ金額が載っています。`sfh runs list` は各 run の `carried_cost_usd` を差し引いてから合計するので、修正を重ねても実際に払った額のままです。`sfh runs show` は引き継いだ分を1行で明示します。
+**二重計上しません**: `own_cost_usd` はその run 自身が使った額、`carried_cost_usd` は引き継いだ額、`budget_position_usd` — own と carried の合計で、`max_cost_usd` が実際に判定する対象の数値 — は `cost_usd` がこれまでずっと意味してきたものと同じで、今もそうです（既存の利用者が困らないよう、その alias として残っています）。`sfh runs list` は `own_cost_usd` だけを合計するので、修正を重ねても、先行 run の行と後続 run すべてで同じ引き継ぎ額を二重に数えることなく、実際に払った額のままです。`sfh runs show` は1つの run について同じ数値を分けて示し、さらに `lineage_cost_usd` — 何も引き継いでいない run まで遡った carry ancestry 全体の合計、または `null`（部分和では決してありません）を返します。`runs clean` が chain 中の ancestor を1つでも削除すれば `null` になります。`runs list` の一覧全体で lineage を合計した値は意図的に用意していません。ancestor を共有する複数行を合計すると二重計上になるからで、まさにそれがこの4つの field で切り分けた bug です。
 
-**まだ走っている run からの引き継ぎは拒否します。** 支出が確定していないので、取った瞬間にそのスナップショットは古くなります。拒否メッセージは `sfh wait` と `sfh stop` を示します。heartbeat が止まっていても記録された process が本当にその run のものであるケース（wedged）も「まだ走っている」として扱います。
+**引き継ぎには「run が止まった」という積極的な証拠が必要です。「止まっていないという証拠がない」だけでは足りません。** status が `running` のままなら即座に拒否しますし、wedged な run — heartbeat は止まっているが、記録された process が本当にその run を起動したものである場合 — も同様です。それ以外では、以前は `status.json` が読めない・存在しないことを「動いていない」＝安全とみなしていました。しかし証拠が失われたことと run が終わったことは同じではないので、今は log 自体が停止を証明すること — durable な `run_end` event、または dead と確認された owner による terminal な routing position — が引き継ぎを許可する条件になりました。どちらの場合も拒否メッセージは `sfh wait` と `sfh stop` を示します。
 
-止まった run の JSON envelope は `resume` と `carry_budget` の**両方**を next action に出します。flow が悪かったのか世界が悪かったのかを知っているのは読み手だけだからです。
+止まった run の JSON envelope は `resume` と `carry_budget` の**両方**を next action として報告しますが、どちらも決めつけではなく診断済みです: `resumable`/`carryable`、`reason`、そして先に必要な flag があれば `requires` が付きます。`argv` はその action が実際に成功できるときだけ入ります — `max_visits` を使い果たして stuck した run は同じ壁に戻るだけの resume を最初から拒否し、workspace drift や closure 変更による失敗では `--adopt-workspace`/`--force-resume` が argv にあらかじめ組み込まれて返ってきます。そして支出がまだ確定と確認できない run は carry を拒否します。flow が悪かったのか世界が悪かったのかを知っているのは読み手だけであり、sfh が返すのは実行できると確認済みの command だけです。
 
 ### `exit_conflict:` — exit code と protocol が食い違うとき（v1.2.1）
 
@@ -379,7 +379,7 @@ sfh run flow.yaml --state-dir ~/.local/state/sfh     # または SFH_STATE_DIR
 
 ## プログラムから sfh を動かす
 
-`--json` を付けると stdout は envelope だけになります。進捗と warning は stderr へ回り、設定エラーであっても prose ではなく envelope が返ります。
+`run` / `plan` / `wait` / `stop` / `status` / `preflight` / `workspaces` で `--json` を付けると、stdout は envelope だけになります。進捗と warning は stderr へ回り、設定エラーであっても prose ではなく envelope が返ります。`validate --json` と `runs list|show|why --json` はenvelopeより前からあるcommandで、今も独自のbare JSONを返します — `schema_version` も `command` も `exit_code` も安定した error code もありません。以下のheader fieldに頼る前に、応答に `schema_version` があるか確認してください。無ければこの4つのどれかです。全fieldの契約とbare JSON側の正確な形は [docs/machine-api.md](docs/machine-api.md) を参照してください。
 
 ```bash
 sfh preflight flow.yaml --json          # 無料: model 呼び出しなし
@@ -388,7 +388,7 @@ sfh run       flow.yaml --json --detach # handle と next_actions を返す
 sfh wait <run-dir> --json               # 完了までブロックし、結果を返す
 ```
 
-失敗には v1.2.x の全期間で意味が固定された code が付きます。message は改善され得るので、code で分岐してください。
+失敗には `schema_version` が変わらない限り意味が固定された code が付きます（現在は `1`）。message は改善され得るので、code で分岐してください。
 
 `SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`
 
@@ -399,17 +399,28 @@ sfh wait <run-dir> --json               # 完了までブロックし、結果�
 ### `preflight` と `doctor`
 
 ```text
-sfh preflight  — 無料。binary はあるか、version は、必要な flag は --help に残っているか。
-                 protocol、session 対応、cost coverage、access の穴は。
+sfh preflight  — 無料。binary はあるか。tool 自身の launcher については: version は、
+                 必要な flag は --help に残っているか（bin: override は resolve する
+                 だけで、--probe-binaries を渡さない限り実行しません）。
+                 protocol、session 対応、cost coverage、access enforcement
+                 （sandboxed/best-effort/unsupported）と穴は。
                  各 cmd: step の program は、絶対 path でどの binary になるか。
                  この flow はどんな workspace と context を組み立てるか。
 sfh doctor     — 有料。実際に 1 token の prompt を送り、sfh がまだ回答を parse できるかを確認。
                  protocol drift を捕まえられる唯一の方法。
 ```
 
-`doctor` は隔離した scratch ディレクトリから実行されるため、実行した場所に置かれている instruction file ではなく adapter そのものを報告します。
+`doctor` と preflight 自身の probe はどちらも隔離した scratch ディレクトリから実行されるため、報告するのは実行した場所に置かれている instruction file ではなく adapter そのものです。
 
 v1.2.1 から、preflight は `cmd:` step が起動する program — 検証 shell、build、test runner、つまり flow が最も強く依存しているもの — も対象にします。**解決するだけで、実行はしません。** `--help` を sfh が対応している adapter へ送るのは安全でも、flow が名指しした任意の program へ送るのは安全ではないからです（`deploy.sh --help` は deploy し得ます）。解決できない名前は blocker です。Windows で bare な `bash` が `System32\bash.exe` へ解決した場合は拒否します。それは WSL launcher、つまり別の OS で、この checkout の path も worktree の `.git` file も読めないため、コードとは無関係な理由で数秒で落ちます。意図する shell を書けば（`"C:\\Program Files\\Git\\bin\\bash.exe"`）sfh は何も言いません。
+
+preset tool の `bin:` override も同じ扱いを受けます。sfh は出荷している各 adapter 自身の launcher が `--help`/`--version` に対して無害であることを検証済みですが、`bin:` は信頼された tool の名前のもとに flow が望む任意の program を指せてしまい、preflight には「新しい claude」と「deploy するスクリプト」を区別する術がありません。PATH 上で resolve された tool 自身の default launcher だけは自動的に probe されます。override は resolve されるだけで、明示的に opt-in しない限り実行されません:
+
+```bash
+sfh preflight flow.yaml --probe-binaries
+```
+
+これを渡すと、すべての override に対しても実際に `--version`/`--help` を実行します（もちろん同じ隔離 scratch ディレクトリから）。どちらの場合も、何が起きたかは report が示します。素の `null` version を「確認済みで問題なし」と誤読させないためです。各 tool の JSON には `probe_state`（`probed` / `resolved_not_probed` / `not_found`）が付き、report 全体の `probe_binaries` field が override の実行を許したかどうかを記録します。
 
 sfh はどの adapter についても **minimum version を固定していません**。各 CLI の公式文書と live probe で確認していない下限を主張する代わりに、`preflight` はインストールされている version を表示し、要件は不明であると述べます。
 
@@ -428,19 +439,21 @@ sfh はどの adapter についても **minimum version を固定していませ
 ## 成果物と公開スキーマ
 
 すべての実行において `.sfh/runs/<run-id>/` 以下に耐久ログが保存されます:
-- `log.jsonl`: 構造化イベントストリーム（ステップ開始・完了・トークン・コスト・protocol evidence・workspace checkpoint）
-- `<step_id>.out.txt` & `<step_id>.err.txt`: サイズ制限付きのraw標準出力・標準エラー出力。32 MiBを超えるstreamは省略marker付きで先頭と末尾を保持し、構造化された最終回答とusage/costは完全なstreamから独立して処理します。
+- `log.jsonl`: 構造化イベントストリーム（ステップ開始・完了・トークン・コスト・protocol evidence・workspace checkpoint・context snapshot）
+- `<step_id>.out.txt` & `<step_id>.err.txt`: 32 MiBを上限としたサイズ制限付きのraw標準出力・標準エラー出力。上限を超えるstreamは省略marker付きで先頭と末尾だけを保持します。pi、codex、opencode は行区切りのprotocolを話し、長いturnではこの上限を超えうるため、それぞれstreaming observerが上限が効く前の完全なpipeから直接読み取ります — terminal record、session id、usageはそちらから読まれるため影響を受けません。1レコードが16 MiBを超えるとstepはfail closedになります（黙って捨てることはしません）。それ以外のadapterのenvelopeは上限より十分小さい単一のblobで、素の`cmd:` stepの出力と同様、このサイズ制限済みfileから読み戻されます。
 - `status.json`: リアルタイムステータススナップショット
 - `execution-closure.json`: この run が固定された入力の hash
 - `workspace.json`: managed workspace（flow が要求した場合）
+- `context-snapshot/` & `context-snapshot.json`: 宣言された`kind: file` contextすべてを run 開始時に一度だけ凍結したコピー（1つも宣言していない flow ではどちらも書かれません）。以降どの step も宣言された path を再度開くのではなくこのコピーを読むため、run の途中で元の file を編集しても後続 step が受け取る内容は変わりません。resume した run は、`--force-resume` の下でも新しく取り直さず元の snapshot をそのまま使います。
 - `<step_id>.context.txt` & `<step_id>.context.json`: 組み立てられた context とその manifest（step が context を指定した場合）
 
-コマンドの長い出力をAI promptへ渡す場合は、`{{steps.verify.output | tail:80 | truncate:8000}}`のように明示的に制限してください。全文artifactは`{{steps.verify.output_file}}`から参照できます。
+`{{steps.verify.output_file}}` はこの同じサイズ制限済み`.out.txt`を指しており、完全なstreamを保証するものではありません。sfhはraw標準出力・標準エラー出力を無制限には保持しません。それでもコマンドの長い出力をAI promptへ渡す場合は、`{{steps.verify.output | tail:80 | truncate:8000}}`のように明示的に制限してください。32 MiBを超えて出力全体を残す必要があるstep — 騒がしいbuildやtest runnerを包む`cmd:` stepなど — は、managed workspace内のfileなど、自分自身のartifact先に出力を書き出してください。
 
 公開 JSON スキーマ:
 - [Flow JSON スキーマ](schema/flow.schema.json)
 - [耐久ログイベント JSON スキーマ](schema/log-event.schema.json)
 - [ステータススナップショット JSON スキーマ](schema/status.schema.json)
+- [Machine API リファレンス](docs/machine-api.md): 各`--json` commandのenvelopeまたはbare JSONの形、error codeの語彙、stabilityの保証範囲。
 
 ---
 

@@ -985,6 +985,15 @@ fn load_resume_for_flow(
     // never as an addend, so it can restore a lost figure without ever
     // double-counting a present one.
     let mut carried_elapsed: u64 = 0;
+    // The most durable elapsed-time source there is (see the restore
+    // precedence at the end of this function): a `run_end` event is logged
+    // exactly once, at the true end of an attempt, and never rewritten
+    // afterwards - unlike status.json, which a detached resume deletes and
+    // reseeds at zero. A log spanning several attempts (a stuck run,
+    // resumed, then failing) can carry more than one of these; the latest
+    // describes the most recent attempt, so it wins (plain assignment, not
+    // a max: an attempt's own total already includes everything before it).
+    let mut run_end_elapsed: Option<u64> = None;
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
     // A completed leaf's chain may later be intentionally replaced by its
@@ -1109,17 +1118,19 @@ fn load_resume_for_flow(
                         }
                     }
                 }
-                // elapsed_sec is deliberately NOT ADDED: status.json records
-                // elapsed_before_attempt PLUS this attempt, so the carried
-                // seconds are normally already inside the value read at the
-                // end of this function, and adding them would double-count.
-                // Remembered as a floor instead, because "normally" is not
-                // "always": detach_run deletes a resumed run's status.json and
-                // seeds a zeroed replacement, so on `--resume <carried-run>
-                // --detach` the only surviving record of the inherited seconds
-                // is this event. Steps, cost and visits are all durable in the
-                // log; wall clock has to be too, or three of the four carried
-                // ceilings hold and the fourth silently resets.
+                // elapsed_sec is deliberately NOT ADDED: whichever of the
+                // three sources wins in the restore precedence at the end of
+                // this function (run_end, then meta.json, then status.json)
+                // records elapsed_before_attempt PLUS this attempt, so the
+                // carried seconds are normally already inside it, and adding
+                // them would double-count. Remembered as a floor instead,
+                // because "normally" is not "always": detach_run deletes a
+                // resumed run's status.json and seeds a zeroed replacement,
+                // so on `--resume <carried-run> --detach` the only surviving
+                // record of the inherited seconds may be this event. Steps,
+                // cost and visits are all durable in the log; wall clock has
+                // to be too, or three of the four carried ceilings hold and
+                // the fourth silently resets.
                 if let Some(secs) = v.get("elapsed_sec").and_then(|x| x.as_u64()) {
                     carried_elapsed = carried_elapsed.max(secs);
                 }
@@ -1742,7 +1753,9 @@ fn load_resume_for_flow(
                     st.workspace_checkpoint = Some(fp.to_string());
                 }
             }
-            "run_end" => {}
+            "run_end" => {
+                run_end_elapsed = v.get("elapsed_sec").and_then(|x| x.as_u64());
+            }
             _ => {}
         }
     }
@@ -1804,19 +1817,46 @@ fn load_resume_for_flow(
             }
         }
     }
-    if let Some(text) = contain::read_contained_opt(run_dir, "status.json")? {
-        if let Ok(status) = serde_json::from_str::<serde_json::Value>(&text) {
-            st.elapsed_sec = status
-                .get("elapsed_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-    }
-    // A run can never have been active for less time than it inherited. Where
-    // status.json survived it already includes these seconds and this changes
-    // nothing; where it was deleted or reseeded, this is what keeps a carried
-    // wall_clock_sec budget from quietly starting over.
-    st.elapsed_sec = st.elapsed_sec.max(carried_elapsed);
+    // ---- restore active time (P1-03) ----
+    // Three possible sources, consulted in this order - most durable first,
+    // and NEVER blended, because status.json's own elapsed already includes
+    // whatever came before it and adding a second source on top would
+    // double it:
+    //
+    // 1. `run_end_elapsed`, above: a run_end event, logged once at the true
+    //    end of an attempt and never rewritten. Most trusted because it is
+    //    both durable AND known-final.
+    // 2. meta.json's `elapsed_sec`: refreshed at that same final moment
+    //    (see the `meta_final` write in run_inner), so it normally agrees
+    //    with (1) exactly - it only falls behind when the attempt that
+    //    would have refreshed it was killed first, in which case it still
+    //    holds the value from the START of that attempt: a valid, if
+    //    stale, lower bound rather than the true total.
+    // 3. status.json's `elapsed_sec`: refreshed on every heartbeat, so the
+    //    freshest source for a run that crashed mid-attempt with neither of
+    //    the above - but the least durable of the three, because
+    //    detach_run deletes a resumed run's copy and seeds a zeroed
+    //    replacement before the child even starts (see the comment on
+    //    `carried_elapsed`, above, for the same durability gap encountered
+    //    one layer up).
+    //
+    // Whichever of the three answers, `carried_elapsed` is still applied as
+    // an unconditional FLOOR afterwards: what this run itself durably
+    // inherited via --carry-budget-from cannot be un-inherited by an
+    // earlier ancestor's record going quiet (see the `budget_carried`
+    // handling above for why that value is a floor and not an addend here
+    // too).
+    let meta_elapsed_sec = contain::read_contained_opt(run_dir, "meta.json")?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|meta| meta.get("elapsed_sec").and_then(|v| v.as_u64()));
+    let status_elapsed_sec = contain::read_contained_opt(run_dir, "status.json")?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|status| status.get("elapsed_sec").and_then(|v| v.as_u64()));
+    st.elapsed_sec = run_end_elapsed
+        .or(meta_elapsed_sec)
+        .or(status_elapsed_sec)
+        .unwrap_or(0)
+        .max(carried_elapsed);
     Ok(st)
 }
 
@@ -2096,7 +2136,7 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
                 "run_id": run_dir.file_name().map(|n| n.to_string_lossy().into_owned()),
                 "run_dir": run_dir.display().to_string(),
                 "flow": abs(&opts.flow_path).display().to_string(),
-                "next_actions": next_actions_for("running", run_dir, &opts.flow_path),
+                "next_actions": next_actions_for("running", run_dir, &opts.flow_path, None),
             }),
         ));
         return Ok(0);
@@ -2483,6 +2523,102 @@ fn seed_status(path: &Path, s: &Status) -> Result<(), String> {
     }
 }
 
+/// Proof, read straight from the log, that an attempt reached a genuine
+/// stop. Returns `(saw_run_end, log_recovers_a_terminal_landing)`:
+///
+/// - `saw_run_end`: a durable `run_end` event exists anywhere in the log.
+///   It is the very last thing `run` ever logs for an attempt, written
+///   exactly once, only at a true stop, so its presence alone proves
+///   finality - see `carry_source_is_final`, the only caller that treats it
+///   that way.
+/// - `log_recovers_a_terminal_landing`: the log's own LAST recorded routing
+///   decision already lands on "end", "fail" or "stuck" - the only three
+///   positions a live run does not step away from - or it logged a
+///   `persistence_failure`, which ends the attempt immediately for the same
+///   reason. This is weaker than `saw_run_end` on its own (the process that
+///   reached it could in principle still be alive), so callers pair it with
+///   independent proof the owning process is gone.
+fn log_terminal_evidence(dir: &Path) -> Result<(bool, bool), String> {
+    let mut run_end = false;
+    let mut last_position_terminal = false;
+    let mut persistence_failure = false;
+    if let Some(text) = contain::read_contained_opt(dir, "log.jsonl")? {
+        for line in text.lines() {
+            // Same fail-safe skip load_resume_for_flow uses: a torn last line
+            // from a kill mid-write is evidence of nothing and must not be
+            // misread as proof of anything (fail-SAFE, not fail-open - see
+            // the matching comment there).
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            match v.get("event").and_then(|x| x.as_str()).unwrap_or("") {
+                "run_end" => run_end = true,
+                "persistence_failure" => persistence_failure = true,
+                "position" => {
+                    let next = v.get("next").and_then(|x| x.as_str()).unwrap_or("");
+                    last_position_terminal = matches!(next, "end" | "fail" | "stuck");
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((run_end, last_position_terminal || persistence_failure))
+}
+
+/// Whether `dir` is a run `--carry-budget-from` may trust as a source: the
+/// finality check, factored out of the carry closure in `run_inner` so it
+/// can also back the `carryable` field `next_actions_for` reports for a run
+/// that just ended (see there) - both questions are "can this run's numbers
+/// be trusted as final", asked at different times.
+///
+/// When status.json can be read, its resolved state decides this exactly as
+/// it always has: refuse a run that is "running", or "wedged" (dead-looking
+/// on disk while the SAME process that started it is still alive - see
+/// execute::pid_start_time). pid_alive alone is not enough here because pid
+/// reuse makes it advisory: a run SIGKILLed with `state: running` still on
+/// disk would read as alive forever the moment the OS handed its pid to
+/// something unrelated, and `sfh stop` would refuse to clear it, leaving no
+/// way to carry at all. The recorded start time is what tells the original
+/// process from a stranger wearing its pid (rev_break #8). Anything else
+/// status.json resolves to - done, failed, stuck, a confirmed dead, a
+/// deliberate stop - is trusted, same as before.
+///
+/// When status.json cannot be read at all - missing, corrupt, or caught
+/// mid-rewrite - that USED TO say nothing either way and carry anyway
+/// (P1-02: fail-open in exactly the case that matters, a source run still
+/// appending to its log). Proof now has to come from the log and the
+/// process table instead: a durable `run_end` settles it outright; short of
+/// that, the owning process must be independently confirmed gone (via the
+/// run dir's own sfh-nonce, since status.json is exactly what is
+/// unavailable here) AND the log's own last word must already be a
+/// terminal landing. Absent both, the carry is refused rather than
+/// assumed.
+fn carry_source_is_final(dir: &Path) -> Result<(), String> {
+    if let Ok(snap) = watch::read(dir) {
+        let wedged = snap.state == "dead"
+            && snap.pid_start.is_some()
+            && execute::pid_start_time(snap.pid) == snap.pid_start;
+        if snap.state == "running" || wedged {
+            return Err(format!(
+                "that run is still going, so its spend is not final yet. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
+                dir.display(), dir.display()
+            ));
+        }
+        return Ok(());
+    }
+    let (run_end, log_terminal) = log_terminal_evidence(dir)?;
+    if run_end {
+        return Ok(());
+    }
+    if log_terminal && matches!(watch::owner_verifiably_dead(dir)?, Some(true)) {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot confirm that run has finished - its status.json is missing or unreadable, and its log does not yet prove it reached a terminal state. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
+        dir.display(), dir.display()
+    ))
+}
+
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // `--runs-dir` keeps meaning exactly what it always meant, and with neither
     // flag the runs root is still `.sfh/runs`: every flow, script and CI job
@@ -2735,11 +2871,18 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // at. This is a decision handed back, not a failure.
                     let mut log = contain::append_private(&dir.join("log.jsonl"))
                         .map_err(|e| format!("cannot open log: {e}"))?;
+                    // Nothing ran this attempt, so the total active time is
+                    // exactly what was already restored - carried forward
+                    // rather than recomputed, for the same reason the other
+                    // three run_end sites now record it durably (P1-03):
+                    // this is the run's own strongest remaining source once
+                    // status.json goes missing or stale.
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "run_end", "state": word,
                                "exit": code, "error": why.clone(),
-                               "replay_refused": policy.as_str(), "step": u.step}),
+                               "replay_refused": policy.as_str(), "step": u.step,
+                               "elapsed_sec": resumed.elapsed_sec}),
                     )?;
                     mark_terminal_status(&dir, word, code, &why)?;
                     if opts.as_json {
@@ -2812,31 +2955,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // A run that is still spending has no final total. Carrying from it
         // would take a snapshot the ancestor immediately invalidates, and the
         // numbers in both runs would then be wrong in a way nothing downstream
-        // could detect.
-        //
-        // "Still going" already has one definition here and it is not
-        // `pid_alive` on its own: pid reuse makes that advisory (see
-        // execute::pid_alive), so a run SIGKILLed with `state: running` still
-        // on disk would read as alive forever the moment the OS handed its pid
-        // to something unrelated - and `sfh stop` would refuse to clear it,
-        // leaving no way to carry at all. Ask the same snapshot `sfh status`
-        // answers from, which pairs the pid with heartbeat freshness. A run
-        // whose heartbeat went stale while its process really is still the one
-        // that started it is the WEDGED case, also not final; the recorded
-        // start time is what tells it from a stranger wearing its pid
-        // (rev_break #8). An unreadable or absent status.json says nothing
-        // either way, and says it without blocking the carry.
-        if let Ok(snap) = watch::read(&dir) {
-            let wedged = snap.state == "dead"
-                && snap.pid_start.is_some()
-                && execute::pid_start_time(snap.pid) == snap.pid_start;
-            if snap.state == "running" || wedged {
-                return Err(format!(
-                    "--carry-budget-from {}: that run is still going, so its spend is not final yet. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
-                    dir.display(), dir.display(), dir.display()
-                ));
-            }
-        }
+        // could detect. See carry_source_is_final for exactly what "final"
+        // means and is proven from - in particular, an unreadable or absent
+        // status.json no longer carries anyway (P1-02): it used to say
+        // nothing either way and let the carry through regardless.
+        carry_source_is_final(&dir)
+            .map_err(|e| format!("--carry-budget-from {}: {e}", dir.display()))?;
         let prior = load_resume_for_flow(&dir, None)
             .map_err(|e| format!("--carry-budget-from {}: {e}", dir.display()))?;
         // A corrected flow may have renamed, split or removed steps. Laps
@@ -3226,6 +3350,74 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
         }
     }
+
+    // ---- context snapshot ----
+    // P0-04: build_closure, above, pins every `kind: file` context by the
+    // bytes it read at that moment - but until now, a step's own context
+    // assembly (leaf::prepare_leaf -> context::build) opened the SAME
+    // declared path again, live, whenever that step happened to run. See
+    // snapshot_file_contexts's doc comment for the bug this closes; this is
+    // the run-start call that closes it, placed after the workspace is
+    // resolved (immediately above) so a context source that is only
+    // contained within the workspace - not the flow directory - validates
+    // exactly the way it will for every step that reads it.
+    //
+    // A resumed run keeps the ORIGINAL snapshot rather than capturing a new
+    // one, even under --force-resume. execution-closure.json is itself
+    // write-once - resuming never rewrites the copy on disk, force or not
+    // (see the closure check above, which reads it back but only ever WRITES
+    // it in the `!is_resume` branch) - so re-snapshotting on resume would
+    // freeze NEW bytes under a closure that still records the OLD hash: the
+    // exact closure/snapshot disagreement this feature must never produce.
+    // --force-resume's documented job is "let this run continue despite what
+    // moved outside it", not "rebase this run onto the new inputs" - that is
+    // what re-running from scratch is for, and a fresh run gets a fresh
+    // snapshot the ordinary way, from a fresh closure. See
+    // `snapshot_and_persist_context` for why a flow with no `kind: file`
+    // context at all leaves no manifest behind on that fresh capture.
+    let containment_now = context::Containment {
+        flow_dir: &flow_dir,
+        workspace: workspace_path.as_deref(),
+    };
+    let context_snapshot: Option<HashMap<String, Option<PathBuf>>> = if is_resume {
+        match load_context_snapshot(&run_dir)? {
+            ResumedSnapshot::Loaded(map) => Some(map),
+            ResumedSnapshot::NotPresent => None,
+            ResumedSnapshot::Corrupt(reason) => {
+                if opts.force_resume {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "force_resume",
+                               "reason": "context_snapshot_unreadable", "error": reason}),
+                    )?;
+                    if !opts.quiet && !opts.as_json {
+                        eprintln!(
+                            "sfh: warning: --force-resume continued past an unreadable context snapshot: {reason}"
+                        );
+                    }
+                    None
+                } else {
+                    return Err(format!(
+                        "{}: this run's context snapshot ({}) cannot be read ({reason}), so sfh cannot confirm every step would see the bytes execution-closure.json pinned.\nRe-run from scratch, or pass --force-resume to continue without that guarantee.",
+                        machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                        run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).display()
+                    ));
+                }
+            }
+        }
+    } else {
+        Some(snapshot_and_persist_context(
+            &flow,
+            &containment_now,
+            &run_dir,
+            &mut log,
+        )?)
+    };
+    // Held for the rest of this run: every prepare_leaf call from here on
+    // resolves its `kind: file` contexts through this pin instead of the
+    // live path. Dropping it (at function exit, or between tests that share
+    // a thread) hands the thread back with no pin active.
+    let _context_snapshot_guard = context_snapshot.map(context::activate_snapshot);
 
     let started = utc_stamp();
     let meta = json!({
@@ -5085,15 +5277,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .or_else(|| last_success.clone().filter(nonempty))
             .or_else(|| last_executed.clone().filter(nonempty))
     };
+    // Shared by meta.json's final write and the run_end event just below it:
+    // the two are meant to agree exactly (P1-03's restore precedence relies
+    // on that - see load_resume_for_flow), so both read it from the same
+    // computation rather than two calls that could drift apart.
+    let final_elapsed_sec = elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs());
     let mut meta_final = meta.clone();
     if let Some(m) = meta_final.as_object_mut() {
         m.insert("finished_utc".into(), json!(utc_stamp()));
         m.insert("leaf_runs".into(), json!(total));
         m.insert("cost_usd".into(), json!(cost_usd));
-        m.insert(
-            "elapsed_sec".into(),
-            json!(elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs())),
-        );
+        m.insert("elapsed_sec".into(), json!(final_elapsed_sec));
         m.insert(
             "status".into(),
             json!(match &result {
@@ -5199,7 +5393,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         Ok(FlowEnd::Completed) => {
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
             let emit_id = opts.emit.clone().or(last_success);
             let emit_id =
@@ -5259,7 +5453,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             let msg = format!("routed to stuck after '{after}'");
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
             if opts.as_json {
                 finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg))?;
@@ -5296,7 +5490,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         Err(msg) => {
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
             if opts.as_json {
                 finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg))?;
@@ -5413,7 +5607,7 @@ fn emit_run_envelope(e: RunEnvelope<'_>) {
             "mode": w.mode.as_str(),
             "branch": w.branch,
         })),
-        "next_actions": next_actions_for(e.state, e.run_dir, e.flow),
+        "next_actions": next_actions_for(e.state, e.run_dir, e.flow, e.error),
     });
     match e.error {
         Some((code, msg)) => machine::emit(&machine::error_envelope(
@@ -5427,9 +5621,101 @@ fn emit_run_envelope(e: RunEnvelope<'_>) {
     }
 }
 
-/// Runnable follow-ups, as argv rather than prose, so a caller can act without
-/// parsing an instruction.
-fn next_actions_for(state: &str, run_dir: &Path, flow: &Path) -> Vec<serde_json::Value> {
+/// Whether resuming `run_dir` right now, unchanged, would walk straight back
+/// into the same `stuck`: true (naming the step) only when the log's LAST
+/// recorded routing decision reached "stuck" through `on_max_visits`
+/// (`PositionVia::MaxVisits`).
+///
+/// That step's visit counter is already at the flow's declared ceiling, and
+/// `--resume` restores it as-is - see the "stuck" arm of the `position`
+/// handling in `load_resume_for_flow`: resetting the counter there would
+/// quietly undo the limit the flow set, which is exactly the escape hatch
+/// on_max_visits exists to close. So re-entering the step on resume
+/// re-triggers on_max_visits immediately, without running anything or
+/// spending anything new: a provable dead end, not just a likely one.
+///
+/// Any OTHER route to stuck - an explicit `goto: stuck` rule, an on_error
+/// stuck, a budget landing - depends on what the step actually does or
+/// decides when it runs again, which resuming can legitimately change (a
+/// human fixed what it was stuck on, or the AI answers differently this
+/// time). Only max_visits exhaustion is deterministic enough to refuse
+/// resume over.
+fn stuck_step_exhausted_max_visits(run_dir: &Path) -> Option<String> {
+    let text = contain::read_contained_opt(run_dir, "log.jsonl")
+        .ok()
+        .flatten()?;
+    let mut exhausted: Option<String> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("event").and_then(|x| x.as_str()) != Some("position") {
+            continue;
+        }
+        // Reassigned on every position event, terminal or not, so the
+        // result reflects the LOG'S LAST word - a later, non-max_visits
+        // position (a resumed attempt that got past it) must clear an
+        // earlier max_visits landing, not leave it lingering.
+        exhausted = (v.get("via").and_then(|x| x.as_str()) == Some("max_visits")).then(|| {
+            v.get("after")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
+    }
+    exhausted
+}
+
+/// Build one diagnosed `resume` or `carry_budget` action. `ok_field` is
+/// "resumable" or "carryable" - the review's own names for the two
+/// diagnoses, kept as the literal JSON key so a caller reads exactly what
+/// was asked for rather than a generic "runnable" flag that does not say
+/// which question it answers.
+///
+/// `argv` is present ONLY when `ok` is true: an unrunnable action is never
+/// handed a command to run verbatim (P1-09's central rule), but it is still
+/// reported - with `reason` and, when relevant, `requires` - so "nothing is
+/// runnable" is something the caller is TOLD, not left to infer from a
+/// shorter list.
+fn diagnosed_action(
+    kind: &str,
+    ok_field: &str,
+    ok: bool,
+    reason: String,
+    requires: &[&str],
+    argv: Vec<String>,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("kind".into(), json!(kind));
+    m.insert(ok_field.to_string(), json!(ok));
+    m.insert("reason".into(), json!(reason));
+    m.insert("requires".into(), json!(requires));
+    if ok {
+        m.insert("argv".into(), json!(argv));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Runnable follow-ups, as argv rather than prose, so a caller can act
+/// without parsing an instruction - "why" (and, mid-run, "wait") always
+/// qualify, but `resume` and `carry_budget` do not just because the state is
+/// `failed` or `stuck`: a persistence failure is not resumable, a stuck run
+/// that exhausted max_visits sticks again the instant it is resumed, and a
+/// workspace or execution-closure problem needs a specific flag before
+/// resuming can work at all (P1-09). Each is diagnosed here rather than
+/// assumed from the state alone, using the same durable facts a human would
+/// have to go check by hand: the classified failure code already computed
+/// for this envelope's `error`, the log's own last routing decision, and -
+/// for carry - the exact finality proof `--carry-budget-from` itself
+/// requires (`carry_source_is_final`, P1-02). An action this run cannot
+/// actually complete is never handed a command to run; only the diagnosis
+/// that explains why is.
+fn next_actions_for(
+    state: &str,
+    run_dir: &Path,
+    flow: &Path,
+    error: Option<(machine::ErrorCode, &str)>,
+) -> Vec<serde_json::Value> {
     let rd = run_dir.display().to_string();
     let mut out = vec![machine::next_action(
         "why",
@@ -5450,25 +5736,97 @@ fn next_actions_for(state: &str, run_dir: &Path, flow: &Path) -> Vec<serde_json:
             ),
         ),
         "failed" | "stuck" => {
-            out.push(machine::next_action(
+            let (resumable, resume_reason, requires): (bool, String, Vec<&str>) = if state
+                == "stuck"
+            {
+                match stuck_step_exhausted_max_visits(run_dir) {
+                    Some(step) => (
+                        false,
+                        format!(
+                            "step '{step}' is stuck because it reached its declared max_visits; resuming walks back into the same step and sticks again immediately, without running anything. Raise max_visits (or change on_max_visits) in the flow, then resume."
+                        ),
+                        vec![],
+                    ),
+                    None => (
+                        true,
+                        "a human decision was requested; resuming continues from where the flow left off.".to_string(),
+                        vec![],
+                    ),
+                }
+            } else {
+                match error.map(|(c, _)| c) {
+                    Some(machine::ErrorCode::PersistenceFailure) => (
+                        false,
+                        "a required result could not be durably persisted, so this run is not resumable: replaying it risks re-running an effect whose completion cannot be verified. Verify the external side effect by hand, then start a fresh run.".to_string(),
+                        vec![],
+                    ),
+                    Some(machine::ErrorCode::WorkspaceMissing) => (
+                        false,
+                        "the managed workspace this run recorded no longer exists, so there is nothing here to resume into. Restore it, or start a fresh run.".to_string(),
+                        vec![],
+                    ),
+                    Some(machine::ErrorCode::WorkspaceDrift) => (
+                        true,
+                        "the managed workspace changed outside this run since its last checkpoint; --adopt-workspace accepts the current contents as the new baseline.".to_string(),
+                        vec!["--adopt-workspace"],
+                    ),
+                    Some(machine::ErrorCode::ExecutionClosureChanged) => (
+                        true,
+                        "the pinned execution inputs (profile, model, context or tool) changed since this run started; --force-resume accepts the change and continues.".to_string(),
+                        vec!["--force-resume"],
+                    ),
+                    _ => (
+                        true,
+                        "the run stopped before completing; resuming continues from the last durable checkpoint.".to_string(),
+                        vec![],
+                    ),
+                }
+            };
+            let mut resume_argv = vec![
+                "sfh".to_string(),
+                "run".into(),
+                flow.display().to_string(),
+                "--resume".into(),
+                rd.clone(),
+            ];
+            resume_argv.extend(requires.iter().map(|f| f.to_string()));
+            resume_argv.push("--json".into());
+            out.push(diagnosed_action(
                 "resume",
-                vec![
-                    "sfh".into(),
-                    "run".into(),
-                    flow.display().to_string(),
-                    "--resume".into(),
-                    rd.clone(),
-                    "--json".into(),
-                ],
+                "resumable",
+                resumable,
+                resume_reason,
+                &requires,
+                resume_argv,
             ));
-            // Offered alongside resume, not instead of it, because the two are
-            // answers to different diagnoses and only the reader knows which
-            // one they are looking at. A caller who concludes the FLOW was
-            // wrong cannot resume - correcting it invalidates the closure, as
-            // it should - and without this the only remaining move is a fresh
-            // run whose budget silently starts over.
-            out.push(machine::next_action(
+
+            // Offered alongside resume, not instead of it, because the two
+            // are answers to different diagnoses and only the reader knows
+            // which one they are looking at. A caller who concludes the FLOW
+            // was wrong cannot resume - correcting it invalidates the
+            // closure, as it should - and without this the only remaining
+            // move is a fresh run whose budget silently starts over. It
+            // depends on a DIFFERENT fact than resume does - not "can this
+            // run continue" but "is this run's spend final" - so it is
+            // diagnosed separately, via the same proof `--carry-budget-from`
+            // itself requires (P1-02). At the point this function is called
+            // that proof always succeeds (this run just wrote its own
+            // terminal status.json a few lines up), but it is still asked
+            // for rather than assumed: the two questions being answered by
+            // the same code, here and at the real carry attempt, is the
+            // point.
+            let carryable = carry_source_is_final(run_dir).is_ok();
+            let carry_reason = if carryable {
+                "this run's spend is final; a corrected flow can start fresh while keeping it on the books instead of silently resetting the budget.".to_string()
+            } else {
+                "this run's spend cannot yet be confirmed final, so carrying from it would risk a snapshot the source immediately invalidates.".to_string()
+            };
+            out.push(diagnosed_action(
                 "carry_budget",
+                "carryable",
+                carryable,
+                carry_reason,
+                &[],
                 vec![
                     "sfh".into(),
                     "run".into(),
@@ -6510,6 +6868,269 @@ fn build_closure(
     Ok(cl)
 }
 
+/// Where every `kind: file` context's frozen copy lives, relative to the run
+/// dir, and the durable record of what run start managed to pin.
+const CONTEXT_SNAPSHOT_DIR: &str = "context-snapshot";
+const CONTEXT_SNAPSHOT_MANIFEST: &str = "context-snapshot.json";
+
+/// What `snapshot_file_contexts` produced: the in-memory registry handed
+/// straight to `context::activate_snapshot`, and the same per-source facts
+/// written to BOTH the durable manifest and the run log (they answer the same
+/// question - "what did this run actually read" - for two different
+/// readers, so there is exactly one place that computes the answer).
+#[derive(Debug)]
+struct ContextSnapshot {
+    registry: HashMap<String, Option<PathBuf>>,
+    sources: Vec<serde_json::Value>,
+    /// Whether the flow declared at least one `kind: file` context at all -
+    /// the same fact that already decides, below, whether this function
+    /// creates `CONTEXT_SNAPSHOT_DIR`. Deliberately NOT the same thing as
+    /// `sources` being non-empty: a source that WAS declared but failed
+    /// validation (a missing required file, a refused symlink) is deferred
+    /// rather than recorded - see the `Err` arm below - so `sources` stays
+    /// empty for that case too, and collapsing the two would make "this flow
+    /// asked for nothing" indistinguishable from "this flow asked for
+    /// something sfh could not get". `snapshot_and_persist_context` uses this
+    /// field, not `sources`, to decide whether a manifest is worth writing at
+    /// all.
+    has_file_contexts: bool,
+}
+
+/// Freeze every `kind: file` context this flow declares, once, so the rest of
+/// this run reads the SAME bytes `build_closure` just pinned instead of
+/// opening the declared path again on every step.
+///
+/// P0-04: without this, an edited TASK.md between the `analyze` and
+/// `implement` steps of one run silently changed what `implement` was
+/// handed, while execution-closure.json went on recording the hash from
+/// before the edit - the run's own record of what it read disagreed with
+/// what it actually read, and no resume was involved.
+///
+/// Unconditional over `flow.contexts` - the same set `build_closure` iterates
+/// above, not just the sources some step happens to name - so the run's
+/// pinned copies and the closure's pinned hashes are always talking about the
+/// same files. `inline` and `template` sources are left alone: an inline
+/// source is already part of the flow's own bytes, and a template is
+/// deliberately re-rendered per step (it may read `{{steps.x.output}}`,
+/// which does not exist yet at run start, so freezing it here would be
+/// wrong, not merely unnecessary).
+///
+/// A source that fails validation outright here - a symlink without
+/// `allow_external`, a required file that is missing - is left OUT of the
+/// registry rather than aborting the run. sfh has never refused a run merely
+/// for DECLARING a broken context nobody uses; that lenience is preserved by
+/// deferring to `context::build`'s own live-path fallback, which raises
+/// exactly the same error the first time some step actually names it.
+fn snapshot_file_contexts(
+    flow: &flow::Flow,
+    containment: &context::Containment,
+    run_dir: &Path,
+) -> Result<ContextSnapshot, String> {
+    let file_contexts: Vec<(&String, &flow::ContextSource)> = flow
+        .contexts
+        .iter()
+        .filter(|(_, s)| matches!(s.kind(), Ok("file")))
+        .collect();
+    let has_file_contexts = !file_contexts.is_empty();
+    let mut registry: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut sources = Vec::new();
+    if file_contexts.is_empty() {
+        return Ok(ContextSnapshot {
+            registry,
+            sources,
+            has_file_contexts,
+        });
+    }
+    let snapshot_dir = run_dir.join(CONTEXT_SNAPSHOT_DIR);
+    contain::mkdir_private(&snapshot_dir).map_err(|e| {
+        format!(
+            "cannot persist context snapshot: cannot create {}: {e}",
+            snapshot_dir.display()
+        )
+    })?;
+    for (name, source) in file_contexts {
+        let raw = source.file.clone().unwrap_or_default();
+        let external = source.allow_external.unwrap_or(false);
+        let optional = source.optional.unwrap_or(false);
+        match context::read_file_source(name, &raw, external, containment, optional) {
+            Ok(Some(text)) => {
+                // Named by a digest of the CONTEXT NAME, never the declared
+                // path: a name is a flow-author identifier, but the identical
+                // name reused across an unrelated OS's path separators or
+                // reserved characters would turn straight into a path
+                // injection if used as a file name verbatim (the same reason
+                // render_bundle escapes a name before it can forge a
+                // delimiter). The declared path is preserved as plain data in
+                // `source`, below, for a human reading the manifest.
+                let file_name = format!("{}.snapshot", sha256::hex(name.as_bytes()));
+                let abs_path = snapshot_dir.join(&file_name);
+                contain::write_private_atomic(&abs_path, &text).map_err(|e| {
+                    format!("cannot persist context snapshot for contexts.{name}: {e}")
+                })?;
+                registry.insert(name.clone(), Some(abs_path));
+                sources.push(json!({
+                    "name": name, "source": raw, "state": "captured",
+                    "sha256": sha256::hex(text.as_bytes()), "bytes": text.len() as u64,
+                    "snapshot": format!("{CONTEXT_SNAPSHOT_DIR}/{file_name}"),
+                }));
+            }
+            Ok(None) => {
+                registry.insert(name.clone(), None);
+                sources.push(json!({"name": name, "source": raw, "state": "absent"}));
+            }
+            // Deferred, not fatal - see the doc comment above.
+            Err(_) => {}
+        }
+    }
+    Ok(ContextSnapshot {
+        registry,
+        sources,
+        has_file_contexts,
+    })
+}
+
+/// Snapshot this flow's `kind: file` contexts at run start (see
+/// `snapshot_file_contexts`, immediately above) and persist the result for a
+/// later `--resume` to read back - UNLESS there is nothing to persist. A flow
+/// that declares no `kind: file` context at all always produces an empty
+/// registry and an empty `sources` list, and writing `CONTEXT_SNAPSHOT_MANIFEST`
+/// for that is a manifest that documents nothing, paid for with an atomic
+/// write and an fsync'd log line at the start of every single run - including
+/// the overwhelming majority of flows that never touch this feature.
+///
+/// Skipping it is safe on resume specifically BECAUSE there was nothing to
+/// pin: `ResumedSnapshot::NotPresent`'s own doc comment already treats "no
+/// manifest at all" and "a flow that declared no `kind: file` context" as
+/// the same, harmless case - both fall every step back to a live read. And a
+/// live read is exactly what a step in THIS run would already do: with no
+/// `kind: file` context declared, `context::build`'s snapshot lookup is never
+/// even consulted for a "file" kind here, so there is no pinned fact for a
+/// resume to disagree with in the first place. See
+/// `context::snapshot_lookup`'s doc comment for the underlying design fact
+/// this leans on - an empty pinned map and no pin at all are indistinguishable
+/// to any lookup, by construction.
+///
+/// Returns the registry to pin for the rest of THIS run either way - an empty
+/// one has the identical effect on `context::activate_snapshot` whether or
+/// not it is ever written down, so the guard the caller installs is
+/// unaffected by which branch below ran.
+fn snapshot_and_persist_context(
+    flow: &flow::Flow,
+    containment: &context::Containment,
+    run_dir: &Path,
+    log: &mut std::fs::File,
+) -> Result<HashMap<String, Option<PathBuf>>, String> {
+    let snap = snapshot_file_contexts(flow, containment, run_dir)?;
+    if snap.has_file_contexts {
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .map_err(|e| format!("cannot serialize the context snapshot: {e}"))?;
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .map_err(|e| format!("cannot persist context snapshot: {e}"))?;
+        // Recorded the same way the closure fingerprint is, right below the
+        // event that pins it, so "what this run actually read" is answerable
+        // from log.jsonl alone without also locating the manifest file.
+        log_event(
+            log,
+            json!({"ts": utc_stamp(), "event": "context_snapshot", "sources": snap.sources}),
+        )?;
+    }
+    Ok(snap.registry)
+}
+
+/// What a resumed run finds for the context snapshot the ORIGINAL attempt
+/// captured.
+#[derive(Debug)]
+enum ResumedSnapshot {
+    /// No manifest at all: a run dir from before this feature existed, or one
+    /// whose flow declared no `kind: file` context. Steps fall back to the
+    /// live path, exactly as every run did before this fix - there is
+    /// nothing to disagree with, because nothing was ever pinned.
+    NotPresent,
+    /// Read back and validated; every step now sees exactly what run start
+    /// pinned, the same as a fresh run would.
+    Loaded(HashMap<String, Option<PathBuf>>),
+    /// The manifest is there but sfh cannot make sense of its CONTENT - which
+    /// should be impossible for a file only sfh ever writes, atomically, into
+    /// a private run dir. Treated as an execution-closure-level problem (the
+    /// caller offers the same refusal and the same --force-resume escape
+    /// hatch the closure mismatch above does) rather than silently falling
+    /// back to live reads that might not agree with what
+    /// execution-closure.json pinned.
+    Corrupt(String),
+}
+
+/// Read back what `snapshot_file_contexts` recorded, so a resume pins its
+/// steps to the SAME bytes the original attempt did rather than capturing a
+/// fresh copy of whatever is on disk now - see the resume-semantics comment
+/// at this function's call site for why re-capturing on resume would be
+/// wrong even under --force-resume.
+fn load_context_snapshot(run_dir: &Path) -> Result<ResumedSnapshot, String> {
+    // Contained, no-follow read: a run dir is untrusted input on --resume
+    // (rev_break #6 already treats meta.json and log.jsonl this way), so a
+    // symlink planted at this fixed name is refused unconditionally rather
+    // than folded into the waivable "Corrupt" case below.
+    let Some(text) = contain::read_contained_opt(run_dir, CONTEXT_SNAPSHOT_MANIFEST)? else {
+        return Ok(ResumedSnapshot::NotPresent);
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST} is not valid JSON: {e}"
+            )))
+        }
+    };
+    let Some(entries) = v.get("sources").and_then(|s| s.as_array()) else {
+        return Ok(ResumedSnapshot::Corrupt(format!(
+            "{CONTEXT_SNAPSHOT_MANIFEST} has no 'sources' array"
+        )));
+    };
+    let mut map = HashMap::new();
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(|x| x.as_str()) else {
+            return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST}: an entry has no 'name'"
+            )));
+        };
+        match entry.get("state").and_then(|x| x.as_str()) {
+            Some("absent") => {
+                map.insert(name.to_string(), None);
+            }
+            Some("captured") => {
+                let Some(rel) = entry.get("snapshot").and_then(|x| x.as_str()) else {
+                    return Ok(ResumedSnapshot::Corrupt(format!(
+                        "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} is 'captured' but names no snapshot file"
+                    )));
+                };
+                // A path that resolves outside run_dir means the run dir was
+                // tampered with, not merely that the record is stale - the
+                // same class of attack meta.json is already read contained
+                // against - so it is propagated unconditionally (rev_break
+                // #6) instead of folded into the waivable case below.
+                match contain::contained_opt(run_dir, rel)? {
+                    Some(path) => {
+                        map.insert(name.to_string(), Some(path));
+                    }
+                    None => {
+                        return Ok(ResumedSnapshot::Corrupt(format!(
+                            "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name}'s pinned snapshot {rel} is missing"
+                        )))
+                    }
+                }
+            }
+            other => {
+                return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} has an unrecognised state {other:?}"
+            )))
+            }
+        }
+    }
+    Ok(ResumedSnapshot::Loaded(map))
+}
+
 fn log_event(f: &mut std::fs::File, mut v: serde_json::Value) -> Result<(), String> {
     if let Some(object) = v.as_object_mut() {
         object
@@ -7202,6 +7823,358 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P0-04: the execution closure pins context files, but steps must
+    // read the SAME bytes, not the live file ----
+
+    fn context_flow(contexts_yaml: &str) -> flow::Flow {
+        serde_yaml_ng::from_str(&format!(
+            "name: t\ncontexts:\n{contexts_yaml}steps:\n  - id: a\n    cmd: [\"echo\", \"x\"]\n"
+        ))
+        .expect("test flow parses")
+    }
+
+    #[test]
+    fn snapshot_file_contexts_freezes_file_sources_and_leaves_inline_and_template_untouched() {
+        let dir = std::env::temp_dir().join(format!("sfh-snap-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "do the thing").unwrap();
+        let flow = context_flow(
+            "  task:\n    file: \"TASK.md\"\n  notes:\n    file: \"notes.md\"\n    optional: true\n  rules:\n    inline: \"be nice\"\n  live:\n    template: \"{{vars.x}}\"\n",
+        );
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+
+        // Only the two `kind: file` sources are captured at all.
+        assert_eq!(snap.registry.len(), 2, "{:?}", snap.registry.keys());
+        assert!(
+            !snap.registry.contains_key("rules"),
+            "inline is flow bytes already, never snapshotted"
+        );
+        assert!(
+            !snap.registry.contains_key("live"),
+            "a template must stay dynamic, never snapshotted"
+        );
+
+        let task_path = snap
+            .registry
+            .get("task")
+            .cloned()
+            .flatten()
+            .expect("task captured");
+        assert_eq!(std::fs::read_to_string(&task_path).unwrap(), "do the thing");
+        assert!(
+            task_path.starts_with(run_dir.join(CONTEXT_SNAPSHOT_DIR)),
+            "{}",
+            task_path.display()
+        );
+        assert_eq!(
+            snap.registry.get("notes"),
+            Some(&None),
+            "optional and missing is pinned as absent"
+        );
+
+        assert_eq!(snap.sources.len(), 2);
+        let by_name = |n: &str| snap.sources.iter().find(|s| s["name"] == n).unwrap();
+        assert_eq!(by_name("task")["state"], "captured");
+        assert_eq!(by_name("task")["source"], "TASK.md");
+        assert_eq!(
+            by_name("task")["sha256"],
+            sha256::hex("do the thing".as_bytes())
+        );
+        assert_eq!(by_name("notes")["state"], "absent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_file_contexts_defers_rather_than_aborts_a_source_that_fails_containment() {
+        // A symlink without allow_external fails read_file_source's check.
+        // snapshot_file_contexts must not let one bad declaration abort a run
+        // whose steps might never even name it - it just leaves that name
+        // unpinned, so context::build's live fallback raises the same error
+        // it always has, the first time something actually asks for it.
+        let dir =
+            std::env::temp_dir().join(format!("sfh-snap-symlink-{}", contain::random_nonce()));
+        let outside = dir.join("outside");
+        contain::mkdir_private(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP SECRET").unwrap();
+        let flow_dir = dir.join("flow");
+        contain::mkdir_private(&flow_dir).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), flow_dir.join("link.txt")).unwrap();
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&run_dir).unwrap();
+        let flow = context_flow("  esc:\n    file: \"link.txt\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        assert!(
+            !snap.registry.contains_key("esc"),
+            "a source that fails validation must not be pinned at all: {:?}",
+            snap.registry.get("esc")
+        );
+        assert!(snap.sources.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_context_snapshot_that_cannot_be_persisted_fails_the_run_instead_of_falling_back_to_live_reads(
+    ) {
+        // The whole point of this feature is that a step never reads the
+        // live path once a run has started; a snapshot sfh could not write
+        // must not be the one case that quietly reopens that hole. It has to
+        // fail run start the same way an unwritable execution-closure.json
+        // or meta.json already does.
+        let dir =
+            std::env::temp_dir().join(format!("sfh-snap-nowrite-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "content").unwrap();
+        // A plain FILE sits where snapshot_file_contexts needs to create the
+        // context-snapshot/ DIRECTORY, so mkdir_private fails.
+        std::fs::write(run_dir.join(CONTEXT_SNAPSHOT_DIR), "not a directory").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let err = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap_err();
+        assert!(err.contains("persist"), "{err}");
+        assert_eq!(
+            run_failure_code(&err),
+            machine::ErrorCode::PersistenceFailure,
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_context_snapshot_round_trips_what_snapshot_file_contexts_wrote() {
+        let dir = std::env::temp_dir().join(format!("sfh-snap-rt-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "the original text").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n  notes:\n    file: \"notes.md\"\n    optional: true\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .unwrap();
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .unwrap();
+
+        let loaded = match load_context_snapshot(&run_dir).unwrap() {
+            ResumedSnapshot::Loaded(map) => map,
+            _ => panic!("expected the round-tripped manifest to load cleanly"),
+        };
+        assert_eq!(loaded.get("notes"), Some(&None));
+        let task_path = loaded.get("task").cloned().flatten().expect("task loaded");
+        assert_eq!(
+            std::fs::read_to_string(&task_path).unwrap(),
+            "the original text"
+        );
+
+        // No manifest at all: an older run dir, not a fault.
+        let bare_run_dir = dir.join("bare-run");
+        contain::mkdir_private(&bare_run_dir).unwrap();
+        assert!(matches!(
+            load_context_snapshot(&bare_run_dir).unwrap(),
+            ResumedSnapshot::NotPresent
+        ));
+
+        // A manifest that exists but is not valid JSON must be reported, not
+        // silently treated as "nothing pinned".
+        let broken_run_dir = dir.join("broken-run");
+        contain::mkdir_private(&broken_run_dir).unwrap();
+        contain::write_private_atomic(&broken_run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), "not json")
+            .unwrap();
+        assert!(matches!(
+            load_context_snapshot(&broken_run_dir).unwrap(),
+            ResumedSnapshot::Corrupt(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flow that declares no `contexts:` at all used to still get
+    /// `context-snapshot.json` written into its run dir - a manifest naming
+    /// zero sources, on every single run, paid for with an atomic write and
+    /// an fsync'd log line for a feature the flow never touches. This is the
+    /// exact scenario a live `sfh run` against such a flow reproduces; see
+    /// `snapshot_and_persist_context`'s doc comment for why skipping both
+    /// artifacts here is safe on a later `--resume`.
+    #[test]
+    fn a_flow_with_no_file_contexts_persists_no_snapshot_manifest_directory_or_log_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-snap-persist-empty-{}",
+            contain::random_nonce()
+        ));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        // No `contexts:` key whatsoever - `#[serde(default)]` gives `flow.contexts`
+        // an empty map, exactly like a flow author who never wrote the block.
+        let flow: flow::Flow =
+            serde_yaml_ng::from_str("name: t\nsteps:\n  - id: a\n    cmd: [\"echo\", \"x\"]\n")
+                .expect("test flow parses");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let mut log = std::fs::File::create(run_dir.join("log.jsonl")).unwrap();
+
+        let registry =
+            snapshot_and_persist_context(&flow, &containment, &run_dir, &mut log).unwrap();
+
+        assert!(registry.is_empty());
+        assert!(
+            !run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).exists(),
+            "a flow with nothing to pin must not leave a manifest naming zero sources"
+        );
+        assert!(
+            !run_dir.join(CONTEXT_SNAPSHOT_DIR).exists(),
+            "a flow with nothing to pin must not create the snapshot directory either"
+        );
+        drop(log);
+        let events: Vec<String> = std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            !events.contains(&"context_snapshot".to_string()),
+            "no event should be logged for a snapshot that pinned nothing: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the test above: a flow that DOES declare a `kind:
+    /// file` context must keep getting the manifest, the snapshot directory
+    /// and the log event exactly as before - this fix only removes the
+    /// artifacts for a run with nothing to pin, never for one that has
+    /// something.
+    #[test]
+    fn a_flow_with_a_file_context_still_persists_the_manifest_directory_and_log_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-snap-persist-nonempty-{}",
+            contain::random_nonce()
+        ));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "do the thing").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let mut log = std::fs::File::create(run_dir.join("log.jsonl")).unwrap();
+
+        let registry =
+            snapshot_and_persist_context(&flow, &containment, &run_dir, &mut log).unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(
+            run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).exists(),
+            "a flow that names a file context must still get a manifest"
+        );
+        assert!(
+            run_dir.join(CONTEXT_SNAPSHOT_DIR).is_dir(),
+            "the frozen copy must still land in the snapshot directory"
+        );
+        drop(log);
+        let events: Vec<String> = std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            events.contains(&"context_snapshot".to_string()),
+            "the run log must still record what this run pinned: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resumed_run_keeps_reading_the_original_snapshot_even_after_the_live_file_changes_before_the_resume(
+    ) {
+        // The resume-semantics decision: --resume (and --force-resume) never
+        // re-capture. A resumed run reads back exactly what the FIRST attempt
+        // pinned, so remaining steps see the same definition of the work the
+        // already-completed steps did - never a mix of the two.
+        let dir = std::env::temp_dir().join(format!("sfh-snap-resume-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        let task = flow_dir.join("TASK.md");
+        std::fs::write(&task, "v1: what the first attempt saw").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        // ---- the original (non-resumed) attempt ----
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .unwrap();
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .unwrap();
+
+        // Something outside the run edits TASK.md before the run is resumed.
+        std::fs::write(&task, "v2: edited after the crash, before the resume").unwrap();
+
+        // ---- the resumed attempt ----
+        let registry = match load_context_snapshot(&run_dir).unwrap() {
+            ResumedSnapshot::Loaded(map) => map,
+            _ => panic!("expected a loaded snapshot"),
+        };
+        let _guard = context::activate_snapshot(registry);
+        let mut r = |_: &str| -> Result<String, String> { Ok(String::new()) };
+        let bundle =
+            context::build(&flow, &["task".to_string()], &containment, None, &mut r).unwrap();
+        assert!(
+            bundle.text.contains("v1: what the first attempt saw"),
+            "{}",
+            bundle.text
+        );
+        assert!(!bundle.text.contains("v2:"), "{}", bundle.text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn every_leaf_run_claim_obeys_the_total_limit() {
@@ -8451,5 +9424,461 @@ mod tests {
         assert!(effort_vocab_warning("opencode", "whatever").is_none());
         assert!(effort_vocab_warning("pi", "off").is_none());
         assert!(effort_vocab_warning("pi", "ultra").is_some());
+    }
+
+    // ---- P1-02: --carry-budget-from must PROVE the source is done, not
+    // just fail to prove it is still going ----
+
+    fn carry_final_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-carry-final-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn carry_refuses_a_source_with_no_status_json_and_no_terminal_event_in_its_log() {
+        let dir = carry_final_test_dir("no-proof");
+        // A log that looks exactly like a run still in progress: a step
+        // started, and nothing durable says it ever stopped.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"step_start\",\"step\":\"a\",\"visit\":1}\n",
+        )
+        .unwrap();
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(
+            err.contains("cannot confirm"),
+            "expected a refusal explaining the proof is missing, got: {err}"
+        );
+        assert!(
+            err.contains("sfh wait") && err.contains("sfh stop"),
+            "the refusal must say how to resolve it, same as the still-going case: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_the_log_holds_a_durable_run_end_event_even_with_no_status_json() {
+        let dir = carry_final_test_dir("run-end-proof");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":0.5,\"elapsed_sec\":10}\n",
+        )
+        .unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_the_owning_process_is_confirmed_gone_and_the_log_lands_on_a_terminal_position(
+    ) {
+        let dir = carry_final_test_dir("dead-owner-proof");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"fail\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        // A live pid whose recorded start time does not match is a reused
+        // pid, not the original owner - confirmed gone, the same reasoning
+        // watch::owner_verifiably_dead's own tests exercise directly.
+        contain::write_nonce(&dir, std::process::id(), Some(1), "tok").unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_still_refuses_a_terminal_looking_log_when_the_owning_process_cannot_be_confirmed_gone()
+    {
+        let dir = carry_final_test_dir("ambiguous-owner");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        // No sfh-nonce at all: nothing here rules out the owning process
+        // still being alive and about to log run_end a moment later.
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(err.contains("cannot confirm"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_refuses_a_source_that_status_json_says_is_still_running_even_if_its_log_has_a_run_end()
+    {
+        let dir = carry_final_test_dir("still-running");
+        // Deliberately contradictory: status.json must win when it can be
+        // read, because it is the freshest signal there is - a stale-but-
+        // still-present run_end from an earlier attempt must not override a
+        // status.json that says this run is going right now.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":5}\n",
+        )
+        .unwrap();
+        let status =
+            serde_json::json!({"state": "running", "pid": std::process::id(), "cost_usd": 1.0});
+        contain::write_private_atomic(&dir.join("status.json"), status.to_string()).unwrap();
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(err.contains("still going"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_status_json_clearly_reads_a_terminal_state() {
+        let dir = carry_final_test_dir("clean-status");
+        let status = serde_json::json!({"state": "failed", "pid": 0});
+        contain::write_private_atomic(&dir.join("status.json"), status.to_string()).unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_terminal_evidence_only_trusts_the_logs_last_position_not_an_earlier_one() {
+        let dir = carry_final_test_dir("last-position-wins");
+        // A first attempt got stuck; a resumed second attempt got past it
+        // and is now mid-step, with no terminal marker of its own yet. The
+        // earlier stuck landing must not leak through as proof.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"stuck\",\"via\":\"rule\"}\n\
+             {\"event\":\"position\",\"after\":\"a\",\"next\":\"b\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        let (run_end, terminal) = log_terminal_evidence(&dir).unwrap();
+        assert!(!run_end);
+        assert!(
+            !terminal,
+            "a later non-terminal position must supersede the earlier stuck landing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P1-03: active time carried across --carry-budget-from must be
+    // durable, not dependent on status.json surviving ----
+
+    #[test]
+    fn elapsed_restore_prefers_run_end_then_meta_then_status_then_the_carried_floor() {
+        let base = std::env::temp_dir().join(format!(
+            "sfh-elapsed-precedence-{}",
+            contain::random_nonce()
+        ));
+        contain::mkdir_private(&base).unwrap();
+
+        // status.json only: the last-resort source.
+        let status_only = base.join("status-only");
+        contain::mkdir_private(&status_only).unwrap();
+        std::fs::write(status_only.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &status_only.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&status_only).unwrap().elapsed_sec, 10);
+
+        // meta.json beats a smaller status.json.
+        let meta_over_status = base.join("meta-over-status");
+        contain::mkdir_private(&meta_over_status).unwrap();
+        std::fs::write(
+            meta_over_status.join("log.jsonl"),
+            "{\"event\":\"run_start\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &meta_over_status.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &meta_over_status.join("meta.json"),
+            serde_json::json!({"elapsed_sec": 20}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&meta_over_status).unwrap().elapsed_sec, 20);
+
+        // A durable run_end beats both meta.json and status.json.
+        let run_end_over_both = base.join("run-end-over-both");
+        contain::mkdir_private(&run_end_over_both).unwrap();
+        std::fs::write(
+            run_end_over_both.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\",\"elapsed_sec\":30}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &run_end_over_both.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &run_end_over_both.join("meta.json"),
+            serde_json::json!({"elapsed_sec": 20}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&run_end_over_both).unwrap().elapsed_sec, 30);
+
+        // With nothing durable at all, the carried floor still holds.
+        let floor_only = base.join("floor-only");
+        contain::mkdir_private(&floor_only).unwrap();
+        std::fs::write(
+            floor_only.join("log.jsonl"),
+            "{\"event\":\"budget_carried\",\"elapsed_sec\":40}\n",
+        )
+        .unwrap();
+        assert_eq!(load_resume(&floor_only).unwrap().elapsed_sec, 40);
+
+        // The floor wins even over a SMALLER durable value: this is a
+        // synthetic, adversarial log (a real run_end can never report less
+        // than what was durably carried in), built only to prove the floor
+        // is applied unconditionally, the way a hand-edited log is tested
+        // elsewhere in this file.
+        let floor_over_run_end = base.join("floor-over-run-end");
+        contain::mkdir_private(&floor_over_run_end).unwrap();
+        std::fs::write(
+            floor_over_run_end.join("log.jsonl"),
+            "{\"event\":\"budget_carried\",\"elapsed_sec\":40}\n{\"event\":\"run_end\",\"status\":\"ok\",\"elapsed_sec\":5}\n",
+        )
+        .unwrap();
+        assert_eq!(load_resume(&floor_over_run_end).unwrap().elapsed_sec, 40);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn carried_active_time_survives_two_hops_of_carry_even_when_every_status_json_is_gone() {
+        // Simulates A -> B (--carry-budget-from A) -> C (--carry-budget-from
+        // B), with status.json absent at EVERY hop: not merely stale, gone
+        // outright, as if each run's status.json had already been cleaned up
+        // by the time the next carry looked for it. Only the run_end events -
+        // and the budget_carried events a real carry closure would write from
+        // what it read back - survive. Before P1-03 this chain lost B's own
+        // 50s the moment C tried to carry from B, because the only place B's
+        // total lived was status.json.
+        let base =
+            std::env::temp_dir().join(format!("sfh-elapsed-chain-{}", contain::random_nonce()));
+        contain::mkdir_private(&base).unwrap();
+
+        let a = base.join("a");
+        contain::mkdir_private(&a).unwrap();
+        std::fs::write(
+            a.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":100}\n",
+        )
+        .unwrap();
+        let a_elapsed = load_resume(&a).unwrap().elapsed_sec;
+        assert_eq!(
+            a_elapsed, 100,
+            "A's own total must survive with no status.json at all"
+        );
+
+        let b = base.join("b");
+        contain::mkdir_private(&b).unwrap();
+        std::fs::write(
+            b.join("log.jsonl"),
+            format!(
+                "{{\"event\":\"budget_carried\",\"elapsed_sec\":{a_elapsed}}}\n\
+                 {{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":150}}\n"
+            ),
+        )
+        .unwrap();
+        let b_elapsed = load_resume(&b).unwrap().elapsed_sec;
+        assert_eq!(
+            b_elapsed, 150,
+            "B must recover A's 100s PLUS its own 50s, from run_end alone"
+        );
+
+        let c = base.join("c");
+        contain::mkdir_private(&c).unwrap();
+        std::fs::write(
+            c.join("log.jsonl"),
+            format!(
+                "{{\"event\":\"budget_carried\",\"elapsed_sec\":{b_elapsed}}}\n\
+                 {{\"event\":\"run_end\",\"status\":\"ok\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":175}}\n"
+            ),
+        )
+        .unwrap();
+        let c_elapsed = load_resume(&c).unwrap().elapsed_sec;
+        assert_eq!(
+            c_elapsed, 175,
+            "C must recover the full chain's 175s - B's carried total plus C's own 25s"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- P1-09: next_actions_for must diagnose resume/carry, not assume
+    // them from the terminal state alone ----
+
+    fn next_actions_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-next-actions-{tag}-{}",
+            contain::random_nonce()
+        ));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stuck_step_exhausted_max_visits_names_the_step_only_when_the_last_position_says_so() {
+        let dir = next_actions_test_dir("max-visits-detect");
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            None,
+            "no log at all is not evidence of anything"
+        );
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            None,
+            "an explicit goto: stuck rule is not a max_visits dead end"
+        );
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            Some("loopy".to_string())
+        );
+        // A later, non-max_visits position (a subsequent resumed attempt
+        // that got past it) must clear the earlier landing.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n\
+             {\"event\":\"position\",\"after\":\"loopy\",\"next\":\"next_step\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        assert_eq!(stuck_step_exhausted_max_visits(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_done_run_offers_only_why() {
+        let dir = PathBuf::from("/does-not-need-to-exist");
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("done", &dir, &flow, None);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["kind"], "why");
+    }
+
+    #[test]
+    fn next_actions_for_a_persistence_failure_does_not_offer_resume_but_still_offers_carry() {
+        let dir = next_actions_test_dir("persistence-failure");
+        // A healthy terminal status.json, so the carry diagnosis (a
+        // separate question from resumability) resolves cleanly and this
+        // test isolates the resume diagnosis.
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "failed", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let error = Some((
+            machine::ErrorCode::PersistenceFailure,
+            "step 'x': required result artifacts could not be persisted",
+        ));
+        let actions = next_actions_for("failed", &dir, &flow, error);
+
+        let resume = actions
+            .iter()
+            .find(|a| a["kind"] == "resume")
+            .expect("a resume diagnosis is always present, even when refused");
+        assert_eq!(resume["resumable"], false);
+        assert!(
+            resume.get("argv").is_none(),
+            "an action that cannot succeed must carry no argv to run: {resume}"
+        );
+        assert!(resume["reason"].as_str().unwrap().contains("persist"));
+
+        let carry = actions
+            .iter()
+            .find(|a| a["kind"] == "carry_budget")
+            .expect("a carry diagnosis is always present");
+        assert_eq!(carry["carryable"], true);
+        assert!(carry.get("argv").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_stuck_run_that_exhausted_max_visits_does_not_offer_resume() {
+        let dir = next_actions_test_dir("stuck-max-visits");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "stuck", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("stuck", &dir, &flow, None);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], false);
+        assert!(resume["reason"].as_str().unwrap().contains("max_visits"));
+        assert!(resume.get("argv").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_an_ordinary_stuck_landing_still_offers_resume() {
+        let dir = next_actions_test_dir("stuck-ordinary");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"review\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "stuck", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("stuck", &dir, &flow, None);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], true);
+        let argv: Vec<String> = resume["argv"]
+            .as_array()
+            .expect("a runnable action carries argv")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(argv.contains(&"--resume".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_workspace_drift_failure_offers_resume_with_adopt_workspace_baked_in() {
+        let dir = next_actions_test_dir("workspace-drift");
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "failed", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let error = Some((
+            machine::ErrorCode::WorkspaceDrift,
+            "SFH_WORKSPACE_DRIFT: the managed workspace changed",
+        ));
+        let actions = next_actions_for("failed", &dir, &flow, error);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], true);
+        assert_eq!(resume["requires"], serde_json::json!(["--adopt-workspace"]));
+        let argv: Vec<String> = resume["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            argv.contains(&"--adopt-workspace".to_string()),
+            "a caller executing this argv verbatim must not be missing the flag the diagnosis named: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

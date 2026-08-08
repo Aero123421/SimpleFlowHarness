@@ -38,7 +38,8 @@
         "budget_landing",
         "budget_carried",
         "persistence_failure",
-        "run_end"
+        "run_end",
+        "context_snapshot"
       ]
     },
     "step": {
@@ -185,7 +186,7 @@
     "elapsed_sec": {
       "type": "integer",
       "minimum": 0,
-      "description": "budget_carried: active run seconds the ancestor spent, counted against wall_clock_sec. Added in v1.3.0."
+      "description": "budget_carried: active run seconds the ancestor spent, counted against wall_clock_sec. Added in v1.3.0. run_end: active run seconds this run itself spent, recorded durably so carry and resume no longer have to fall back to status.json's heartbeat (which can be stale or missing) to recover elapsed time. Added in v1.4.0; a run_end from before that carries no elapsed_sec."
     },
     "outcome": {
       "type": [
@@ -207,6 +208,49 @@
         "null"
       ],
       "description": "step_end: the free-form label from that same entry. sfh records and compares it and never interprets it. Added in v1.4.0."
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "source",
+          "state"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The contexts.<name> this source was declared under."
+          },
+          "source": {
+            "type": "string",
+            "description": "The declared file path, as written in the flow."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "captured",
+              "absent"
+            ],
+            "description": "captured: the file existed and was frozen into context-snapshot/. absent: an optional source that was not there at run start, so every step sees it as absent too."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "captured only: hash of the frozen bytes."
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "captured only: size of the frozen bytes."
+          },
+          "snapshot": {
+            "type": "string",
+            "description": "captured only: path to the frozen copy, relative to the run directory."
+          }
+        }
+      },
+      "description": "context_snapshot: one entry per kind: file context this flow declares, recorded once at run start so every step reads the SAME bytes instead of re-opening the declared path. Also written durably to context-snapshot.json. Added in v1.4.0."
     }
   },
   "allOf": [
@@ -437,6 +481,20 @@
           "status",
           "leaf_runs",
           "cost_usd"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "context_snapshot"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "sources"
         ]
       }
     }

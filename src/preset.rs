@@ -8,8 +8,11 @@
 //! three things at once: a clean final message, the session id, and token/cost
 //! usage. Key per-tool facts encoded here:
 //! - codex: prompt on stdin via '-'; final text from --output-last-message;
-//!   `--json` stdout carries thread.started/turn.completed; `exec resume` has
-//!   no -s flag, so the sandbox is re-specified with -c sandbox_mode=...
+//!   `--json` stdout carries thread.started/turn.completed; `exec resume` and
+//!   `exec fork` (P1-07) both lack -s, so the sandbox is re-specified with
+//!   -c sandbox_mode=...; fork ships after this file's LAST_VERIFIED date, so
+//!   sfh additionally demands a live --help probe of the installed binary
+//!   before it will use it (see `codex_fork_confirmed`).
 //! - claude: prompt on stdin; --output-format json gives .result/.session_id/
 //!   .total_cost_usd; plan mode is only advisory, so read = dontAsk + --tools.
 //! - opencode: prompt on stdin; --auto is mandatory headless (an "ask" hangs
@@ -256,16 +259,39 @@ pub fn session_is_cwd_scoped(tool: &str) -> bool {
 }
 
 /// Fork resolution is more tolerant than resume: pi's --fork looks up the id
-/// project-locally then globally, and opencode session ids are global.
+/// project-locally then globally, and opencode session ids are global. codex
+/// stays out of this list for the same reason it is absent from
+/// `session_is_cwd_scoped`: sfh has no evidence that codex scopes a thread id
+/// to the directory it was created in, so treating a cwd change as risky here
+/// would warn about a danger nothing has shown to exist.
 pub fn fork_is_cwd_scoped(tool: &str) -> bool {
     matches!(tool, "claude" | "grok")
 }
 
 /// Tools that can branch a session headlessly into a NEW independent session.
-/// codex's `fork` is TUI-only and `exec resume` appends to the parent; agy has
-/// no fork at all.
+/// codex's `exec fork` (P1-07) joined this list after this file's
+/// LAST_VERIFIED baseline was pinned, so `true` here is only the adapter-wide
+/// half of the answer: `build_fork`'s codex arm additionally demands live
+/// proof from the installed binary before it actually emits anything (see
+/// `codex_fork_confirmed`) - this function alone is not permission to launch
+/// it. agy has no fork at all.
 pub fn supports_fork(tool: &str) -> bool {
-    matches!(tool, "claude" | "opencode" | "grok" | "pi")
+    FORKABLE.contains(&tool)
+}
+
+/// The one list, because there used to be three.
+///
+/// `supports_fork` decided the answer while two error messages - one here and
+/// one in `flow.rs` - each spelled the list out again for the operator. Adding
+/// codex moved the decision and left both messages telling people codex could
+/// not do the thing sfh had just started doing. A refusal that names the wrong
+/// alternatives is worse than one that names none, so the messages now read
+/// from the same slice the decision does.
+pub const FORKABLE: &[&str] = &["codex", "claude", "opencode", "grok", "pi"];
+
+/// `FORKABLE` as a message fragment, in the shape both refusals want.
+pub fn forkable_list() -> String {
+    FORKABLE.join("/")
 }
 
 /// The executable a preset launches when no `bin:` overrides it. Every preset
@@ -281,7 +307,9 @@ pub fn default_program(tool: &str) -> String {
 /// Forking pays off because the child's prompt prefix is byte-identical to the
 /// parent's, so the provider's prompt cache can hit - but N children racing the
 /// first cache write all miss it. Measured on claude: one warm-up child first
-/// turned $0.0337 per child into $0.0026. Only claude showed a real saving.
+/// turned $0.0337 per child into $0.0026. Only claude showed a real saving;
+/// codex fork (P1-07) has never been run through this measurement and is left
+/// out rather than assumed to share claude's cache economics.
 pub fn fork_warmup_pays(tool: &str) -> bool {
     tool == "claude"
 }
@@ -308,13 +336,47 @@ impl Coverage {
 /// `access:` is a request to the CLI's own permission system, never an OS
 /// sandbox, and the four answers below are the honest range of what a CLI does
 /// with that request.
+///
+/// The bar for `Enforced` (P0-02, after the review found it over-claimed for
+/// claude/opencode/grok/pi/cursor): the CLI itself must guarantee that ONE
+/// flag or mode sfh passes closes the WHOLE class of access the level names.
+/// "sfh enumerated the builtin tools it knew about and denied them" is not
+/// that guarantee - a builtin-tool allowlist says nothing about an MCP tool,
+/// a plugin, a hook, a subagent, or a project instruction file, all of which
+/// reach the same capabilities through a door the allowlist never named. The
+/// preset author's list can be complete on the day it is written and wrong a
+/// release later, because the surface it did not enumerate is precisely the
+/// part nobody was looking at. A holistic guarantee looks different: codex's
+/// `-s` picks an OS sandbox tier that bounds the whole process, not just the
+/// tools codex itself shipped with. When in doubt between `Enforced` and
+/// `BestEffort`, the honest default is `BestEffort` - it costs a warning in
+/// `preflight`, where over-claiming costs an operator a false sense of a
+/// boundary that was never really there.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Enforcement {
     /// The tool has a real sandbox for this level.
     Sandboxed,
-    /// The tool enforces it in-process (permission config, tool allowlist).
+    /// The CLI's own flag or mode is documented to close the entire class of
+    /// access this level names - not just the specific tools, edits or
+    /// commands sfh's preset happens to enumerate. See the enum doc comment
+    /// for the bar this has to clear.
+    ///
+    /// No adapter clears this bar today: agy's P0-02 pass (the last of the
+    /// seven) found its `--mode` is the same bare, non-sandboxed switch as
+    /// every other downgraded adapter's, leaving `Sandboxed` (codex's real OS
+    /// sandbox) the only mechanism currently on the holistic side of the
+    /// line. The variant stays - removing it would silently drop `"enforced"`
+    /// from the `access_enforcement` vocabulary CHANGELOG v1.4.0 already
+    /// documented as machine-readable output, and a tool that closes a whole
+    /// access class through its own guarantee without an OS sandbox is a real
+    /// case this taxonomy still needs to be able to say.
+    #[allow(dead_code)]
     Enforced,
-    /// Requested, but the tool's own defaults or config can widen it.
+    /// Requested, but the tool's own defaults or config can widen it - or the
+    /// preset only closes the surface its author enumerated (builtin tools),
+    /// while MCP tools, plugins, hooks, subagents, skills, instruction files
+    /// or auto-update sit outside it, unverified. `known_gaps` names which of
+    /// these actually apply to this adapter.
     BestEffort,
     /// The tool has no such level; sfh refuses the combination.
     Unsupported,
@@ -333,18 +395,28 @@ impl Enforcement {
 
 /// What sfh knows about one adapter without running a model.
 ///
-/// `minimum_version` is deliberately `None` for every adapter. The spec asks
-/// for it to be re-confirmed against each CLI's official documentation and a
-/// live probe before being pinned, and pinning a number from memory would let
-/// `preflight` report a confident-looking floor sfh never verified. `preflight`
-/// therefore prints the installed version and says the required floor is
-/// unknown, which is a true statement a user can act on.
+/// `minimum_version` stays `None` unless a floor is independently documented
+/// somewhere sfh can point to - a CLI's own changelog or release notes saying
+/// a feature this adapter depends on shipped in version Y, not a number
+/// recalled from memory or inferred from LAST_VERIFIED. Pinning a number sfh
+/// has not seen documented would let `preflight` report a confident-looking
+/// floor it never verified, which is the exact failure this field exists to
+/// avoid (P1-06). A live probe against the running binary is a DIFFERENT,
+/// stronger check that `sfh doctor` performs; `minimum_version` only claims
+/// what the CLI's own authors put in writing. Every `Some` must therefore
+/// carry a comment at its `adapter_info` match arm citing that source, so the
+/// next reader can tell a documented floor from a guess without redoing the
+/// research. Where it stays `None`, `preflight` prints the installed version
+/// and says the required floor is unknown, which is a true statement a user
+/// can act on.
 #[derive(Clone, Debug)]
 pub struct AdapterInfo {
     pub tool: &'static str,
     pub default_program: String,
     /// When this adapter's command line was last checked against the real CLI.
     pub last_verified: &'static str,
+    /// `None` unless a floor is documented (see the struct doc comment); every
+    /// `Some` cites its source where it is pinned in `adapter_info`.
     pub minimum_version: Option<&'static str>,
     /// The structured protocol its output must complete.
     pub protocol: &'static str,
@@ -379,81 +451,211 @@ impl AdapterInfo {
 /// The date the header of this module records as its live-verification point.
 pub const LAST_VERIFIED: &str = "2026-07-27";
 
+/// The per-tool literals `adapter_info` switches on, in the order they fill
+/// `AdapterInfo`: protocol, cost coverage, read/write/full enforcement,
+/// required flags, known gaps, and a documented minimum version (or `None`).
+/// Named so the match below reads as data, not a six-tuple clippy has to
+/// squint at.
+type AdapterFacts = (
+    &'static str,
+    Coverage,
+    [Enforcement; 3],
+    &'static [&'static str],
+    &'static [&'static str],
+    Option<&'static str>,
+);
+
 /// Metadata for one preset, or `None` for a name that is not a preset.
 pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
     use Enforcement::*;
-    let (protocol, cost, policy, flags, gaps): (
-        &'static str,
-        Coverage,
-        [Enforcement; 3],
-        &'static [&'static str],
-        &'static [&'static str],
-    ) = match tool {
+    let (protocol, cost, policy, flags, gaps, min_version): AdapterFacts = match tool {
         "codex" => (
             "codex-jsonl",
             Coverage::TokensOnly,
-            // codex is the one preset with a real OS sandbox behind -s.
+            // codex is the one preset with a real OS sandbox behind -s: the
+            // sandbox bounds the whole process, not just the tools codex
+            // itself ships with, so it clears the P0-02 bar for `Enforced`.
             [Sandboxed, Sandboxed, BestEffort],
-            &["exec", "--json", "--output-last-message", "-s", "-c"],
+            &[
+                "exec",
+                "--skip-git-repo-check",
+                "--color",
+                "--json",
+                "-c",
+                "-s",
+                "--output-last-message",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
             &["access: full disables the sandbox entirely (--dangerously-bypass-approvals-and-sandbox)"],
+            None,
         ),
         "claude" => (
             "claude-json",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["-p", "--output-format", "--permission-mode", "--session-id"],
+            // P0-02: downgraded from Enforced. --tools/--allowedTools only
+            // close the builtin tools sfh enumerated; see known_gaps for what
+            // that enumeration does not reach.
+            [BestEffort, BestEffort, BestEffort],
+            &[
+                "-p",
+                "--output-format",
+                "--model",
+                "--effort",
+                "--agent",
+                "--permission-mode",
+                "--tools",
+                "--allowedTools",
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "--fork-session",
+            ],
             &[
                 "plan mode is advisory, so read is enforced by an explicit --tools allowlist rather than by a sandbox",
-                "user- and project-level settings, MCP servers, hooks and skills are not visible to sfh",
+                "MCP tools live in a permission namespace separate from --tools/--allowedTools, so an MCP server the project wires up is not covered by either allowlist",
+                "plugins, hooks and skills run project- or user-authored code outside the --tools surface entirely, and no flag sfh passes disables them",
+                "global (user-level) and project-level instruction files (e.g. CLAUDE.md) load into context unfiltered; sfh neither inspects nor suppresses them",
             ],
+            None,
         ),
         "opencode" => (
             "opencode-ndjson",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["run", "--format", "--agent", "--auto"],
+            // P0-02: downgraded from Enforced. OPENCODE_CONFIG_CONTENT only
+            // denies the permission keys sfh names; --auto approves whatever
+            // it does not name, so an unnamed capability defaults to open.
+            [BestEffort, BestEffort, BestEffort],
+            &["run", "--format", "--variant", "--agent", "--auto", "--fork"],
             &[
                 "read/write are enforced through OPENCODE_CONFIG_CONTENT, which merges with the user's own config",
                 "there is no OS sandbox, so write denies bash outright",
+                "--auto approves anything the config does not explicitly deny, so a capability this preset's deny list omits defaults to allowed",
+                "task (subagent) and skill invocations are not covered by the edit/bash/external_directory denies this preset writes",
+                "MCP servers and custom tools sit outside the permission keys this preset sets, and plugins run outside the permission system entirely",
             ],
+            None,
         ),
         "grok" => (
             "grok-json",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["--output-format", "--prompt-file", "--session-id"],
-            &["no OS sandbox; read is a permission-mode plus explicit denies"],
+            // P0-02: downgraded from Enforced. --deny only names Edit/Write/
+            // Bash; MCPTool is documented as its own permission, and sandbox
+            // vs. permission are separate axes grok never promised --deny covers.
+            [BestEffort, BestEffort, BestEffort],
+            &[
+                "--output-format",
+                "--reasoning-effort",
+                "--agent",
+                "--permission-mode",
+                "--deny",
+                "--session-id",
+                "--prompt-file",
+                "--resume",
+                "--fork-session",
+            ],
+            &[
+                "no OS sandbox; read is a permission-mode plus explicit --deny rules, and grok documents sandbox and permission as separate axes",
+                "MCPTool is a permission distinct from Edit/Write/Bash, so an MCP-provided tool is not covered by --deny Edit/Write/Bash",
+                "plugins, hooks, skills and subagents are undocumented for headless denial, so sfh cannot say whether --deny reaches them",
+                "no flag sfh has confirmed for the pinned grok CLI disables auto-update, so a scripted run's binary could change mid-flow",
+            ],
+            None,
         ),
         "agy" => (
             "agy-json",
             Coverage::TokensOnly,
-            [Enforced, Enforced, BestEffort],
-            &["--output-format", "--mode", "--print-timeout", "-p"],
+            // P0-02: downgraded from Enforced. agy's builder pushes nothing
+            // for read/write but the bare --mode flag itself - no --tools-
+            // style allowlist, no sandbox flag - identical in shape to
+            // cursor's --mode plan (BestEffort) and to claude's plan mode,
+            // whose own gap text calls plan mode advisory. A mode switch is a
+            // request to agy's own permission system, not a demonstrated
+            // guarantee that it bounds the whole process, so nothing here
+            // clears the bar Enforced requires.
+            [BestEffort, BestEffort, BestEffort],
+            &[
+                "--model",
+                "--effort",
+                "--agent",
+                "--print-timeout",
+                "--mode",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "-p",
+                "--conversation",
+            ],
             &[
                 "exit codes are unreliable; sfh trusts the envelope's status field",
                 "no fork: a branch of an existing conversation is not available headlessly",
+                "--mode plan/accept-edits is a bare mode switch - no --tools-style allowlist and no sandbox flag back it, so its reach over an MCP server, a plugin, a hook or a subagent agy loads is undocumented",
+                "project- or user-level instruction files agy may read are not inspected or suppressed by any flag this preset passes",
             ],
+            // P1-06: agy's own changelog documents structured print output
+            // (the --output-format json envelope this preset's whole parse
+            // path depends on) as shipping in 1.1.8. LAST_VERIFIED here is
+            // 1.0.8 - a version below the floor the feature needs - so a
+            // build between those two numbers would accept this preset's
+            // flags and then have no structured envelope to answer with.
+            // Pinning the floor is a claim about what agy's authors put in
+            // writing, not a re-verification of the live-verified research
+            // date above; it does not move LAST_VERIFIED.
+            Some("1.1.8"),
         ),
         "pi" => (
             "pi-jsonl",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["--mode", "--offline", "--session-id", "--tools"],
+            // P0-02: downgraded from Enforced. The --tools allowlist closes
+            // pi's own tool surface, but AGENTS.md/CLAUDE.md and a SYSTEM or
+            // APPEND_SYSTEM environment variable reach the model outside it.
+            [BestEffort, BestEffort, BestEffort],
+            &[
+                "--mode",
+                "--offline",
+                "--model",
+                "--thinking",
+                "--tools",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                "--no-approve",
+                "--approve",
+                "--session-id",
+                "--fork",
+            ],
             &[
                 "no sandbox at all: access is expressed purely as a --tools allowlist, and write therefore excludes bash",
                 "--session-id CREATES a session when the id is not found in this cwd, so a resume is only trustworthy with the session marker",
+                "--no-context-files stops pi reading AGENTS.md/CLAUDE.md off disk, but a SYSTEM or APPEND_SYSTEM environment variable injects a hidden system prompt through a path sfh does not scrub",
             ],
+            None,
         ),
         "cursor" => (
             "cursor-json",
             Coverage::TokensOnly,
             // Headless cursor has exactly two tiers; there is no write.
-            [Enforced, Unsupported, BestEffort],
-            &["-p", "--output-format", "--trust", "--disable-project-configs"],
+            // P0-02: read downgraded from Enforced. Public docs describe print
+            // mode as reaching every tool; --mode=plan is a per-action gate on
+            // top of that, not a narrower tool list, and its reach over project/
+            // global rules, MCP and any headless sandbox is unverified.
+            [BestEffort, Unsupported, BestEffort],
+            &[
+                "-p",
+                "--output-format",
+                "--trust",
+                "--disable-auto-update",
+                "--disable-project-configs",
+                "--model",
+                "--mode",
+                "--force",
+                "--resume",
+            ],
             &[
                 "headless permissions are binary: deny-all without --force, approve-all with it, so access: write is refused rather than silently promoted",
                 "--resume creates a chat when the id is unknown, so sfh verifies the chat store on disk",
+                "print mode exposes the full tool surface regardless of --mode; plan mode denies gated operations rather than narrowing which tools exist, and whether project/global Cursor rules still apply under it is undocumented",
+                "MCP servers configured for the project are a separate surface from the built-in tools --mode=plan is documented against",
             ],
+            None,
         ),
         _ => return None,
     };
@@ -461,7 +663,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
         tool: crate::flow::TOOLS.iter().find(|t| **t == tool)?,
         default_program: default_program(tool),
         last_verified: LAST_VERIFIED,
-        minimum_version: None,
+        minimum_version: min_version,
         protocol,
         supports_resume: true,
         supports_fork: supports_fork(tool),
@@ -483,6 +685,66 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
 /// is a failure. A flow that knows better says so with `exit_conflict:`.
 pub fn exit_code_trustworthy(tool: &str) -> bool {
     tool != "agy"
+}
+
+/// Extra CLI args and env vars to apply ONLY while probing a tool's own
+/// launcher (`--help`/`--version`) - never during a real run, whose argv and
+/// env already come from `build`/`build_resume`/`build_fork`. `preflight`'s
+/// `read_help` and `probe_version_isolated` are the two call sites. A probe is
+/// still a real invocation, and some launchers treat ANY invocation as a
+/// chance to do more than answer - self-update, phone home, write a cache -
+/// which is exactly the side effect a free, offline check must not cause
+/// (P3-02).
+///
+/// This lives here, next to the rest of each adapter's command-line facts,
+/// for the same reason `required_flags` and `known_gaps` do rather than being
+/// duplicated in `preflight` - which flag or env var keeps a given CLI quiet
+/// is knowledge about that CLI, not about preflight.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeHardening {
+    pub extra_args: &'static [&'static str],
+    pub env_set: &'static [(&'static str, &'static str)],
+}
+
+/// What sfh can actually confirm keeps a probe quiet, per tool - nothing
+/// more. An empty table is the correct, honest answer for an adapter whose
+/// probe-safe flags sfh has not verified, not a placeholder waiting to be
+/// filled in: `probe_hardening_resolves_for_every_tool_and_never_contradicts_a_declined_auto_update_gap`,
+/// below, pins that an empty table and a missing `known_gaps` entry about
+/// auto-update can never drift apart.
+///
+/// cursor is the one adapter with a confirmed entry. Its own builder
+/// (`build`/`build_resume`) already sends `--disable-auto-update` on every
+/// invocation, fresh or resumed, because cursor's launcher can otherwise pipe
+/// an installer into PowerShell mid-flow - see the comment at that call site.
+/// That risk is exactly as real on a bare `--help`/`--version` probe as it is
+/// on a scripted run, so the same, already-attested flag applies here too.
+/// `--disable-project-configs`, cursor's other hardening flag, is
+/// deliberately NOT repeated here: it suppresses a repo-supplied
+/// approval-mode override, which has nothing to do with self-update or phone
+/// home - the two concerns this seam exists for - and a bare `--help`/
+/// `--version` call never reaches an approval prompt in the first place, so
+/// adding it would be decoration, not hardening.
+///
+/// Every other adapter resolves to an empty table. In particular, grok is
+/// deliberately absent: the P0-02 review asked for a `--no-auto-update`-style
+/// flag on every scripted grok invocation, but nothing in this codebase's
+/// prior research confirms that flag's name for the pinned grok CLI (see
+/// `grok_does_not_claim_an_unconfirmed_auto_update_flag` in this module's
+/// tests, and grok's own `known_gaps` entry). Inventing one here to harden a
+/// probe would repeat exactly the failure that test exists to catch, just
+/// one call site removed from the one it already guards.
+pub fn probe_hardening(tool: &str) -> ProbeHardening {
+    match tool {
+        "cursor" => ProbeHardening {
+            extra_args: &["--disable-auto-update"],
+            env_set: &[],
+        },
+        _ => ProbeHardening {
+            extra_args: &[],
+            env_set: &[],
+        },
+    }
 }
 
 /// pi has no sandbox and no permission prompts: the only real lever is which
@@ -519,12 +781,23 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
         // process rights regardless of the tool allowlist, so anything below full
         // must refuse to load them for the allowlist to mean anything: an
         // extension in the repo could register Bash and undo the write tier.
+        //
+        // --no-context-files (P0-02) belongs on read AND write, not read
+        // alone: AGENTS.md/CLAUDE.md on disk and pi's SYSTEM/APPEND_SYSTEM
+        // path are an unaudited prompt input regardless of which tools are
+        // registered, and the read-vs-write line is about which tools pi may
+        // USE, not about whether a file neither sfh nor the flow author wrote
+        // gets to add hidden instructions. full does not get the flag: full
+        // already means the operator trusts this tool with everything, so
+        // suppressing pi's normal project-context behavior there would be an
+        // undocumented narrowing of the one tier meant to hold nothing back.
         Access::Read => push(
             a,
             &[
                 "--no-extensions",
                 "--no-skills",
                 "--no-prompt-templates",
+                "--no-context-files",
                 "--no-approve",
             ],
         ),
@@ -535,6 +808,7 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
                     "--no-extensions",
                     "--no-skills",
                     "--no-prompt-templates",
+                    "--no-context-files",
                     "--no-approve",
                 ],
             );
@@ -1535,20 +1809,43 @@ pub fn build_resume(
     })
 }
 
+/// The token codex's own `--help` has to contain for sfh to trust `exec fork`
+/// on the installed binary (P1-07). Deliberately NOT folded into
+/// `AdapterInfo.required_flags`, which `preflight` checks on every run
+/// regardless of what the step asked for: a codex whose `--help` stays silent
+/// about `fork` is still a perfectly good codex for a fresh run or a
+/// `continue_from` resume, so refusing those too would be exactly the
+/// per-adapter-vs-per-capability mismatch this function exists to avoid.
+/// `None` (the caller could not read `--help` at all) is exactly as
+/// untrustworthy as help text that never mentions fork, so both fail closed
+/// the same way.
+fn codex_fork_confirmed(installed_help: Option<&str>) -> bool {
+    installed_help.is_some_and(|h| h.contains("fork"))
+}
+
 /// Build the command line to FORK a session: the child inherits the parent's
 /// history but writes to its own session, so N children can diverge from one
 /// context concurrently without corrupting each other or the parent.
 ///
-/// All four supporting tools refuse loudly (exit 1, before any model call) when
+/// Every supporting tool refuses loudly (exit 1, before any model call) when
 /// the parent id does not exist, so - unlike pi's create-or-resume --session-id -
 /// a fork cannot silently degrade into a cold session. The remaining risk is the
 /// fork flag being ignored, which the caller detects by requiring child != parent.
+///
+/// `installed_help` is the resolved binary's own `--help` output, when the
+/// caller could read it. It is consulted ONLY by codex's arm: `exec fork`
+/// shipped after this file's `LAST_VERIFIED` baseline, so `supports_fork`
+/// returning `true` for codex is an adapter-wide fact, not proof THIS
+/// installed build has ever heard of the subcommand - see
+/// `codex_fork_confirmed`. Every other tool's fork predates that baseline and
+/// ignores this argument.
 pub fn build_fork(
     tool: &str,
     parent_session_id: &str,
     child_session_id: &str,
     inp: PresetInput,
     paths: &BuildPaths,
+    installed_help: Option<&str>,
 ) -> Result<Built, String> {
     let mut a: Vec<String> = Vec::new();
     let mut warnings = Vec::new();
@@ -1556,9 +1853,76 @@ pub fn build_fork(
     let mut env_set = Vec::new();
     let parse;
     let delivery;
-    // opencode mints the child id itself; the others let sfh name it.
+    // opencode and codex mint the child id themselves; the others let sfh
+    // name it.
     let mut preassigned = Some(child_session_id.to_string());
     match tool {
+        "codex" => {
+            // sfh's belief that codex CAN fork is adapter-wide (supports_fork);
+            // whether THIS installed binary has ever heard of the subcommand
+            // is not, so launching blind risks the exact failure this gate
+            // exists to avoid: an older codex either erroring in a way sfh
+            // cannot tell apart from a real failure, or silently treating
+            // "fork" as an ordinary argument and spending a real turn on a
+            // request nobody made.
+            if !codex_fork_confirmed(installed_help) {
+                return Err(format!(
+                    "codex needs a build that recognises 'exec fork' to branch a session headlessly, and sfh {}. Run 'codex exec --help' yourself to check, upgrade codex if it is missing, or use continue_from to chain this step serially instead",
+                    if installed_help.is_some() {
+                        "could read its --help but it never mentions fork"
+                    } else {
+                        "could not confirm this from the installed binary"
+                    }
+                ));
+            }
+            push(&mut a, &["codex", "exec", "fork"]);
+            a.push(parent_session_id.to_string());
+            push(
+                &mut a,
+                &[
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-c",
+                    "approval_policy=\"never\"",
+                ],
+            );
+            if let Some(m) = &inp.model {
+                push(&mut a, &["-m"]);
+                a.push(m.clone());
+            }
+            if let Some(e) = &inp.effort {
+                push(&mut a, &["-c"]);
+                a.push(format!("model_reasoning_effort=\"{e}\""));
+            }
+            // Like `exec resume`, `exec fork` has no -s flag - rebuild the
+            // sandbox via -c instead of assuming the child inherits the
+            // parent's.
+            match inp.access {
+                Access::Read => {
+                    push(&mut a, &["-c"]);
+                    a.push("sandbox_mode=\"read-only\"".into());
+                }
+                Access::Write => {
+                    push(&mut a, &["-c"]);
+                    a.push("sandbox_mode=\"workspace-write\"".into());
+                }
+                Access::Full => push(&mut a, &["--dangerously-bypass-approvals-and-sandbox"]),
+            }
+            if inp.agent.is_some() {
+                warnings.push("codex preset ignores 'agent' (no --agent flag in exec)".into());
+            }
+            a.extend(inp.extra.iter().cloned());
+            push(&mut a, &["--output-last-message"]);
+            a.push(paths.last_msg.display().to_string());
+            push(&mut a, &["-"]);
+            // codex mints the child's session id itself and reports it via
+            // thread.started in the fork run's own JSONL, exactly like a
+            // fresh run - sfh cannot preassign it (codex is absent from
+            // wants_preassign for the same reason).
+            preassigned = None;
+            parse = OutputParse::CodexJsonl(paths.last_msg.to_path_buf());
+            delivery = Delivery::Stdin;
+        }
         "claude" => {
             push(&mut a, &["claude", "-p", "--output-format", "json", "-r"]);
             a.push(parent_session_id.to_string());
@@ -1615,7 +1979,7 @@ pub fn build_fork(
         other => {
             return Err(format!(
                 "tool '{other}' cannot fork a session headlessly (only {}); use continue_from to chain serially, or give this step its own context",
-                ["claude", "opencode", "grok", "pi"].join("/")
+                forkable_list()
             ))
         }
     }
@@ -1979,6 +2343,11 @@ mod tests {
         assert!(!supports_fork("cursor"));
     }
 
+    /// codex's own `--help`, shaped enough to convince `codex_fork_confirmed`
+    /// that this installed build has heard of `exec fork` - used wherever a
+    /// test needs codex to actually clear the P1-07 capability gate.
+    const CODEX_HELP_WITH_FORK: &str = "usage: codex exec [OPTIONS] [PROMPT]\n\nSUBCOMMANDS:\n    resume    Resume a previous session\n    fork      Fork a previous session into a new one\n";
+
     #[test]
     fn fork_builds_a_child_session_for_every_supporting_tool() {
         let (l, p) = paths();
@@ -1986,18 +2355,28 @@ mod tests {
             last_msg: &l,
             prompt_file: &p,
         };
-        for t in ["claude", "opencode", "grok", "pi"] {
+        for t in ["claude", "opencode", "grok", "pi", "codex"] {
             assert!(supports_fork(t), "{t}");
-            let b = build_fork(t, "PARENT", "CHILD", inp(Access::Read, &[]), &bp).unwrap();
+            // codex additionally needs live proof the installed binary knows
+            // about `exec fork` (P1-07; see build_fork's codex arm) before it
+            // will build anything - every other tool's fork is unconditional
+            // once supports_fork says yes, so this argument is None for them.
+            let help = (t == "codex").then_some(CODEX_HELP_WITH_FORK);
+            let b = build_fork(t, "PARENT", "CHILD", inp(Access::Read, &[]), &bp, help).unwrap();
             assert!(
                 b.argv.iter().any(|x| x == "PARENT"),
                 "{t}: parent id missing"
             );
             match t {
-                // opencode mints the child id itself; it cannot be named.
+                // opencode and codex mint the child id themselves; it cannot
+                // be named up front the way claude/grok/pi's can.
                 "opencode" => {
                     assert!(b.preassigned_session.is_none());
                     assert!(b.argv.iter().any(|x| x == "--fork"));
+                }
+                "codex" => {
+                    assert!(b.preassigned_session.is_none());
+                    assert!(b.argv.windows(2).any(|w| w[0] == "exec" && w[1] == "fork"));
                 }
                 _ => {
                     assert_eq!(b.preassigned_session.as_deref(), Some("CHILD"), "{t}");
@@ -2007,19 +2386,100 @@ mod tests {
             // A fork must never be asserted to equal the parent session.
             assert!(b.expect_session.is_none(), "{t}");
         }
-        for t in ["codex", "agy", "cursor"] {
+        for t in ["agy", "cursor"] {
             assert!(!supports_fork(t), "{t}");
-            let e = build_fork(t, "P", "C", inp(Access::Read, &[]), &bp)
+            let e = build_fork(t, "P", "C", inp(Access::Read, &[]), &bp, None)
                 .err()
                 .unwrap();
             assert!(e.contains("cannot fork"), "{t}: {e}");
         }
     }
 
+    /// P1-07. `supports_fork("codex")` is an adapter-wide fact; it must not by
+    /// itself be enough to spend a real `exec fork` call. Neither a probe that
+    /// failed outright (`None`) nor one that succeeded but never mentions fork
+    /// (an old codex whose `--help` only knows about `resume`) is trusted, and
+    /// the refusal has to name what an operator can actually do about it.
+    #[test]
+    fn codex_fork_refuses_an_older_or_unknown_codex_and_says_what_to_do() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        for help in [
+            None,
+            Some("usage: codex exec resume [OPTIONS] SESSION_ID\n"),
+        ] {
+            let e = build_fork(
+                "codex",
+                "parent-1",
+                "child-1",
+                inp(Access::Read, &[]),
+                &bp,
+                help,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("help={help:?} must not be trusted to fork"));
+            assert!(e.contains("exec fork"), "{e}");
+            assert!(
+                e.contains("upgrade") && e.contains("continue_from"),
+                "the refusal must name what to do next: {e}"
+            );
+        }
+    }
+
+    /// P1-07. Once the capability gate clears, codex's fork argv has to
+    /// follow the same shape as its resume: the subcommand form (not
+    /// --session-id/-r, which codex does not have), no -s (rebuilt via -c),
+    /// and the prompt on stdin.
+    #[test]
+    fn codex_fork_rebuilds_the_sandbox_like_resume_and_reads_stdin() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        let b = build_fork(
+            "codex",
+            "parent-1",
+            "child-1",
+            inp(Access::Write, &[]),
+            &bp,
+            Some(CODEX_HELP_WITH_FORK),
+        )
+        .unwrap();
+        assert!(b.argv.windows(2).any(|w| w[0] == "exec" && w[1] == "fork"));
+        assert!(b.argv.iter().any(|x| x == "parent-1"), "{:?}", b.argv);
+        assert!(
+            !b.argv.iter().any(|x| x == "-s"),
+            "exec fork has no -s flag, same as exec resume: {:?}",
+            b.argv
+        );
+        assert!(b
+            .argv
+            .iter()
+            .any(|x| x == "sandbox_mode=\"workspace-write\""));
+        assert_eq!(
+            b.argv.last().unwrap(),
+            "-",
+            "codex reads the prompt from stdin"
+        );
+    }
+
+    #[test]
+    fn codex_is_not_cwd_scoped_for_fork_the_same_way_it_is_not_for_resume() {
+        // codex looks sessions up by thread id alone; see fork_is_cwd_scoped's
+        // and session_is_cwd_scoped's doc comments for why this is deliberate,
+        // not an oversight.
+        assert!(!fork_is_cwd_scoped("codex"));
+        assert!(!session_is_cwd_scoped("codex"));
+    }
+
     #[test]
     fn only_claude_warms_up_by_default() {
         assert!(fork_warmup_pays("claude"));
-        for t in ["opencode", "grok", "pi"] {
+        for t in ["opencode", "grok", "pi", "codex"] {
             assert!(!fork_warmup_pays(t), "{t} showed no measured saving");
         }
     }
@@ -2060,6 +2520,7 @@ mod tests {
                         last_msg: &l,
                         prompt_file: &p,
                     },
+                    None,
                 )
                 .unwrap()
                 .argv
@@ -2531,6 +2992,367 @@ mod tests {
                 opencode_env(name, Access::Full).is_empty(),
                 "full access sets no enforcement layer"
             );
+        }
+    }
+
+    /// P0-02. `Enforced` used to mean "sfh denied the builtin tools its
+    /// preset author enumerated"; the review found that bar too low for five
+    /// adapters, because none of the five denials reach MCP tools, plugins,
+    /// hooks, subagents or instruction files. agy was left at `Enforced` in
+    /// that first pass only because the review did not name it, not because
+    /// it was examined - a later pass applied the same bar and found agy's
+    /// `--mode` is the identical bare mode switch cursor's and claude's
+    /// already-downgraded modes are, so it joined them. Only a tool whose OWN
+    /// flag is documented to bound the entire process (codex's sandbox)
+    /// still earns `Enforced` today. This test pins the corrected table so a
+    /// future edit cannot silently re-claim `Enforced` for an
+    /// enumerated-denylist or bare-mode adapter without a reviewer noticing
+    /// the diff.
+    #[test]
+    fn enforced_is_reserved_for_a_holistic_guarantee_not_an_enumerated_denylist() {
+        let expected: &[(&str, Enforcement, Enforcement, Enforcement)] = &[
+            (
+                "codex",
+                Enforcement::Sandboxed,
+                Enforcement::Sandboxed,
+                Enforcement::BestEffort,
+            ),
+            (
+                "claude",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "opencode",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "grok",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "agy",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "pi",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "cursor",
+                Enforcement::BestEffort,
+                Enforcement::Unsupported,
+                Enforcement::BestEffort,
+            ),
+        ];
+        for (tool, read, write, full) in expected {
+            let i = adapter_info(tool).unwrap();
+            assert_eq!(i.enforcement(Access::Read), *read, "{tool} read");
+            assert_eq!(i.enforcement(Access::Write), *write, "{tool} write");
+            assert_eq!(i.enforcement(Access::Full), *full, "{tool} full");
+        }
+    }
+
+    /// P0-02. A gap list that is merely non-empty but generic ("some things
+    /// may not be covered") would pass a bare emptiness check and still tell
+    /// an operator nothing they could act on - and a copy-pasted list is the
+    /// same failure wearing a different tool name. Every adapter's list has
+    /// to name its own concrete uncovered surfaces, and no two adapters may
+    /// share one.
+    #[test]
+    fn known_gaps_name_concrete_surfaces_and_are_not_copy_pasted_across_adapters() {
+        let mut seen: Vec<(&str, &[&str])> = Vec::new();
+        for tool in crate::flow::TOOLS {
+            let i = adapter_info(tool).unwrap();
+            assert!(!i.known_gaps.is_empty(), "{tool} lists no known gaps");
+            for (other_tool, other_gaps) in &seen {
+                assert_ne!(
+                    i.known_gaps, *other_gaps,
+                    "{tool} and {other_tool} share an identical known_gaps list - that is a generic list wearing two names"
+                );
+            }
+            seen.push((tool, i.known_gaps));
+        }
+        // Spot-check that the concrete surfaces the P0-02 review named for
+        // each adapter actually made it into the list, so a future edit
+        // cannot quietly water these back down to something generic.
+        let must_mention: &[(&str, &[&str])] = &[
+            ("claude", &["MCP", "plugin", "hook", "instruction"]),
+            ("opencode", &["--auto", "task", "skill", "MCP", "plugin"]),
+            ("grok", &["MCP", "sandbox", "auto-update", "plugin"]),
+            ("agy", &["MCP", "plugin", "hook", "instruction", "sandbox"]),
+            ("pi", &["SYSTEM", "APPEND_SYSTEM", "AGENTS.md"]),
+            ("cursor", &["MCP", "rule"]),
+        ];
+        for (tool, needles) in must_mention {
+            let i = adapter_info(tool).unwrap();
+            let joined = i.known_gaps.join(" | ");
+            for needle in *needles {
+                assert!(
+                    joined.contains(needle),
+                    "{tool}'s known_gaps do not mention '{needle}': {joined}"
+                );
+            }
+        }
+    }
+
+    /// P0-02. Pi documents --no-context-files, and the concrete gap it closes
+    /// (AGENTS.md/CLAUDE.md loading unaudited into the prompt) applies to both
+    /// restrictive tiers, not read alone - see the comment in pi_common. full
+    /// is deliberately excluded: it already means the operator trusts pi with
+    /// everything, so suppressing normal project context there would be an
+    /// undocumented narrowing of the one tier meant to hold nothing back.
+    #[test]
+    fn pi_strict_presets_suppress_hidden_context_files() {
+        assert!(build_argv("pi", Access::Read)
+            .iter()
+            .any(|x| x == "--no-context-files"));
+        assert!(build_argv("pi", Access::Write)
+            .iter()
+            .any(|x| x == "--no-context-files"));
+        assert!(
+            !build_argv("pi", Access::Full)
+                .iter()
+                .any(|x| x == "--no-context-files"),
+            "full trusts pi with everything; suppressing context files there would be a silent narrowing"
+        );
+    }
+
+    /// P0-02. The review asked for --no-auto-update on every scripted grok
+    /// invocation, but nothing in this codebase's prior research (unlike
+    /// cursor's --disable-auto-update, which IS attested here) confirms that
+    /// flag's name for the pinned grok CLI. Inventing a plausible-looking
+    /// flag would repeat exactly the failure this whole fix is about: a
+    /// guarantee sfh claims but never verified. The gap stays open and named
+    /// in known_gaps instead, until someone confirms the real flag against
+    /// grok's own --help or documentation.
+    #[test]
+    fn grok_does_not_claim_an_unconfirmed_auto_update_flag() {
+        for access in [Access::Read, Access::Write, Access::Full] {
+            let argv = build_argv("grok", access);
+            assert!(
+                !argv.iter().any(|x| x.contains("auto-update")),
+                "grok argv claims an auto-update flag sfh never confirmed: {argv:?}"
+            );
+        }
+        let i = adapter_info("grok").unwrap();
+        assert!(
+            i.known_gaps.iter().any(|g| g.contains("auto-update")),
+            "the declined flag must stay a named, tracked gap: {:?}",
+            i.known_gaps
+        );
+    }
+
+    /// P3-02. `probe_hardening` and `known_gaps` are two independent
+    /// descriptions of the same underlying fact - whether sfh has actually
+    /// confirmed a flag that keeps a given tool's own launcher quiet - and
+    /// nothing forces them to stay in agreement as either table is edited on
+    /// its own. This pins both halves so they cannot quietly drift apart:
+    ///
+    /// - The seam resolves for every tool sfh ships (`flow::TOOLS`), never
+    ///   panicking on a tool preflight might actually ask it about.
+    /// - No tool may claim an auto-update-safe probe flag while its OWN
+    ///   known_gaps still says, in the same breath, that no such flag is
+    ///   confirmed - claiming and disclaiming the identical fact about the
+    ///   identical tool is a direct self-contradiction, not two honest views
+    ///   of it. Concretely, today: grok declines the probe-path flag (see
+    ///   `grok_does_not_claim_an_unconfirmed_auto_update_flag`, just above)
+    ///   and must keep naming the gap that explains why; cursor confirms
+    ///   one, both in its real argv and here, and must not also carry a
+    ///   "not confirmed" disclaimer for that same flag.
+    #[test]
+    fn probe_hardening_resolves_for_every_tool_and_never_contradicts_a_declined_auto_update_gap() {
+        for tool in crate::flow::TOOLS {
+            let hardening = probe_hardening(tool);
+            let claims_auto_update_flag = hardening
+                .extra_args
+                .iter()
+                .any(|a| a.contains("auto-update"));
+            let i = adapter_info(tool).expect("every flow::TOOLS entry has adapter metadata");
+            let gap_mentions_auto_update = i.known_gaps.iter().any(|g| g.contains("auto-update"));
+            assert!(
+                !(claims_auto_update_flag && gap_mentions_auto_update),
+                "{tool}: probe_hardening claims an auto-update-safe flag while known_gaps still \
+                 disclaims one - these describe the same fact and must not disagree: \
+                 extra_args={:?} known_gaps={:?}",
+                hardening.extra_args,
+                i.known_gaps
+            );
+        }
+
+        // The concrete case this seam exists to protect (P0-02 asked for a
+        // grok flag sfh could never confirm the name of): declining here
+        // must not quietly undo the tracked gap that already records why.
+        let grok = probe_hardening("grok");
+        assert!(
+            !grok.extra_args.iter().any(|a| a.contains("auto-update")),
+            "grok must keep declining an unconfirmed auto-update flag in the probe path too: {:?}",
+            grok.extra_args
+        );
+        assert!(
+            adapter_info("grok")
+                .unwrap()
+                .known_gaps
+                .iter()
+                .any(|g| g.contains("auto-update")),
+            "grok's declined flag must stay a named, tracked gap"
+        );
+
+        // The one adapter with a confirmed flag: the probe path reuses
+        // exactly what cursor's real argv already sends (see `build`).
+        let cursor = probe_hardening("cursor");
+        assert!(
+            cursor.extra_args.contains(&"--disable-auto-update"),
+            "cursor's confirmed --disable-auto-update should harden the probe path too: {:?}",
+            cursor.extra_args
+        );
+    }
+
+    /// The other half of P1-06's drift problem, in the direction the sfh-side
+    /// test above cannot see.
+    ///
+    /// Preflight blocks a run when a flag an adapter needs is missing from the
+    /// binary's own `--help`. The shell suite points every preset at one stub
+    /// binary, so that stub's help text has to stay a superset of every
+    /// adapter's `required_flags` - and when the lists above were widened to
+    /// what the builders really emit, it silently stopped being one. The
+    /// failure that produces is maximally misleading: `tests/engine_behaviour.sh`
+    /// reports a missing flag on a CLI that never had one, and nothing points
+    /// at the fixture. Reading the stub's source here turns that into a unit
+    /// test failure naming the exact flag, next to the list that caused it.
+    #[test]
+    fn the_session_stub_advertises_every_flag_an_adapter_requires() {
+        // The stub is a separate binary, not part of this crate, so its source
+        // is read as text rather than linked against.
+        let stub = include_str!("../tests/stub/session_stub.rs");
+        let help = stub
+            .split_once("const STUB_HELP: &str = \"\\")
+            .expect("the stub still defines STUB_HELP")
+            .1
+            .split_once("\";")
+            .expect("STUB_HELP is still a single literal")
+            .0;
+        for tool in crate::flow::TOOLS {
+            let i = adapter_info(tool).unwrap();
+            for flag in i.required_flags {
+                assert!(
+                    help.split_whitespace().any(|w| w == *flag),
+                    "{tool} requires {flag}, which tests/stub/session_stub.rs's STUB_HELP does not advertise - preflight will block the shell suite with a missing-flag blocker that has nothing to do with the CLI"
+                );
+            }
+        }
+    }
+
+    /// P1-06. `required_flags` used to be hand-maintained and drifted from
+    /// what the builders actually emit, so preflight's `--help` drift check
+    /// could miss a flag the upstream CLI renamed or dropped simply because
+    /// nobody had added it to this list. This walks every builder (fresh,
+    /// resume, fork), every access level, with every optional field turned on
+    /// so conditional flags (--model, --agent, ...) actually appear, and
+    /// asserts every long ("--foo") flag emitted is named in that adapter's
+    /// required_flags. It deliberately ignores short flags (-s, -c, -p, ...)
+    /// and bare subcommands (exec, run): the drift this guards against is a
+    /// long flag silently going unlisted, and those are the ones `preflight`
+    /// is most likely to have never had a reason to name explicitly.
+    #[test]
+    fn required_flags_names_every_long_flag_a_builder_can_emit() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        let full_inp = |access: Access| PresetInput {
+            model: Some("test-model".to_string()),
+            effort: Some("high".to_string()),
+            access,
+            agent: Some("test-agent".to_string()),
+            extra: &[],
+            bin: None,
+            timeout_sec: Some(900),
+        };
+        let long_flags = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .filter(|a| a.starts_with("--"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for tool in crate::flow::TOOLS {
+            let info = adapter_info(tool).unwrap();
+            let mut emitted: Vec<String> = Vec::new();
+            // Only codex's fork arm consults this; every other tool ignores
+            // it, and passing it unconditionally is what lets this loop stay
+            // tool-agnostic instead of special-casing codex around itself.
+            let codex_help = (tool == "codex").then_some(CODEX_HELP_WITH_FORK);
+            for access in [Access::Read, Access::Write, Access::Full] {
+                if let Ok(b) = build(tool, full_inp(access), &bp, Some("preassigned-id")) {
+                    emitted.extend(long_flags(&b.argv));
+                }
+                if let Ok(b) = build_resume(tool, "resume-id", full_inp(access), &bp) {
+                    emitted.extend(long_flags(&b.argv));
+                }
+                if let Ok(b) = build_fork(
+                    tool,
+                    "parent-id",
+                    "child-id",
+                    full_inp(access),
+                    &bp,
+                    codex_help,
+                ) {
+                    emitted.extend(long_flags(&b.argv));
+                }
+            }
+            emitted.sort();
+            emitted.dedup();
+            for flag in &emitted {
+                assert!(
+                    info.required_flags.contains(&flag.as_str()),
+                    "{tool} emits '{flag}' but required_flags does not list it - preflight's --help drift check would miss it disappearing"
+                );
+            }
+        }
+    }
+
+    /// P1-06. The old rule ("every adapter's minimum_version is None") was a
+    /// stand-in for a stricter one: never claim a version floor sfh did not
+    /// verify. Agy's structured print output - the --output-format json
+    /// envelope this preset's entire parse path depends on - is documented in
+    /// agy's own changelog as shipping in 1.1.8, and LAST_VERIFIED here is
+    /// 1.0.8: a floor below what the feature needs is not a floor at all, so
+    /// 1.1.8 is pinned (with its source cited in the comment at the match
+    /// arm). Every OTHER adapter still has no such documented floor, so
+    /// `None` remains the honest answer for them - this test still fails if
+    /// any of them starts claiming one without the same kind of evidence.
+    ///
+    /// NOTE: `src/preflight.rs`'s `no_adapter_claims_a_minimum_version_it_never_verified`
+    /// asserts the OLD rule (every minimum is `None`) and will now fail on
+    /// agy; that file is out of scope for this change (see the accompanying
+    /// report) and needs the same "unless documented" rewrite this test gives
+    /// the invariant here.
+    #[test]
+    fn only_agy_pins_a_minimum_version_and_it_names_its_source() {
+        for tool in crate::flow::TOOLS {
+            let i = adapter_info(tool).unwrap();
+            if tool == "agy" {
+                assert_eq!(
+                    i.minimum_version,
+                    Some("1.1.8"),
+                    "agy's structured print output needs 1.1.8; pinning it stops sfh driving a build that cannot produce it"
+                );
+            } else {
+                assert_eq!(
+                    i.minimum_version, None,
+                    "{tool} pins a floor that is not documented anywhere sfh can point to"
+                );
+            }
         }
     }
 }

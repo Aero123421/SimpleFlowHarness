@@ -2,6 +2,209 @@
 
 ## Unreleased
 
+v1.4.0の深掘りreviewへの対応です。見つかった問題はengineの基本制御ではなく、
+**sfhと外の世界との境界**に集中していました。「sfhが何を保証したと言っているか」と
+「実際に保証できているか」がずれている箇所、と言い換えられます。
+
+flow fileの書き方は変わりません。既存flowはそのまま動きます。
+
+### `access:` が閉じていない範囲まで「enforced」と表示していました
+
+- **これは何が起きたか。** `AdapterInfo`はclaude/opencode/grok/piのread/writeを
+  `Enforced`と報告し、preflightがそれを表示し、SECURITY.mdもその表示に寄りかかって
+  いました。しかしpresetが実際に閉じていたのは**adapter作者が列挙したbuiltin tool
+  だけ**です。MCP toolは別のpermission名前空間、plugin・hook・skillはallowlistの
+  外側、instruction fileは無検査で読み込まれます。opencodeの`--auto`に至っては
+  **deny listが挙げなかった能力を承認します**。
+- `Enforced`の基準をenumのdoc commentに明文化しました。「CLI自身がそのaccess
+  class全体を閉じると保証するflagをsfhが渡している」ことであって、「presetが
+  たまたま知っていたtoolをdenyした」ではありません。
+- この基準に照らして claude / opencode / grok / pi / cursor / agy を
+  `BestEffort` へ下げました。実OS sandboxでprocessごと囲うcodexだけが
+  `Sandboxed`のまま残ります。**現在`Enforced`を名乗るadapterはありません。**
+- `known_gaps`は総論をやめ、adapterごとに閉じられていない面を名指しします。
+- piのstrict presetに`--no-context-files`を追加しました。read/writeの線引きは
+  「piがどのtoolを使ってよいか」であって「disk上のfileがinstructionを注入して
+  よいか」ではないので、制限側の2 tierとも抑止します。
+- **grokの`--no-auto-update`は追加していません。** pinしたgrok CLIでこのflag名を
+  確認できませんでした。確認できないflagを足すのは、この修正が正そうとしている
+  誤りそのものです。`known_gaps`に記録し、勝手に「直され」ないようtestで固定して
+  います。
+
+### 32 MiBを超えるstructured streamが、terminal recordごと落ちていました
+
+- **これは何が起きたか。** `OutputObserver`はstdoutを流れながら受け取れる設計で、
+  raw captureの32 MiB上限より手前に立っています。しかしsemantic observerを持って
+  いたのは**piだけ**でした。Codex JSONLもOpenCode NDJSONも、process終了後に
+  **上限で切られた**`stdout_clean`をparseしていました。
+- 結果として大きなstreamでは、terminal recordが消えて正常runがprotocol
+  invalidになり、session idが消えてresume/forkが迷子になり、usage recordが消えて
+  **costを過少計上**し、途中のerror recordが消えて失敗が成功として報告され得ました。
+- Codex JSONLとOpenCode NDJSONにもstreaming observerを付けました。行分割の共通部分は
+  `LineStreamObserver`に括り出し、record解釈だけadapterごとに残しています。同じ
+  accumulatorをstreaming pathと非streaming pathの両方が使うので、adapterごとの
+  意味論の実装は1つです。
+- 1 recordあたり16 MiBの上限を追加し、超過はfail-closedです。protocolが無制限に
+  bufferさせられる余地を残しません。
+
+### run途中でcontext fileを書き換えると、記録と実際に渡したものがずれました
+
+- **これは何が起きたか。** execution closureはrun開始時にcontext fileを**内容で**
+  pinします。ところがstep準備時の`context::build`は**元のpathを開き直して**いました。
+  両者をstep起動前に突き合わせる処理はありません。つまりanalyze stepのあとに
+  `TASK.md`を書き換えると、implement stepは新しい内容を読み、
+  `execution-closure.json`は古いhashのままです。resumeを待たずにprovenanceが壊れます。
+- run開始時に`kind: file`のcontextをrun dirへsnapshotし、**各stepはsnapshotを読みます**。
+  closureがpinしたbytesとmodelが見たbytesが、構造として同じものになります。
+- inline/templateは対象外です。templateは`{{steps.x.output}}`を参照でき、step
+  ごとに変わることが仕様なので、凍結してはいけません。
+- **resumeは`--force-resume`でも元のsnapshotを使い続けます。** closureは
+  write-onceなので、resume時に取り直すと「新しいbytesを、古いhashを記録したclosureの
+  下で凍結する」ことになり、この修正が消そうとしている食い違いを作り直してしまいます。
+- snapshotを書けない場合はpersistence failureです。live読み込みへ黙って戻ることは
+  しません。戻ることこそがこのbugだからです。
+
+### `preflight` が任意の `bin:` を実行していました
+
+- **これは何が起きたか。** `cmd:`のprogramをpreflightが**resolveするだけで実行しない**
+  理由は、code中にそう書いてあります —「`deploy.sh --help`はdeployしかねない」。
+  この理屈がpreset toolの`bin:` overrideには適用されていませんでした。`bin:`は任意の
+  pathを取れるので、`sfh preflight flow.yaml`が**そのflowの選んだprogramを実行**します。
+  未信頼のflowが安全か確かめるためのcommandが、まさにその確認の場でcodeを走らせて
+  いたことになります。AI生成flowに対して特に危険です。
+- 線引きはPATH上で解決したtool自身の既定launcherです。sfhが同梱supportしていて
+  `--help`/`--version`が無害だと確認済みのものだけを実行します。それ以外の`bin:`は
+  resolveするだけで、`--probe-binaries`を明示した場合にのみ実行します。
+- 沈黙が「問題なし」に読めてはいけないので、`ProbeState`が区別します。従来の
+  `version: null`は「実行したが読めなかった」と「そもそも実行していない」の両方を
+  意味していました。JSONは`probe_state`と`probe_binaries`を、人向け出力は
+  「not probed」と該当flagを示します。
+- 実行するprobeもisolated scratch directoryから走らせます（`doctor`と同じ理由です）。
+  作れない場合は何もprobeしません。「isolationなしでprobeした」にはしません。
+
+### parallel childのreplay policyが、warningから見えていませんでした
+
+- **これは何が起きたか。** `replay_summary`と`replay_warnings`はtop-level stepだけを
+  走査していました。一方runtimeは未完了のchildをidで引き、**そのchild自身の**policyを
+  適用します。したがって`effects: external` + `replay.unfinished: rerun`をchildに
+  書いたflowは、resumeで外部送信をやり直すのに、`plan`も`validate --strict`も
+  何も言いませんでした。重複した外部作用を止めるために書かれたwarningが、まさに
+  その場面で黙っていたわけです。
+- 走査を`all_steps`ひとつに集約し、childは`parent.child`という既存の命名で現れます。
+  他のstep走査も監査しました。多くは既に再帰済みで、再帰していないもの
+  （concurrency ceiling、control-flow graph）は`parallel:`内に`route:`や入れ子を
+  禁じているため正しく、その旨をコメントに残しました。
+
+### carry元の「終わっている」確認が、status.jsonを読めないときfail-openでした
+
+- **これは何が起きたか。** carryは`running`なsourceを拒否しますが、status.jsonが
+  無い・読めない場合は「どちらとも言えないので止めない」でした。まだlogへ
+  append中のrunからcarryでき、取ったsnapshotは直後に無効になり、双方の数字が
+  検出不能なまま狂います。
+- carryには**停止の積極的な証明**を要求します。durableな`run_end` eventがあるか、
+  run自身のnonceでowner processのdeathを確認したうえでlogの最終位置がterminalか。
+  拒否がないことは、もはや「はい」ではありません。
+
+### carryしたactive timeが、status.json頼みでした
+
+- **これは何が起きたか。** `run_end`はleaf_runsとcostを持つのにelapsedを持たず、
+  carry/resumeはwall-clockをstatus.jsonから復元していました。status.jsonが欠けたり
+  古かったりすると、A→B→Cの中間runの時間が消え、`wall_clock_sec`が実質resetします。
+- `run_end`に`elapsed_sec`を記録し、復元順序を
+  **`run_end` → `meta` → `status`** と明示して、使用箇所にその理由を書きました。
+
+### `runs list` の行とtotalが別の量でした
+
+- **これは何が起きたか。** 行の`cost_usd`は引き継ぎ込みのbudget position、totalは
+  引き継ぎ分を差し引いた額でした。行を足してもtotalにならず、どちらの数字も
+  「これは何の金額か」を名乗っていませんでした。
+- `own_cost_usd` / `carried_cost_usd` / `budget_position_usd` / `lineage_cost_usd`
+  を分離し、JSONとtable header双方で名乗らせます。`cost_usd`は
+  `budget_position_usd`のaliasとして**残します**（documentedでtestも参照しており、
+  値自体は変わらないため）。
+- `lineage_cost_usd`はancestorがcleanされていれば`null`です。部分和は出しません。
+  **lineageの合計行も出しません** — ancestorを共有する行を足すと二重計上になり、
+  それはこの分離が解こうとしているbugそのものです。
+
+### failed/stuck runが、実行できないactionを提示していました
+
+- **これは何が起きたか。** failed/stuckには`resume`と`carry_budget`が無条件で
+  並んでいました。persistence failureは再開できず、max-visitsで止まったrunは同じ
+  flowで再開すればまた止まり、closure/workspaceの問題には先に別のflagが要ります。
+  AI callerは`next_actions[].argv`をそのまま実行します。
+- 各actionをdiagnosisにしました。`resumable`/`carryable`、`reason`、先に必要な
+  `requires`を持ち、**実際に成功し得るときだけ`argv`が入ります**。max-visitsの
+  行き止まりはresumeを拒否し、workspace driftや変更されたclosureには該当flagを
+  argvへ畳み込みます。
+
+### codexがheadlessでforkできるようになりました
+
+- `codex exec fork`が存在するのに、sfhはcodexのforkをTUI専用として拒否していました。
+  branchが欲しいflowは直列に繋ぐか、cold sessionの費用を払うしかありませんでした。
+- adapter全体としてはforkを認めたうえで、`build_fork`のcodex armは**installed
+  binaryの`--help`にforkが現れることを確認するまで何も組み立てません**。証拠がない
+  場合と古い場合は同じく拒否します。既定は拒否で、supportは示される側です。
+- **version floorとしては表現していません。** `exec fork`がどのreleaseで入ったかを
+  示せる資料がなく、ここに数字を書けばそれは捏造です（grokのflagと同じ誤り）。
+  加えて`minimum_version`は報告されるだけで比較には使われないので、floorを置いても
+  何もgateしません。`--help` probeは数字を要らず、実際に起動を止めます。
+
+### adapter metadataとrequired_flags
+
+- `required_flags`は手書きで、builderが実際に出すflagから乖離していました。つまり
+  preflightの`--help` drift checkは、**列挙されていないflagが消えても気づけません**
+  でした。全builder・全access levelを歩いて照合するtestを追加したところ、全adapterで
+  不足が見つかったので補いました。
+- agyの`minimum_version`を`1.1.8`にpinしました。このpresetのparse pathが依存する
+  `--output-format json` envelopeは、agy自身のchangelogでそのreleaseとされています。
+  `LAST_VERIFIED`は動かしていません — 実CLIへのlive probeは行っていないためです。
+
+### machine JSON契約とdocumentの訂正
+
+- READMEは`output_file`を「32 MiB超のstreamの全文が残る場所」と説明していました。
+  実際にはcanonicalな`.out.txt`自体がbounded captureから書き戻されるので、全文は
+  どこにも残りません。structured protocolの最終回答と会計はstream全体から取られる
+  ので無事ですが、素の`cmd:` stepにその解釈はなく、記録される出力はまさにその
+  上限付きfileです。
+- 「すべての`--json` commandが同じenvelopeを返す」は事実ではありませんでした。
+  `validate`と`runs list|show|why`はenvelope以前のbare JSONです。どちらがどちらかを
+  両側で名指しし、`schema_version`の有無を実行時の見分け方として示しました。
+  移行は破壊的変更なので、意図した方向として記録するに留めています。
+- error code保証をv1.4.0 tag上で「v1.2.xの間」と書いていた4箇所を、実行時に読める
+  `schema_version`基準へ改めました。SECURITY.mdのsupported versionも同様です。
+- `docs/machine-api.md`を追加しました。
+
+### `outcomes:` の細かい2点
+
+- Schemaはcanonical decimalしか受け付けないのに、runtimeはtrimしてからparseして
+  いました。`" 2 "`や`"02"`はsfhでは動きEditorでは無効、という食い違いです。
+  runtimeもcanonical formを要求します。
+- preset AI stepに`outcomes:`が付いている場合、`validate --strict`がwarningを出します。
+  tableはraw exit codeを読みますが、素のAI CLIはPASSでもREVISEでもexit 0なので、
+  `when_label_is`は検証を通ったうえで**永久に発火しません**。errorではなくwarningです
+  — 回答を検査してexit statusを決めるwrapperは正当な使い方だからです。
+
+### 非UTF-8 filenameでworkspace fingerprintが失敗していました
+
+- `git ls-files -z`の`-z`は、git自身のC-quotingを**切る**指定です。したがってUnixでは
+  filenameが持ち得る任意のbyteが出てきます。lossy decodeしてから組み直したpathは
+  diskに存在しないため、`fingerprint`はそこにあるfileでErrを返し、そのworkspaceは
+  安全なresumeもcleanupも拒否され続けました。
+- 該当callだけraw bytesで扱います。symlink targetも同様で、こちらは結末がより
+  厄介でした — 不正byteだけが違う2つのtargetが同じhashになり、**link先の変更が
+  「変更なし」としてfingerprintされる**、この関数が絶対にやってはいけないことです。
+- filenameがすべて妥当なUTF-8のworkspaceは従来と同じpreimageになるので、既存の
+  checkpointは一致し続けます。
+
+### releaseの出所を追えるようにしました
+
+- tagは`v1.4.0`なのに`Cargo.toml`が`1.2.0`のsource archiveが配布され、archiveだけ
+  ではそれが分からず、reviewが別のtreeに対して行われました。
+- release workflowが`provenance.json`（version / tag / commit / archive sha256 /
+  生成時刻）をasset として発行します。tag・Cargo.toml・CHANGELOGの一致checkは従来
+  どおり、何かがbuildされる前に落ちます。`docs/distribution.md`に展開後の照合手順を
+  足しました。
+
 ## v1.4.0 — 2026-08-08
 
 長時間運用のfeedbackから2件。どちらも「sfhが答えを症状として読んでいた」という

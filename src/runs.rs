@@ -142,6 +142,32 @@ impl StepSummary {
     }
 }
 
+/// P1-08: `cost_usd` used to be the only cost field a row reported, and it
+/// answers a specific question - "what is this run's position against
+/// max_cost_usd" - that is NOT the same as "what did this run itself
+/// spend" the moment `--carry-budget-from` is involved. Four questions,
+/// four fields, each named for exactly what it answers:
+///
+/// - `own_cost_usd`: what THIS run itself spent, carried inheritance
+///   excluded.
+/// - `carried_cost_usd`: what it inherited from an earlier run via
+///   `--carry-budget-from`, spent by neither this run nor computed by it.
+/// - `budget_position_usd`: own + carried - what `max_cost_usd` is actually
+///   judged against, i.e. the same number `cost_usd` has always reported.
+/// - `lineage_cost_usd`: the total spent across this run's WHOLE carry
+///   ancestry, back to a run that carried nothing - but ONLY when every
+///   ancestor in that chain is still present and readable. `runs clean`
+///   deletes old run dirs; a descendant's `carried_budget.cost_usd` survives
+///   that deletion (it was captured durably at carry time), so
+///   `budget_position_usd` stays correct, but nothing can re-verify an
+///   ancestor that is gone - so this is `None` rather than a value nothing
+///   backs, instead of quietly reusing `budget_position_usd` and calling it
+///   a lineage total it may not be.
+///
+/// `cost_usd` is kept, identical to `budget_position_usd`, so an existing
+/// JSON consumer reading `.cost_usd` keeps getting the same number it
+/// always did; new callers get the labelled fields instead of having to
+/// guess which quantity `cost_usd` was.
 #[derive(Serialize)]
 struct RunSummary {
     run_dir: String,
@@ -152,15 +178,24 @@ struct RunSummary {
     failed: u64,
     visit: u64,
     repeat: u64,
+    /// Kept for backward compatibility with existing JSON consumers;
+    /// identical to `budget_position_usd`. New code should read the
+    /// labelled fields below instead - this one does not say which of the
+    /// four quantities it is.
     cost_usd: f64,
-    /// How much of `cost_usd` this run INHERITED from an earlier one via
-    /// `--carry-budget-from` rather than spending itself. `cost_usd` is the
-    /// run's position against `max_cost_usd`, so it has to include the carried
-    /// spend - but the ancestor's own row already reports those same dollars,
-    /// so anything summing rows must take this back out or it counts the
-    /// carried spend once per hop. Zero for the ordinary run that carried
-    /// nothing.
+    own_cost_usd: f64,
+    /// How much of `budget_position_usd` this run INHERITED from an earlier
+    /// one via `--carry-budget-from` rather than spending itself. Zero for
+    /// the ordinary run that carried nothing. Never negative and never
+    /// larger than the run's own total: a hand-edited meta.json must not be
+    /// able to turn a fleet total into a refund (see `summary`'s clamp).
     carried_cost_usd: f64,
+    budget_position_usd: f64,
+    /// `None` when this run's carry ancestry cannot be fully verified right
+    /// now (an ancestor run dir was cleaned, or its meta.json cannot be
+    /// read) - see the struct doc comment. Never a partial sum standing in
+    /// for the real total.
+    lineage_cost_usd: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +302,46 @@ fn opt_string(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// The maximum number of `--carry-budget-from` hops `lineage_is_resolvable`
+/// walks before giving up. A real ancestry is never remotely this long;
+/// hitting the bound means `carried_budget.from` cycles back on itself
+/// (by accident, or by a hand-edited meta.json) rather than naming a real
+/// ancestor, so it is itself treated as proof the chain cannot be trusted.
+const MAX_LINEAGE_HOPS: usize = 10_000;
+
+/// Whether `dir`'s complete `--carry-budget-from` ancestry - back to a run
+/// that carried nothing - is still present and its meta.json still
+/// readable, hop by hop. `runs clean` deletes old run dirs; this is what
+/// lets `lineage_cost_usd` notice when that has happened to one of THIS
+/// run's ancestors, rather than silently reporting a total that stopped
+/// being verifiable the moment the evidence for one hop was gone.
+fn lineage_is_resolvable(dir: &Path) -> bool {
+    let mut current = dir.to_path_buf();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..MAX_LINEAGE_HOPS {
+        // A dir this walk has already visited means `carried_budget.from`
+        // cycles back on itself - not a real ancestry, and not something to
+        // report a total for.
+        if !seen.insert(current.clone()) {
+            return false;
+        }
+        let m = meta(&current);
+        if m.is_null() {
+            return false;
+        }
+        match m
+            .get("carried_budget")
+            .and_then(|c| c.get("from"))
+            .and_then(Value::as_str)
+        {
+            Some(from) => current = PathBuf::from(from),
+            // An origin that carried nothing: the chain is complete.
+            None => return true,
+        }
+    }
+    false
+}
+
 fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
     let m = meta(dir);
     let s = status(dir);
@@ -279,7 +354,10 @@ fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
     let failed = steps.iter().map(|x| x.failed).sum();
     let visit = steps.iter().map(|x| x.visit).max().unwrap_or(0);
     let repeat = steps.iter().map(|x| x.repeat).max().unwrap_or(0);
-    let cost_usd = m
+    // What max_cost_usd is actually judged against - own spend plus
+    // whatever was carried in. This is what `cost_usd` has always reported;
+    // `budget_position_usd` is the same number under the name that says so.
+    let budget_position_usd = m
         .get("cost_usd")
         .or_else(|| s.get("cost_usd"))
         .and_then(Value::as_f64)
@@ -292,7 +370,15 @@ fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
         .and_then(Value::as_f64)
         .filter(|c| c.is_finite() && *c > 0.0)
         .unwrap_or(0.0)
-        .min(cost_usd.max(0.0));
+        .min(budget_position_usd.max(0.0));
+    // What this run itself spent, carried inheritance backed out. The clamp
+    // above guarantees this is never negative for a non-negative
+    // budget_position_usd.
+    let own_cost_usd = budget_position_usd - carried_cost_usd;
+    // Resolvable exactly when every ancestor this run's own carried_cost_usd
+    // depends on can still be independently verified; see the doc comment on
+    // `RunSummary::lineage_cost_usd`.
+    let lineage_cost_usd = lineage_is_resolvable(dir).then_some(budget_position_usd);
     RunSummary {
         run_dir: dir.display().to_string(),
         status,
@@ -302,8 +388,11 @@ fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
         failed,
         visit,
         repeat,
-        cost_usd,
+        cost_usd: budget_position_usd,
+        own_cost_usd,
         carried_cost_usd,
+        budget_position_usd,
+        lineage_cost_usd,
     }
 }
 
@@ -332,14 +421,19 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
     // when no runs existed. Start the fold from an explicit positive zero.
     //
     // A run started with --carry-budget-from reports its ANCESTOR's spend
-    // inside its own cost_usd, because that is the number its max_cost_usd is
-    // judged against. The ancestor's row reports those same dollars, so a
-    // plain sum of the rows bills the carried spend once per hop - which is
-    // exactly the miscount this listing exists to prevent. Sum what each run
-    // actually spent.
-    let total_cost_usd = selected.iter().fold(0.0_f64, |total, run| {
-        total + (run.summary.cost_usd - run.summary.carried_cost_usd)
-    });
+    // inside its own budget_position_usd, because that is the number its
+    // max_cost_usd is judged against. The ancestor's row reports those same
+    // dollars, so a plain sum of the rows bills the carried spend once per
+    // hop - which is exactly the miscount this listing exists to prevent.
+    // Sum what each SELECTED row actually spent, i.e. own_cost_usd - this is
+    // named total_own_cost_usd below for exactly that reason (P1-08): it is
+    // not a lineage total (an ancestor outside --limit, or already cleaned,
+    // contributes nothing to it either), and it is not each row's
+    // budget_position_usd summed either. `total_cost_usd` is kept, equal to
+    // it, for existing JSON consumers.
+    let total_own_cost_usd = selected
+        .iter()
+        .fold(0.0_f64, |total, run| total + run.summary.own_cost_usd);
 
     if as_json {
         let runs: Vec<&RunSummary> = selected.iter().map(|r| &r.summary).collect();
@@ -347,7 +441,8 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "runs": runs,
-                "total_cost_usd": total_cost_usd,
+                "total_cost_usd": total_own_cost_usd,
+                "total_own_cost_usd": total_own_cost_usd,
             }))
             .expect("serializing run summaries cannot fail")
         );
@@ -358,13 +453,30 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
         println!("no runs under {}", root.display());
     } else {
         println!(
-            "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>10}  RUN DIR",
-            "STATUS", "STARTED(UTC)", "EXIT", "OK", "FAILED", "VISIT", "REPEAT", "COST_USD"
+            "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>9} {:>11} {:>11} {:>12}  RUN DIR",
+            "STATUS",
+            "STARTED(UTC)",
+            "EXIT",
+            "OK",
+            "FAILED",
+            "VISIT",
+            "REPEAT",
+            "OWN_USD",
+            "CARRIED_USD",
+            "BUDGET_USD",
+            "LINEAGE_USD"
         );
         for run in &selected {
             let r = &run.summary;
+            // A dash, not a number, when the ancestry cannot be verified -
+            // never a value that looks like a total but silently is not one
+            // (P1-08).
+            let lineage = r
+                .lineage_cost_usd
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>10.4}  {}",
+                "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>9.4} {:>11.4} {:>11.4} {:>12}  {}",
                 r.status.as_deref().unwrap_or("-"),
                 r.started_utc.as_deref().unwrap_or("-"),
                 r.exit
@@ -374,12 +486,15 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
                 r.failed,
                 r.visit,
                 r.repeat,
-                r.cost_usd,
+                r.own_cost_usd,
+                r.carried_cost_usd,
+                r.budget_position_usd,
+                lineage,
                 r.run_dir
             );
         }
     }
-    println!("\ntotal cost: ${total_cost_usd:.4}");
+    println!("\ntotal own cost across the {} run(s) listed: ${total_own_cost_usd:.4} (excludes carried spend, and excludes any ancestor outside this listing)", selected.len());
     0
 }
 
@@ -468,7 +583,20 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
             step.cost_usd,
         );
     }
-    println!("\ntotal cost: ${:.4}", run.summary.cost_usd);
+    println!(
+        "\nown cost: ${:.4}   budget position (own + carried, judged against max_cost_usd): ${:.4}",
+        run.summary.own_cost_usd, run.summary.budget_position_usd
+    );
+    // Only worth a line when this run actually has ancestry to report on;
+    // for an ordinary run lineage_cost_usd is just own_cost_usd again.
+    if run.summary.carried_cost_usd > 0.0 {
+        match run.summary.lineage_cost_usd {
+            Some(v) => println!("lineage cost (this run's full --carry-budget-from ancestry): ${v:.4}"),
+            None => println!(
+                "lineage cost: not resolvable - an ancestor in the --carry-budget-from chain is missing or unreadable (see `carried` above)"
+            ),
+        }
+    }
     0
 }
 
@@ -1045,5 +1173,142 @@ mod tests {
         assert_eq!(step.repeat, 1);
         assert_eq!(step.ok, 3);
         assert_eq!(step.failed, 1);
+    }
+
+    // ---- P1-08: a run's cost fields must be individually correct, and a
+    // lineage total must be absent rather than wrong when an ancestor is
+    // gone ----
+
+    fn cost_fields_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-runs-cost-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn own_carried_and_budget_position_cost_fields_are_individually_correct() {
+        let base = cost_fields_test_dir("fields");
+
+        let ancestor = base.join("ancestor");
+        contain::mkdir_private(&ancestor).unwrap();
+        std::fs::write(ancestor.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &ancestor.join("meta.json"),
+            serde_json::json!({"cost_usd": 2.0}).to_string(),
+        )
+        .unwrap();
+
+        let child = base.join("child");
+        contain::mkdir_private(&child).unwrap();
+        std::fs::write(child.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &child.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 5.0,
+                "carried_budget": {"cost_usd": 2.0, "from": ancestor.display().to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let s = summary(&child, &[]);
+        assert_eq!(
+            s.budget_position_usd, 5.0,
+            "own + carried - what max_cost_usd is judged against"
+        );
+        assert_eq!(s.carried_cost_usd, 2.0, "what this run inherited");
+        assert_eq!(
+            s.own_cost_usd, 3.0,
+            "what this run itself spent: budget position minus carried"
+        );
+        assert_eq!(
+            s.cost_usd, 5.0,
+            "cost_usd is kept for existing consumers, identical to budget_position_usd"
+        );
+        assert_eq!(
+            s.lineage_cost_usd,
+            Some(5.0),
+            "the ancestor is present and readable, so the lineage total is resolvable"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lineage_cost_usd_is_absent_rather_than_wrong_when_an_ancestor_is_gone() {
+        let base = cost_fields_test_dir("gone-ancestor");
+        // Names an ancestor that was never created here, simulating `runs
+        // clean` having removed it after the carry that recorded it.
+        let cleaned_ancestor = base.join("cleaned-ancestor");
+
+        let child = base.join("child");
+        contain::mkdir_private(&child).unwrap();
+        std::fs::write(child.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &child.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 5.0,
+                "carried_budget": {"cost_usd": 2.0, "from": cleaned_ancestor.display().to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let s = summary(&child, &[]);
+        // The clamp still protects these three: they are durable in THIS
+        // run's own meta.json and do not need the ancestor to still exist.
+        assert_eq!(s.budget_position_usd, 5.0);
+        assert_eq!(s.carried_cost_usd, 2.0);
+        assert_eq!(s.own_cost_usd, 3.0);
+        // But the lineage total cannot be independently re-verified, so it
+        // must be absent rather than a value nothing backs (P1-08) - never
+        // silently substituted with budget_position_usd or a partial sum.
+        assert_eq!(s.lineage_cost_usd, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_hand_edited_carried_cost_cannot_exceed_the_runs_own_total_or_go_negative() {
+        let dir = cost_fields_test_dir("clamp");
+        std::fs::write(dir.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &dir.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 3.0,
+                // Hand-edited to claim MORE was carried than the run's own
+                // total: must clamp to 3.0, never turn into a refund via a
+                // negative own_cost_usd.
+                "carried_budget": {"cost_usd": 999.0, "from": "/nowhere"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let s = summary(&dir, &[]);
+        assert_eq!(s.carried_cost_usd, 3.0);
+        assert_eq!(s.own_cost_usd, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lineage_is_resolvable_refuses_a_cycle_instead_of_looping_forever() {
+        let base = cost_fields_test_dir("cycle");
+        let a = base.join("a");
+        let b = base.join("b");
+        contain::mkdir_private(&a).unwrap();
+        contain::mkdir_private(&b).unwrap();
+        contain::write_private_atomic(
+            &a.join("meta.json"),
+            serde_json::json!({"carried_budget": {"from": b.display().to_string()}}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &b.join("meta.json"),
+            serde_json::json!({"carried_budget": {"from": a.display().to_string()}}).to_string(),
+        )
+        .unwrap();
+        assert!(!lineage_is_resolvable(&a));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
