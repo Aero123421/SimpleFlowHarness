@@ -829,7 +829,21 @@ mod tests {
         // 0xFF is not a valid byte anywhere in UTF-8, so this is exactly the
         // input a lossy decode would corrupt.
         let name_a = OsStr::from_bytes(b"bad-\xff-name-a.txt");
-        std::fs::write(base.join(name_a), b"hello").unwrap();
+        // `#[cfg(unix)]` is not a narrow enough gate for this one. Unix says a
+        // filename is an arbitrary byte sequence, but the FILESYSTEM gets the
+        // last word, and macOS's rejects a name that is not valid UTF-8 with
+        // EILSEQ before it ever reaches the disk. That is the OS declining to
+        // create the fixture, not sfh mishandling it - the fix under test is
+        // still right, and still exercised on the platforms that can express
+        // the input - so skip rather than fail. Checked on the first write,
+        // so every later step can keep unwrapping.
+        if std::fs::write(base.join(name_a), b"hello").is_err() {
+            eprintln!(
+                "skipping fingerprint_follows_an_untracked_filename_that_is_not_valid_utf8: this filesystem refuses a non-UTF-8 filename"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
         let fp_a = fingerprint(&base).expect("a non-UTF-8 filename must still fingerprint");
         assert_eq!(fp_a.len(), 64, "a fingerprint is a SHA-256 hex digest");
 
