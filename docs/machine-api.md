@@ -52,7 +52,7 @@ Every envelope carries this header, built by `machine::envelope` /
 | `sfh_version` | string | sfh's own release version (`CARGO_PKG_VERSION`) — separate from `schema_version` and expected to change every release. |
 | `error` | object or `null` | `null` on success; otherwise `{"code": "SFH_...", "message": "..."}`. |
 | `warnings` | array | Non-fatal notes. Empty array when there are none. |
-| `next_actions` | array | Zero or more `{"kind": "...", "argv": [...]}` objects: a runnable argv, never prose, so a caller can execute the suggested next step without parsing an instruction. |
+| `next_actions` | array | Zero or more diagnosed follow-ups. `why` and `wait` are always `{"kind", "argv"}` — a runnable argv, never prose. `resume` and `carry_budget` are diagnosed rather than assumed from state alone: they also carry `resumable`/`carryable`, `reason` and `requires`, and `argv` is present only when the action can actually succeed — an unrunnable one is still reported, with `reason` explaining why, instead of being silently dropped from the list. |
 
 Header keys always win: a command's own fields are merged in first and the
 header is applied on top, so nothing sfh runs can accidentally redefine `ok`
@@ -118,9 +118,22 @@ these four incorrectly.
   "api_version", "warnings", "steps"}`. On failure: `{"ok": false, "path",
   "strict", "error"}`, where `error` is a plain string, not the
   `{"code", "message"}` object the envelope uses.
-- **`sfh runs list --json`** — `{"runs": [...], "total_cost_usd"}`, where each
-  entry in `runs` has `run_dir`, `status`, `started_utc`, `exit`, `ok`,
-  `failed`, `visit`, `repeat`, `cost_usd`, `carried_cost_usd`.
+- **`sfh runs list --json`** — `{"runs": [...], "total_cost_usd",
+  "total_own_cost_usd"}` (the two totals are identical; `total_cost_usd` is
+  kept for existing consumers and sums each listed run's `own_cost_usd` —
+  never `budget_position_usd`, which would double-count a carried run's
+  inherited dollars against its ancestor's own row). Each entry in `runs` has
+  `run_dir`, `status`, `started_utc`, `exit`, `ok`, `failed`, `visit`,
+  `repeat`, `cost_usd`, `own_cost_usd`, `carried_cost_usd`,
+  `budget_position_usd`, `lineage_cost_usd` — four differently-named answers
+  to "how much did this cost" (own spend; inherited via
+  `--carry-budget-from`; own+carried, what `max_cost_usd` is judged against;
+  and the full carry ancestry). `cost_usd` is kept, identical to
+  `budget_position_usd`, for existing consumers. `lineage_cost_usd` is `null`
+  — never a partial sum — the moment an ancestor in the carry chain has been
+  removed by `runs clean` and so can no longer be verified. There is no
+  lineage total across the listing: rows that share an ancestor would
+  double-count it.
 - **`sfh runs show --json`** — the same per-run fields as above flattened
   into the top level (no nested `summary` key) alongside `flow`,
   `sfh_version`, `tools`, `budget_landed`, `steps` — with no wrapper at all.

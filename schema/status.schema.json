@@ -208,18 +208,42 @@
     },
     "next_actions": {
       "type": "array",
-      "description": "Runnable follow-ups as argv, never prose, so a caller can act without parsing an instruction. Added in v1.2.0.",
+      "description": "Follow-ups, never prose. Added in v1.2.0. `why` and `wait` are always runnable: just `kind` and `argv`. Since v1.4.0, `resume` and `carry_budget` are diagnosed instead of assumed from state alone: they add `resumable`/`carryable`, `reason` and `requires`, and `argv` is present only when the action can actually succeed - an action that cannot is still reported, with `reason` explaining why, rather than silently omitted.",
       "items": {
         "type": "object",
+        "required": [
+          "kind"
+        ],
         "properties": {
           "kind": {
-            "type": "string"
+            "type": "string",
+            "description": "\"why\" | \"wait\" | \"resume\" | \"carry_budget\"."
           },
           "argv": {
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "A runnable command, never prose. Present unconditionally for why/wait; for resume/carry_budget, present only when resumable/carryable is true."
+          },
+          "resumable": {
+            "type": "boolean",
+            "description": "kind: resume only. Whether resuming this run can actually continue it - false for, e.g., a persistence failure or a stuck run that exhausted max_visits, where resuming would only repeat the same dead end. Added in v1.4.0."
+          },
+          "carryable": {
+            "type": "boolean",
+            "description": "kind: carry_budget only. Whether this run's spend is confirmed final (see the durable run_end / positive-stop rules) and therefore safe to carry into a corrected flow. Added in v1.4.0."
+          },
+          "reason": {
+            "type": "string",
+            "description": "kind: resume/carry_budget. Why the action is, or is not, runnable right now. Added in v1.4.0."
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "kind: resume/carry_budget. Extra flags this run's resume needs before it can succeed, e.g. \"--adopt-workspace\" for workspace drift or \"--force-resume\" for a changed execution closure - already the flags argv carries when resumable is true. Empty when nothing extra is required. Added in v1.4.0."
           }
         }
       }

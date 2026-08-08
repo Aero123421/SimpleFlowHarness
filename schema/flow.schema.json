@@ -595,7 +595,7 @@
         },
         "fork_from": {
           "type": "string",
-          "description": "Branch that step's session: inherit its context but write to a new session. claude/opencode/grok/pi only; several steps may fork the same parent."
+          "description": "Branch that step's session: inherit its context but write to a new session. codex/claude/opencode/grok/pi only; several steps may fork the same parent. codex additionally requires the installed binary's own --help to mention fork; an older codex is refused rather than launched."
         },
         "retry": {
           "$ref": "#/definitions/retry"
