@@ -1075,6 +1075,13 @@ mod tests {
     /// A scratch dir for these tests, distinct from the one `run` creates for
     /// a real preflight: these drive `probe` directly and need to inspect
     /// what landed inside it.
+    ///
+    /// Gated the same way its callers are. Every test below spawns a real
+    /// shell script to prove a binary did or did not run, which is a Unix
+    /// fixture, so on Windows this helper has no callers at all and
+    /// `-D warnings` fails the build on dead code rather than skipping a
+    /// test.
+    #[cfg(unix)]
     fn test_scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "sfh-preflight-test-{label}-{}",
