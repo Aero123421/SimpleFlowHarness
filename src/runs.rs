@@ -153,6 +153,14 @@ struct RunSummary {
     visit: u64,
     repeat: u64,
     cost_usd: f64,
+    /// How much of `cost_usd` this run INHERITED from an earlier one via
+    /// `--carry-budget-from` rather than spending itself. `cost_usd` is the
+    /// run's position against `max_cost_usd`, so it has to include the carried
+    /// spend - but the ancestor's own row already reports those same dollars,
+    /// so anything summing rows must take this back out or it counts the
+    /// carried spend once per hop. Zero for the ordinary run that carried
+    /// nothing.
+    carried_cost_usd: f64,
 }
 
 #[derive(Serialize)]
@@ -276,6 +284,15 @@ fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
         .or_else(|| s.get("cost_usd"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    // Never negative and never larger than the run's own total: a hand-edited
+    // meta.json must not be able to turn a fleet total into a refund.
+    let carried_cost_usd = m
+        .get("carried_budget")
+        .and_then(|c| c.get("cost_usd"))
+        .and_then(Value::as_f64)
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .unwrap_or(0.0)
+        .min(cost_usd.max(0.0));
     RunSummary {
         run_dir: dir.display().to_string(),
         status,
@@ -286,6 +303,7 @@ fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
         visit,
         repeat,
         cost_usd,
+        carried_cost_usd,
     }
 }
 
@@ -312,9 +330,16 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
     // `f64::sum()` uses the additive identity -0.0 for an empty iterator on
     // supported Rust versions, which surfaced as the nonsensical `$-0.0000`
     // when no runs existed. Start the fold from an explicit positive zero.
-    let total_cost_usd = selected
-        .iter()
-        .fold(0.0_f64, |total, run| total + run.summary.cost_usd);
+    //
+    // A run started with --carry-budget-from reports its ANCESTOR's spend
+    // inside its own cost_usd, because that is the number its max_cost_usd is
+    // judged against. The ancestor's row reports those same dollars, so a
+    // plain sum of the rows bills the carried spend once per hop - which is
+    // exactly the miscount this listing exists to prevent. Sum what each run
+    // actually spent.
+    let total_cost_usd = selected.iter().fold(0.0_f64, |total, run| {
+        total + (run.summary.cost_usd - run.summary.carried_cost_usd)
+    });
 
     if as_json {
         let runs: Vec<&RunSummary> = selected.iter().map(|r| &r.summary).collect();
@@ -392,6 +417,17 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
             .map(|x| x.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    // Said out loud, because otherwise the total at the bottom looks like money
+    // this run spent and part of it belongs to an earlier one.
+    if run.summary.carried_cost_usd > 0.0 {
+        println!(
+            "carried : ${:.4} of the total was inherited from {}",
+            run.summary.carried_cost_usd,
+            m.get("carried_budget")
+                .map(|c| get(c, "from"))
+                .unwrap_or("-")
+        );
+    }
     if let Some(b) = &run.budget_landed {
         println!(
             "budget  : landed on {} after ${:.4} / {}s -> goto {}",

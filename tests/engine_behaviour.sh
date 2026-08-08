@@ -5771,6 +5771,161 @@ check "context: and the documented file-delivery pattern runs" 0 $?
 # A step naming no context still renders both, as the runtime always has.
 not_contains "context: no step failed on an unknown template key" "unknown template key" ctx-b.out
 
+# --- --carry-budget-from: a corrected flow keeps the spend on the clock ------
+# The case --resume cannot serve. A run stops, the diagnosis is "the flow was
+# wrong", and correcting it invalidates the closure - so resume refuses, as it
+# should. What was left was a fresh run whose counters started at zero, so the
+# budget already spent vanished and the only way to account for it was to edit
+# the ceilings by hand.
+cat > carry.yaml <<YAML
+api_version: 1
+name: carry
+defaults:
+  max_total_steps: 10
+  max_visits: 3
+steps:
+  - id: loop
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "AGAIN"]
+    route:
+      - {when_last_line_is: AGAIN, goto: loop}
+      - {goto: end}
+YAML
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" -q > carry1.out 2>&1
+check "carry: the first run burns its three laps" 1 $?
+contains "carry: and stops for the max_visits reason, not another one" \
+  "exceeded max_visits" carry1.out
+CARRY1="$(ls -d "$WORK"/carry-runs/*/ | head -1)"
+CARRY1_NATIVE="$(native_path "${CARRY1%/}")"
+CARRY1_LAPS="$(grep -cF '"event":"step_end"' "$CARRY1/log.jsonl")"
+check "carry: three laps really ran the first time" 3 "$CARRY1_LAPS"
+
+# The whole point. The SAME flow, run fresh, gets a full budget again - three
+# more laps, three more paid steps.
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" -q > carry-fresh.out 2>&1
+check "carry: a plain fresh run stops the same way" 1 $?
+CARRY_FRESH="$(ls -dt "$WORK"/carry-runs/*/ | head -1)"
+FRESH_LAPS="$(grep -cF '"event":"step_end"' "$CARRY_FRESH/log.jsonl")"
+check "carry: because a fresh run starts the loop budget over" 3 "$FRESH_LAPS"
+
+# With the budget carried it does not: the laps are already spent, so the run
+# stops WITHOUT executing anything. That is the whole claim, and counting
+# step_end is the only way to prove it - the exit code alone cannot.
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
+  --carry-budget-from "$CARRY1_NATIVE" > carry2.out 2>&1
+check "carry: a carried run stops for the same reason" 1 $?
+contains "carry: on max_visits, with the laps inherited" "exceeded max_visits" carry2.out
+contains "carry: it says what it carried and from where" "carried from" carry2.out
+contains "carry: including the per-step visit high-water mark" "loop@3" carry2.out
+
+CARRY2="$(ls -dt "$WORK"/carry-runs/*/ | head -1)"
+if [ -f "$CARRY2/meta.json" ]; then
+  CARRIED_LAPS="$(grep -cF '"event":"step_end"' "$CARRY2/log.jsonl")"
+  check "carry: and spends nothing, because the budget was already gone" 0 "$CARRIED_LAPS"
+  contains "carry: the inheritance is durable in meta.json" '"carried_budget"' "$CARRY2/meta.json"
+  contains "carry: and named as a durable log event" '"event":"budget_carried"' "$CARRY2/log.jsonl"
+else
+  echo "FAIL - carry: the carried run wrote no meta.json"
+  fail=$((fail + 1))
+fi
+
+# It composes. A second correction must not forget the first run's spend -
+# that is exactly the hand arithmetic this replaces.
+CARRY2_NATIVE="$(native_path "${CARRY2%/}")"
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
+  --carry-budget-from "$CARRY2_NATIVE" > carry3.out 2>&1
+check "carry: carrying from a carried run is still refused by the budget" 1 $?
+contains "carry: the second hop still holds the first hop's laps" "loop@3" carry3.out
+
+# A step the corrected flow no longer defines is NAMED, not silently dropped.
+cat > carry-renamed.yaml <<YAML
+api_version: 1
+name: carry
+defaults:
+  max_total_steps: 10
+  max_visits: 3
+steps:
+  - id: rewritten
+    cmd: ["$STUB_BIN", "--stub-plain"]
+YAML
+"$SFH" run carry-renamed.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
+  --carry-budget-from "$CARRY1_NATIVE" > carry-renamed.out 2>&1
+check "carry: a corrected flow with renamed steps still runs" 0 $?
+contains "carry: and says whose laps it could not apply" "no longer in the flow: loop" carry-renamed.out
+
+# --resume and --carry-budget-from answer different questions.
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
+  --carry-budget-from "$CARRY1_NATIVE" --resume "$CARRY1_NATIVE" > carry-both.out 2>&1
+check "carry: --carry-budget-from and --resume are refused together" 2 $?
+contains "carry: and the refusal explains which to reach for" "different answers" carry-both.out
+
+# A run that is still spending has no final total, so carrying from it would
+# snapshot a number the ancestor immediately invalidates. The condition is
+# built directly (state running + a pid that really is alive) rather than by
+# racing a detached run, so the guard is what is under test and nothing else.
+cp "$CARRY1/status.json" carry-status.bak
+python3 - "$CARRY1/status.json" "$$" <<'PY'
+import json, sys
+p, pid = sys.argv[1], int(sys.argv[2])
+s = json.load(open(p))
+s["state"], s["pid"] = "running", pid
+json.dump(s, open(p, "w"))
+PY
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
+  --carry-budget-from "$CARRY1_NATIVE" > carry-live.out 2>&1
+check "carry: carrying from a run that is still going is refused" 2 $?
+contains "carry: and says to wait for it or stop it first" "still going" carry-live.out
+cp carry-status.bak "$CARRY1/status.json"
+
+# A refused carry must not leave its half-started run dir behind: an empty run
+# dir is a phantom entry for `runs list`/`runs clean` and pushes the next run
+# onto a "-2" name for no reason.
+CARRY_DIRS_BEFORE="$(ls -d "$WORK"/carry-runs/*/ | wc -l)"
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
+  --carry-budget-from "$WORK_NATIVE/carry-no-such-run" > carry-missing.out 2>&1
+check "carry: naming a directory that is not a run is refused" 2 $?
+contains "carry: and the refusal names the flag that caused it" \
+  "--carry-budget-from" carry-missing.out
+CARRY_DIRS_AFTER="$(ls -d "$WORK"/carry-runs/*/ | wc -l)"
+check "carry: a refused carry leaves no empty run dir behind" \
+  "$CARRY_DIRS_BEFORE" "$CARRY_DIRS_AFTER"
+
+# The accounting the feature exists for. A carried run's own cost_usd INCLUDES
+# the ancestor's spend, because that is what max_cost_usd is judged against -
+# so a listing that just adds the rows up bills the same dollars once per hop.
+cat > carry-cost.yaml <<YAML
+api_version: 1
+name: carrycost
+steps:
+  - id: paid
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    env:
+      SFH_STUB_COST: "0.25"
+    prompt: "spend a quarter"
+YAML
+"$SFH" run carry-cost.yaml --runs-dir "$WORK_NATIVE/carry-cost-runs" -q > carry-cost1.out 2>&1
+check "carry: the ancestor of the cost check ran" 0 $?
+CARRY_COST1="$(ls -d "$WORK"/carry-cost-runs/*/ | head -1)"
+"$SFH" run carry-cost.yaml --runs-dir "$WORK_NATIVE/carry-cost-runs" -q \
+  --carry-budget-from "$(native_path "${CARRY_COST1%/}")" > carry-cost2.out 2>&1
+check "carry: and the carried run ran" 0 $?
+"$SFH" runs list --runs-dir "$WORK_NATIVE/carry-cost-runs" --json > carry-cost-list.json 2>&1
+contains "carry: the carried run reports the inherited spend in its own ceiling" \
+  '"cost_usd": 0.5' carry-cost-list.json
+contains "carry: and names how much of that it inherited" \
+  '"carried_cost_usd": 0.25' carry-cost-list.json
+# $0.50 was reported across two runs, but only $0.50 of real money exists:
+# 0.25 spent by the ancestor and 0.25 by the run that carried it.
+contains "carry: so the fleet total is money spent, not money counted twice" \
+  '"total_cost_usd": 0.5' carry-cost-list.json
+
+# A stopped run offers BOTH follow-ups, because only the reader knows whether
+# the flow was wrong or the world was.
+"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" --json > carry-json.out 2>&1
+contains "carry: a failed run's envelope offers resume" '"resume"' carry-json.out
+contains "carry: and offers carrying the budget into a corrected flow" '"carry_budget"' carry-json.out
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

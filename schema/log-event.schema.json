@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.1/schema/log-event.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.3.0/schema/log-event.schema.json",
   "title": "sfh durable log event",
   "description": "One JSON object from a run directory's append-only log.jsonl. Readers must ignore unknown properties for forward compatibility.",
   "type": "object",
@@ -36,6 +36,7 @@
         "postprocess_end",
         "max_visits",
         "budget_landing",
+        "budget_carried",
         "persistence_failure",
         "run_end"
       ]
@@ -161,9 +162,72 @@
       "type": "integer",
       "minimum": 0,
       "description": "step_end: records in the structured stream that the adapter could not parse. Added in v1.2.0."
+    },
+    "from": {
+      "type": "string",
+      "description": "budget_carried: the run directory whose spend this run inherited via --carry-budget-from. Added in v1.3.0."
+    },
+    "visits": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "description": "budget_carried: the highest visit number reached per step id in the ancestor run, applied as this run's starting high-water mark so max_visits keeps counting where it left off. Only ids the current flow still defines appear. Added in v1.3.0."
+    },
+    "dropped_steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "budget_carried: step ids the ancestor had visited that this flow no longer defines, so their laps are counted in `steps` but enforced against no max_visits. Named rather than silently forgotten. Added in v1.3.0."
+    },
+    "elapsed_sec": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "budget_carried: active run seconds the ancestor spent, counted against wall_clock_sec. Added in v1.3.0."
     }
   },
   "allOf": [
+    {
+      "$comment": "`steps` carries a different shape per event, so its type is stated per event rather than once for the whole document: members_restored names the member ids it restored, budget_carried counts the leaf runs it inherited. A single shared definition would have made one of the two writers invalid.",
+      "if": {
+        "properties": {
+          "event": {
+            "const": "members_restored"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "members_restored: fan-out member step ids a resume carried into the next lap instead of re-running."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "budget_carried"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "steps": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "budget_carried: leaf runs the ancestor already spent, added to this run's max_total_steps counter. Includes anything the ancestor itself carried, so repeated corrections compose. Added in v1.3.0."
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
