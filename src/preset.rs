@@ -276,7 +276,22 @@ pub fn fork_is_cwd_scoped(tool: &str) -> bool {
 /// `codex_fork_confirmed`) - this function alone is not permission to launch
 /// it. agy has no fork at all.
 pub fn supports_fork(tool: &str) -> bool {
-    matches!(tool, "claude" | "opencode" | "grok" | "pi" | "codex")
+    FORKABLE.contains(&tool)
+}
+
+/// The one list, because there used to be three.
+///
+/// `supports_fork` decided the answer while two error messages - one here and
+/// one in `flow.rs` - each spelled the list out again for the operator. Adding
+/// codex moved the decision and left both messages telling people codex could
+/// not do the thing sfh had just started doing. A refusal that names the wrong
+/// alternatives is worse than one that names none, so the messages now read
+/// from the same slice the decision does.
+pub const FORKABLE: &[&str] = &["codex", "claude", "opencode", "grok", "pi"];
+
+/// `FORKABLE` as a message fragment, in the shape both refusals want.
+pub fn forkable_list() -> String {
+    FORKABLE.join("/")
 }
 
 /// The executable a preset launches when no `bin:` overrides it. Every preset
@@ -1904,7 +1919,7 @@ pub fn build_fork(
         other => {
             return Err(format!(
                 "tool '{other}' cannot fork a session headlessly (only {}); use continue_from to chain serially, or give this step its own context",
-                ["codex", "claude", "opencode", "grok", "pi"].join("/")
+                forkable_list()
             ))
         }
     }

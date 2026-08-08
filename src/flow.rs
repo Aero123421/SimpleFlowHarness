@@ -3269,7 +3269,8 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
         if let Some(t) = tool {
             if !crate::preset::supports_fork(&t) {
                 return Err(format!(
-                    "step '{sid}': tool '{t}' cannot fork a session headlessly (only claude/opencode/grok/pi can); use continue_from to chain this step serially, or drop fork_from and give it its own context"
+                    "step '{sid}': tool '{t}' cannot fork a session headlessly (only {} can); use continue_from to chain this step serially, or drop fork_from and give it its own context",
+                    crate::preset::forkable_list()
                 ));
             }
         }

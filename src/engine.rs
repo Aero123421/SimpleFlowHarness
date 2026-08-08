@@ -9255,4 +9255,455 @@ mod tests {
         assert!(effort_vocab_warning("pi", "off").is_none());
         assert!(effort_vocab_warning("pi", "ultra").is_some());
     }
+
+    // ---- P1-02: --carry-budget-from must PROVE the source is done, not
+    // just fail to prove it is still going ----
+
+    fn carry_final_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-carry-final-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn carry_refuses_a_source_with_no_status_json_and_no_terminal_event_in_its_log() {
+        let dir = carry_final_test_dir("no-proof");
+        // A log that looks exactly like a run still in progress: a step
+        // started, and nothing durable says it ever stopped.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"step_start\",\"step\":\"a\",\"visit\":1}\n",
+        )
+        .unwrap();
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(
+            err.contains("cannot confirm"),
+            "expected a refusal explaining the proof is missing, got: {err}"
+        );
+        assert!(
+            err.contains("sfh wait") && err.contains("sfh stop"),
+            "the refusal must say how to resolve it, same as the still-going case: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_the_log_holds_a_durable_run_end_event_even_with_no_status_json() {
+        let dir = carry_final_test_dir("run-end-proof");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":0.5,\"elapsed_sec\":10}\n",
+        )
+        .unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_the_owning_process_is_confirmed_gone_and_the_log_lands_on_a_terminal_position(
+    ) {
+        let dir = carry_final_test_dir("dead-owner-proof");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"fail\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        // A live pid whose recorded start time does not match is a reused
+        // pid, not the original owner - confirmed gone, the same reasoning
+        // watch::owner_verifiably_dead's own tests exercise directly.
+        contain::write_nonce(&dir, std::process::id(), Some(1), "tok").unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_still_refuses_a_terminal_looking_log_when_the_owning_process_cannot_be_confirmed_gone(
+    ) {
+        let dir = carry_final_test_dir("ambiguous-owner");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        // No sfh-nonce at all: nothing here rules out the owning process
+        // still being alive and about to log run_end a moment later.
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(err.contains("cannot confirm"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_refuses_a_source_that_status_json_says_is_still_running_even_if_its_log_has_a_run_end(
+    ) {
+        let dir = carry_final_test_dir("still-running");
+        // Deliberately contradictory: status.json must win when it can be
+        // read, because it is the freshest signal there is - a stale-but-
+        // still-present run_end from an earlier attempt must not override a
+        // status.json that says this run is going right now.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":5}\n",
+        )
+        .unwrap();
+        let status = serde_json::json!({"state": "running", "pid": std::process::id(), "cost_usd": 1.0});
+        contain::write_private_atomic(&dir.join("status.json"), status.to_string()).unwrap();
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(err.contains("still going"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_status_json_clearly_reads_a_terminal_state() {
+        let dir = carry_final_test_dir("clean-status");
+        let status = serde_json::json!({"state": "failed", "pid": 0});
+        contain::write_private_atomic(&dir.join("status.json"), status.to_string()).unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_terminal_evidence_only_trusts_the_logs_last_position_not_an_earlier_one() {
+        let dir = carry_final_test_dir("last-position-wins");
+        // A first attempt got stuck; a resumed second attempt got past it
+        // and is now mid-step, with no terminal marker of its own yet. The
+        // earlier stuck landing must not leak through as proof.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"stuck\",\"via\":\"rule\"}\n\
+             {\"event\":\"position\",\"after\":\"a\",\"next\":\"b\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        let (run_end, terminal) = log_terminal_evidence(&dir).unwrap();
+        assert!(!run_end);
+        assert!(
+            !terminal,
+            "a later non-terminal position must supersede the earlier stuck landing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P1-03: active time carried across --carry-budget-from must be
+    // durable, not dependent on status.json surviving ----
+
+    #[test]
+    fn elapsed_restore_prefers_run_end_then_meta_then_status_then_the_carried_floor() {
+        let base = std::env::temp_dir()
+            .join(format!("sfh-elapsed-precedence-{}", contain::random_nonce()));
+        contain::mkdir_private(&base).unwrap();
+
+        // status.json only: the last-resort source.
+        let status_only = base.join("status-only");
+        contain::mkdir_private(&status_only).unwrap();
+        std::fs::write(status_only.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &status_only.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&status_only).unwrap().elapsed_sec, 10);
+
+        // meta.json beats a smaller status.json.
+        let meta_over_status = base.join("meta-over-status");
+        contain::mkdir_private(&meta_over_status).unwrap();
+        std::fs::write(
+            meta_over_status.join("log.jsonl"),
+            "{\"event\":\"run_start\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &meta_over_status.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &meta_over_status.join("meta.json"),
+            serde_json::json!({"elapsed_sec": 20}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&meta_over_status).unwrap().elapsed_sec, 20);
+
+        // A durable run_end beats both meta.json and status.json.
+        let run_end_over_both = base.join("run-end-over-both");
+        contain::mkdir_private(&run_end_over_both).unwrap();
+        std::fs::write(
+            run_end_over_both.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\",\"elapsed_sec\":30}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &run_end_over_both.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &run_end_over_both.join("meta.json"),
+            serde_json::json!({"elapsed_sec": 20}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&run_end_over_both).unwrap().elapsed_sec, 30);
+
+        // With nothing durable at all, the carried floor still holds.
+        let floor_only = base.join("floor-only");
+        contain::mkdir_private(&floor_only).unwrap();
+        std::fs::write(
+            floor_only.join("log.jsonl"),
+            "{\"event\":\"budget_carried\",\"elapsed_sec\":40}\n",
+        )
+        .unwrap();
+        assert_eq!(load_resume(&floor_only).unwrap().elapsed_sec, 40);
+
+        // The floor wins even over a SMALLER durable value: this is a
+        // synthetic, adversarial log (a real run_end can never report less
+        // than what was durably carried in), built only to prove the floor
+        // is applied unconditionally, the way a hand-edited log is tested
+        // elsewhere in this file.
+        let floor_over_run_end = base.join("floor-over-run-end");
+        contain::mkdir_private(&floor_over_run_end).unwrap();
+        std::fs::write(
+            floor_over_run_end.join("log.jsonl"),
+            "{\"event\":\"budget_carried\",\"elapsed_sec\":40}\n{\"event\":\"run_end\",\"status\":\"ok\",\"elapsed_sec\":5}\n",
+        )
+        .unwrap();
+        assert_eq!(load_resume(&floor_over_run_end).unwrap().elapsed_sec, 40);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn carried_active_time_survives_two_hops_of_carry_even_when_every_status_json_is_gone() {
+        // Simulates A -> B (--carry-budget-from A) -> C (--carry-budget-from
+        // B), with status.json absent at EVERY hop: not merely stale, gone
+        // outright, as if each run's status.json had already been cleaned up
+        // by the time the next carry looked for it. Only the run_end events -
+        // and the budget_carried events a real carry closure would write from
+        // what it read back - survive. Before P1-03 this chain lost B's own
+        // 50s the moment C tried to carry from B, because the only place B's
+        // total lived was status.json.
+        let base =
+            std::env::temp_dir().join(format!("sfh-elapsed-chain-{}", contain::random_nonce()));
+        contain::mkdir_private(&base).unwrap();
+
+        let a = base.join("a");
+        contain::mkdir_private(&a).unwrap();
+        std::fs::write(
+            a.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":100}\n",
+        )
+        .unwrap();
+        let a_elapsed = load_resume(&a).unwrap().elapsed_sec;
+        assert_eq!(
+            a_elapsed, 100,
+            "A's own total must survive with no status.json at all"
+        );
+
+        let b = base.join("b");
+        contain::mkdir_private(&b).unwrap();
+        std::fs::write(
+            b.join("log.jsonl"),
+            format!(
+                "{{\"event\":\"budget_carried\",\"elapsed_sec\":{a_elapsed}}}\n\
+                 {{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":150}}\n"
+            ),
+        )
+        .unwrap();
+        let b_elapsed = load_resume(&b).unwrap().elapsed_sec;
+        assert_eq!(
+            b_elapsed, 150,
+            "B must recover A's 100s PLUS its own 50s, from run_end alone"
+        );
+
+        let c = base.join("c");
+        contain::mkdir_private(&c).unwrap();
+        std::fs::write(
+            c.join("log.jsonl"),
+            format!(
+                "{{\"event\":\"budget_carried\",\"elapsed_sec\":{b_elapsed}}}\n\
+                 {{\"event\":\"run_end\",\"status\":\"ok\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":175}}\n"
+            ),
+        )
+        .unwrap();
+        let c_elapsed = load_resume(&c).unwrap().elapsed_sec;
+        assert_eq!(
+            c_elapsed, 175,
+            "C must recover the full chain's 175s - B's carried total plus C's own 25s"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- P1-09: next_actions_for must diagnose resume/carry, not assume
+    // them from the terminal state alone ----
+
+    fn next_actions_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("sfh-next-actions-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stuck_step_exhausted_max_visits_names_the_step_only_when_the_last_position_says_so() {
+        let dir = next_actions_test_dir("max-visits-detect");
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            None,
+            "no log at all is not evidence of anything"
+        );
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            None,
+            "an explicit goto: stuck rule is not a max_visits dead end"
+        );
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            Some("loopy".to_string())
+        );
+        // A later, non-max_visits position (a subsequent resumed attempt
+        // that got past it) must clear the earlier landing.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n\
+             {\"event\":\"position\",\"after\":\"loopy\",\"next\":\"next_step\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        assert_eq!(stuck_step_exhausted_max_visits(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_done_run_offers_only_why() {
+        let dir = PathBuf::from("/does-not-need-to-exist");
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("done", &dir, &flow, None);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["kind"], "why");
+    }
+
+    #[test]
+    fn next_actions_for_a_persistence_failure_does_not_offer_resume_but_still_offers_carry() {
+        let dir = next_actions_test_dir("persistence-failure");
+        // A healthy terminal status.json, so the carry diagnosis (a
+        // separate question from resumability) resolves cleanly and this
+        // test isolates the resume diagnosis.
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "failed", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let error = Some((
+            machine::ErrorCode::PersistenceFailure,
+            "step 'x': required result artifacts could not be persisted",
+        ));
+        let actions = next_actions_for("failed", &dir, &flow, error);
+
+        let resume = actions
+            .iter()
+            .find(|a| a["kind"] == "resume")
+            .expect("a resume diagnosis is always present, even when refused");
+        assert_eq!(resume["resumable"], false);
+        assert!(
+            resume.get("argv").is_none(),
+            "an action that cannot succeed must carry no argv to run: {resume}"
+        );
+        assert!(resume["reason"].as_str().unwrap().contains("persist"));
+
+        let carry = actions
+            .iter()
+            .find(|a| a["kind"] == "carry_budget")
+            .expect("a carry diagnosis is always present");
+        assert_eq!(carry["carryable"], true);
+        assert!(carry.get("argv").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_stuck_run_that_exhausted_max_visits_does_not_offer_resume() {
+        let dir = next_actions_test_dir("stuck-max-visits");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "stuck", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("stuck", &dir, &flow, None);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], false);
+        assert!(resume["reason"].as_str().unwrap().contains("max_visits"));
+        assert!(resume.get("argv").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_an_ordinary_stuck_landing_still_offers_resume() {
+        let dir = next_actions_test_dir("stuck-ordinary");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"review\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "stuck", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("stuck", &dir, &flow, None);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], true);
+        let argv: Vec<String> = resume["argv"]
+            .as_array()
+            .expect("a runnable action carries argv")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(argv.contains(&"--resume".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_workspace_drift_failure_offers_resume_with_adopt_workspace_baked_in() {
+        let dir = next_actions_test_dir("workspace-drift");
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "failed", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let error = Some((
+            machine::ErrorCode::WorkspaceDrift,
+            "SFH_WORKSPACE_DRIFT: the managed workspace changed",
+        ));
+        let actions = next_actions_for("failed", &dir, &flow, error);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], true);
+        assert_eq!(resume["requires"], serde_json::json!(["--adopt-workspace"]));
+        let argv: Vec<String> = resume["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            argv.contains(&"--adopt-workspace".to_string()),
+            "a caller executing this argv verbatim must not be missing the flag the diagnosis named: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
