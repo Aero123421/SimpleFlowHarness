@@ -1664,10 +1664,7 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
             // the flow has said, guessing on top of that is not caution, it is
             // sfh overruling a statement it asked for.
             RetryMode::Transient if done.outcome.is_some() => {
-                matches!(
-                    done.outcome.as_ref().map(|(r, _)| *r),
-                    Some(flow::OutcomeResult::Retryable)
-                )
+                matches!(done.outcome, Some((flow::OutcomeResult::Retryable, _)))
             }
             RetryMode::Transient => {
                 // A PRESET step's chain output is the tool's own report, so a
@@ -2043,7 +2040,20 @@ fn exec_once(p: Prepared) -> LeafDone {
     // structured protocol never completed. Fail-closed keeps precedence, so a
     // preset step whose stream died mid-answer cannot be relabelled "complete"
     // by an exit-code table.
-    let declared = (protocol_failure.is_none() && !outcome.timed_out && !outcome.interrupted)
+    //
+    // `!parsed.failed` belongs in that gate too, and not only as a restatement
+    // of the protocol test. A containment violation reading the tool's artifact
+    // (`parse_output` Err, rev_break #4) reports itself as `failed: true` with
+    // DEFAULT evidence - and the default protocol state is `Plain`, which
+    // allows success - so `protocol_failure` is None there. Without this term a
+    // codex step carrying any `outcomes:` entry for the code it exited with
+    // turned "refusing to read the codex last-message file: it is a symlink"
+    // into a green step with empty output, which is precisely the fail-open the
+    // artifact check exists to prevent.
+    let declared = (protocol_failure.is_none()
+        && !parsed.failed
+        && !outcome.timed_out
+        && !outcome.interrupted)
         .then(|| p.outcomes.get(&outcome.exit_code))
         .flatten()
         .cloned();
@@ -2188,7 +2198,20 @@ fn exec_once(p: Prepared) -> LeafDone {
         tag: p.tag,
         // The only site where a process really ran, so the only one that can
         // carry what its exit code was declared to mean.
-        outcome: declared.map(|d| (d.result, d.label)),
+        //
+        // A declared SUCCESS is dropped when the step did not, in the end,
+        // succeed. Checks that run AFTER the table is read can still fail the
+        // step - session identity on a resume, an empty answer under
+        // allow_empty: false, an unpersistable artifact - and recording
+        // "complete" for a step sfh failed is worse than recording nothing: the
+        // label is exposed as {{steps.<id>.label}} and matched by
+        // `when_label_is:`, so an `on_error: continue` probe routed down the
+        // success branch of a step that failed. A `retryable`/`fail`
+        // declaration claims no success and is kept as-is, which is also what
+        // the retry decision in exec_leaf reads.
+        outcome: declared
+            .filter(|d| !d.result.is_success() || exit_code == 0)
+            .map(|d| (d.result, d.label)),
         exit_code,
         timed_out: outcome.timed_out,
         interrupted: outcome.interrupted,

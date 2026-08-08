@@ -6029,13 +6029,34 @@ check "outcomes: a declared 'continue' is not a failure" 0 $?
 contains "outcomes: and the run carried on to the labelled route" "REVIEWED" outcomes.out
 not_contains "outcomes: a deliberate answer is never retried" "transient failure" outcomes.out
 OUT_RUN="$(ls -d "$WORK"/outcomes-runs/*/ | head -1)"
-GATE_RUNS="$(grep -cF '"step":"gate"' "$OUT_RUN/log.jsonl")"
+# The claim "no retry was considered" is what this counts: `continue` is not a
+# failure, so the gate must have been launched exactly once even though the
+# flow allows two retries and the process exited non-zero.
+GATE_RUNS="$(grep -F '"step":"gate"' "$OUT_RUN/log.jsonl" | grep -cF '"event":"step_end"')"
+check "outcomes: so the gate ran exactly once" 1 "$GATE_RUNS"
 contains "outcomes: the class is durable in step_end" '"outcome":"continue"' "$OUT_RUN/log.jsonl"
 contains "outcomes: and so is the label sfh never interprets" \
   '"outcome_label":"acceptance_incomplete"' "$OUT_RUN/log.jsonl"
 
-# The same exit code, undeclared, keeps its historical reading exactly.
-sed '/outcomes:/,+1d' outcomes.yaml | sed '/when_label_is/d' > outcomes-bare.yaml
+# The same exit code, undeclared, keeps its historical reading exactly. Written
+# out rather than sed-ed out of the flow above: `sed '/re/,+1d'` is a GNU
+# extension that BSD sed (the macOS leg of CI) rejects outright, which would
+# have left this check running against an empty file.
+cat > outcomes-bare.yaml <<YAML
+api_version: 1
+name: outcomes
+defaults:
+  retry: {max: 2, backoff_sec: 1}
+  max_visits: 4
+steps:
+  - id: gate
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "GATE", "--stub-exit", "2"]
+    route:
+      - {goto: end}
+  - id: review
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "REVIEWED"]
+    route: [{goto: end}]
+YAML
 "$SFH" run outcomes-bare.yaml --runs-dir "$WORK_NATIVE/outcomes-bare-runs" -q > outcomes-bare.out 2>&1
 check "outcomes: without the table, exit 2 still fails the step" 1 $?
 

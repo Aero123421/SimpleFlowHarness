@@ -599,6 +599,7 @@ fn precheck(
                 &r.when_last_line_is,
                 &r.when_last_line_matches,
                 &r.when_stderr_matches,
+                &r.when_label_is,
             ]
             .into_iter()
             .flatten()
@@ -6229,6 +6230,16 @@ fn dry_run(
             }
             if let Some(c) = &r.when_stderr_matches {
                 cond.push(format!("stderr matches {c:?}"));
+            }
+            // A predicate missing from this list prints as "always", which is
+            // not a cosmetic slip: the plan then shows two unconditional rules
+            // on one step - a shape `validate` refuses - and the reader cannot
+            // see which branch the flow will actually take.
+            if let Some(c) = &r.when_label_is {
+                cond.push(format!("label is {c:?}"));
+            }
+            if let Some(c) = &r.when_outcome_is {
+                cond.push(format!("outcome is {}", c.as_str()));
             }
             if let Some(m) = &r.when_members {
                 let quantifier = match (m.all, m.at_least) {

@@ -228,7 +228,7 @@ fn lookup(key: &str, ctx: &Ctx) -> Result<String, String> {
             "outcome" => Ok(so.map(|s| s.outcome.clone()).unwrap_or_default()),
             "label" => Ok(so.map(|s| s.label.clone()).unwrap_or_default()),
             other => Err(format!(
-                "unknown field 'steps.{id}.{other}' (use output, outputs, output_file, exit or stderr_file)"
+                "unknown field 'steps.{id}.{other}' (use output, outputs, output_file, exit, stderr_file, outcome or label)"
             )),
         };
     }
