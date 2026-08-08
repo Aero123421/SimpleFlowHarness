@@ -5859,22 +5859,41 @@ check "carry: --carry-budget-from and --resume are refused together" 2 $?
 contains "carry: and the refusal explains which to reach for" "different answers" carry-both.out
 
 # A run that is still spending has no final total, so carrying from it would
-# snapshot a number the ancestor immediately invalidates. The condition is
-# built directly (state running + a pid that really is alive) rather than by
-# racing a detached run, so the guard is what is under test and nothing else.
-cp "$CARRY1/status.json" carry-status.bak
-python3 - "$CARRY1/status.json" "$$" <<'PY'
-import json, sys
-p, pid = sys.argv[1], int(sys.argv[2])
-s = json.load(open(p))
-s["state"], s["pid"] = "running", pid
-json.dump(s, open(p, "w"))
-PY
-"$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
-  --carry-budget-from "$CARRY1_NATIVE" > carry-live.out 2>&1
-check "carry: carrying from a run that is still going is refused" 2 $?
-contains "carry: and says to wait for it or stop it first" "still going" carry-live.out
-cp carry-status.bak "$CARRY1/status.json"
+# snapshot a number the ancestor immediately invalidates.
+#
+# Tested against a REAL detached run rather than a hand-written status.json.
+# The first attempt patched in `$$`, which is the msys shell's pid on Windows
+# and not a native one, so sfh correctly saw no such process and the guard
+# never fired - the fixture was wrong, not the guard. A run sfh started writes
+# its own pid in whatever form sfh reads back, on every platform.
+cat > carry-live.yaml <<YAML
+api_version: 1
+name: carrylive
+steps:
+  - id: slow
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-sleep", "20"]
+YAML
+LIVE_DIR="$("$SFH" run carry-live.yaml --runs-dir "$WORK_NATIVE/carry-live-runs" --detach -q 2>/dev/null)"
+if [ -n "$LIVE_DIR" ]; then
+  # Wait for the run to actually be running before asking sfh about it. On a
+  # slow runner the detached child may not have published status.json yet, and
+  # a carry attempted in that window would be allowed for a timing reason
+  # rather than the one under test.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    "$SFH" status "$LIVE_DIR" > /dev/null 2>&1
+    # 3 is sfh's exit code for "this run is running".
+    [ "$?" = "3" ] && break
+    sleep 1
+  done
+  "$SFH" run carry.yaml --runs-dir "$WORK_NATIVE/carry-runs" \
+    --carry-budget-from "$LIVE_DIR" > carry-live.out 2>&1
+  check "carry: carrying from a run that is still going is refused" 2 $?
+  contains "carry: and says to wait for it or stop it first" "still going" carry-live.out
+  "$SFH" stop "$LIVE_DIR" > /dev/null 2>&1
+else
+  echo "FAIL - carry: could not start a detached run to carry from"
+  fail=$((fail + 1))
+fi
 
 # A refused carry must not leave its half-started run dir behind: an empty run
 # dir is a phantom entry for `runs list`/`runs clean` and pushes the next run
