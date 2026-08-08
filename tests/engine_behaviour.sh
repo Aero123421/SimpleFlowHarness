@@ -69,6 +69,20 @@ not_contains() { # not_contains <name> <needle> <file>
     pass=$((pass + 1))
   fi
 }
+# `contains` for the cases where the exact text depends on how fast the machine
+# is. Use it only where the SHAPE of the output is the contract and one of its
+# numbers is not - a literal assertion there passes on a fast runner and fails
+# on a slow one, which reports a timing difference as a behaviour change.
+matches() { # matches <name> <extended-regex> <file>
+  if grep -qE -e "$2" "$3"; then
+    echo "ok   - $1"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - $1 (nothing matching /$2/ in $3)"
+    sed -n '1,40p' "$3"
+    fail=$((fail + 1))
+  fi
+}
 # Real (native) symlink support. msys' default ln -s writes a copy or a marker
 # file a native Windows binary does not follow, which would test nothing; force
 # native-or-fail so the symlink attacks are only run where they can exist.
@@ -4336,7 +4350,13 @@ YAML
 "$SFH" run f5-vars.yaml --runs-dir f5v-runs -q > f5v.out 2> f5v.err
 check "F5: the budget template variables render" 0 $?
 contains "F5: spend renders to four decimals" "SPENT=0.0000" f5v.out
-contains "F5: elapsed seconds render" "SECS=0" f5v.out
+# Not `SECS=0`: that asserted the whole run reached its first step inside one
+# second, which is a property of the runner rather than of the rendering. It
+# held until run start grew a little more durable work to do and then failed on
+# Windows only. What this line is actually for is that the variable renders as
+# a number at all - an empty or missing value would read as a budget with no
+# clock, which is the bug worth catching.
+matches "F5: elapsed seconds render" "SECS=[0-9]+ " f5v.out
 contains "F5: a declared ceiling renders as what is left" "RUSD=2.0000" f5v.out
 contains "F5: an undeclared ceiling renders as unlimited" "RSEC=unlimited" f5v.out
 
