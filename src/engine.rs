@@ -6596,6 +6596,7 @@ const CONTEXT_SNAPSHOT_MANIFEST: &str = "context-snapshot.json";
 /// written to BOTH the durable manifest and the run log (they answer the same
 /// question - "what did this run actually read" - for two different
 /// readers, so there is exactly one place that computes the answer).
+#[derive(Debug)]
 struct ContextSnapshot {
     registry: HashMap<String, Option<PathBuf>>,
     sources: Vec<serde_json::Value>,
@@ -6687,6 +6688,7 @@ fn snapshot_file_contexts(
 
 /// What a resumed run finds for the context snapshot the ORIGINAL attempt
 /// captured.
+#[derive(Debug)]
 enum ResumedSnapshot {
     /// No manifest at all: a run dir from before this feature existed, or one
     /// whose flow declared no `kind: file` context. Steps fall back to the
@@ -6767,8 +6769,8 @@ fn load_context_snapshot(run_dir: &Path) -> Result<ResumedSnapshot, String> {
             }
             other => {
                 return Ok(ResumedSnapshot::Corrupt(format!(
-                    "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} has an unrecognised state {other:?}"
-                )))
+                "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} has an unrecognised state {other:?}"
+            )))
             }
         }
     }
@@ -7467,6 +7469,253 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P0-04: the execution closure pins context files, but steps must
+    // read the SAME bytes, not the live file ----
+
+    fn context_flow(contexts_yaml: &str) -> flow::Flow {
+        serde_yaml_ng::from_str(&format!(
+            "name: t\ncontexts:\n{contexts_yaml}steps:\n  - id: a\n    cmd: [\"echo\", \"x\"]\n"
+        ))
+        .expect("test flow parses")
+    }
+
+    #[test]
+    fn snapshot_file_contexts_freezes_file_sources_and_leaves_inline_and_template_untouched() {
+        let dir = std::env::temp_dir().join(format!("sfh-snap-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "do the thing").unwrap();
+        let flow = context_flow(
+            "  task:\n    file: \"TASK.md\"\n  notes:\n    file: \"notes.md\"\n    optional: true\n  rules:\n    inline: \"be nice\"\n  live:\n    template: \"{{vars.x}}\"\n",
+        );
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+
+        // Only the two `kind: file` sources are captured at all.
+        assert_eq!(snap.registry.len(), 2, "{:?}", snap.registry.keys());
+        assert!(
+            !snap.registry.contains_key("rules"),
+            "inline is flow bytes already, never snapshotted"
+        );
+        assert!(
+            !snap.registry.contains_key("live"),
+            "a template must stay dynamic, never snapshotted"
+        );
+
+        let task_path = snap
+            .registry
+            .get("task")
+            .cloned()
+            .flatten()
+            .expect("task captured");
+        assert_eq!(std::fs::read_to_string(&task_path).unwrap(), "do the thing");
+        assert!(
+            task_path.starts_with(run_dir.join(CONTEXT_SNAPSHOT_DIR)),
+            "{}",
+            task_path.display()
+        );
+        assert_eq!(
+            snap.registry.get("notes"),
+            Some(&None),
+            "optional and missing is pinned as absent"
+        );
+
+        assert_eq!(snap.sources.len(), 2);
+        let by_name = |n: &str| snap.sources.iter().find(|s| s["name"] == n).unwrap();
+        assert_eq!(by_name("task")["state"], "captured");
+        assert_eq!(by_name("task")["source"], "TASK.md");
+        assert_eq!(
+            by_name("task")["sha256"],
+            sha256::hex("do the thing".as_bytes())
+        );
+        assert_eq!(by_name("notes")["state"], "absent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_file_contexts_defers_rather_than_aborts_a_source_that_fails_containment() {
+        // A symlink without allow_external fails read_file_source's check.
+        // snapshot_file_contexts must not let one bad declaration abort a run
+        // whose steps might never even name it - it just leaves that name
+        // unpinned, so context::build's live fallback raises the same error
+        // it always has, the first time something actually asks for it.
+        let dir =
+            std::env::temp_dir().join(format!("sfh-snap-symlink-{}", contain::random_nonce()));
+        let outside = dir.join("outside");
+        contain::mkdir_private(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP SECRET").unwrap();
+        let flow_dir = dir.join("flow");
+        contain::mkdir_private(&flow_dir).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), flow_dir.join("link.txt")).unwrap();
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&run_dir).unwrap();
+        let flow = context_flow("  esc:\n    file: \"link.txt\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        assert!(
+            !snap.registry.contains_key("esc"),
+            "a source that fails validation must not be pinned at all: {:?}",
+            snap.registry.get("esc")
+        );
+        assert!(snap.sources.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_context_snapshot_that_cannot_be_persisted_fails_the_run_instead_of_falling_back_to_live_reads(
+    ) {
+        // The whole point of this feature is that a step never reads the
+        // live path once a run has started; a snapshot sfh could not write
+        // must not be the one case that quietly reopens that hole. It has to
+        // fail run start the same way an unwritable execution-closure.json
+        // or meta.json already does.
+        let dir =
+            std::env::temp_dir().join(format!("sfh-snap-nowrite-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "content").unwrap();
+        // A plain FILE sits where snapshot_file_contexts needs to create the
+        // context-snapshot/ DIRECTORY, so mkdir_private fails.
+        std::fs::write(run_dir.join(CONTEXT_SNAPSHOT_DIR), "not a directory").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let err = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap_err();
+        assert!(err.contains("persist"), "{err}");
+        assert_eq!(
+            run_failure_code(&err),
+            machine::ErrorCode::PersistenceFailure,
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_context_snapshot_round_trips_what_snapshot_file_contexts_wrote() {
+        let dir = std::env::temp_dir().join(format!("sfh-snap-rt-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "the original text").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n  notes:\n    file: \"notes.md\"\n    optional: true\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .unwrap();
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .unwrap();
+
+        let loaded = match load_context_snapshot(&run_dir).unwrap() {
+            ResumedSnapshot::Loaded(map) => map,
+            _ => panic!("expected the round-tripped manifest to load cleanly"),
+        };
+        assert_eq!(loaded.get("notes"), Some(&None));
+        let task_path = loaded.get("task").cloned().flatten().expect("task loaded");
+        assert_eq!(
+            std::fs::read_to_string(&task_path).unwrap(),
+            "the original text"
+        );
+
+        // No manifest at all: an older run dir, not a fault.
+        let bare_run_dir = dir.join("bare-run");
+        contain::mkdir_private(&bare_run_dir).unwrap();
+        assert!(matches!(
+            load_context_snapshot(&bare_run_dir).unwrap(),
+            ResumedSnapshot::NotPresent
+        ));
+
+        // A manifest that exists but is not valid JSON must be reported, not
+        // silently treated as "nothing pinned".
+        let broken_run_dir = dir.join("broken-run");
+        contain::mkdir_private(&broken_run_dir).unwrap();
+        contain::write_private_atomic(&broken_run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), "not json")
+            .unwrap();
+        assert!(matches!(
+            load_context_snapshot(&broken_run_dir).unwrap(),
+            ResumedSnapshot::Corrupt(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resumed_run_keeps_reading_the_original_snapshot_even_after_the_live_file_changes_before_the_resume(
+    ) {
+        // The resume-semantics decision: --resume (and --force-resume) never
+        // re-capture. A resumed run reads back exactly what the FIRST attempt
+        // pinned, so remaining steps see the same definition of the work the
+        // already-completed steps did - never a mix of the two.
+        let dir = std::env::temp_dir().join(format!("sfh-snap-resume-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        let task = flow_dir.join("TASK.md");
+        std::fs::write(&task, "v1: what the first attempt saw").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        // ---- the original (non-resumed) attempt ----
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .unwrap();
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .unwrap();
+
+        // Something outside the run edits TASK.md before the run is resumed.
+        std::fs::write(&task, "v2: edited after the crash, before the resume").unwrap();
+
+        // ---- the resumed attempt ----
+        let registry = match load_context_snapshot(&run_dir).unwrap() {
+            ResumedSnapshot::Loaded(map) => map,
+            _ => panic!("expected a loaded snapshot"),
+        };
+        let _guard = context::activate_snapshot(registry);
+        let mut r = |_: &str| -> Result<String, String> { Ok(String::new()) };
+        let bundle =
+            context::build(&flow, &["task".to_string()], &containment, None, &mut r).unwrap();
+        assert!(
+            bundle.text.contains("v1: what the first attempt saw"),
+            "{}",
+            bundle.text
+        );
+        assert!(!bundle.text.contains("v2:"), "{}", bundle.text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn every_leaf_run_claim_obeys_the_total_limit() {

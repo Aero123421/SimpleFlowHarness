@@ -3431,7 +3431,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_ndjson_a_later_error_overrides_an_earlier_step_finishs_verdict() {
+    fn opencode_ndjson_a_later_error_overrides_an_earlier_step_finish_verdict() {
         // parse_opencode_ndjson's existing rule: step_finish/finish only sets
         // the verdict if nothing has set it yet (get_or_insert), but error
         // always overrides it outright. So a later in-band failure still

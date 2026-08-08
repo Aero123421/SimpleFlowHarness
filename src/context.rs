@@ -207,7 +207,7 @@ thread_local! {
     /// is exactly as global as a real run needs. In `cargo test`, where many
     /// independent "runs" share a process across a thread pool, it keeps
     /// them from ever reading each other's pins.
-    static SNAPSHOT: RefCell<Option<HashMap<String, Option<PathBuf>>>> = RefCell::new(None);
+    static SNAPSHOT: RefCell<Option<HashMap<String, Option<PathBuf>>>> = const { RefCell::new(None) };
 }
 
 /// Releases this thread's pin when it drops, so a thread the test pool
@@ -658,8 +658,8 @@ mod tests {
     // read the SAME bytes, not the live file ----
 
     #[test]
-    fn a_context_file_edited_between_two_steps_of_one_run_no_longer_changes_what_the_second_step_receives_and_the_closure_still_matches()
-     {
+    fn a_context_file_edited_between_two_steps_of_one_run_no_longer_changes_what_the_second_step_receives_and_the_closure_still_matches(
+    ) {
         let dir = std::env::temp_dir().join(format!("sfh-ctx-snapshot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let task = dir.join("TASK.md");
