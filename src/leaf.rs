@@ -121,6 +121,9 @@ pub struct Prepared {
     /// they were handed, without the log carrying the content itself.
     pub context_hash: Option<String>,
     pub context_file: Option<PathBuf>,
+    /// What the flow declared about exit-code/protocol disagreement, or None to
+    /// keep the adapter's own default.
+    pub exit_conflict: Option<flow::ExitConflict>,
     pub retry: RetryCfg,
     /// Run-level activity clock every child of this run touches when it writes
     /// anything, so `status.json` can say how long the whole run has been quiet.
@@ -1164,6 +1167,7 @@ pub fn prepare_leaf(
         allow_empty: step.allow_empty.unwrap_or(!is_preset),
         context_hash: (!bundle.is_empty()).then(|| bundle.hash.clone()),
         context_file: (!bundle.is_empty()).then_some(context_file),
+        exit_conflict: step.exit_conflict(cx.flow),
         retry: retry_cfg(cx.flow, step),
         run_clock: cx.run_clock.cloned(),
         quiet: cx.quiet,
@@ -1955,9 +1959,14 @@ fn exec_once(p: Prepared) -> LeafDone {
     // the usage message. `certifies_success` cannot be satisfied by raw text,
     // an unknown status, a malformed envelope or a missing terminal record.
     //
-    // The correction stays scoped to agy, the one adapter whose exit codes are
-    // documented as unreliable: this narrows P0-01 rather than spreading the
-    // correction to tools whose exit status IS trustworthy.
+    // Which way the second correction falls is the flow's call, not a hardcoded
+    // adapter list: v1.2.0 excused only agy, and a CLI that exits 1 because
+    // some intermediate tool call failed - after producing and committing a
+    // complete final answer - had no way to say so except to stop checking exit
+    // codes at all, which is fail-open. `exit_conflict: trust_protocol` is the
+    // narrow, declared alternative, and it still cannot fire without positive
+    // evidence of success. The default stays `fail` for every tool whose exit
+    // status is trustworthy, so no existing flow changes meaning.
     // An incomplete structured protocol is recorded FIRST, whichever way the
     // exit code lands. "The tool failed" and "sfh could not verify that the
     // tool finished" are different diagnoses, and only one of them tells a user
@@ -1983,14 +1992,54 @@ fn exec_once(p: Prepared) -> LeafDone {
             });
         }
     }
+    // "The flow said nothing" and "the flow said fail" are different: only the
+    // second may override an adapter documented to get its exit codes wrong.
+    let trust_protocol = match p.exit_conflict {
+        Some(flow::ExitConflict::TrustProtocol) => true,
+        Some(flow::ExitConflict::Fail) => false,
+        None => !preset::exit_code_trustworthy(p.tool.as_deref().unwrap_or("")),
+    };
+    // Neither correction may run over a step that was killed or that said, in
+    // its own protocol, that it failed. A terminal success record can arrive
+    // and the process still be cut down afterwards by `sfh stop` or Ctrl-C -
+    // reporting that as a completed step would turn "a human stopped this" into
+    // "this finished", which is the one thing a stopped run must never say.
     if (parsed.failed || protocol_failure.is_some()) && exit_code == 0 {
         exit_code = 1;
     } else if exit_code != 0
         && !outcome.timed_out
-        && matches!(p.parse, preset::OutputParse::AgyJson)
+        && !outcome.interrupted
+        && !parsed.failed
         && parsed.evidence.certifies_success()
     {
-        exit_code = 0;
+        if trust_protocol {
+            exit_code = 0;
+        } else {
+            // The step still fails - but silently reporting only the exit code
+            // hides that sfh held proof of a completed turn, which is the one
+            // fact that tells a user whether to reach for `exit_conflict:` or
+            // to go looking for a real failure.
+            let why = format!(
+                "{} exited {} but its own protocol certified this turn as successful \
+                 (terminal record found, status success). sfh failed the step because an \
+                 exit code is a failure unless the flow says otherwise. If this tool is \
+                 known to exit non-zero without invalidating its answer, declare \
+                 `exit_conflict: trust_protocol` on the step or in defaults - do not stop \
+                 checking exit codes.",
+                p.tool.as_deref().unwrap_or("the tool"),
+                outcome.exit_code
+            );
+            stderr_clean.push_str(&format!("\nsfh: {why}\n"));
+            harness_diagnostic.get_or_insert(why);
+            if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+                persistence_error.get_or_insert_with(|| {
+                    format!(
+                        "cannot persist required stderr artifact {}: {e}",
+                        p.err_file.display()
+                    )
+                });
+            }
+        }
     }
     let protocol_evidence = parsed.evidence.clone();
     let chain_output = parsed.text.clone();

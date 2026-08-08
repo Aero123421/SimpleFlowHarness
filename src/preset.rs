@@ -360,6 +360,10 @@ pub struct AdapterInfo {
     /// Known, documented gaps between what `access:` asks for and what the tool
     /// will actually hold to.
     pub known_gaps: &'static [&'static str],
+    /// Whether this CLI's exit status can be believed over its own protocol.
+    /// False only where the tool's documentation says the exit code is
+    /// unreliable; it decides the default for `exit_conflict:`.
+    pub exit_code_trustworthy: bool,
 }
 
 impl AdapterInfo {
@@ -465,7 +469,20 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
         policy_coverage: policy,
         required_flags: flags,
         known_gaps: gaps,
+        exit_code_trustworthy: exit_code_trustworthy(tool),
     })
+}
+
+/// Whether a tool's exit status may be believed over a terminal record that
+/// certifies the turn as successful.
+///
+/// agy is the one preset whose own documentation calls its exit codes
+/// unreliable, and sfh has trusted its envelope over its exit status since
+/// before v1.2. Everything else - including a custom `cmd:`, which has no
+/// protocol to weigh against - keeps the conservative reading: a non-zero exit
+/// is a failure. A flow that knows better says so with `exit_conflict:`.
+pub fn exit_code_trustworthy(tool: &str) -> bool {
+    tool != "agy"
 }
 
 /// pi has no sandbox and no permission prompts: the only real lever is which

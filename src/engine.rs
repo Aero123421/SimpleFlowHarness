@@ -5492,6 +5492,11 @@ fn prepare_compact(
         access: Some(preset::Access::Read),
         session_parent: None,
         allow_empty: false,
+        // A step's `exit_conflict:` is a statement about the tool that step
+        // launches. The summarizer may be a different tool entirely, so it
+        // keeps its own adapter default rather than inheriting a licence the
+        // flow granted to something else.
+        exit_conflict: None,
         retry: leaf::RetryCfg::default(),
         run_clock: Some(Arc::clone(run_clock)),
         quiet: *quiet,

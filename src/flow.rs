@@ -97,6 +97,42 @@ pub struct Defaults {
     /// characters. sfh never summarizes or silently drops context to fit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_chars: Option<u64>,
+    /// What to do when a tool's own protocol certifies the turn as successful
+    /// but the process exits non-zero. Omitted keeps the adapter's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_conflict: Option<ExitConflict>,
+}
+
+/// How to resolve a disagreement between a tool's exit code and its own
+/// structured protocol.
+///
+/// This only ever applies where sfh has POSITIVE evidence of success:
+/// `ProtocolEvidence::certifies_success`, meaning the documented terminal
+/// record was found, it was well formed, and it said the turn succeeded. Raw
+/// text, an unknown status, a malformed envelope or a missing terminal record
+/// can never reach this decision, so `trust_protocol` cannot turn a usage error
+/// printed on stdout into a successful step.
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitConflict {
+    /// The exit code wins: the step fails. Correct wherever a CLI's exit status
+    /// is trustworthy, which is most of them.
+    #[default]
+    Fail,
+    /// The protocol wins: the step succeeds. Declare this for a CLI that is
+    /// known to exit non-zero for reasons that do not invalidate the answer -
+    /// for example one that returns 1 because some intermediate tool call
+    /// failed, after producing and committing a complete final result.
+    TrustProtocol,
+}
+
+impl ExitConflict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitConflict::Fail => "fail",
+            ExitConflict::TrustProtocol => "trust_protocol",
+        }
+    }
 }
 
 /// How to treat a step whose effects may have happened even though sfh never
@@ -545,6 +581,9 @@ pub struct Step {
     /// Overrides `defaults.replay` for this step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay: Option<Replay>,
+    /// Overrides `defaults.exit_conflict` for this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_conflict: Option<ExitConflict>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -594,6 +633,15 @@ impl Step {
 
     pub fn context_delivery(&self) -> ContextDelivery {
         self.context_delivery.unwrap_or_default()
+    }
+
+    /// What this step declares about exit-code/protocol disagreement, or `None`
+    /// when it declares nothing and the adapter's own default should stand.
+    /// Kept as an Option so "the flow said nothing" and "the flow said fail"
+    /// are distinguishable: only the latter overrides an adapter that is
+    /// documented to get its exit codes wrong.
+    pub fn exit_conflict(&self, flow: &Flow) -> Option<ExitConflict> {
+        self.exit_conflict.or(flow.defaults.exit_conflict)
     }
 }
 
@@ -1246,7 +1294,23 @@ impl Flow {
                 out.insert(format!("contexts.{name}.allow_external"));
             }
         }
+        if self.defaults.exit_conflict == Some(ExitConflict::TrustProtocol) {
+            out.insert(format!(
+                "defaults.exit_conflict={}",
+                ExitConflict::TrustProtocol.as_str()
+            ));
+        }
         let mut note = |s: &Step| {
+            // Believing a protocol over a non-zero exit is narrow and evidence-
+            // gated, but it is still sfh overriding what the OS reported. It
+            // belongs in the same list a reviewer reads before a paid run.
+            if s.exit_conflict == Some(ExitConflict::TrustProtocol) {
+                out.insert(format!(
+                    "steps.{}.exit_conflict={}",
+                    s.id,
+                    ExitConflict::TrustProtocol.as_str()
+                ));
+            }
             if s.unsafe_shell_template.unwrap_or(false) {
                 out.insert(format!("steps.{}.unsafe_shell_template", s.id));
             }
@@ -1266,6 +1330,44 @@ impl Flow {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// Every program a `cmd:` step would launch, mapped to the steps that
+    /// launch it.
+    ///
+    /// `resolved_tools` deliberately skips `cmd:` steps, because tool/fallback
+    /// resolution is a preset concept. That left the programs a flow leans on
+    /// hardest - the verification shell, the build, the test runner - as the
+    /// only ones preflight never looked at, so a `bash` that resolved to
+    /// something entirely different was reported as "no blockers".
+    ///
+    /// argv[0] carrying a `{{...}}` placeholder is not resolvable before the
+    /// run, and is reported as such rather than guessed at.
+    pub fn resolved_commands(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut note = |s: &Step| {
+            let program = match &s.cmd {
+                Some(Cmd::Argv(argv)) => argv.first().cloned(),
+                // A `cmd:` string is handed to the platform shell, never to a
+                // shell the flow chose. Naming it is the point: a flow that
+                // writes bash syntax into a `cmd:` string is running it under
+                // `sh` (or `cmd`), and that is worth seeing before the run.
+                Some(Cmd::Shell(_)) => Some(if cfg!(windows) { "cmd" } else { "sh" }.to_string()),
+                None => None,
+            };
+            if let Some(program) = program {
+                out.entry(program).or_default().insert(s.id.clone());
+            }
+        };
+        for s in &self.steps {
+            note(s);
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    note(c);
+                }
+            }
+        }
+        out
     }
 
     /// An upper bound on leaves this flow can execute, from its static shape.
@@ -3505,6 +3607,7 @@ mod tests {
             "\"context_delivery\"",
             "\"replay\"",
             "\"max_context_chars\"",
+            "\"exit_conflict\"",
         ] {
             assert!(
                 !json.contains(key),
@@ -3518,6 +3621,63 @@ mod tests {
         )
         .unwrap();
         assert_ne!(json, with.effective_config_json().unwrap());
+    }
+
+    #[test]
+    fn exit_conflict_distinguishes_saying_nothing_from_saying_fail() {
+        let f: Flow = yaml::from_str(
+            "defaults: {exit_conflict: trust_protocol}\nsteps:\n  - id: a\n    tool: agy\n    prompt: x\n  - id: b\n    tool: agy\n    prompt: y\n    exit_conflict: fail\n  - id: c\n    tool: pi\n    prompt: z\n",
+        )
+        .unwrap();
+        let by = |id: &str| {
+            let s = f.steps.iter().find(|s| s.id == id).unwrap();
+            s.exit_conflict(&f)
+        };
+        assert_eq!(by("a"), Some(ExitConflict::TrustProtocol));
+        // A step may pull BACK to strict even where defaults loosened, and that
+        // has to be distinguishable from "nothing was declared" - otherwise it
+        // could not override agy's own default either.
+        assert_eq!(by("b"), Some(ExitConflict::Fail));
+        assert_eq!(by("c"), Some(ExitConflict::TrustProtocol));
+
+        let silent: Flow =
+            yaml::from_str("steps:\n  - id: a\n    tool: pi\n    prompt: x\n").unwrap();
+        assert_eq!(silent.steps[0].exit_conflict(&silent), None);
+    }
+
+    #[test]
+    fn trusting_a_protocol_over_an_exit_code_is_listed_as_an_override() {
+        let f: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    tool: pi\n    prompt: x\n    exit_conflict: trust_protocol\n  - id: b\n    tool: pi\n    prompt: y\n    exit_conflict: fail\n",
+        )
+        .unwrap();
+        let o = f.unsafe_overrides();
+        assert!(
+            o.contains(&"steps.a.exit_conflict=trust_protocol".to_string()),
+            "{o:?}"
+        );
+        // Declaring the strict default is not an override of anything.
+        assert!(!o.iter().any(|s| s.starts_with("steps.b.")), "{o:?}");
+    }
+
+    #[test]
+    fn every_program_a_cmd_step_launches_is_visible_to_preflight() {
+        let f: Flow = yaml::from_str(
+            "steps:\n  - id: verify\n    cmd: [\"bash\", \"-lc\", \"cargo test\"]\n  - id: fan\n    parallel:\n      - id: fmt\n        cmd: [\"bash\", \"-lc\", \"cargo fmt --check\"]\n      - id: node\n        cmd: [\"pnpm\", \"test\"]\n  - id: agent\n    tool: codex\n    prompt: x\n  - id: line\n    cmd: \"echo hi\"\n",
+        )
+        .unwrap();
+        let c = f.resolved_commands();
+        // Both steps that launch bash are attributed to it, including the one
+        // nested in a parallel group - the shape that hid a bad `bin` before.
+        assert_eq!(
+            c.get("bash").map(|s| s.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["fmt".to_string(), "verify".to_string()])
+        );
+        assert!(c.contains_key("pnpm"));
+        // A preset step launches no command, and a `cmd:` STRING is run by the
+        // platform shell rather than by anything the flow named.
+        assert!(!c.contains_key("codex"));
+        assert!(c.contains_key(if cfg!(windows) { "cmd" } else { "sh" }));
     }
 
     #[test]
