@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-The latest v1.2.x release receives security fixes. Older releases may be used
-to reproduce a report but are not maintained.
+The latest stable v1.x release receives security fixes. Older releases may be
+used to reproduce a report but are not maintained.
 
 ## Reporting a vulnerability
 
@@ -57,7 +57,8 @@ unsafe override in the plan, the execution closure and the run's metadata:
 ## What is not a secret
 
 `--var` values are not secrets: they are recorded in the run's `meta.json` and
-may be rendered into prompts. sfh has no first-class secret input in v1.2.
+may be rendered into prompts. sfh still has no first-class secret input or
+provider.
 
 Prompts are treated as sensitive in the durable command log: an adapter that
 delivers the prompt through argv records it as `<prompt chars=N sha256=...>`

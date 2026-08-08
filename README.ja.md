@@ -379,7 +379,7 @@ sfh run flow.yaml --state-dir ~/.local/state/sfh     # または SFH_STATE_DIR
 
 ## プログラムから sfh を動かす
 
-`--json` を付けると stdout は envelope だけになります。進捗と warning は stderr へ回り、設定エラーであっても prose ではなく envelope が返ります。
+`run` / `plan` / `wait` / `stop` / `status` / `preflight` / `workspaces` で `--json` を付けると、stdout は envelope だけになります。進捗と warning は stderr へ回り、設定エラーであっても prose ではなく envelope が返ります。`validate --json` と `runs list|show|why --json` はenvelopeより前からあるcommandで、今も独自のbare JSONを返します — `schema_version` も `command` も `exit_code` も安定した error code もありません。以下のheader fieldに頼る前に、応答に `schema_version` があるか確認してください。無ければこの4つのどれかです。全fieldの契約とbare JSON側の正確な形は [docs/machine-api.md](docs/machine-api.md) を参照してください。
 
 ```bash
 sfh preflight flow.yaml --json          # 無料: model 呼び出しなし
@@ -388,7 +388,7 @@ sfh run       flow.yaml --json --detach # handle と next_actions を返す
 sfh wait <run-dir> --json               # 完了までブロックし、結果を返す
 ```
 
-失敗には v1.2.x の全期間で意味が固定された code が付きます。message は改善され得るので、code で分岐してください。
+失敗には `schema_version` が変わらない限り意味が固定された code が付きます（現在は `1`）。message は改善され得るので、code で分岐してください。
 
 `SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`
 
@@ -429,18 +429,19 @@ sfh はどの adapter についても **minimum version を固定していませ
 
 すべての実行において `.sfh/runs/<run-id>/` 以下に耐久ログが保存されます:
 - `log.jsonl`: 構造化イベントストリーム（ステップ開始・完了・トークン・コスト・protocol evidence・workspace checkpoint）
-- `<step_id>.out.txt` & `<step_id>.err.txt`: サイズ制限付きのraw標準出力・標準エラー出力。32 MiBを超えるstreamは省略marker付きで先頭と末尾を保持し、構造化された最終回答とusage/costは完全なstreamから独立して処理します。
+- `<step_id>.out.txt` & `<step_id>.err.txt`: 32 MiBを上限としたサイズ制限付きのraw標準出力・標準エラー出力。上限を超えるstreamは省略marker付きで先頭と末尾だけを保持します。構造化protocolの最終回答とusage/costは上限が効く前の完全なin-flight streamから解析されるため、そちらは影響を受けません。一方、素の`cmd:` stepにはそうした解析がなく、記録される出力はこのサイズ制限済みfileそのものです。
 - `status.json`: リアルタイムステータススナップショット
 - `execution-closure.json`: この run が固定された入力の hash
 - `workspace.json`: managed workspace（flow が要求した場合）
 - `<step_id>.context.txt` & `<step_id>.context.json`: 組み立てられた context とその manifest（step が context を指定した場合）
 
-コマンドの長い出力をAI promptへ渡す場合は、`{{steps.verify.output | tail:80 | truncate:8000}}`のように明示的に制限してください。全文artifactは`{{steps.verify.output_file}}`から参照できます。
+`{{steps.verify.output_file}}` はこの同じサイズ制限済み`.out.txt`を指しており、完全なstreamを保証するものではありません。sfhはraw標準出力・標準エラー出力を無制限には保持しません。それでもコマンドの長い出力をAI promptへ渡す場合は、`{{steps.verify.output | tail:80 | truncate:8000}}`のように明示的に制限してください。32 MiBを超えて出力全体を残す必要があるstep — 騒がしいbuildやtest runnerを包む`cmd:` stepなど — は、managed workspace内のfileなど、自分自身のartifact先に出力を書き出してください。
 
 公開 JSON スキーマ:
 - [Flow JSON スキーマ](schema/flow.schema.json)
 - [耐久ログイベント JSON スキーマ](schema/log-event.schema.json)
 - [ステータススナップショット JSON スキーマ](schema/status.schema.json)
+- [Machine API リファレンス](docs/machine-api.md): 各`--json` commandのenvelopeまたはbare JSONの形、error codeの語彙、stabilityの保証範囲。
 
 ---
 

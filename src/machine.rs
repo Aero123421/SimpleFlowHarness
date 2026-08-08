@@ -4,11 +4,20 @@
 //! sfh is increasingly driven by another program - a script, a CI job, or an AI
 //! agent that has to decide what to do next from what sfh just said. Prose is a
 //! bad interface for that: the wording of a message is allowed to improve, and
-//! a caller that greps for it breaks when it does. So every `--json` command
-//! answers with the same header, and every failure carries a code whose MEANING
-//! is fixed for the whole 1.2.x series even as its message changes.
+//! a caller that greps for it breaks when it does. So `run`, `plan`, `wait`,
+//! `stop`, `status`, `preflight` and `workspaces` (`list`/`show`/`clean`/
+//! `remove`) answer `--json` with the header built here, and every failure
+//! among them carries a code whose MEANING is fixed for as long as
+//! `SCHEMA_VERSION` below does not change, even as its message changes.
 //!
-//! Two rules keep this usable:
+//! `validate --json` and `runs list|show|why --json` predate this module and
+//! still print their own bare JSON instead: no `schema_version`, no
+//! `command`, no `exit_code`, no code from `ErrorCode` at all. A caller has to
+//! special-case those four rather than assume the header below is universal -
+//! see docs/machine-api.md for the exact shape each one answers with and the
+//! plan to unify them onto this envelope.
+//!
+//! Two rules keep the envelope usable:
 //!
 //! - In JSON mode, stdout carries JSON and nothing else. Progress, warnings and
 //!   human notes go to stderr. A caller may `sfh ... --json | jq` safely.
@@ -19,7 +28,7 @@
 use serde_json::json;
 
 /// The stable failure vocabulary. Messages may be reworded; these may not be
-/// re-pointed at a different meaning inside 1.2.x.
+/// re-pointed at a different meaning while `SCHEMA_VERSION` stays the same.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ErrorCode {
     /// The command line itself was wrong.
@@ -71,6 +80,10 @@ impl ErrorCode {
 }
 
 /// The version of the envelope shape itself, independent of sfh's version.
+/// `ErrorCode` meanings are pinned to this too, not to a release number: a
+/// caller's cached understanding of a code is safe to keep using for as long
+/// as this stays 1, and a bump here - not a `sfh --version` bump - is the
+/// signal that it may be stale.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// What a caller should or could do next. Always a runnable argv, never prose:
@@ -192,8 +205,9 @@ mod tests {
             );
             assert!(seen.insert(s), "{s} is used by two codes");
         }
-        // The set the spec fixes for 1.2.x. Adding one is fine; changing what
-        // an existing one means is not, and this catches a silent rename.
+        // The set the spec fixes for this SCHEMA_VERSION. Adding one is fine;
+        // changing what an existing one means is not, and this catches a
+        // silent rename.
         for expected in [
             "SFH_USAGE",
             "SFH_FLOW_INVALID",

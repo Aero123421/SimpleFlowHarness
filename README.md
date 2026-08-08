@@ -377,7 +377,7 @@ Puts `runs`, `workspaces`, `plans` and `doctor` under one directory. `--runs-dir
 
 ## Driving sfh from a program
 
-`--json` makes stdout an envelope and nothing else — progress and warnings go to stderr, and a configuration error is still an envelope rather than prose.
+`--json` on `run`, `plan`, `wait`, `stop`, `status`, `preflight` and `workspaces` makes stdout an envelope and nothing else — progress and warnings go to stderr, and a configuration error is still an envelope rather than prose. `validate --json` and `runs list|show|why --json` predate the envelope and still print their own bare JSON: no `schema_version`, no `command`, no `exit_code`, no stable error code. Check the response for `schema_version` before relying on the header fields below — its absence means you are looking at one of those four. See [docs/machine-api.md](docs/machine-api.md) for the full contract, every header field, and the exact shape the bare-JSON holdouts answer with instead.
 
 ```bash
 sfh preflight flow.yaml --json          # free: no model calls
@@ -403,7 +403,7 @@ sfh wait <run-dir> --json               # blocks, then the result
 }
 ```
 
-Failures carry a code whose meaning is fixed for all of v1.2.x — branch on the code, not on the message, which is allowed to improve:
+Failures carry a code whose meaning is fixed for as long as `schema_version` does not change (currently `1`) — branch on the code, not on the message, which is allowed to improve:
 
 `SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`.
 
@@ -444,18 +444,19 @@ sfh pins **no minimum version** for any adapter. Rather than assert a floor it h
 
 Every run generates durable, append-only records inside `.sfh/runs/<run-id>/`:
 - `log.jsonl`: Structured event stream (step start, completion, token usage, cost, protocol evidence, workspace checkpoints).
-- `<step_id>.out.txt` & `<step_id>.err.txt`: Bounded raw stdout/stderr snapshots. Streams over 32 MiB retain their head and tail with an omission marker; structured final answers and accounting are processed independently from the complete stream.
+- `<step_id>.out.txt` & `<step_id>.err.txt`: Bounded raw stdout/stderr snapshots, capped at 32 MiB. A stream over the cap keeps its head and tail with an omission marker in between. A structured protocol's final answer and accounting are parsed from the complete in-flight stream before the cap applies and so survive regardless; a plain `cmd:` step has no such parsing, so its recorded output is exactly this capped file.
 - `status.json`: Real-time status snapshot.
 - `execution-closure.json`: The hashed inputs this run is pinned to.
 - `workspace.json`: The managed workspace, when the flow asked for one.
 - `<step_id>.context.txt` & `<step_id>.context.json`: The assembled context and its manifest, when the step named any.
 
-When forwarding a command's verbose output into an AI prompt, prefer an explicit bound such as `{{steps.verify.output | tail:80 | truncate:8000}}`; the full artifact remains available through `{{steps.verify.output_file}}`.
+`{{steps.verify.output_file}}` names this same capped `.out.txt`, not a guarantee of the complete stream — sfh keeps no unbounded copy of raw stdout/stderr anywhere. When forwarding a command's verbose output into an AI prompt, prefer an explicit bound such as `{{steps.verify.output | tail:80 | truncate:8000}}` regardless. A step that needs its full output to survive past 32 MiB — a `cmd:` step wrapping a noisy build or test run, say — has to write it itself, to a file in the managed workspace or another artifact path of its own.
 
 Public JSON Schemas:
 - [Flow JSON Schema](schema/flow.schema.json)
 - [Durable Log Event JSON Schema](schema/log-event.schema.json)
 - [Status Snapshot JSON Schema](schema/status.schema.json)
+- [Machine API Reference](docs/machine-api.md): every `--json` command's envelope or bare-JSON shape, the error-code vocabulary, and the stability guarantee.
 
 ---
 
