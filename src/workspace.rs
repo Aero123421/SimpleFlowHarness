@@ -375,7 +375,11 @@ pub fn verify_ownership(ws: &Workspace) -> Result<(), String> {
 /// Untracked filenames are read as raw bytes, not decoded text (see
 /// `git_bytes`): a filename on Unix can be any byte sequence, and the join,
 /// stat and open below all need to land on the exact file git named, not on
-/// whatever a lossy decode turned that name into.
+/// whatever a lossy decode turned that name into. A symlink's target is
+/// hashed the same way and for the same reason (see `symlink_target_bytes`):
+/// two targets a lossy decode would collapse to the same text must still
+/// hash differently, or repointing a symlink becomes a change this function
+/// cannot see.
 pub fn fingerprint(path: &Path) -> Result<String, String> {
     let head = git(path, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "no-head".to_string());
     let index = git(path, &["diff", "--cached", "--full-index"])?;
@@ -423,7 +427,7 @@ pub fn fingerprint(path: &Path) -> Result<String, String> {
             let target = std::fs::read_link(&file)
                 .map_err(|e| format!("cannot read the link {}: {e}", file.display()))?;
             acc.extend_from_slice(b"symlink:");
-            acc.extend_from_slice(sha256::hex(target.to_string_lossy().as_bytes()).as_bytes());
+            acc.extend_from_slice(sha256::hex(&symlink_target_bytes(&target)).as_bytes());
         } else if md.is_file() {
             acc.extend_from_slice(hash_file_streaming(&file)?.as_bytes());
         } else {
@@ -456,6 +460,32 @@ fn path_from_ls_files_entry(bytes: &[u8]) -> PathBuf {
 #[cfg(not(unix))]
 fn path_from_ls_files_entry(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The exact bytes a symlink target is made of, for hashing.
+///
+/// `read_link` already hands back the target undecoded - on Unix a
+/// `PathBuf`'s internal representation IS the raw bytes the kernel stores,
+/// with no UTF-8 requirement, the same as a filename. Hashing it through
+/// `to_string_lossy` would throw that precision away right back out again:
+/// two targets that differ only in one invalid byte both decode to the same
+/// U+FFFD text, so repointing such a symlink from one to the other would
+/// hash identically before and after. `fingerprint`'s entire job is to
+/// prove nothing changed underneath the workspace; a collision here would
+/// make it prove that about a symlink that DID change, and a resume would
+/// carry on as if it had not. As with `path_from_ls_files_entry`, Windows
+/// targets are UTF-16, not an arbitrary byte sequence, so there is no
+/// equivalent raw-byte move to make there, and non-Unix keeps the previous
+/// lossy decode.
+#[cfg(unix)]
+fn symlink_target_bytes(target: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(target: &Path) -> Vec<u8> {
+    target.to_string_lossy().into_owned().into_bytes()
 }
 
 /// Hash a file without ever holding it in memory. A large untracked artifact is
@@ -826,6 +856,52 @@ mod tests {
         assert_ne!(
             fp_b, fp_c,
             "editing the file under a non-UTF-8 name must change the fingerprint"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// P3-01 follow-up: an untracked symlink repointed from one non-UTF-8
+    /// target to a different non-UTF-8 target must fingerprint differently.
+    /// Before this fix both targets were hashed through `to_string_lossy`,
+    /// so two targets differing only in an invalid byte could hash
+    /// identically - which would mean repointing the link fingerprinted as
+    /// no change at all, and a resume would proceed past a real one.
+    #[test]
+    #[cfg(unix)]
+    fn fingerprint_distinguishes_two_symlink_targets_that_differ_only_in_an_invalid_byte() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let base =
+            std::env::temp_dir().join(format!("sfh-ws-symlink-nonutf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        if git(&base, &["init", "-q"]).is_err() {
+            eprintln!(
+                "skipping fingerprint_distinguishes_two_symlink_targets_that_differ_only_in_an_invalid_byte: git is not available"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        // The link need not resolve to anything real: `read_link` only reads
+        // the text the symlink itself stores, and `fingerprint` never
+        // follows it. Two targets differing in a single invalid byte (0xFF
+        // vs 0xFE) are exactly what a lossy decode would both turn into the
+        // same U+FFFD text.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(OsStr::from_bytes(b"target-\xff-a"), &link).unwrap();
+        let fp_a = fingerprint(&base).expect("a non-UTF-8 symlink target must still fingerprint");
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(OsStr::from_bytes(b"target-\xfe-a"), &link).unwrap();
+        let fp_b =
+            fingerprint(&base).expect("the repointed non-UTF-8 symlink must still fingerprint");
+
+        assert_ne!(
+            fp_a, fp_b,
+            "two non-UTF-8 symlink targets differing only in an invalid byte must not fingerprint identically"
         );
 
         let _ = std::fs::remove_dir_all(&base);
