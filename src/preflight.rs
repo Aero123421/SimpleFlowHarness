@@ -16,27 +16,85 @@
 //! preflight = will this flow even start, and under what policy?   (free)
 //! doctor    = does the tool still speak the protocol sfh parses?  (paid)
 //! ```
+//!
+//! "Makes NO model calls" is a claim about MODELS, not about every program a
+//! flow can name. A `cmd:` step's program is resolved and never run, because
+//! sfh did not write it and cannot know `deploy.sh --help` will not deploy
+//! (see `CommandReport`). A preset tool's `bin:` override is the identical
+//! danger wearing a trusted tool's name: sfh has verified that claude's,
+//! codex's, and every other shipped adapter's OWN launcher is inert on
+//! `--help`/`--version`, but `bin:` can point `tool: claude` at any program
+//! the flow wants, and preflight has no way to tell "a newer claude" from "a
+//! script that deploys". So a non-default `bin:` gets the same treatment as a
+//! `cmd:` program - resolved, never run - unless the operator opts in with
+//! `--probe-binaries`. See `ProbeState` for how the report says which
+//! happened, for both a tool and a `cmd:` program.
 
-use crate::{execute, flow, preset, state};
+use crate::{contain, execute, flow, leaf, preset, state};
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One tool the flow would actually launch, as preflight found it.
 pub struct ToolReport {
     pub tool: String,
     pub program: String,
     pub resolved_path: Option<String>,
+    /// Whether `program` was actually run - see `ProbeState`. A `bin:`
+    /// override is resolved but not probed unless `--probe-binaries` was
+    /// given (P0-05); the tool's own default launcher is always probed.
+    pub probe_state: ProbeState,
+    /// `None` either because the CLI printed nothing usable on `--version`
+    /// or because `probe_state` is not `Probed` - check that field before
+    /// reading a `None` here as "something is wrong with the tool".
     pub version: Option<String>,
     pub info: Option<preset::AdapterInfo>,
-    /// Required flags that this binary's `--help` did not mention. Empty when
-    /// help could not be read at all (see `help_readable`).
+    /// Required flags that this binary's `--help` did not mention. Empty
+    /// when help could not be read at all (see `help_readable`), or when
+    /// `probe_state` is not `Probed` and `--help` was never sent.
     pub missing_flags: Vec<String>,
     pub help_readable: bool,
     /// Access levels this flow asks this tool for.
     pub requested_access: Vec<String>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// Whether, and why, preflight ran `<program> --help`/`--version` for one
+/// tool/program pair.
+///
+/// Exists because a bare `None` version is ambiguous: it can mean "sfh ran
+/// this and the CLI printed nothing usable" or "sfh never ran this at all",
+/// and those are different answers an operator must not confuse - reading
+/// the second as the first is exactly how a `bin:` override preflight
+/// correctly refused to execute could be misread as one that was checked and
+/// came back clean (P0-05).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeState {
+    /// `<program> --help` and `--version` were actually run, in an isolated
+    /// scratch directory. `version`, `help_readable` and `missing_flags`
+    /// reflect a real invocation.
+    Probed,
+    /// The binary exists but preflight did not run it - either it is a
+    /// `bin:` override and `--probe-binaries` was not given (the same
+    /// reasoning `CommandReport` already applies to a `cmd:` step's
+    /// program), or preflight could not create an isolated place to run it
+    /// in. `version`, `help_readable` and `missing_flags` are all their
+    /// empty defaults: absence of evidence, not evidence of absence.
+    ResolvedNotProbed,
+    /// Not found on PATH (or at the literal path given), so there was
+    /// nothing to run.
+    NotFound,
+}
+
+impl ProbeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeState::Probed => "probed",
+            ProbeState::ResolvedNotProbed => "resolved_not_probed",
+            ProbeState::NotFound => "not_found",
+        }
+    }
 }
 
 /// One program a `cmd:` step would launch, as preflight found it.
@@ -47,6 +105,10 @@ pub struct ToolReport {
 /// flow names, because `deploy.sh --help` may well deploy. Resolution answers
 /// the question that actually bit - "which binary is this name?" - without
 /// executing anything.
+///
+/// A preset tool's non-default `bin:` override is the same danger wearing a
+/// trusted tool's name; see `ProbeState::ResolvedNotProbed` on `ToolReport`
+/// for where this exact reasoning was carried across (P0-05).
 pub struct CommandReport {
     pub program: String,
     pub resolved_path: Option<String>,
@@ -77,6 +139,11 @@ pub struct Report {
     pub sfh_version: &'static str,
     pub flow_path: Option<String>,
     pub flow_name: Option<String>,
+    /// Whether `--probe-binaries` was given, so a JSON consumer can tell "no
+    /// bin: overrides existed" apart from "overrides existed but this run
+    /// was not allowed to execute them" without re-deriving it by scanning
+    /// every tool's `probe_state`.
+    pub probe_binaries: bool,
     pub tools: Vec<ToolReport>,
     /// Programs launched by `cmd:` steps. Empty for a flowless survey.
     pub commands: Vec<CommandReport>,
@@ -100,6 +167,7 @@ impl Report {
             "flow": self.flow_path,
             "flow_name": self.flow_name,
             "ok": self.ok(),
+            "probe_binaries": self.probe_binaries,
             "tools": self.tools.iter().map(ToolReport::to_json).collect::<Vec<_>>(),
             "commands": self.commands.iter().map(CommandReport::to_json).collect::<Vec<_>>(),
             "flow_facts": self.flow_facts,
@@ -120,6 +188,10 @@ impl ToolReport {
             "default_program": info.map(|i| i.default_program.clone()),
             "adapter": info.map(|i| i.tool),
             "resolved_path": self.resolved_path,
+            // Distinguishes "ran, found nothing" from "never ran" - see
+            // `ProbeState`. A machine caller must check this before reading
+            // `version: null` as a problem with the tool.
+            "probe_state": self.probe_state.as_str(),
             "version": self.version,
             // Deliberately null: sfh does not pin a floor it has not verified
             // against the CLI's own documentation and a live probe.
@@ -150,19 +222,59 @@ impl ToolReport {
     }
 }
 
+/// Extra CLI args and env vars to apply ONLY while probing a tool's own
+/// launcher (`--help`/`--version`) - never during a real run, whose argv and
+/// env already come from `preset::build`. Exists because a probe is still a
+/// real invocation, and some launchers treat ANY invocation as a chance to do
+/// more than answer - self-update, phone home, write a cache - which is
+/// exactly the side effect a free, offline check must not cause (P3-02).
+struct ProbeHardening {
+    extra_args: &'static [&'static str],
+    env_set: &'static [(&'static str, &'static str)],
+}
+
+/// Nothing is known here on purpose. Which tool needs which flag or env var
+/// to stay quiet on a probe is adapter-specific knowledge, and that
+/// knowledge belongs next to the rest of each adapter's command-line facts in
+/// `preset.rs` - not duplicated here, for the same reason preflight does not
+/// keep its own copy of what a `cmd:` program's flags mean. This is the seam:
+/// every tool probes as if it had no hardening today, which is the current
+/// behaviour and therefore always safe to default to. Swap the body below for
+/// a call to `preset::probe_hardening(tool)` once that table lands (P3-02).
+fn probe_hardening(_tool: &str) -> ProbeHardening {
+    ProbeHardening {
+        extra_args: &[],
+        env_set: &[],
+    }
+}
+
 /// Read a CLI's own `--help`. Bounded and never fatal: a tool that has no
 /// `--help`, prints it to stderr, or wants to talk to a terminal is reported as
 /// "help unreadable" rather than as a missing flag, because "sfh could not
 /// check" and "the flag is gone" are different answers and only one of them
 /// should stop a run.
-fn read_help(program: &str) -> Option<String> {
+///
+/// Runs in `cwd`, never sfh's own working directory: every one of these CLIs
+/// is documented (see `doctor::run_probe`) to read project instruction files
+/// out of its working directory on a real run, and nothing here has verified
+/// `--help` is an exception. `tool` looks up any probe-only hardening
+/// (`probe_hardening`, P3-02).
+fn read_help(program: &str, tool: &str, cwd: &Path) -> Option<String> {
+    let hardening = probe_hardening(tool);
+    let mut argv = vec![program.to_string(), "--help".to_string()];
+    argv.extend(hardening.extra_args.iter().map(|s| s.to_string()));
+    let env_set: Vec<(String, String)> = hardening
+        .env_set
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
     let out = execute::run_cmd(
-        &execute::Invocation::Argv(vec![program.to_string(), "--help".to_string()]),
+        &execute::Invocation::Argv(argv),
         None,
-        None,
+        Some(cwd),
         Some(std::time::Duration::from_secs(15)),
         &[],
-        &[],
+        &env_set,
         execute::Observe::default(),
     )
     .ok()?;
@@ -174,20 +286,83 @@ fn read_help(program: &str) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// `<program> --version`, isolated the same way `read_help` is and for the
+/// same reason (see there). Bounded like `execute::probe_version` already
+/// is: a CLI that hangs on `--version` (an auth prompt, a stuck update check)
+/// must not stop preflight from finishing - this is metadata, not a
+/// dependency.
+///
+/// Mirrors `execute::probe_version`'s own parsing exactly; duplicated rather
+/// than shared because that function always runs in the CALLING process's
+/// cwd, which for `sfh preflight` is the operator's own project - the one
+/// place this probe must not run.
+fn probe_version_isolated(program: &str, tool: &str, cwd: &Path) -> Option<String> {
+    let hardening = probe_hardening(tool);
+    let mut argv = vec![program.to_string(), "--version".to_string()];
+    argv.extend(hardening.extra_args.iter().map(|s| s.to_string()));
+    let env_set: Vec<(String, String)> = hardening
+        .env_set
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let out = execute::run_cmd(
+        &execute::Invocation::Argv(argv),
+        None,
+        Some(cwd),
+        Some(std::time::Duration::from_secs(15)),
+        &[],
+        &env_set,
+        execute::Observe::default(),
+    )
+    .ok()?;
+    if out.timed_out {
+        return None;
+    }
+    let text = String::from_utf8_lossy(if out.stdout.is_empty() {
+        &out.stderr
+    } else {
+        &out.stdout
+    });
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim().to_string())
+}
+
 /// Inspect one tool/program pair without calling a model.
 ///
 /// `required` distinguishes the two questions preflight answers. A flow that
 /// launches this tool cannot start without it, so a missing binary is a
 /// blocker. A flowless survey is just asking what is installed, and "codex is
 /// not on this machine" is an answer, not a failure.
-fn probe(tool: &str, program: &str, requested_access: Vec<String>, required: bool) -> ToolReport {
+///
+/// `probe_binaries` and `probe_dir` are the P0-05 fix. `program` is only ever
+/// RUN when it is the tool's own default launcher (`program ==
+/// preset::default_program(tool)`, resolved on PATH) - sfh ships that
+/// adapter and has verified its `--help`/`--version` are inert. Anything else
+/// is a `bin:` override the FLOW chose, and gets the identical treatment a
+/// `cmd:` step's program already gets (see `CommandReport`'s doc comment):
+/// resolved, never run, unless the operator passes `--probe-binaries`.
+/// `probe_dir` is where an allowed probe actually runs - never sfh's own
+/// working directory (see `read_help`) - and is `None` only when preflight
+/// could not create one, in which case nothing is run rather than something
+/// being run unisolated.
+fn probe(
+    tool: &str,
+    program: &str,
+    requested_access: Vec<String>,
+    required: bool,
+    probe_binaries: bool,
+    probe_dir: Option<&Path>,
+) -> ToolReport {
     let info = preset::adapter_info(tool);
     let resolved_path = execute::which(program);
+    let is_default = program == preset::default_program(tool);
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
     let mut missing_flags = Vec::new();
     let mut help_readable = false;
     let mut version = None;
+    let mut probe_state = ProbeState::NotFound;
     if resolved_path.is_none() {
         let msg = format!("'{program}' is not on PATH (install it, or set bin: to its full path)");
         if required {
@@ -195,34 +370,50 @@ fn probe(tool: &str, program: &str, requested_access: Vec<String>, required: boo
         } else {
             warnings.push(msg);
         }
+    } else if !is_default && !probe_binaries {
+        probe_state = ProbeState::ResolvedNotProbed;
+        warnings.push(format!(
+            "'{program}' is this flow's bin: override for {tool}, not {tool}'s own launcher, so preflight only resolved it and did not run it. sfh has verified {tool}'s shipped launcher is inert on --help/--version; it has no idea what '{program}' is, and a cmd: step's program gets the identical treatment for the identical reason (\"deploy.sh --help\" may well deploy). No version was recorded and flags were not checked - do not read that silence as \"the tool is fine\". Pass --probe-binaries to actually run '{program} --version' and '--help'."
+        ));
     } else {
-        version = execute::probe_version(program);
-        if version.is_none() {
-            warnings.push(format!(
-                "'{program} --version' produced nothing usable, so sfh cannot record which build this run used"
-            ));
-        }
-        match read_help(program) {
-            Some(help) => {
-                help_readable = true;
-                if let Some(i) = &info {
-                    for flag in i.required_flags {
-                        if !help.contains(flag) {
-                            missing_flags.push((*flag).to_string());
-                        }
-                    }
-                }
-                if !missing_flags.is_empty() {
-                    blockers.push(format!(
-                        "'{program} --help' does not mention {} - the installed CLI does not look like the one this adapter was built against (last verified {}). Run `sfh doctor` to see what it actually returns.",
-                        missing_flags.join(", "),
-                        info.as_ref().map(|i| i.last_verified).unwrap_or("unknown")
+        match probe_dir {
+            None => {
+                probe_state = ProbeState::ResolvedNotProbed;
+                warnings.push(format!(
+                    "'{program}' was not probed: no isolated scratch directory was available for this preflight run (see the top-level warning for why)"
+                ));
+            }
+            Some(cwd) => {
+                probe_state = ProbeState::Probed;
+                version = probe_version_isolated(program, tool, cwd);
+                if version.is_none() {
+                    warnings.push(format!(
+                        "'{program} --version' produced nothing usable, so sfh cannot record which build this run used"
                     ));
                 }
+                match read_help(program, tool, cwd) {
+                    Some(help) => {
+                        help_readable = true;
+                        if let Some(i) = &info {
+                            for flag in i.required_flags {
+                                if !help.contains(flag) {
+                                    missing_flags.push((*flag).to_string());
+                                }
+                            }
+                        }
+                        if !missing_flags.is_empty() {
+                            blockers.push(format!(
+                                "'{program} --help' does not mention {} - the installed CLI does not look like the one this adapter was built against (last verified {}). Run `sfh doctor` to see what it actually returns.",
+                                missing_flags.join(", "),
+                                info.as_ref().map(|i| i.last_verified).unwrap_or("unknown")
+                            ));
+                        }
+                    }
+                    None => warnings.push(format!(
+                        "'{program} --help' could not be read, so sfh could not check that this adapter's flags still exist"
+                    )),
+                }
             }
-            None => warnings.push(format!(
-                "'{program} --help' could not be read, so sfh could not check that this adapter's flags still exist"
-            )),
         }
     }
     if let Some(i) = &info {
@@ -256,6 +447,7 @@ fn probe(tool: &str, program: &str, requested_access: Vec<String>, required: boo
         tool: tool.to_string(),
         program: program.to_string(),
         resolved_path,
+        probe_state,
         version,
         info,
         missing_flags,
@@ -342,15 +534,25 @@ fn probe_command(program: &str, steps: BTreeSet<String>) -> CommandReport {
 }
 
 /// Preflight with no flow: report every preset's local availability.
-pub fn all_adapters() -> Report {
+pub fn all_adapters(probe_dir: Option<&Path>, probe_binaries: bool) -> Report {
     let tools = flow::TOOLS
         .iter()
-        .map(|t| probe(t, &preset::default_program(t), Vec::new(), false))
+        .map(|t| {
+            probe(
+                t,
+                &preset::default_program(t),
+                Vec::new(),
+                false,
+                probe_binaries,
+                probe_dir,
+            )
+        })
         .collect();
     Report {
         sfh_version: env!("CARGO_PKG_VERSION"),
         flow_path: None,
         flow_name: None,
+        probe_binaries,
         tools,
         commands: Vec::new(),
         blockers: Vec::new(),
@@ -363,7 +565,13 @@ pub fn all_adapters() -> Report {
 /// launch. An unused profile's binary is never touched - the same rule the
 /// `doctor` path already follows, and the reason a hostile unused profile
 /// cannot get itself executed by a check.
-pub fn for_flow(path: &Path, root: &state::StateRoot, overlays: &[std::path::PathBuf]) -> Report {
+pub fn for_flow(
+    path: &Path,
+    root: &state::StateRoot,
+    overlays: &[std::path::PathBuf],
+    probe_binaries: bool,
+    probe_dir: Option<&Path>,
+) -> Report {
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
     let flow = match flow::load_with_overlays(path, overlays) {
@@ -373,6 +581,7 @@ pub fn for_flow(path: &Path, root: &state::StateRoot, overlays: &[std::path::Pat
                 sfh_version: env!("CARGO_PKG_VERSION"),
                 flow_path: Some(path.display().to_string()),
                 flow_name: None,
+                probe_binaries,
                 tools: Vec::new(),
                 commands: Vec::new(),
                 blockers: vec![e],
@@ -398,7 +607,16 @@ pub fn for_flow(path: &Path, root: &state::StateRoot, overlays: &[std::path::Pat
     }
     let tools = by_program
         .into_iter()
-        .map(|((tool, program), access)| probe(&tool, &program, access.into_iter().collect(), true))
+        .map(|((tool, program), access)| {
+            probe(
+                &tool,
+                &program,
+                access.into_iter().collect(),
+                true,
+                probe_binaries,
+                probe_dir,
+            )
+        })
         .collect::<Vec<_>>();
     let commands = flow
         .resolved_commands()
@@ -439,6 +657,7 @@ pub fn for_flow(path: &Path, root: &state::StateRoot, overlays: &[std::path::Pat
         sfh_version: env!("CARGO_PKG_VERSION"),
         flow_path: Some(path.display().to_string()),
         flow_name: flow.name.clone(),
+        probe_binaries,
         tools,
         commands,
         blockers,
@@ -461,8 +680,15 @@ pub fn print_human(r: &Report) {
             .clone()
             .unwrap_or_else(|| "NOT FOUND on PATH".to_string());
         println!("[{}] {} -> {}", t.tool, t.program, where_);
-        if let Some(v) = &t.version {
-            println!("     version: {v}");
+        match (t.probe_state, &t.version) {
+            (ProbeState::Probed, Some(v)) => println!("     version: {v}"),
+            (ProbeState::Probed, None) => {
+                println!("     version: probed, but produced nothing usable")
+            }
+            (ProbeState::ResolvedNotProbed, _) => {
+                println!("     version: not probed (see warning below)")
+            }
+            (ProbeState::NotFound, _) => {}
         }
         if let Some(i) = &t.info {
             println!(
@@ -498,7 +724,7 @@ pub fn print_human(r: &Report) {
                 println!("     gap: {gap}");
             }
         }
-        if !t.help_readable && t.resolved_path.is_some() {
+        if t.probe_state == ProbeState::Probed && !t.help_readable {
             println!("     help: unreadable (flags not checked)");
         }
         for b in &t.blockers {
@@ -538,6 +764,14 @@ pub fn print_human(r: &Report) {
     for w in &r.warnings {
         println!("warning: {w}");
     }
+    if r.tools
+        .iter()
+        .any(|t| t.probe_state == ProbeState::ResolvedNotProbed)
+    {
+        println!(
+            "note: at least one binary above was resolved but not run; pass --probe-binaries to actually check it."
+        );
+    }
     println!(
         "{}",
         if r.ok() {
@@ -556,17 +790,41 @@ fn yn(b: bool) -> &'static str {
     }
 }
 
+/// A fresh, private scratch directory to probe binaries in - never the
+/// operator's own working directory. Mirrors `doctor`'s isolation (see
+/// `doctor::run_probe`) for the identical reason: some launchers read
+/// project instruction files or write a cache on ANY invocation, and a free,
+/// offline check must not do that to the caller's own repository. Unlike
+/// doctor's, nothing here needs to outlive the command: `run` removes it once
+/// every probe in this preflight is done.
+fn probe_scratch_dir() -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("sfh-preflight-{}", leaf::gen_uuid()));
+    contain::mkdir_private(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    dir.canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))
+}
+
 /// `sfh preflight [flow.yaml]`.
 pub fn run(
     flow_path: Option<&Path>,
     root: &state::StateRoot,
     overlays: &[std::path::PathBuf],
     as_json: bool,
+    probe_binaries: bool,
 ) -> i32 {
-    let report = match flow_path {
-        Some(p) => for_flow(p, root, overlays),
-        None => all_adapters(),
+    let probe_dir = probe_scratch_dir();
+    let mut report = match flow_path {
+        Some(p) => for_flow(p, root, overlays, probe_binaries, probe_dir.as_deref().ok()),
+        None => all_adapters(probe_dir.as_deref().ok(), probe_binaries),
     };
+    if let Err(e) = &probe_dir {
+        report.warnings.push(format!(
+            "no tool binary below was probed: sfh could not create an isolated scratch directory to run --help/--version in ({e}); running them in sfh's own working directory instead is exactly what preflight must not do"
+        ));
+    }
+    if let Ok(dir) = &probe_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     if as_json {
         let code = if report.ok() { 0 } else { 2 };
         if report.ok() {
@@ -618,7 +876,7 @@ mod tests {
 
     #[test]
     fn a_flowless_preflight_covers_every_preset_and_calls_no_model() {
-        let r = all_adapters();
+        let r = all_adapters(None, false);
         assert_eq!(r.tools.len(), flow::TOOLS.len());
         for t in &r.tools {
             assert!(
@@ -771,6 +1029,7 @@ mod tests {
             sfh_version: "test",
             flow_path: None,
             flow_name: None,
+            probe_binaries: false,
             tools: Vec::new(),
             commands: vec![probe_command(
                 "definitely-not-a-real-binary-9d3f",
@@ -799,11 +1058,202 @@ mod tests {
             "definitely-not-a-real-binary-9d3f",
             vec!["write".into()],
             true,
+            false,
+            None,
         );
         assert!(
             r.blockers.iter().any(|b| b.contains("access: write")),
             "an unsupported level must be a blocker: {:?}",
             r.blockers
         );
+    }
+
+    // --- P0-05: a `bin:` override is resolved, never executed, unless the
+    // operator opts in with `--probe-binaries`. The tool's own default
+    // launcher is unaffected and keeps being probed unconditionally. -------
+
+    /// A scratch dir for these tests, distinct from the one `run` creates for
+    /// a real preflight: these drive `probe` directly and need to inspect
+    /// what landed inside it.
+    fn test_scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-preflight-test-{label}-{}",
+            contain::random_nonce()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test scratch dir");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).expect("write test fixture script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod test fixture script");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_bin_override_that_would_leave_a_marker_is_not_executed_by_a_default_preflight() {
+        let dir = test_scratch_dir("no-probe");
+        let marker = dir.join("ran.marker");
+        let script = dir.join("fake-adapter.sh");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ntouch \"{}\"\necho fake-version 1.0.0\n",
+                marker.display()
+            ),
+        );
+        let program = script.to_string_lossy().into_owned();
+
+        // tool: claude, bin: <script> - a non-default override, probed by
+        // neither the caller nor a required binary check.
+        let r = probe("claude", &program, Vec::new(), false, false, Some(&dir));
+
+        assert!(
+            !marker.exists(),
+            "a default `sfh preflight` must not execute a bin: override"
+        );
+        assert_eq!(r.probe_state, ProbeState::ResolvedNotProbed);
+        assert!(r.version.is_none());
+        assert!(
+            r.warnings.iter().any(|w| w.contains("--probe-binaries")),
+            "the report must say how to actually check it: {:?}",
+            r.warnings
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_binaries_makes_the_same_override_actually_run_and_still_checks_its_flags() {
+        // Omit exactly one of claude's real required flags from the fake
+        // --help text (computed from live adapter metadata so this stays
+        // correct if that list changes), so a genuine flag-drift blocker
+        // must appear - proving the check still runs once something IS
+        // probed, not just that the binary was invoked.
+        let required = preset::adapter_info("claude").unwrap().required_flags;
+        assert!(
+            required.len() >= 2,
+            "need at least two required flags to omit just one and keep the rest"
+        );
+        let (last, kept) = required.split_last().expect("claude has required flags");
+        let omitted: &str = last;
+
+        let dir = test_scratch_dir("probe");
+        let marker = dir.join("ran.marker");
+        let script = dir.join("fake-claude.sh");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ntouch \"{}\"\nif [ \"$1\" = \"--version\" ]; then\n  echo fake-version 1.0.0\nelse\n  echo '{}'\nfi\n",
+                marker.display(),
+                kept.join(" "),
+            ),
+        );
+        let program = script.to_string_lossy().into_owned();
+
+        let r = probe("claude", &program, Vec::new(), false, true, Some(&dir));
+
+        assert!(
+            marker.exists(),
+            "--probe-binaries must actually execute a bin: override"
+        );
+        assert_eq!(r.probe_state, ProbeState::Probed);
+        assert_eq!(r.version.as_deref(), Some("fake-version 1.0.0"));
+        assert!(
+            r.missing_flags.iter().any(|f| f.as_str() == omitted),
+            "a probed override must still be checked for flag drift: {:?}",
+            r.missing_flags
+        );
+        assert!(
+            r.blockers.iter().any(|b| b.contains(omitted)),
+            "{:?}",
+            r.blockers
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_report_distinguishes_resolved_not_probed_from_probed_with_no_usable_version() {
+        let dir = test_scratch_dir("silent");
+        let script = dir.join("silent.sh");
+        write_executable_script(&script, "#!/bin/sh\nexit 0\n");
+        let program = script.to_string_lossy().into_owned();
+
+        let not_probed = probe("claude", &program, Vec::new(), false, false, Some(&dir));
+        let probed = probe("claude", &program, Vec::new(), false, true, Some(&dir));
+
+        // Both report no version - the exact ambiguity P0-05 found - but they
+        // must not be the same fact.
+        assert!(not_probed.version.is_none());
+        assert!(probed.version.is_none());
+        assert_eq!(not_probed.probe_state, ProbeState::ResolvedNotProbed);
+        assert_eq!(probed.probe_state, ProbeState::Probed);
+        assert_ne!(
+            not_probed.to_json()["probe_state"],
+            probed.to_json()["probe_state"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_program_matching_its_tools_own_default_name_is_probed_even_without_probe_binaries() {
+        // `default_program` returns its input verbatim for any tool it does
+        // not special-case (only "cursor" maps elsewhere), so a program that
+        // equals its own `tool` string IS that tool's default launcher by
+        // the same rule `probe` itself uses - no bin: override involved,
+        // even though the name here is a throwaway test path rather than a
+        // real preset name.
+        let dir = test_scratch_dir("default");
+        let marker = dir.join("ran.marker");
+        let script = dir.join("fake-tool.sh");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\ntouch \"{}\"\necho fake-version 1.0.0\n",
+                marker.display()
+            ),
+        );
+        let program = script.to_string_lossy().into_owned();
+        assert_eq!(preset::default_program(&program), program);
+
+        let r = probe(&program, &program, Vec::new(), false, false, Some(&dir));
+
+        assert!(
+            marker.exists(),
+            "a tool's own default launcher must be probed without needing --probe-binaries"
+        );
+        assert_eq!(r.probe_state, ProbeState::Probed);
+        assert_eq!(r.version.as_deref(), Some("fake-version 1.0.0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_probed_binary_runs_with_the_isolated_directory_as_its_cwd() {
+        // The marker is written with a RELATIVE name, so it only lands
+        // inside `dir` if the child's cwd was actually set there. If
+        // isolation regressed, it would land in sfh's own working directory
+        // instead and this assertion would fail.
+        let dir = test_scratch_dir("isolated-cwd");
+        let script = dir.join("relative-marker.sh");
+        write_executable_script(
+            &script,
+            "#!/bin/sh\ntouch ran.marker\necho fake-version 1.0.0\n",
+        );
+        let program = script.to_string_lossy().into_owned();
+
+        let r = probe(&program, &program, Vec::new(), false, false, Some(&dir));
+
+        assert_eq!(r.probe_state, ProbeState::Probed);
+        assert!(
+            dir.join("ran.marker").exists(),
+            "the probe must run with the isolated scratch directory as its cwd, not sfh's own"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
