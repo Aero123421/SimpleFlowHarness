@@ -189,8 +189,40 @@ impl OutcomeResult {
 /// generating a flow will most naturally emit one - can only produce the
 /// second, because JSON object keys are always strings. sfh exists to be
 /// driven by other programs, so both spellings have to mean the same thing.
+///
+/// The quoted spelling is held to exactly the form
+/// `schema/flow.schema.json`'s `outcomes` key pattern accepts -
+/// `^(0|[1-9][0-9]*)$`: plain decimal, no sign, no leading zero, no
+/// surrounding whitespace. An earlier version trimmed the string and parsed
+/// what was left, so `" 2 "` (and `"+2"`, `"02"`) deserialized here but failed
+/// that pattern - a flow an editor's schema check called invalid while `sfh`
+/// ran it anyway, or the reverse. The bare-integer spelling needs no
+/// equivalent guard: YAML has already resolved `2` (or `-1`) to a plain
+/// integer by the time a visitor sees it, with no leftover spelling left to
+/// disagree about.
+///
+/// A negative key of either spelling is still refused, just not here: the
+/// Schema's pattern has no `-` branch at all, and a bare negative integer
+/// keeps deserializing (nothing left to canonicalize) but is refused by
+/// `check_outcomes` during `validate` - by name, not by pattern, because sfh
+/// reserves negative exit codes for its own "no process ran" marker. A
+/// negative QUOTED key never reaches that check: it already fails the
+/// canonical-form gate below, for the same reason the Schema rejects it.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct ExitKey(i32);
+
+/// Whether an `outcomes:` key string is spelled exactly the way
+/// `schema/flow.schema.json`'s `outcomes` key pattern requires:
+/// `^(0|[1-9][0-9]*)$` - plain decimal, no sign, no leading zero, no
+/// surrounding whitespace.
+fn is_canonical_exit_key(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some('0') => chars.next().is_none(),
+        Some(c) if c.is_ascii_digit() => chars.all(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
 
 impl<'de> serde::Deserialize<'de> for ExitKey {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -211,10 +243,18 @@ impl<'de> serde::Deserialize<'de> for ExitKey {
                     .map_err(|_| E::custom(format!("outcomes key {v} is not a possible exit code")))
             }
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ExitKey, E> {
-                v.trim().parse().map(ExitKey).map_err(|_| {
-                    E::custom(format!(
-                        "outcomes key '{v}' is not an exit code - use the number the command exits with, e.g. 2"
-                    ))
+                // Canonical only, matched against the Schema's own pattern -
+                // no trim-and-parse, because trimming is exactly how " 2 "
+                // used to slip past sfh and then fail an editor's schema
+                // check (or the reverse: a key the Schema accepts and sfh
+                // does not).
+                if !is_canonical_exit_key(v) {
+                    return Err(E::custom(format!(
+                        "outcomes key '{v}' is not an exit code - write the canonical decimal form the command exits with: no sign, no leading zero, no surrounding space (e.g. 0 or 2, not \"+2\", \"02\" or \" 2 \")"
+                    )));
+                }
+                v.parse().map(ExitKey).map_err(|_| {
+                    E::custom(format!("outcomes key '{v}' is not a possible exit code"))
                 })
             }
         }
@@ -1389,17 +1429,54 @@ impl Flow {
         out
     }
 
+    /// Every step in the flow, top-level and parallel children alike, paired
+    /// with a name a human (or a warning string) can be pointed at: a
+    /// top-level id alone, or `"{parent}.{child}"` for a member of a
+    /// `parallel:` group - the same form `potential_writers` already uses to
+    /// name a writer inside a fan-out.
+    ///
+    /// The shared walk every flow-wide step scan in this file should route
+    /// through, so a scan cannot silently regress into looking only at the
+    /// top level. `replay_summary` and `replay_warnings` used to loop over
+    /// `self.steps` alone and never see a parallel child at all - but at
+    /// resume time the engine looks up an unfinished CHILD by id and applies
+    /// THAT CHILD's own `replay:` policy, not its parent's. A fan-out member
+    /// with `effects: external` and `replay.unfinished: rerun` could re-fire a
+    /// side effect on resume while `plan` and `validate --strict` reported
+    /// nothing, because neither scan had ever looked at it.
+    ///
+    /// One level deep only: `validate_step` refuses to nest `parallel:` or
+    /// `foreach:` inside a `parallel:` child ("parallel/foreach cannot be
+    /// nested"), so a child never has grandchildren for this to miss.
+    fn all_steps(&self) -> Vec<(String, &Step)> {
+        let mut out = Vec::new();
+        for s in &self.steps {
+            out.push((s.id.clone(), s));
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    out.push((format!("{}.{}", s.id, c.id), c));
+                }
+            }
+        }
+        out
+    }
+
     /// A per-step view of the replay policy, plus the cases `validate --strict`
     /// and `plan` should point at: an effect that reaches outside the workspace
     /// (or is not declared at all) is the one where re-running after a crash is
     /// a real decision rather than a formality.
+    ///
+    /// Walks parallel children too (`all_steps`): a resumed run applies a
+    /// child's OWN `replay:` policy to that child, so a summary that stopped
+    /// at the group would show the parent's policy and hide the one that
+    /// actually governs the child on resume.
     pub fn replay_summary(&self) -> serde_json::Value {
         let mut steps = Vec::new();
-        for s in &self.steps {
+        for (name, s) in self.all_steps() {
             let effects = s.effects(self);
             let policy = s.replay_policy(self);
             steps.push(serde_json::json!({
-                "step": s.id,
+                "step": name,
                 "effects": effects.as_str(),
                 "unfinished": policy.as_str(),
                 "risky": policy == ReplayPolicy::Rerun
@@ -1420,16 +1497,21 @@ impl Flow {
     /// Warnings `validate --strict` emits about replay choices. Each names a
     /// step whose unfinished work would be re-run even though the flow says it
     /// may have already reached outside the workspace.
+    ///
+    /// Walks parallel children too (`all_steps`), and names a flagged child
+    /// `parent.child`: a child's `replay:` is resolved and applied
+    /// independently of its group on resume (see `all_steps`), so a
+    /// rerun-on-external child hiding inside a fan-out is exactly the case
+    /// this warning exists to catch, not an exception to it.
     pub fn replay_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for s in &self.steps {
+        for (name, s) in self.all_steps() {
             let effects = s.effects(self);
             if s.replay_policy(self) == ReplayPolicy::Rerun
                 && matches!(effects, Effects::External | Effects::Unknown)
             {
                 out.push(format!(
-                    "step '{}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. Set replay.unfinished: stuck (or fail) if that is not safe.",
-                    s.id,
+                    "step '{name}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. Set replay.unfinished: stuck (or fail) if that is not safe.",
                     effects.as_str()
                 ));
             }
@@ -2333,6 +2415,12 @@ fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
 /// `validate --strict`. Callers decide whether their output mode should show
 /// them; validation itself stays side-effect free so `run -q` can actually be
 /// quiet and machine-readable commands are not polluted on stderr.
+///
+/// Deliberately walks only `flow.steps`, never parallel children: this reads
+/// `route:` chains between steps, and `validate_step` refuses `route:`
+/// entirely inside a `parallel:` child ("route: is not allowed inside
+/// parallel:"), so there is no child-level routing for a recursive walk to
+/// find.
 pub fn runtime_warnings(flow: &Flow) -> Vec<String> {
     let indices: std::collections::HashMap<&str, usize> = flow
         .steps
@@ -2394,6 +2482,35 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
         }
     }
 
+    // `outcomes:` labels a step's own RAW exit code. That is deterministic for
+    // a `cmd:` gate or wrapper that chooses its exit status on purpose, but a
+    // bare preset AI CLI exits 0 whether its verdict was PASS or REVISE - the
+    // exit code carries no verdict for outcomes: to read. A when_label_is /
+    // when_outcome_is rule against it still passes the "can this ever match"
+    // check (the label really is declared), and then never fires at run time,
+    // which is silent in exactly the way `validate --strict` exists to catch.
+    // A warning, not a hard error: a wrapper around a preset tool that DOES
+    // encode its verdict in its own exit status is a legitimate use, and sfh
+    // cannot tell that apart from a naive one without running it. Walks
+    // parallel children too (`all_steps`): the same bare-CLI exit code applies
+    // to a fan-out member exactly as it does to a lone step.
+    for (name, s) in flow.all_steps() {
+        if s.outcomes.is_empty() {
+            continue;
+        }
+        if let Some(tool) = flow.step_tool(s) {
+            warnings.push(format!(
+                "step '{name}' declares outcomes: but runs preset tool '{tool}' rather than cmd: - outcomes: reads the process's raw exit code, and a bare AI CLI exits 0 whether its verdict was PASS or REVISE, so it cannot tell them apart here and a when_label_is/when_outcome_is rule against it can pass validate and then never fire. Only a gate command or a wrapper that inspects the answer and picks its own exit status can make outcomes: mean something on this step."
+            ));
+        }
+    }
+
+    // Everything from here reasons about the CONTROL-FLOW GRAPH between
+    // steps - route:/on_error:/on_max_visits: goto chains - which is a
+    // top-level-only concept for the same reason runtime_warnings above is:
+    // a parallel: child can never carry route: (validate_step refuses it), so
+    // it is neither a node this graph needs nor a source of an edge it could
+    // add.
     let n = flow.steps.len();
     let index: HashMap<&str, usize> = flow
         .steps

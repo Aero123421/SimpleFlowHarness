@@ -94,9 +94,13 @@ impl Workspace {
     }
 }
 
-/// Run `git` with no shell, inside `cwd`. `Err` carries git's own stderr, which
-/// is normally the actionable part.
-fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+/// Run `git` with no shell, inside `cwd`, and hand back the raw outcome.
+/// `Err` carries git's own stderr, which is normally the actionable part.
+///
+/// Shared by `git` and `git_bytes` below so the two can never disagree about
+/// what counts as a successful run - only about how the winning stdout gets
+/// decoded, which is the one thing that has to differ.
+fn run_git(cwd: &Path, args: &[&str]) -> Result<execute::ExecOutcome, String> {
     let mut argv = vec!["git".to_string()];
     argv.extend(args.iter().map(|s| (*s).to_string()));
     let out = execute::run_cmd(
@@ -126,7 +130,33 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    Ok(out)
+}
+
+/// Run `git`, decoding stdout as text.
+///
+/// Safe for everything here except a raw filename listing: HEAD, a diff, a
+/// status line and a submodule listing are either plain ASCII or come back
+/// through git's own C-quoting (git escapes any "unusual" byte in a path
+/// unless `-z` is given), so the lossy decode below never actually has
+/// anything invalid left to replace.
+fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let out = run_git(cwd, args)?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Run `git`, returning stdout as raw bytes instead of decoding it.
+///
+/// This is the variant any caller that is about to rebuild a filesystem path
+/// from git's output must use. `-z` output is exactly what turns OFF the
+/// C-quoting `git` above relies on, so on Unix it can contain any byte a
+/// filename can contain, valid UTF-8 or not. Decoding it first, the way
+/// `git` does, would replace an invalid byte with U+FFFD before it was ever
+/// split into entries, and the path rebuilt from that would name a
+/// different file than the one git listed - or none at all.
+fn git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = run_git(cwd, args)?;
+    Ok(out.stdout)
 }
 
 /// The repository `dir` belongs to, or `None` when it is not in one.
@@ -341,52 +371,91 @@ pub fn verify_ownership(ws: &Workspace) -> Result<(), String> {
 /// fingerprint UNKNOWN rather than being skipped. "I could not read it" and "it
 /// is unchanged" are different answers, and only one of them may let a resume
 /// proceed as if nothing had happened.
+///
+/// Untracked filenames are read as raw bytes, not decoded text (see
+/// `git_bytes`): a filename on Unix can be any byte sequence, and the join,
+/// stat and open below all need to land on the exact file git named, not on
+/// whatever a lossy decode turned that name into.
 pub fn fingerprint(path: &Path) -> Result<String, String> {
     let head = git(path, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "no-head".to_string());
     let index = git(path, &["diff", "--cached", "--full-index"])?;
     let worktree = git(path, &["diff", "--full-index"])?;
     let submodules = git(path, &["submodule", "status", "--recursive"]).unwrap_or_default();
-    // -z so a filename containing a newline cannot forge an extra entry.
-    let untracked_raw = git(path, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    // -z so a filename containing a newline cannot forge an extra entry, and
+    // `git_bytes` rather than `git` because -z is also what turns off the
+    // C-quoting that would otherwise make this output safe to decode as text
+    // (see `git_bytes`'s doc comment) - this is the one call in this function
+    // whose output is about to be turned back into a path used to open a
+    // real file.
+    let untracked_raw = git_bytes(path, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     // sfh's own ownership marker is not the user's work: counting it would make
     // every managed workspace differ from an unmanaged one for no reason a
     // reader could act on, and would report drift the moment sfh wrote it.
-    let mut untracked: Vec<&str> = untracked_raw
-        .split('\0')
-        .filter(|s| !s.is_empty() && *s != MARKER)
+    let mut untracked: Vec<&[u8]> = untracked_raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty() && *s != MARKER.as_bytes())
         .collect();
     untracked.sort_unstable();
-    let mut acc = String::new();
-    acc.push_str("head\0");
-    acc.push_str(&head);
-    acc.push_str("\0index\0");
-    acc.push_str(&sha256::hex(index.as_bytes()));
-    acc.push_str("\0worktree\0");
-    acc.push_str(&sha256::hex(worktree.as_bytes()));
-    acc.push_str("\0submodules\0");
-    acc.push_str(&sha256::hex(submodules.as_bytes()));
+    let mut acc: Vec<u8> = Vec::new();
+    acc.extend_from_slice(b"head\0");
+    acc.extend_from_slice(head.as_bytes());
+    acc.extend_from_slice(b"\0index\0");
+    acc.extend_from_slice(sha256::hex(index.as_bytes()).as_bytes());
+    acc.extend_from_slice(b"\0worktree\0");
+    acc.extend_from_slice(sha256::hex(worktree.as_bytes()).as_bytes());
+    acc.extend_from_slice(b"\0submodules\0");
+    acc.extend_from_slice(sha256::hex(submodules.as_bytes()).as_bytes());
     for rel in untracked {
-        let file = path.join(rel);
+        let file = path.join(path_from_ls_files_entry(rel));
         // A directory symlink among the untracked entries must not be followed
         // out of the workspace, and an unreadable file must not read as absent.
         let md = file
             .symlink_metadata()
-            .map_err(|e| format!("cannot stat untracked {rel}: {e}"))?;
-        acc.push('\0');
-        acc.push_str(rel);
-        acc.push('\0');
+            .map_err(|e| format!("cannot stat untracked {}: {e}", file.display()))?;
+        acc.push(0);
+        // The raw bytes go straight into the hash instead of through
+        // `file.display()`'s lossy formatting: on Unix that is what makes two
+        // names differing only in an invalid byte fingerprint differently,
+        // instead of both collapsing to the same U+FFFD text.
+        acc.extend_from_slice(rel);
+        acc.push(0);
         if md.file_type().is_symlink() {
             let target = std::fs::read_link(&file)
-                .map_err(|e| format!("cannot read the link {rel}: {e}"))?;
-            acc.push_str("symlink:");
-            acc.push_str(&sha256::hex(target.to_string_lossy().as_bytes()));
+                .map_err(|e| format!("cannot read the link {}: {e}", file.display()))?;
+            acc.extend_from_slice(b"symlink:");
+            acc.extend_from_slice(sha256::hex(target.to_string_lossy().as_bytes()).as_bytes());
         } else if md.is_file() {
-            acc.push_str(&hash_file_streaming(&file)?);
+            acc.extend_from_slice(hash_file_streaming(&file)?.as_bytes());
         } else {
-            acc.push_str("other");
+            acc.extend_from_slice(b"other");
         }
     }
-    Ok(sha256::hex(acc.as_bytes()))
+    Ok(sha256::hex(&acc))
+}
+
+/// Turn one NUL-delimited entry from `git ls-files -z` into a path.
+///
+/// On Unix a filename is an arbitrary byte sequence with no required
+/// encoding, and `OsStr::from_bytes` wraps those bytes into a path exactly,
+/// the same way `std::fs::read_dir` would have handed them back. Windows
+/// paths are UTF-16, not an arbitrary byte sequence, so there is no
+/// equivalent "just reinterpret the raw bytes" move to make there, and
+/// git's own output encoding on Windows is a separate question this fix
+/// does not attempt to answer - so non-Unix keeps exactly the lossy UTF-8
+/// decode `git()` has always used, just applied per entry instead of over
+/// the whole listing at once. Those give the same result: `-z` guarantees
+/// every split point is a plain NUL byte, and NUL cannot occur inside a
+/// multi-byte UTF-8 sequence or its lossy replacement, so decoding before or
+/// after splitting agrees either way.
+#[cfg(unix)]
+fn path_from_ls_files_entry(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(bytes)).to_path_buf()
+}
+
+#[cfg(not(unix))]
+fn path_from_ls_files_entry(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Hash a file without ever holding it in memory. A large untracked artifact is
@@ -698,5 +767,67 @@ mod tests {
         forged["ownership_nonce"] = serde_json::Value::Null;
         let back = Workspace::from_manifest(&forged).unwrap();
         assert!(verify_ownership(&back).is_err());
+    }
+
+    /// P3-01: an untracked file whose name is not valid UTF-8 must still be
+    /// fingerprinted through the exact file git listed, not through whatever
+    /// `String::from_utf8_lossy` would have turned that name into. Before
+    /// this fix, the join below landed on a path nothing on disk had (the
+    /// U+FFFD replacement is a different, longer byte sequence than the
+    /// invalid byte it stands in for), and `fingerprint` failed outright on
+    /// a file that was sitting right there.
+    #[test]
+    #[cfg(unix)]
+    fn fingerprint_follows_an_untracked_filename_that_is_not_valid_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = std::env::temp_dir().join(format!("sfh-ws-nonutf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // A test that shells out to a real `git` binary has to be able to
+        // skip when there is none on PATH, rather than fail a sandbox that
+        // simply does not have one.
+        if git(&base, &["init", "-q"]).is_err() {
+            eprintln!(
+                "skipping fingerprint_follows_an_untracked_filename_that_is_not_valid_utf8: git is not available"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        // 0xFF is not a valid byte anywhere in UTF-8, so this is exactly the
+        // input a lossy decode would corrupt.
+        let name_a = OsStr::from_bytes(b"bad-\xff-name-a.txt");
+        std::fs::write(base.join(name_a), b"hello").unwrap();
+        let fp_a = fingerprint(&base).expect("a non-UTF-8 filename must still fingerprint");
+        assert_eq!(fp_a.len(), 64, "a fingerprint is a SHA-256 hex digest");
+
+        // Renaming it to a DIFFERENT non-UTF-8 name must move the
+        // fingerprint. A lossy decode would not necessarily collapse these
+        // two particular names together, but landing the join on the wrong
+        // (nonexistent) reconstructed path would fail the whole function
+        // rather than silently mis-fingerprint it - so this also re-proves
+        // the success case above wasn't a fluke.
+        std::fs::remove_file(base.join(name_a)).unwrap();
+        let name_b = OsStr::from_bytes(b"bad-\xff-name-b.txt");
+        std::fs::write(base.join(name_b), b"hello").unwrap();
+        let fp_b = fingerprint(&base).expect("a second non-UTF-8 filename must fingerprint too");
+        assert_ne!(
+            fp_a, fp_b,
+            "two different non-UTF-8 filenames must not fingerprint identically"
+        );
+
+        // Editing the content under the same non-UTF-8 name must also move
+        // the fingerprint - proof the loop reached and hashed the real file
+        // at the byte-exact path, rather than reading nothing.
+        std::fs::write(base.join(name_b), b"goodbye").unwrap();
+        let fp_c = fingerprint(&base).expect("editing it must still fingerprint");
+        assert_ne!(
+            fp_b, fp_c,
+            "editing the file under a non-UTF-8 name must change the fingerprint"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

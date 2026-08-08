@@ -308,13 +308,36 @@ impl Coverage {
 /// `access:` is a request to the CLI's own permission system, never an OS
 /// sandbox, and the four answers below are the honest range of what a CLI does
 /// with that request.
+///
+/// The bar for `Enforced` (P0-02, after the review found it over-claimed for
+/// claude/opencode/grok/pi/cursor): the CLI itself must guarantee that ONE
+/// flag or mode sfh passes closes the WHOLE class of access the level names.
+/// "sfh enumerated the builtin tools it knew about and denied them" is not
+/// that guarantee - a builtin-tool allowlist says nothing about an MCP tool,
+/// a plugin, a hook, a subagent, or a project instruction file, all of which
+/// reach the same capabilities through a door the allowlist never named. The
+/// preset author's list can be complete on the day it is written and wrong a
+/// release later, because the surface it did not enumerate is precisely the
+/// part nobody was looking at. A holistic guarantee looks different: codex's
+/// `-s` picks an OS sandbox tier that bounds the whole process, not just the
+/// tools codex itself shipped with. When in doubt between `Enforced` and
+/// `BestEffort`, the honest default is `BestEffort` - it costs a warning in
+/// `preflight`, where over-claiming costs an operator a false sense of a
+/// boundary that was never really there.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Enforcement {
     /// The tool has a real sandbox for this level.
     Sandboxed,
-    /// The tool enforces it in-process (permission config, tool allowlist).
+    /// The CLI's own flag or mode is documented to close the entire class of
+    /// access this level names - not just the specific tools, edits or
+    /// commands sfh's preset happens to enumerate. See the enum doc comment
+    /// for the bar this has to clear.
     Enforced,
-    /// Requested, but the tool's own defaults or config can widen it.
+    /// Requested, but the tool's own defaults or config can widen it - or the
+    /// preset only closes the surface its author enumerated (builtin tools),
+    /// while MCP tools, plugins, hooks, subagents, skills, instruction files
+    /// or auto-update sit outside it, unverified. `known_gaps` names which of
+    /// these actually apply to this adapter.
     BestEffort,
     /// The tool has no such level; sfh refuses the combination.
     Unsupported,
@@ -333,18 +356,28 @@ impl Enforcement {
 
 /// What sfh knows about one adapter without running a model.
 ///
-/// `minimum_version` is deliberately `None` for every adapter. The spec asks
-/// for it to be re-confirmed against each CLI's official documentation and a
-/// live probe before being pinned, and pinning a number from memory would let
-/// `preflight` report a confident-looking floor sfh never verified. `preflight`
-/// therefore prints the installed version and says the required floor is
-/// unknown, which is a true statement a user can act on.
+/// `minimum_version` stays `None` unless a floor is independently documented
+/// somewhere sfh can point to - a CLI's own changelog or release notes saying
+/// a feature this adapter depends on shipped in version Y, not a number
+/// recalled from memory or inferred from LAST_VERIFIED. Pinning a number sfh
+/// has not seen documented would let `preflight` report a confident-looking
+/// floor it never verified, which is the exact failure this field exists to
+/// avoid (P1-06). A live probe against the running binary is a DIFFERENT,
+/// stronger check that `sfh doctor` performs; `minimum_version` only claims
+/// what the CLI's own authors put in writing. Every `Some` must therefore
+/// carry a comment at its `adapter_info` match arm citing that source, so the
+/// next reader can tell a documented floor from a guess without redoing the
+/// research. Where it stays `None`, `preflight` prints the installed version
+/// and says the required floor is unknown, which is a true statement a user
+/// can act on.
 #[derive(Clone, Debug)]
 pub struct AdapterInfo {
     pub tool: &'static str,
     pub default_program: String,
     /// When this adapter's command line was last checked against the real CLI.
     pub last_verified: &'static str,
+    /// `None` unless a floor is documented (see the struct doc comment); every
+    /// `Some` cites its source where it is pinned in `adapter_info`.
     pub minimum_version: Option<&'static str>,
     /// The structured protocol its output must complete.
     pub protocol: &'static str,
@@ -382,78 +415,191 @@ pub const LAST_VERIFIED: &str = "2026-07-27";
 /// Metadata for one preset, or `None` for a name that is not a preset.
 pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
     use Enforcement::*;
-    let (protocol, cost, policy, flags, gaps): (
+    let (protocol, cost, policy, flags, gaps, min_version): (
         &'static str,
         Coverage,
         [Enforcement; 3],
         &'static [&'static str],
         &'static [&'static str],
+        Option<&'static str>,
     ) = match tool {
         "codex" => (
             "codex-jsonl",
             Coverage::TokensOnly,
-            // codex is the one preset with a real OS sandbox behind -s.
+            // codex is the one preset with a real OS sandbox behind -s: the
+            // sandbox bounds the whole process, not just the tools codex
+            // itself ships with, so it clears the P0-02 bar for `Enforced`.
             [Sandboxed, Sandboxed, BestEffort],
-            &["exec", "--json", "--output-last-message", "-s", "-c"],
+            &[
+                "exec",
+                "--skip-git-repo-check",
+                "--color",
+                "--json",
+                "-c",
+                "-s",
+                "--output-last-message",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
             &["access: full disables the sandbox entirely (--dangerously-bypass-approvals-and-sandbox)"],
+            None,
         ),
         "claude" => (
             "claude-json",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["-p", "--output-format", "--permission-mode", "--session-id"],
+            // P0-02: downgraded from Enforced. --tools/--allowedTools only
+            // close the builtin tools sfh enumerated; see known_gaps for what
+            // that enumeration does not reach.
+            [BestEffort, BestEffort, BestEffort],
+            &[
+                "-p",
+                "--output-format",
+                "--model",
+                "--effort",
+                "--agent",
+                "--permission-mode",
+                "--tools",
+                "--allowedTools",
+                "--dangerously-skip-permissions",
+                "--session-id",
+                "--fork-session",
+            ],
             &[
                 "plan mode is advisory, so read is enforced by an explicit --tools allowlist rather than by a sandbox",
-                "user- and project-level settings, MCP servers, hooks and skills are not visible to sfh",
+                "MCP tools live in a permission namespace separate from --tools/--allowedTools, so an MCP server the project wires up is not covered by either allowlist",
+                "plugins, hooks and skills run project- or user-authored code outside the --tools surface entirely, and no flag sfh passes disables them",
+                "global (user-level) and project-level instruction files (e.g. CLAUDE.md) load into context unfiltered; sfh neither inspects nor suppresses them",
             ],
+            None,
         ),
         "opencode" => (
             "opencode-ndjson",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["run", "--format", "--agent", "--auto"],
+            // P0-02: downgraded from Enforced. OPENCODE_CONFIG_CONTENT only
+            // denies the permission keys sfh names; --auto approves whatever
+            // it does not name, so an unnamed capability defaults to open.
+            [BestEffort, BestEffort, BestEffort],
+            &["run", "--format", "--variant", "--agent", "--auto", "--fork"],
             &[
                 "read/write are enforced through OPENCODE_CONFIG_CONTENT, which merges with the user's own config",
                 "there is no OS sandbox, so write denies bash outright",
+                "--auto approves anything the config does not explicitly deny, so a capability this preset's deny list omits defaults to allowed",
+                "task (subagent) and skill invocations are not covered by the edit/bash/external_directory denies this preset writes",
+                "MCP servers and custom tools sit outside the permission keys this preset sets, and plugins run outside the permission system entirely",
             ],
+            None,
         ),
         "grok" => (
             "grok-json",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["--output-format", "--prompt-file", "--session-id"],
-            &["no OS sandbox; read is a permission-mode plus explicit denies"],
+            // P0-02: downgraded from Enforced. --deny only names Edit/Write/
+            // Bash; MCPTool is documented as its own permission, and sandbox
+            // vs. permission are separate axes grok never promised --deny covers.
+            [BestEffort, BestEffort, BestEffort],
+            &[
+                "--output-format",
+                "--reasoning-effort",
+                "--agent",
+                "--permission-mode",
+                "--deny",
+                "--session-id",
+                "--prompt-file",
+                "--resume",
+                "--fork-session",
+            ],
+            &[
+                "no OS sandbox; read is a permission-mode plus explicit --deny rules, and grok documents sandbox and permission as separate axes",
+                "MCPTool is a permission distinct from Edit/Write/Bash, so an MCP-provided tool is not covered by --deny Edit/Write/Bash",
+                "plugins, hooks, skills and subagents are undocumented for headless denial, so sfh cannot say whether --deny reaches them",
+                "no flag sfh has confirmed for the pinned grok CLI disables auto-update, so a scripted run's binary could change mid-flow",
+            ],
+            None,
         ),
         "agy" => (
             "agy-json",
             Coverage::TokensOnly,
             [Enforced, Enforced, BestEffort],
-            &["--output-format", "--mode", "--print-timeout", "-p"],
+            &[
+                "--model",
+                "--effort",
+                "--agent",
+                "--print-timeout",
+                "--mode",
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "-p",
+                "--conversation",
+            ],
             &[
                 "exit codes are unreliable; sfh trusts the envelope's status field",
                 "no fork: a branch of an existing conversation is not available headlessly",
             ],
+            // P1-06: agy's own changelog documents structured print output
+            // (the --output-format json envelope this preset's whole parse
+            // path depends on) as shipping in 1.1.8. LAST_VERIFIED here is
+            // 1.0.8 - a version below the floor the feature needs - so a
+            // build between those two numbers would accept this preset's
+            // flags and then have no structured envelope to answer with.
+            // Pinning the floor is a claim about what agy's authors put in
+            // writing, not a re-verification of the live-verified research
+            // date above; it does not move LAST_VERIFIED.
+            Some("1.1.8"),
         ),
         "pi" => (
             "pi-jsonl",
             Coverage::Cost,
-            [Enforced, Enforced, BestEffort],
-            &["--mode", "--offline", "--session-id", "--tools"],
+            // P0-02: downgraded from Enforced. The --tools allowlist closes
+            // pi's own tool surface, but AGENTS.md/CLAUDE.md and a SYSTEM or
+            // APPEND_SYSTEM environment variable reach the model outside it.
+            [BestEffort, BestEffort, BestEffort],
+            &[
+                "--mode",
+                "--offline",
+                "--model",
+                "--thinking",
+                "--tools",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                "--no-approve",
+                "--approve",
+                "--session-id",
+                "--fork",
+            ],
             &[
                 "no sandbox at all: access is expressed purely as a --tools allowlist, and write therefore excludes bash",
                 "--session-id CREATES a session when the id is not found in this cwd, so a resume is only trustworthy with the session marker",
+                "--no-context-files stops pi reading AGENTS.md/CLAUDE.md off disk, but a SYSTEM or APPEND_SYSTEM environment variable injects a hidden system prompt through a path sfh does not scrub",
             ],
+            None,
         ),
         "cursor" => (
             "cursor-json",
             Coverage::TokensOnly,
             // Headless cursor has exactly two tiers; there is no write.
-            [Enforced, Unsupported, BestEffort],
-            &["-p", "--output-format", "--trust", "--disable-project-configs"],
+            // P0-02: read downgraded from Enforced. Public docs describe print
+            // mode as reaching every tool; --mode=plan is a per-action gate on
+            // top of that, not a narrower tool list, and its reach over project/
+            // global rules, MCP and any headless sandbox is unverified.
+            [BestEffort, Unsupported, BestEffort],
+            &[
+                "-p",
+                "--output-format",
+                "--trust",
+                "--disable-auto-update",
+                "--disable-project-configs",
+                "--model",
+                "--mode",
+                "--force",
+                "--resume",
+            ],
             &[
                 "headless permissions are binary: deny-all without --force, approve-all with it, so access: write is refused rather than silently promoted",
                 "--resume creates a chat when the id is unknown, so sfh verifies the chat store on disk",
+                "print mode exposes the full tool surface regardless of --mode; plan mode denies gated operations rather than narrowing which tools exist, and whether project/global Cursor rules still apply under it is undocumented",
+                "MCP servers configured for the project are a separate surface from the built-in tools --mode=plan is documented against",
             ],
+            None,
         ),
         _ => return None,
     };
@@ -461,7 +607,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
         tool: crate::flow::TOOLS.iter().find(|t| **t == tool)?,
         default_program: default_program(tool),
         last_verified: LAST_VERIFIED,
-        minimum_version: None,
+        minimum_version: min_version,
         protocol,
         supports_resume: true,
         supports_fork: supports_fork(tool),
@@ -519,12 +665,23 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
         // process rights regardless of the tool allowlist, so anything below full
         // must refuse to load them for the allowlist to mean anything: an
         // extension in the repo could register Bash and undo the write tier.
+        //
+        // --no-context-files (P0-02) belongs on read AND write, not read
+        // alone: AGENTS.md/CLAUDE.md on disk and pi's SYSTEM/APPEND_SYSTEM
+        // path are an unaudited prompt input regardless of which tools are
+        // registered, and the read-vs-write line is about which tools pi may
+        // USE, not about whether a file neither sfh nor the flow author wrote
+        // gets to add hidden instructions. full does not get the flag: full
+        // already means the operator trusts this tool with everything, so
+        // suppressing pi's normal project-context behavior there would be an
+        // undocumented narrowing of the one tier meant to hold nothing back.
         Access::Read => push(
             a,
             &[
                 "--no-extensions",
                 "--no-skills",
                 "--no-prompt-templates",
+                "--no-context-files",
                 "--no-approve",
             ],
         ),
@@ -535,6 +692,7 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
                     "--no-extensions",
                     "--no-skills",
                     "--no-prompt-templates",
+                    "--no-context-files",
                     "--no-approve",
                 ],
             );
@@ -2531,6 +2689,51 @@ mod tests {
                 opencode_env(name, Access::Full).is_empty(),
                 "full access sets no enforcement layer"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_probe {
+    use super::*;
+
+    #[test]
+    fn dump_long_flags() {
+        let l = PathBuf::from("/tmp/last.txt");
+        let p = PathBuf::from("/tmp/p.txt");
+        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+        let full_inp = |access: Access| PresetInput {
+            model: Some("test-model".to_string()),
+            effort: Some("high".to_string()),
+            access,
+            agent: Some("test-agent".to_string()),
+            extra: &[],
+            bin: None,
+            timeout_sec: Some(900),
+        };
+        for tool in crate::flow::TOOLS {
+            let info = adapter_info(tool).unwrap();
+            let mut emitted: Vec<String> = Vec::new();
+            for access in [Access::Read, Access::Write, Access::Full] {
+                if let Ok(b) = build(tool, full_inp(access), &bp, Some("preassigned-id")) {
+                    emitted.extend(b.argv.iter().filter(|a| a.starts_with("--")).cloned());
+                }
+                if let Ok(b) = build_resume(tool, "resume-id", full_inp(access), &bp) {
+                    emitted.extend(b.argv.iter().filter(|a| a.starts_with("--")).cloned());
+                }
+                if let Ok(b) = build_fork(tool, "parent-id", "child-id", full_inp(access), &bp) {
+                    emitted.extend(b.argv.iter().filter(|a| a.starts_with("--")).cloned());
+                }
+            }
+            emitted.sort();
+            emitted.dedup();
+            let missing: Vec<&String> = emitted
+                .iter()
+                .filter(|f| !info.required_flags.contains(&f.as_str()))
+                .collect();
+            println!("TOOL {tool}: emitted={:?}", emitted);
+            println!("TOOL {tool}: required_flags={:?}", info.required_flags);
+            println!("TOOL {tool}: MISSING={:?}", missing);
         }
     }
 }
