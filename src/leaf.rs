@@ -1653,8 +1653,26 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
             // clock separates them: silence longer than hang_after_sec is a
             // hang, and a hang is exactly the kind of failure a retry fixes.
             RetryMode::Transient => {
-                (!done.timed_out
-                    && execute::is_transient_failure(&done.stderr_clean, &done.chain_output))
+                // A PRESET step's chain output is the tool's own report, so a
+                // rate limit or a serving abort in it really does describe how
+                // this attempt failed. A custom `cmd:` step's stdout is its
+                // RESULT - the test list, the diff, the JSON it was asked to
+                // produce - and scanning that for provider needles reads the
+                // command's data as if it were a statement about the harness.
+                //
+                // A verification step whose suite contains a case named
+                // `tcp_502_returns_error` was therefore re-run in full on every
+                // deterministic failure: minutes of compute and a second bill,
+                // for a match on the word 502 inside a test name. stderr is
+                // still read for both, because that is where a command reports
+                // operational trouble - `curl` writing "connection reset" is
+                // exactly the transient case, and it goes there.
+                let tool_report = if done.tool.is_some() {
+                    done.chain_output.as_str()
+                } else {
+                    ""
+                };
+                (!done.timed_out && execute::is_transient_failure(&done.stderr_clean, tool_report))
                     || (done.timed_out && done.idle_ms >= cfg.hang_after_sec.saturating_mul(1000))
             }
         };

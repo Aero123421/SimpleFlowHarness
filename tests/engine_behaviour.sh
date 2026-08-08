@@ -5945,6 +5945,61 @@ contains "carry: so the fleet total is money spent, not money counted twice" \
 contains "carry: a failed run's envelope offers resume" '"resume"' carry-json.out
 contains "carry: and offers carrying the budget into a corrected flow" '"carry_budget"' carry-json.out
 
+# --- a command's stdout is its result, not a report about the harness --------
+# retry_on: transient scans for provider failures - rate limits, 5xx, dropped
+# sockets. Scanning a custom command's STDOUT for those reads its data as if it
+# were a statement about the run: a verification suite containing a case named
+# `tcp_502_returns_error` had its whole (expensive, deterministic) run repeated
+# on every genuine failure, for a match on the word 502 inside a test name.
+cat > transient.yaml <<'YAML'
+api_version: 1
+name: transient
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: verify
+    cmd: ["sh", "-c", "echo 'test tcp_502_returns_error ... FAILED'; echo '1 failed, 292 passed'; exit 2"]
+YAML
+"$SFH" run transient.yaml --runs-dir "$WORK_NATIVE/transient-runs" > transient.out 2>&1
+check "transient: a deterministic command failure still fails" 1 $?
+not_contains "transient: a test name mentioning 502 does not re-run the suite" \
+  "transient failure" transient.out
+TRANSIENT_RUNS="$(grep -cF '"event":"step_end"' "$(ls -d "$WORK"/transient-runs/*/ | head -1)"/log.jsonl)"
+check "transient: so the command ran exactly once" 1 "$TRANSIENT_RUNS"
+
+# stderr is still read for a command, because that is where a program reports
+# operational trouble - and that really is the transient case.
+cat > transient-net.yaml <<'YAML'
+api_version: 1
+name: transientnet
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: fetch
+    cmd: ["sh", "-c", "echo 'curl: (56) connection reset by peer' >&2; exit 7"]
+YAML
+"$SFH" run transient-net.yaml --runs-dir "$WORK_NATIVE/transient-net-runs" > transient-net.out 2>&1
+check "transient: a genuine network failure still fails after its retry" 1 $?
+contains "transient: and it really was retried" "transient failure" transient-net.out
+
+# A preset step's chain output IS the tool's own report, so it keeps being read.
+cat > transient-tool.yaml <<YAML
+api_version: 1
+name: transienttool
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: ask
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    prompt: "go"
+    args: ["--stub-exit", "1", "--stub-quote", "429 rate limit exceeded"]
+YAML
+"$SFH" run transient-tool.yaml --runs-dir "$WORK_NATIVE/transient-tool-runs" > transient-tool.out 2>&1
+contains "transient: a preset tool reporting a rate limit is still retried" \
+  "transient failure" transient-tool.out
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
