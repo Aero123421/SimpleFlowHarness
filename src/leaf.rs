@@ -1798,6 +1798,53 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
     }
 }
 
+/// Which streaming semantic observer (if any) a step's declared protocol
+/// wires up. pi/codex/opencode are the line-delimited adapters, each capable
+/// of an event stream larger than the 32 MiB raw-capture bound, so each gets
+/// an `execute::OutputObserver` that reads its terminal record, session id,
+/// and usage/cost off the complete stream instead of off `stdout_clean`,
+/// which that bound may have gapped in the middle (P0-03). Every other
+/// adapter's documented shape is a single envelope well under that bound, so
+/// it is still read back from `stdout_clean` after the process exits.
+enum StreamObserver {
+    Pi(Arc<PiStreamObserver>),
+    Codex(Arc<CodexStreamObserver>),
+    Opencode(Arc<OpencodeStreamObserver>),
+}
+
+impl StreamObserver {
+    fn for_parse(parse: &preset::OutputParse) -> Option<Self> {
+        match parse {
+            preset::OutputParse::PiJsonl => {
+                Some(StreamObserver::Pi(Arc::new(PiStreamObserver::default())))
+            }
+            preset::OutputParse::CodexJsonl(_) => Some(StreamObserver::Codex(Arc::new(
+                CodexStreamObserver::default(),
+            ))),
+            preset::OutputParse::OpencodeNdjson => Some(StreamObserver::Opencode(Arc::new(
+                OpencodeStreamObserver::default(),
+            ))),
+            _ => None,
+        }
+    }
+
+    fn as_output_observer(&self) -> Arc<dyn execute::OutputObserver> {
+        match self {
+            StreamObserver::Pi(o) => Arc::clone(o) as Arc<dyn execute::OutputObserver>,
+            StreamObserver::Codex(o) => Arc::clone(o) as Arc<dyn execute::OutputObserver>,
+            StreamObserver::Opencode(o) => Arc::clone(o) as Arc<dyn execute::OutputObserver>,
+        }
+    }
+
+    fn finish(&self) -> (ParsedOut, Option<String>) {
+        match self {
+            StreamObserver::Pi(o) => o.finish(),
+            StreamObserver::Codex(o) => o.finish(),
+            StreamObserver::Opencode(o) => o.finish(),
+        }
+    }
+}
+
 fn exec_once(p: Prepared) -> LeafDone {
     if !p.quiet {
         eprintln!("sfh: [{}] start", p.tag);
@@ -2019,13 +2066,18 @@ fn exec_once(p: Prepared) -> LeafDone {
         });
     }
 
-    // The observer (when there is one) already built the adapter's semantic
-    // state from the complete stream; route it through the same
-    // `finish_parsed` step `parse_output` uses so a run whose transcript blew
-    // past the raw-capture bound and one that did not resolve codex's
-    // file/session fallback identically, and share one error path: a
-    // containment violation reading that file is a failure of this step, not
-    // empty output (rev_break #4).
+    // `stdout_clean` is the bounded, head+tail raw ARTIFACT (see MAX_CAPTURE in
+    // execute.rs); `stream_result`, when there is one, is the SEMANTIC state a
+    // streaming observer already built from the complete pipe, before that
+    // bound applied. These are deliberately kept as two different values
+    // instead of one "parsed output" derived from whichever text survived
+    // truncation: a run whose transcript blew past the raw-capture bound must
+    // not be failed or degraded on that account alone when its observer saw
+    // every byte, so `parsed` below is built from `stream_result` whenever one
+    // exists and `stdout_clean` is never consulted for it. Both cases still
+    // route through the same `finish_parsed` step `parse_output` uses, so a
+    // large codex run and a small one resolve the file/session fallback
+    // identically.
     let mut parsed = {
         let result = match stream_result {
             Some((observed, _)) => {
@@ -3304,6 +3356,190 @@ mod tests {
         assert_eq!(parse_opencode_ndjson(s).text, "partial full");
     }
 
+    // P0-03: opencode --format json can emit an NDJSON transcript well past the
+    // 32 MiB raw capture bound. These prove the streaming observer, not just
+    // the non-streaming `parse_opencode_ndjson` fallback, carries the session,
+    // the terminal record and its usage/cost across that bound intact - and
+    // that the two paths keep agreeing on everything else.
+
+    #[test]
+    fn opencode_ndjson_streaming_semantics_survive_more_than_raw_capture_limit() {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p0","messageID":"m0","text":"interim"}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy = format!("{{\"type\":\"step_start\",\"payload\":\"{payload}\"}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        observer.observe(
+            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p1","messageID":"m1","text":"VERDICT: PASS"}}
+"#,
+        );
+        let final_record = br#"{"type":"step_finish","sessionID":"stream-session","part":{"tokens":{"input":20,"output":3},"cost":0.5}}"#;
+        observer.observe(&final_record[..40]);
+        observer.observe(&final_record[40..]);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(parsed.text, "VERDICT: PASS");
+        assert_eq!(parsed.session.as_deref(), Some("stream-session"));
+        assert_eq!(parsed.usage.input_tokens, Some(20));
+        assert_eq!(parsed.usage.output_tokens, Some(3));
+        assert_eq!(parsed.usage.cost_usd, Some(0.5));
+        assert!(!parsed.failed);
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn opencode_ndjson_cost_before_and_after_the_truncation_point_sums_while_tokens_take_the_last()
+    {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":100,"output":10},"cost":0.1}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy = format!("{{\"type\":\"step_start\",\"payload\":\"{payload}\"}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":200,"output":20},"cost":0.25}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        // Cost accumulates across every step_finish (preset::Usage's
+        // add_reported_cost); tokens do not - they are overwritten by the
+        // latest step. Both are parse_opencode_ndjson's existing rule, not
+        // something the streaming path may change.
+        assert_eq!(parsed.usage.cost_usd, Some(0.35));
+        assert_eq!(parsed.usage.input_tokens, Some(200));
+        assert_eq!(parsed.usage.output_tokens, Some(20));
+    }
+
+    #[test]
+    fn opencode_ndjson_a_later_error_overrides_an_earlier_step_finishs_verdict() {
+        // parse_opencode_ndjson's existing rule: step_finish/finish only sets
+        // the verdict if nothing has set it yet (get_or_insert), but error
+        // always overrides it outright. So a later in-band failure still
+        // invalidates an apparent completion, but a later step_finish cannot
+        // paper back over an error - the same asymmetry an internal retry that
+        // ultimately errors out relies on.
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":1,"output":1},"cost":0.01}}
+{"type":"error","sessionID":"s"}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert!(parsed.failed);
+        assert_eq!(parsed.evidence.terminal_success, Some(false));
+        assert!(parsed.evidence.terminal_seen);
+    }
+
+    #[test]
+    fn opencode_ndjson_single_record_over_the_per_record_ceiling_fails_closed() {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"before"}}
+"#,
+        );
+        // One line bigger than MAX_JSONL_LINE_BYTES, delivered in 64 KiB pieces
+        // the way spawn_reader's fixed read buffer actually would.
+        let giant = vec![b'y'; MAX_JSONL_LINE_BYTES + 1024];
+        for chunk in giant.chunks(65536) {
+            observer.observe(chunk);
+        }
+        observer.observe(b"\n");
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":1,"output":1}}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert!(parsed.failed);
+        assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid);
+        let diagnostic = diagnostic.expect("an oversized record must explain itself");
+        assert!(
+            diagnostic.contains("larger than 16 MiB"),
+            "got {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn opencode_ndjson_final_line_without_a_trailing_newline_is_still_a_complete_record() {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"answer"}}
+"#,
+        );
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":5,"output":1}}}"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert!(parsed.evidence.terminal_seen);
+        assert_eq!(parsed.evidence.terminal_success, Some(true));
+        assert_eq!(parsed.text, "answer");
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn opencode_ndjson_observer_and_non_streaming_parser_agree_on_small_input() {
+        let text = concat!(
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old"}}"#,
+            "\n",
+            "{not json",
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new "}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer"}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"tokens":{"input":171,"output":6},"cost":0.5}}"#,
+            "\n",
+        );
+
+        let direct = parse_opencode_ndjson(text);
+
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(text.as_bytes());
+        let (streamed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, direct.evidence.diagnostic);
+        assert_eq!(streamed.text, direct.text);
+        assert_eq!(streamed.session, direct.session);
+        assert_eq!(streamed.usage.input_tokens, direct.usage.input_tokens);
+        assert_eq!(streamed.usage.output_tokens, direct.usage.output_tokens);
+        assert_eq!(streamed.usage.cost_usd, direct.usage.cost_usd);
+        assert_eq!(streamed.failed, direct.failed);
+        assert_eq!(streamed.evidence.protocol, direct.evidence.protocol);
+        assert_eq!(
+            streamed.evidence.malformed_records,
+            direct.evidence.malformed_records
+        );
+
+        // Concretely, not just "the two agree": the malformed line must have
+        // been counted and the protocol must fail closed, on both paths.
+        assert_eq!(direct.evidence.malformed_records, 1);
+        assert_eq!(direct.evidence.protocol, ProtocolState::Invalid);
+    }
+
     #[test]
     fn parses_grok_and_agy_envelopes() {
         let g = parse_grok_json(
@@ -3606,6 +3842,182 @@ mod tests {
             codex_session_from_stderr("session id:\n019fa375-ae0f-7962-bcf6-8682ff388db6\n")
                 .is_none()
         );
+    }
+
+    // P0-03: codex --json can emit a JSONL transcript well past the 32 MiB raw
+    // capture bound. These prove the streaming observer, not just the
+    // non-streaming `parse_codex_jsonl` fallback, carries the session, the
+    // terminal record and its usage across that bound intact - and that the
+    // two paths keep agreeing on everything else.
+
+    #[test]
+    fn codex_jsonl_streaming_semantics_survive_more_than_raw_capture_limit() {
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}
+{"type":"item.completed","item":{"type":"agent_message","text":"interim"}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy =
+            format!("{{\"type\":\"item.updated\",\"partial\":{{\"payload\":\"{payload}\"}}}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        observer.observe(
+            br#"{"type":"item.completed","item":{"type":"agent_message","text":"VERDICT: PASS"}}
+"#,
+        );
+        let final_record =
+            br#"{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":3}}"#;
+        observer.observe(&final_record[..37]);
+        observer.observe(&final_record[37..]);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(parsed.text, "VERDICT: PASS");
+        assert_eq!(
+            parsed.session.as_deref(),
+            Some("019fa375-ae0f-7962-bcf6-8682ff388db6")
+        );
+        assert_eq!(parsed.usage.input_tokens, Some(20));
+        assert_eq!(parsed.usage.output_tokens, Some(3));
+        assert!(!parsed.failed);
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn codex_jsonl_more_than_one_terminal_record_keeps_the_last_ones_session_and_usage() {
+        // parse_codex_jsonl's existing rule for thread.started/turn.completed is
+        // a plain overwrite, not an accumulation: the pair re-emitted by an
+        // internal retry replaces the earlier attempt's session and usage
+        // entirely rather than being summed with it. The streaming observer
+        // must reproduce exactly that, not invent a merge rule of its own.
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"11111111-1111-1111-1111-111111111111"}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+{"type":"thread.started","thread_id":"22222222-2222-2222-2222-222222222222"}
+{"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":2}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(
+            parsed.session.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(parsed.usage.input_tokens, Some(2));
+        assert_eq!(parsed.usage.output_tokens, Some(2));
+        assert!(parsed.evidence.terminal_seen);
+        assert_eq!(parsed.evidence.terminal_success, Some(true));
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn codex_jsonl_single_record_over_the_per_record_ceiling_fails_closed() {
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}
+"#,
+        );
+        // One line bigger than MAX_JSONL_LINE_BYTES, delivered in 64 KiB pieces
+        // the way spawn_reader's fixed read buffer actually would.
+        let giant = vec![b'y'; MAX_JSONL_LINE_BYTES + 1024];
+        for chunk in giant.chunks(65536) {
+            observer.observe(chunk);
+        }
+        observer.observe(b"\n");
+        observer.observe(
+            br#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert!(parsed.failed);
+        assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid);
+        let diagnostic = diagnostic.expect("an oversized record must explain itself");
+        assert!(
+            diagnostic.contains("larger than 16 MiB"),
+            "got {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_final_line_without_a_trailing_newline_is_still_a_complete_record() {
+        // The child can be killed the instant after it writes its terminal
+        // record's closing brace but before the newline that would normally
+        // follow it. That newline is a delimiter, not payload, so the record
+        // itself must still be read, not silently dropped on exit.
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}
+"#,
+        );
+        observer
+            .observe(br#"{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":1}}"#);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert!(parsed.evidence.terminal_seen);
+        assert_eq!(parsed.evidence.terminal_success, Some(true));
+        assert_eq!(parsed.usage.input_tokens, Some(5));
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn codex_jsonl_observer_and_non_streaming_parser_agree_on_small_input() {
+        let text = concat!(
+            r#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}"#,
+            "\n",
+            "{not json",
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":20224,"output_tokens":12}}"#,
+            "\n",
+        );
+
+        let direct = parse_codex_jsonl(text);
+
+        let observer = CodexStreamObserver::default();
+        observer.observe(text.as_bytes());
+        let (streamed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, direct.evidence.diagnostic);
+        assert_eq!(streamed.text, direct.text);
+        assert_eq!(streamed.session, direct.session);
+        assert_eq!(streamed.usage.input_tokens, direct.usage.input_tokens);
+        assert_eq!(streamed.usage.output_tokens, direct.usage.output_tokens);
+        assert_eq!(streamed.usage.cost_usd, direct.usage.cost_usd);
+        assert_eq!(streamed.failed, direct.failed);
+        assert_eq!(streamed.evidence.protocol, direct.evidence.protocol);
+        assert_eq!(
+            streamed.evidence.terminal_seen,
+            direct.evidence.terminal_seen
+        );
+        assert_eq!(
+            streamed.evidence.terminal_success,
+            direct.evidence.terminal_success
+        );
+        assert_eq!(
+            streamed.evidence.malformed_records,
+            direct.evidence.malformed_records
+        );
+        assert_eq!(
+            streamed.evidence.final_message_seen,
+            direct.evidence.final_message_seen
+        );
+
+        // Concretely, not just "the two agree": the malformed line must have
+        // been counted and the protocol must fail closed, on both paths.
+        assert_eq!(direct.evidence.malformed_records, 1);
+        assert_eq!(direct.evidence.protocol, ProtocolState::Invalid);
     }
 
     #[test]
