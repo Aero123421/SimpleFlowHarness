@@ -631,14 +631,38 @@ mod tests {
         assert!(r.blockers.is_empty());
     }
 
+    /// The rule this test has always been about is "preflight must not report
+    /// a version floor sfh invented". It used to spell that as "every
+    /// `minimum_version` is `None`", which was accurate only while no adapter
+    /// had a documented floor to point at.
+    ///
+    /// P1-06 gave agy one: its changelog dates the `--output-format json`
+    /// envelope that preset's whole parse path depends on to 1.1.8, so a
+    /// build below that accepts the flags and then cannot answer. The
+    /// underlying rule is unchanged - a pinned floor has to be something
+    /// agy's authors put in writing - so the assertion moves to that rule
+    /// rather than to whichever adapters happen to pin one today.
+    /// `preset::tests::only_agy_pins_a_minimum_version_and_it_names_its_source`
+    /// guards the same invariant next to the data; this one guards what
+    /// preflight goes on to print.
     #[test]
-    fn no_adapter_claims_a_minimum_version_it_never_verified() {
+    fn preflight_only_reports_a_version_floor_that_is_documented() {
         for tool in flow::TOOLS {
             let i = preset::adapter_info(tool).expect("every preset has metadata");
-            assert_eq!(
-                i.minimum_version, None,
-                "{tool} pins a floor that was not confirmed against the CLI's docs and a live probe"
-            );
+            match tool {
+                "agy" => assert_eq!(
+                    i.minimum_version,
+                    Some("1.1.8"),
+                    "agy's structured print output needs 1.1.8, and preflight reports that floor"
+                ),
+                _ => assert_eq!(
+                    i.minimum_version, None,
+                    "{tool} pins a floor that was not confirmed against the CLI's docs and a live probe"
+                ),
+            }
+            // Not incidental to this test: preflight's `--help` drift check
+            // can only look for flags that are listed, so an empty list makes
+            // the check silently pass on any binary at all.
             assert!(
                 !i.required_flags.is_empty(),
                 "{tool} lists no required flags"
