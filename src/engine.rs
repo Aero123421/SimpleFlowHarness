@@ -3227,6 +3227,82 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         }
     }
 
+    // ---- context snapshot ----
+    // P0-04: build_closure, above, pins every `kind: file` context by the
+    // bytes it read at that moment - but until now, a step's own context
+    // assembly (leaf::prepare_leaf -> context::build) opened the SAME
+    // declared path again, live, whenever that step happened to run. See
+    // snapshot_file_contexts's doc comment for the bug this closes; this is
+    // the run-start call that closes it, placed after the workspace is
+    // resolved (immediately above) so a context source that is only
+    // contained within the workspace - not the flow directory - validates
+    // exactly the way it will for every step that reads it.
+    //
+    // A resumed run keeps the ORIGINAL snapshot rather than capturing a new
+    // one, even under --force-resume. execution-closure.json is itself
+    // write-once - resuming never rewrites the copy on disk, force or not
+    // (see the closure check above, which reads it back but only ever WRITES
+    // it in the `!is_resume` branch) - so re-snapshotting on resume would
+    // freeze NEW bytes under a closure that still records the OLD hash: the
+    // exact closure/snapshot disagreement this feature must never produce.
+    // --force-resume's documented job is "let this run continue despite what
+    // moved outside it", not "rebase this run onto the new inputs" - that is
+    // what re-running from scratch is for, and a fresh run gets a fresh
+    // snapshot the ordinary way, from a fresh closure.
+    let containment_now = context::Containment {
+        flow_dir: &flow_dir,
+        workspace: workspace_path.as_deref(),
+    };
+    let context_snapshot: Option<HashMap<String, Option<PathBuf>>> = if is_resume {
+        match load_context_snapshot(&run_dir)? {
+            ResumedSnapshot::Loaded(map) => Some(map),
+            ResumedSnapshot::NotPresent => None,
+            ResumedSnapshot::Corrupt(reason) => {
+                if opts.force_resume {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "force_resume",
+                               "reason": "context_snapshot_unreadable", "error": reason}),
+                    )?;
+                    if !opts.quiet && !opts.as_json {
+                        eprintln!(
+                            "sfh: warning: --force-resume continued past an unreadable context snapshot: {reason}"
+                        );
+                    }
+                    None
+                } else {
+                    return Err(format!(
+                        "{}: this run's context snapshot ({}) cannot be read ({reason}), so sfh cannot confirm every step would see the bytes execution-closure.json pinned.\nRe-run from scratch, or pass --force-resume to continue without that guarantee.",
+                        machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                        run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).display()
+                    ));
+                }
+            }
+        }
+    } else {
+        let snap = snapshot_file_contexts(&flow, &containment_now, &run_dir)?;
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .map_err(|e| format!("cannot serialize the context snapshot: {e}"))?;
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .map_err(|e| format!("cannot persist context snapshot: {e}"))?;
+        // Recorded the same way the closure fingerprint is, right below the
+        // event that pins it, so "what this run actually read" is answerable
+        // from log.jsonl alone without also locating the manifest file.
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "context_snapshot", "sources": snap.sources}),
+        )?;
+        Some(snap.registry)
+    };
+    // Held for the rest of this run: every prepare_leaf call from here on
+    // resolves its `kind: file` contexts through this pin instead of the
+    // live path. Dropping it (at function exit, or between tests that share
+    // a thread) hands the thread back with no pin active.
+    let _context_snapshot_guard = context_snapshot.map(context::activate_snapshot);
+
     let started = utc_stamp();
     let meta = json!({
         "schema_version": 1,
@@ -6508,6 +6584,195 @@ fn build_closure(
         cl.set("tools", serde_json::Value::Object(tools.clone()));
     }
     Ok(cl)
+}
+
+/// Where every `kind: file` context's frozen copy lives, relative to the run
+/// dir, and the durable record of what run start managed to pin.
+const CONTEXT_SNAPSHOT_DIR: &str = "context-snapshot";
+const CONTEXT_SNAPSHOT_MANIFEST: &str = "context-snapshot.json";
+
+/// What `snapshot_file_contexts` produced: the in-memory registry handed
+/// straight to `context::activate_snapshot`, and the same per-source facts
+/// written to BOTH the durable manifest and the run log (they answer the same
+/// question - "what did this run actually read" - for two different
+/// readers, so there is exactly one place that computes the answer).
+struct ContextSnapshot {
+    registry: HashMap<String, Option<PathBuf>>,
+    sources: Vec<serde_json::Value>,
+}
+
+/// Freeze every `kind: file` context this flow declares, once, so the rest of
+/// this run reads the SAME bytes `build_closure` just pinned instead of
+/// opening the declared path again on every step.
+///
+/// P0-04: without this, an edited TASK.md between the `analyze` and
+/// `implement` steps of one run silently changed what `implement` was
+/// handed, while execution-closure.json went on recording the hash from
+/// before the edit - the run's own record of what it read disagreed with
+/// what it actually read, and no resume was involved.
+///
+/// Unconditional over `flow.contexts` - the same set `build_closure` iterates
+/// above, not just the sources some step happens to name - so the run's
+/// pinned copies and the closure's pinned hashes are always talking about the
+/// same files. `inline` and `template` sources are left alone: an inline
+/// source is already part of the flow's own bytes, and a template is
+/// deliberately re-rendered per step (it may read `{{steps.x.output}}`,
+/// which does not exist yet at run start, so freezing it here would be
+/// wrong, not merely unnecessary).
+///
+/// A source that fails validation outright here - a symlink without
+/// `allow_external`, a required file that is missing - is left OUT of the
+/// registry rather than aborting the run. sfh has never refused a run merely
+/// for DECLARING a broken context nobody uses; that lenience is preserved by
+/// deferring to `context::build`'s own live-path fallback, which raises
+/// exactly the same error the first time some step actually names it.
+fn snapshot_file_contexts(
+    flow: &flow::Flow,
+    containment: &context::Containment,
+    run_dir: &Path,
+) -> Result<ContextSnapshot, String> {
+    let file_contexts: Vec<(&String, &flow::ContextSource)> = flow
+        .contexts
+        .iter()
+        .filter(|(_, s)| matches!(s.kind(), Ok("file")))
+        .collect();
+    let mut registry: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut sources = Vec::new();
+    if file_contexts.is_empty() {
+        return Ok(ContextSnapshot { registry, sources });
+    }
+    let snapshot_dir = run_dir.join(CONTEXT_SNAPSHOT_DIR);
+    contain::mkdir_private(&snapshot_dir).map_err(|e| {
+        format!(
+            "cannot persist context snapshot: cannot create {}: {e}",
+            snapshot_dir.display()
+        )
+    })?;
+    for (name, source) in file_contexts {
+        let raw = source.file.clone().unwrap_or_default();
+        let external = source.allow_external.unwrap_or(false);
+        let optional = source.optional.unwrap_or(false);
+        match context::read_file_source(name, &raw, external, containment, optional) {
+            Ok(Some(text)) => {
+                // Named by a digest of the CONTEXT NAME, never the declared
+                // path: a name is a flow-author identifier, but the identical
+                // name reused across an unrelated OS's path separators or
+                // reserved characters would turn straight into a path
+                // injection if used as a file name verbatim (the same reason
+                // render_bundle escapes a name before it can forge a
+                // delimiter). The declared path is preserved as plain data in
+                // `source`, below, for a human reading the manifest.
+                let file_name = format!("{}.snapshot", sha256::hex(name.as_bytes()));
+                let abs_path = snapshot_dir.join(&file_name);
+                contain::write_private_atomic(&abs_path, &text).map_err(|e| {
+                    format!("cannot persist context snapshot for contexts.{name}: {e}")
+                })?;
+                registry.insert(name.clone(), Some(abs_path));
+                sources.push(json!({
+                    "name": name, "source": raw, "state": "captured",
+                    "sha256": sha256::hex(text.as_bytes()), "bytes": text.len() as u64,
+                    "snapshot": format!("{CONTEXT_SNAPSHOT_DIR}/{file_name}"),
+                }));
+            }
+            Ok(None) => {
+                registry.insert(name.clone(), None);
+                sources.push(json!({"name": name, "source": raw, "state": "absent"}));
+            }
+            // Deferred, not fatal - see the doc comment above.
+            Err(_) => {}
+        }
+    }
+    Ok(ContextSnapshot { registry, sources })
+}
+
+/// What a resumed run finds for the context snapshot the ORIGINAL attempt
+/// captured.
+enum ResumedSnapshot {
+    /// No manifest at all: a run dir from before this feature existed, or one
+    /// whose flow declared no `kind: file` context. Steps fall back to the
+    /// live path, exactly as every run did before this fix - there is
+    /// nothing to disagree with, because nothing was ever pinned.
+    NotPresent,
+    /// Read back and validated; every step now sees exactly what run start
+    /// pinned, the same as a fresh run would.
+    Loaded(HashMap<String, Option<PathBuf>>),
+    /// The manifest is there but sfh cannot make sense of its CONTENT - which
+    /// should be impossible for a file only sfh ever writes, atomically, into
+    /// a private run dir. Treated as an execution-closure-level problem (the
+    /// caller offers the same refusal and the same --force-resume escape
+    /// hatch the closure mismatch above does) rather than silently falling
+    /// back to live reads that might not agree with what
+    /// execution-closure.json pinned.
+    Corrupt(String),
+}
+
+/// Read back what `snapshot_file_contexts` recorded, so a resume pins its
+/// steps to the SAME bytes the original attempt did rather than capturing a
+/// fresh copy of whatever is on disk now - see the resume-semantics comment
+/// at this function's call site for why re-capturing on resume would be
+/// wrong even under --force-resume.
+fn load_context_snapshot(run_dir: &Path) -> Result<ResumedSnapshot, String> {
+    // Contained, no-follow read: a run dir is untrusted input on --resume
+    // (rev_break #6 already treats meta.json and log.jsonl this way), so a
+    // symlink planted at this fixed name is refused unconditionally rather
+    // than folded into the waivable "Corrupt" case below.
+    let Some(text) = contain::read_contained_opt(run_dir, CONTEXT_SNAPSHOT_MANIFEST)? else {
+        return Ok(ResumedSnapshot::NotPresent);
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST} is not valid JSON: {e}"
+            )))
+        }
+    };
+    let Some(entries) = v.get("sources").and_then(|s| s.as_array()) else {
+        return Ok(ResumedSnapshot::Corrupt(format!(
+            "{CONTEXT_SNAPSHOT_MANIFEST} has no 'sources' array"
+        )));
+    };
+    let mut map = HashMap::new();
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(|x| x.as_str()) else {
+            return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST}: an entry has no 'name'"
+            )));
+        };
+        match entry.get("state").and_then(|x| x.as_str()) {
+            Some("absent") => {
+                map.insert(name.to_string(), None);
+            }
+            Some("captured") => {
+                let Some(rel) = entry.get("snapshot").and_then(|x| x.as_str()) else {
+                    return Ok(ResumedSnapshot::Corrupt(format!(
+                        "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} is 'captured' but names no snapshot file"
+                    )));
+                };
+                // A path that resolves outside run_dir means the run dir was
+                // tampered with, not merely that the record is stale - the
+                // same class of attack meta.json is already read contained
+                // against - so it is propagated unconditionally (rev_break
+                // #6) instead of folded into the waivable case below.
+                match contain::contained_opt(run_dir, rel)? {
+                    Some(path) => {
+                        map.insert(name.to_string(), Some(path));
+                    }
+                    None => {
+                        return Ok(ResumedSnapshot::Corrupt(format!(
+                            "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name}'s pinned snapshot {rel} is missing"
+                        )))
+                    }
+                }
+            }
+            other => {
+                return Ok(ResumedSnapshot::Corrupt(format!(
+                    "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} has an unrecognised state {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(ResumedSnapshot::Loaded(map))
 }
 
 fn log_event(f: &mut std::fs::File, mut v: serde_json::Value) -> Result<(), String> {
