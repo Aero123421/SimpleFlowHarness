@@ -44,7 +44,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、展開、`PATH` 設定までを行います。
 実行前に [Shell版](installers/sfh-installer.sh) および [PowerShell版](installers/sfh-installer.ps1) の内容を確認できます。
 バージョン固定や設定変更オプション:
-- `SFH_VERSION=1.2.0`: 特定のバージョンに固定。
+- `SFH_VERSION=1.2.1`: 特定のバージョンに固定。
 - `SFH_INSTALL_DIR=/path/to/bin`: インストール先ディレクトリの指定。
 - `SFH_NO_MODIFY_PATH=1`: 永続的な `PATH` 変更を無効化。
 
@@ -268,6 +268,23 @@ steps:
 
 これは retry（同じ invocation の再試行）でも、fallback（別 profile）でも、route による再入場でも、完了済み step の結果の再利用でもありません。sfh は外部副作用について exactly-once を約束しません。約束するのは、黙って再実行しないことと、不確かな結果を成功と偽らないことです。
 
+### `exit_conflict:` — exit code と protocol が食い違うとき（v1.2.1）
+
+作業を終え、回答を書き、commit まで済ませたうえで、途中の tool call が 1 つ失敗していたという理由だけで非ゼロ exit を返す CLI があります。sfh の手元には turn が完了した証拠（文書化された terminal record が、壊れておらず、成功と述べている）があり、OS は失敗したと言う。正しいのは片方だけで、sfh は当てずっぽうをしません。
+
+```yaml
+steps:
+  - id: implement
+    tool: pi
+    exit_conflict: trust_protocol   # fail（既定）| trust_protocol
+```
+
+既定は、exit status を信頼できる全 adapter で `fail` です。非ゼロ exit は従来どおり step の失敗になります。v1.2.1 で変わったのは、**sfh がこの食い違いを黙らなくなった**ことです。step の stderr、error artifact、`sfh runs why` のいずれもが「protocol は turn を成功として certify している」と述べ、この key を名指しします。
+
+`trust_protocol` は意図的に狭く作ってあります。参照されるのは sfh が積極的な証拠を持っているとき — 認識済みの terminal record が存在し、壊れておらず、成功を報告しているとき — だけです。raw text、未知の status、壊れた envelope、terminal 欠落はこの条件を満たさないので、stdout へ出した usage error が成功 step になることはありません。使用すると `sfh plan --json` の `unsafe_overrides` に載ります。
+
+追い詰められたときに思いつくもう一方の手 — flow から exit code 判定を消して、何であれ次段へ流す — の代わりにこちらを使ってください。あちらは fail-open で、本当に落ちた step の出力が、次にそれを読むものへ届いてしまいます。
+
 ### 再利用可能な flow: `--profiles`
 
 共有 flow は tool ではなく役割名を書き、実行する人が中身を決められます。
@@ -318,12 +335,15 @@ sfh wait <run-dir> --json               # 完了までブロックし、結果�
 ```text
 sfh preflight  — 無料。binary はあるか、version は、必要な flag は --help に残っているか。
                  protocol、session 対応、cost coverage、access の穴は。
+                 各 cmd: step の program は、絶対 path でどの binary になるか。
                  この flow はどんな workspace と context を組み立てるか。
 sfh doctor     — 有料。実際に 1 token の prompt を送り、sfh がまだ回答を parse できるかを確認。
                  protocol drift を捕まえられる唯一の方法。
 ```
 
 `doctor` は隔離した scratch ディレクトリから実行されるため、実行した場所に置かれている instruction file ではなく adapter そのものを報告します。
+
+v1.2.1 から、preflight は `cmd:` step が起動する program — 検証 shell、build、test runner、つまり flow が最も強く依存しているもの — も対象にします。**解決するだけで、実行はしません。** `--help` を sfh が対応している adapter へ送るのは安全でも、flow が名指しした任意の program へ送るのは安全ではないからです（`deploy.sh --help` は deploy し得ます）。解決できない名前は blocker です。Windows で bare な `bash` が `System32\bash.exe` へ解決した場合は拒否します。それは WSL launcher、つまり別の OS で、この checkout の path も worktree の `.git` file も読めないため、コードとは無関係な理由で数秒で落ちます。意図する shell を書けば（`"C:\\Program Files\\Git\\bin\\bash.exe"`）sfh は何も言いません。
 
 sfh はどの adapter についても **minimum version を固定していません**。各 CLI の公式文書と live probe で確認していない下限を主張する代わりに、`preflight` はインストールされている version を表示し、要件は不明であると述べます。
 

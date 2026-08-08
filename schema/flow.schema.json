@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.0/schema/flow.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.1/schema/flow.schema.json",
   "title": "sfh flow",
   "description": "A SimpleFlowHarness flow: staged AI CLI invocations with routing, parallelism and session continuation.",
   "type": "object",
@@ -243,6 +243,9 @@
           "type": "integer",
           "minimum": 1,
           "description": "Refuse to spawn when a step's assembled context bundle is larger. Checked before anything is launched; sfh never summarizes or drops sources to fit."
+        },
+        "exit_conflict": {
+          "$ref": "#/definitions/exit_conflict"
         }
       }
     },
@@ -644,8 +647,22 @@
         },
         "replay": {
           "$ref": "#/definitions/replay"
+        },
+        "exit_conflict": {
+          "$ref": "#/definitions/exit_conflict"
         }
       }
+    },
+    "exit_conflict": {
+      "enum": [
+        "fail",
+        "trust_protocol"
+      ],
+      "default": "fail",
+      "description": "What to do when a tool's own structured protocol certifies the turn as successful but the process exits non-zero. fail (default, and the behaviour of every release before 1.2.1 for every adapter except agy): the exit code wins and the step fails. trust_protocol: the protocol wins. Only ever consulted where sfh holds POSITIVE evidence - the documented terminal record was found, was well formed and said success - so it can never turn a usage error printed on stdout into a successful step. Declare it for a CLI that exits non-zero for reasons that do not invalidate its answer, rather than removing the exit-code gate from the flow.",
+      "examples": [
+        "trust_protocol"
+      ]
     },
     "effects": {
       "enum": [

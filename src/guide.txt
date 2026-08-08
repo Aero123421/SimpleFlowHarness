@@ -79,7 +79,7 @@ steps:
 DETACH AND COLLECT: `sfh run flow.yaml --detach` → `sfh status` → `sfh wait` / `sfh stop`
 DRIVING SFH FROM A PROGRAM — add --json; stdout is then the envelope and nothing else:
 ```text
-sfh preflight flow.yaml --json   # free: binaries, flags, protocols, policy gaps. No model calls.
+sfh preflight flow.yaml --json   # free: binaries (incl. every cmd: program), flags, protocols, gaps.
 sfh plan      flow.yaml --json   # what would run, with prompts redacted. Starts nothing.
 sfh run       flow.yaml --json --detach   # returns {run_dir, next_actions:[{argv:[...]}]}
 sfh wait <run-dir> --json        # blocks, then {ok, state, result, result_file}
@@ -98,6 +98,7 @@ steps:
     effects: workspace         # read | workspace | external | unknown (cmd: defaults to unknown)
     context: [rules]
     replay: {unfinished: stuck}   # a crashed external effect: stuck/fail launch nothing
+    exit_conflict: trust_protocol # ONLY for a CLI that exits non-zero after a certified-good turn
     cmd: ["sh", "-c", "true"]
 ```
 `--state-dir` keeps workspaces out of the repository; `--profiles f.yaml` swaps tools without editing the flow.
