@@ -11,6 +11,13 @@ pub struct StepOutput {
     /// Exit code normalized by sfh after parsing and session validation.
     pub exit: i32,
     pub stderr_file: String,
+    /// The outcome class an `outcomes:` entry gave this step, or empty when the
+    /// step declared none for the code it exited with. Kept as text so a
+    /// resumed run restores it from the log without a second vocabulary.
+    pub outcome: String,
+    /// The free-form label from that same entry, or empty. sfh never assigns it
+    /// meaning; it stores it, exposes it, and routes on it.
+    pub label: String,
 }
 
 pub struct Ctx<'a> {
@@ -218,6 +225,8 @@ fn lookup(key: &str, ctx: &Ctx) -> Result<String, String> {
             "output_file" => Ok(so.map(|s| s.output_file.clone()).unwrap_or_default()),
             "exit" => Ok(so.map(|s| s.exit.to_string()).unwrap_or_default()),
             "stderr_file" => Ok(so.map(|s| s.stderr_file.clone()).unwrap_or_default()),
+            "outcome" => Ok(so.map(|s| s.outcome.clone()).unwrap_or_default()),
+            "label" => Ok(so.map(|s| s.label.clone()).unwrap_or_default()),
             other => Err(format!(
                 "unknown field 'steps.{id}.{other}' (use output, outputs, output_file, exit or stderr_file)"
             )),
@@ -328,6 +337,8 @@ mod tests {
             output_file: "/run/gen.out.txt".to_string(),
             exit: 7,
             stderr_file: "/run/gen.err.txt".to_string(),
+            outcome: "continue".to_string(),
+            label: "needs_review".to_string(),
         }
     }
 

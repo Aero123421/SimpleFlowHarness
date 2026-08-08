@@ -6000,6 +6000,96 @@ YAML
 contains "transient: a preset tool reporting a rate limit is still retried" \
   "transient failure" transient-tool.out
 
+# --- outcomes: an exit code carries two facts and sfh could only read one ----
+# "The process ended cleanly" is transport. "The work is done" is semantics. A
+# gate that exits 2 for "ran fine, the acceptance criteria are not met yet" was
+# indistinguishable from one that exits 2 because it crashed, so sfh failed the
+# step - and under retry_on: transient could re-run an expensive suite for a
+# deliberate, correct, reproducible answer.
+cat > outcomes.yaml <<YAML
+api_version: 1
+name: outcomes
+defaults:
+  retry: {max: 2, backoff_sec: 1}
+  max_visits: 4
+steps:
+  - id: gate
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "GATE", "--stub-exit", "2"]
+    outcomes:
+      2: {result: continue, label: acceptance_incomplete}
+    route:
+      - {when_label_is: acceptance_incomplete, goto: review}
+      - {goto: end}
+  - id: review
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "REVIEWED"]
+    route: [{goto: end}]
+YAML
+"$SFH" run outcomes.yaml --runs-dir "$WORK_NATIVE/outcomes-runs" > outcomes.out 2>&1
+check "outcomes: a declared 'continue' is not a failure" 0 $?
+contains "outcomes: and the run carried on to the labelled route" "REVIEWED" outcomes.out
+not_contains "outcomes: a deliberate answer is never retried" "transient failure" outcomes.out
+OUT_RUN="$(ls -d "$WORK"/outcomes-runs/*/ | head -1)"
+GATE_RUNS="$(grep -cF '"step":"gate"' "$OUT_RUN/log.jsonl")"
+contains "outcomes: the class is durable in step_end" '"outcome":"continue"' "$OUT_RUN/log.jsonl"
+contains "outcomes: and so is the label sfh never interprets" \
+  '"outcome_label":"acceptance_incomplete"' "$OUT_RUN/log.jsonl"
+
+# The same exit code, undeclared, keeps its historical reading exactly.
+sed '/outcomes:/,+1d' outcomes.yaml | sed '/when_label_is/d' > outcomes-bare.yaml
+"$SFH" run outcomes-bare.yaml --runs-dir "$WORK_NATIVE/outcomes-bare-runs" -q > outcomes-bare.out 2>&1
+check "outcomes: without the table, exit 2 still fails the step" 1 $?
+
+# retryable replaces the needle guess rather than adding to it.
+cat > outcomes-retry.yaml <<YAML
+api_version: 1
+name: outcomesretry
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: fetch
+    cmd: ["sh", "-c", "echo 'deterministic bad input' >&2; exit 10"]
+    outcomes:
+      10: {result: retryable}
+YAML
+"$SFH" run outcomes-retry.yaml --runs-dir "$WORK_NATIVE/outcomes-retry-runs" > outcomes-retry.out 2>&1
+check "outcomes: a declared retryable still fails after its retries" 1 $?
+contains "outcomes: and it really was retried, with no needle in sight" \
+  "transient failure" outcomes-retry.out
+
+# ...and 'fail' means never, even when the text looks transient.
+cat > outcomes-final.yaml <<YAML
+api_version: 1
+name: outcomesfinal
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: fetch
+    cmd: ["sh", "-c", "echo 'connection reset by peer' >&2; exit 20"]
+    outcomes:
+      20: {result: fail}
+YAML
+"$SFH" run outcomes-final.yaml --runs-dir "$WORK_NATIVE/outcomes-final-runs" > outcomes-final.out 2>&1
+check "outcomes: a declared final failure fails" 1 $?
+not_contains "outcomes: and is not retried despite transient-looking stderr" \
+  "transient failure" outcomes-final.out
+
+# A rule that can never match is caught before anything is spent.
+cat > outcomes-bad.yaml <<'YAML'
+api_version: 1
+name: outcomesbad
+steps:
+  - id: gate
+    cmd: ["sh", "-c", "true"]
+    outcomes:
+      2: {result: continue, label: incomplete}
+    route:
+      - {when_label_is: typo, goto: end}
+      - {goto: end}
+YAML
+"$SFH" validate outcomes-bad.yaml > outcomes-bad.out 2>&1
+check "outcomes: a label no entry carries is a validation error" 2 $?
+contains "outcomes: and the error says it can never match" "can never match" outcomes-bad.out
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

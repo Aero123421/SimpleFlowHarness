@@ -124,6 +124,8 @@ pub struct Prepared {
     /// What the flow declared about exit-code/protocol disagreement, or None to
     /// keep the adapter's own default.
     pub exit_conflict: Option<flow::ExitConflict>,
+    /// This step's `outcomes:` table, keyed by raw process exit code.
+    pub outcomes: BTreeMap<i32, flow::Outcome>,
     pub retry: RetryCfg,
     /// Run-level activity clock every child of this run touches when it writes
     /// anything, so `status.json` can say how long the whole run has been quiet.
@@ -159,6 +161,10 @@ pub struct LeafDone {
     /// tool failure that on_error/fallback may ignore: without the artifact a
     /// later resume cannot reconstruct what happened.
     pub persistence_error: Option<String>,
+    /// The `outcomes:` entry that matched this step's raw process exit, if any.
+    /// `None` means the flow declared nothing for that code and the historical
+    /// reading stands.
+    pub outcome: Option<(flow::OutcomeResult, Option<String>)>,
     /// What the structured protocol proved, recorded in `step_end` so a reader
     /// can tell "the tool failed" from "sfh could not verify that it finished".
     pub protocol: ProtocolEvidence,
@@ -1168,6 +1174,7 @@ pub fn prepare_leaf(
         context_hash: (!bundle.is_empty()).then(|| bundle.hash.clone()),
         context_file: (!bundle.is_empty()).then_some(context_file),
         exit_conflict: step.exit_conflict(cx.flow),
+        outcomes: step.outcomes.clone(),
         retry: retry_cfg(cx.flow, step),
         run_clock: cx.run_clock.cloned(),
         quiet: cx.quiet,
@@ -1652,6 +1659,16 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
             // wrong for "the pipe went dead 38 minutes ago" (B-12). The idle
             // clock separates them: silence longer than hang_after_sec is a
             // hang, and a hang is exactly the kind of failure a retry fixes.
+            // A declared outcome replaces the guess entirely. Needle-matching
+            // exists because sfh usually cannot know why a step failed; when
+            // the flow has said, guessing on top of that is not caution, it is
+            // sfh overruling a statement it asked for.
+            RetryMode::Transient if done.outcome.is_some() => {
+                matches!(
+                    done.outcome.as_ref().map(|(r, _)| *r),
+                    Some(flow::OutcomeResult::Retryable)
+                )
+            }
             RetryMode::Transient => {
                 // A PRESET step's chain output is the tool's own report, so a
                 // rate limit or a serving abort in it really does describe how
@@ -1795,6 +1812,9 @@ fn exec_once(p: Prepared) -> LeafDone {
             // unsafe. The engine treats this like any other durability error
             // and aborts the run without recording a reusable completion.
             persistence_error: Some(why.clone()),
+            // Nothing ran, so there is no exit code for an `outcomes:` table
+            // to describe.
+            outcome: None,
             protocol: ProtocolEvidence::default(),
         };
     }
@@ -1839,6 +1859,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             cmd: cmd_desc,
             harness_diagnostic: Some(why.into()),
             persistence_error,
+            outcome: None,
             protocol: ProtocolEvidence::default(),
         };
     }
@@ -1895,6 +1916,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 cmd: cmd_desc,
                 harness_diagnostic: Some(format!("failed to spawn tool: {e}")),
                 persistence_error,
+                outcome: None,
                 protocol: ProtocolEvidence::default(),
             };
         }
@@ -2010,6 +2032,32 @@ fn exec_once(p: Prepared) -> LeafDone {
             });
         }
     }
+    // What this step's own exit code MEANS, if the flow said. Read from the RAW
+    // process exit, before any correction: `outcomes: {2: ...}` is a statement
+    // about what the command prints on its way out, and a table that shifted
+    // under sfh's own adjustments would mean something different from what it
+    // says.
+    //
+    // Deliberately gated on the protocol first. A declared outcome describes a
+    // command that RAN and reported; it is not a licence to accept a turn whose
+    // structured protocol never completed. Fail-closed keeps precedence, so a
+    // preset step whose stream died mid-answer cannot be relabelled "complete"
+    // by an exit-code table.
+    let declared = (protocol_failure.is_none() && !outcome.timed_out && !outcome.interrupted)
+        .then(|| p.outcomes.get(&outcome.exit_code))
+        .flatten()
+        .cloned();
+    if let Some(d) = &declared {
+        if d.result.is_success() {
+            // "Ran fine, there is more to do" is not a failure, and must not be
+            // read as one: no on_error, no retry, no partial-emit path.
+            exit_code = 0;
+        } else if exit_code == 0 {
+            // A flow that calls exit 0 a failure is unusual but coherent, and
+            // saying so must actually fail the step.
+            exit_code = 1;
+        }
+    }
     // "The flow said nothing" and "the flow said fail" are different: only the
     // second may override an adapter documented to get its exit codes wrong.
     let trust_protocol = match p.exit_conflict {
@@ -2022,7 +2070,10 @@ fn exec_once(p: Prepared) -> LeafDone {
     // and the process still be cut down afterwards by `sfh stop` or Ctrl-C -
     // reporting that as a completed step would turn "a human stopped this" into
     // "this finished", which is the one thing a stopped run must never say.
-    if (parsed.failed || protocol_failure.is_some()) && exit_code == 0 {
+    if declared.is_some() {
+        // The flow has spoken about this exit code. Neither the in-band failure
+        // fold nor the exit_conflict correction gets a second opinion.
+    } else if (parsed.failed || protocol_failure.is_some()) && exit_code == 0 {
         exit_code = 1;
     } else if exit_code != 0
         && !outcome.timed_out
@@ -2135,6 +2186,9 @@ fn exec_once(p: Prepared) -> LeafDone {
     }
     LeafDone {
         tag: p.tag,
+        // The only site where a process really ran, so the only one that can
+        // carry what its exit code was declared to mean.
+        outcome: declared.map(|d| (d.result, d.label)),
         exit_code,
         timed_out: outcome.timed_out,
         interrupted: outcome.interrupted,
@@ -2863,6 +2917,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         cmd: String::new(),
         harness_diagnostic: Some("worker thread died before producing a result".into()),
         persistence_error: None,
+        outcome: None,
         protocol: ProtocolEvidence::invalid("worker thread died before producing a result"),
     }
 }

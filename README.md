@@ -42,7 +42,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 The installer detects your OS and architecture, verifies the SHA-256 checksum, extracts the binary, and updates your `PATH`.
 You can inspect the [Shell](installers/sfh-installer.sh) and [PowerShell](installers/sfh-installer.ps1) scripts prior to execution.
 To pin a specific version or customize installation behavior:
-- `SFH_VERSION=1.3.0`: Pin the target release version.
+- `SFH_VERSION=1.4.0`: Pin the target release version.
 - `SFH_INSTALL_DIR=/path/to/bin`: Specify a custom installation directory.
 - `SFH_NO_MODIFY_PATH=1`: Skip automatic `PATH` modifications.
 
@@ -265,6 +265,41 @@ steps:
 `rerun` is the default and is what every earlier release did. `stuck` (exit 4) and `fail` (exit 1) launch nothing at all, keep the workspace and every partial artifact, and answer with `SFH_REPLAY_REFUSED`.
 
 This is not retry (another attempt at the same invocation), not fallback (a different profile), not a route revisit, and not the reuse of a completed step's result. sfh does not promise exactly-once for external effects; it promises not to silently re-run one, and not to call an uncertain outcome a success.
+
+### `outcomes:` — an exit code carries two facts (v1.4.0)
+
+"The process ended cleanly" is a transport fact. "The work is done" is a semantic one, and only you know how your command spells it. sfh could only read the first, so a gate that exits 2 for *ran fine, the acceptance criteria are not met yet* was indistinguishable from one that exits 2 because it crashed — and under `retry_on: transient` an expensive suite could be re-run for a deliberate, correct, reproducible answer.
+
+```yaml
+- id: gate
+  cmd: ["./scripts/acceptance.sh"]
+  outcomes:
+    2:  {result: continue, label: acceptance_incomplete}
+    10: {result: retryable}
+    20: {result: fail}
+  route:
+    - {when_label_is: acceptance_incomplete, goto: implement}
+    - {goto: end}
+```
+
+| `result` | meaning |
+|---|---|
+| `complete` | the work is done; the step succeeds however it exited |
+| `continue` | the step did its job and reports there is more to do — **not** a failure, so `on_error` does not fire and no retry is considered |
+| `retryable` | a failure worth another attempt, whatever the text says |
+| `fail` | a failure that is final; never retried under `retry_on: transient` |
+
+The vocabulary is deliberately tiny and domain-free: sfh learns only whether to carry on, retry, or stop. Everything domain-shaped goes in `label`, which sfh stores, exposes as `{{steps.<id>.label}}`, routes on with `when_label_is:`, records in `step_end` — and never interprets. `sfh` does not know what "acceptance" means and does not need to.
+
+`when_label_is:` is also the deterministic replacement for reading a verdict out of prose. A `when_last_line_is: PASS` rule depends on the model ending its answer on exactly that token; one trailing remark and the run goes to `stuck` for a formatting reason. A label comes from your own exit-code table.
+
+Three guarantees:
+
+- **An exit code with no entry keeps its historical reading exactly**, so declaring one code says nothing about the others, and a flow with no `outcomes:` is unchanged.
+- **A declared outcome replaces the retry guess rather than adding to it.** `retry_on: transient` normally matches provider-failure text (rate limits, 5xx, dropped sockets); once you have said what an exit code means, sfh does not second-guess it.
+- **Protocol evidence still wins.** An `outcomes:` table describes a command that ran and reported. It is not a licence to accept a turn whose structured protocol never completed, and it is never consulted for a step that timed out or was interrupted.
+
+A rule that could never match — a label no entry carries, an outcome class no entry declares — is a `validate` error, not a surprise three hours into a run.
 
 ### `--carry-budget-from` — when the flow itself was wrong (v1.3.0)
 

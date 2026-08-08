@@ -2,6 +2,59 @@
 
 ## Unreleased
 
+## v1.4.0 — 2026-08-08
+
+長時間運用のfeedbackから2件。どちらも「sfhが答えを症状として読んでいた」という
+同じ形の問題です。新しいkeyを書かなければ既存flowの挙動は変わりません。
+
+### `outcomes:` — exit codeは2つの事実を運んでいる
+
+- **これは何が起きたか。** 「正常に走ったが受け入れ基準はまだ満たしていない」で
+  exit 2を返すgateと、クラッシュしてexit 2になったgateを、sfhは区別できません
+  でした。前者はstepの失敗として扱われ、`retry_on: transient`の下では**意図的で
+  正しく再現性のある答えのために重いテストスイートが再実行**され得ました。
+- `outcomes:`はstep自身のexit codeが何を意味するかを宣言します。keyは**生の
+  process exit code**です。
+
+  ```yaml
+  outcomes:
+    2:  {result: continue, label: acceptance_incomplete}
+    10: {result: retryable}
+    20: {result: fail}
+  ```
+- `result`の語彙は意図的に小さく、ドメイン非依存です。`complete`（仕事は終わった）、
+  `continue`（役目は果たした、まだ続きがある — **失敗ではない**ので`on_error`は
+  発火せずretryも検討されない）、`retryable`（textが何と言おうと再試行に値する）、
+  `fail`（最終的な失敗、`transient`でも再試行しない）。sfhが学ぶのは「続けるか、
+  再試行するか、止めるか」だけです。
+- ドメインの形をしたものはすべて`label`に入ります。sfhはそれを保存し、
+  `{{steps.<id>.label}}`で公開し、`when_label_is:`でルーティングし、`step_end`に
+  記録し、**決して解釈しません**。sfhは「acceptance」が何かを知りません。
+- `when_label_is:` / `when_outcome_is:`をrouteに追加しました。前者は「判定を散文
+  から読み取る」ことの決定論的な代替です。`when_last_line_is: PASS`はmodelが最終行を
+  ちょうどそのtokenで終えることに依存しており、一言添えられただけで書式の理由で
+  stuckになります。
+- 保証3つ: entryの無いexit codeは**従来どおりの読みを保つ**／宣言されたoutcomeは
+  retryの推測に**上書きする**（足さない）／**protocolの証拠は依然として優先する**
+  （structured protocolが完了しなかったturnを受け入れる免許ではなく、timeout・
+  中断されたstepでは参照されない）。
+- 決して一致し得ないrule（どのentryも持たないlabel、どのentryも宣言していない
+  outcome class）、`0: {result: retryable}`、空のlabel、負のexit codeは
+  `validate`のエラーです。3時間走ったあとの驚きではありません。
+
+### `retry_on: transient` がコマンドのstdoutを症状として読まなくなりました
+
+- **これは何が起きたか。** transient判定のneedleは`429` `502` `rate limit`
+  `connection reset`など22個で、すべて**provider障害**を指す語です。preset stepなら
+  tool自身の報告なので正しい。しかし`cmd:` stepのstdoutは**結果データ**です。
+  検証スイートに`tcp_502_returns_error`というテストが含まれているだけで、
+  決定論的な失敗のたびにスイート全体が再実行されていました。テスト名の中の`502`
+  への一致で、数分の計算と2回目の請求が発生します。
+- `cmd:` stepのstdoutは走査しなくなりました。stderrは引き続き見ます。プログラムが
+  運用上の問題を報告するのはそこで、`curl`の"connection reset by peer"はまさに
+  transientそのものだからです。preset stepは変更なしです（chain outputはtool自身の
+  報告なので）。
+
 ## v1.3.0 — 2026-08-08
 
 v1.2.1のすべての修正に加えて、そのv1.2.1のきっかけになった事例が残していた

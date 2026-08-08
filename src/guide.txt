@@ -99,6 +99,7 @@ steps:
     context: [rules]
     replay: {unfinished: stuck}   # a crashed external effect: stuck/fail launch nothing
     exit_conflict: trust_protocol # ONLY for a CLI that exits non-zero after a certified-good turn
+    outcomes: {2: {result: continue, label: more_to_do}}  # exit code -> meaning; route with when_label_is
     cmd: ["sh", "-c", "true"]
 ```
 `--state-dir` keeps workspaces out of the repository; `--profiles f.yaml` swaps tools without editing the flow.
