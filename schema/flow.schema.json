@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.3.0/schema/flow.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.4.0/schema/flow.schema.json",
   "title": "sfh flow",
   "description": "A SimpleFlowHarness flow: staged AI CLI invocations with routing, parallelism and session continuation.",
   "type": "object",
@@ -382,6 +382,14 @@
         "goto": {
           "type": "string",
           "description": "step id | end (exit 0) | fail (exit 1) | stuck (exit 4: work saved, needs a human)"
+        },
+        "when_label_is": {
+          "type": "string",
+          "description": "Exact match against the label an outcomes: entry gave this step. The deterministic alternative to reading a verdict out of prose: a when_last_line_is rule depends on the model ending its answer on exactly that token, and one trailing remark sends the run to stuck for a formatting reason. A step with no matching outcome has no label and never matches. Added in v1.4.0."
+        },
+        "when_outcome_is": {
+          "$ref": "#/definitions/outcomeResult",
+          "description": "Equality against the outcome class sfh recorded for this step. Added in v1.4.0."
         }
       }
     },
@@ -650,6 +658,16 @@
         },
         "exit_conflict": {
           "$ref": "#/definitions/exit_conflict"
+        },
+        "outcomes": {
+          "type": "object",
+          "description": "What this step's own exit codes mean, keyed by the RAW process exit code. An exit code with no entry keeps its historical reading exactly, so declaring one code says nothing about the others. Read before any of sfh's own exit-code corrections, and never consulted when the step timed out, was interrupted, or failed to complete its structured protocol - a declaration describes a command that ran and reported, not a licence to accept an unfinished turn. Added in v1.4.0.",
+          "propertyNames": {
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "additionalProperties": {
+            "$ref": "#/definitions/outcome"
+          }
         }
       }
     },
@@ -763,6 +781,33 @@
           "type": "boolean",
           "default": false,
           "description": "Tolerate a missing file instead of failing the step."
+        }
+      }
+    },
+    "outcomeResult": {
+      "enum": [
+        "complete",
+        "continue",
+        "retryable",
+        "fail"
+      ],
+      "description": "What an exit code MEANS for this step. complete: the work is done, the step succeeds however it exited. continue: the step did its job and reports there is more to do - NOT a failure, so on_error does not fire and no retry is considered; route on the label. retryable: a failure worth another attempt, whatever the text says - under retry_on: transient this retries, replacing the needle-matching guess rather than adding to it. fail: a failure that is final, never retried under retry_on: transient. Deliberately tiny and domain-free: sfh learns only whether to carry on, retry or stop. Added in v1.4.0."
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "result"
+      ],
+      "description": "One exit-code-to-meaning declaration. Added in v1.4.0.",
+      "properties": {
+        "result": {
+          "$ref": "#/definitions/outcomeResult"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A free-form single-line name for this outcome. sfh stores it, exposes it as {{steps.<id>.label}}, routes on it with when_label_is:, records it in step_end - and never assigns it any meaning of its own. This is where everything domain-shaped goes, so the harness itself stays generic."
         }
       }
     }

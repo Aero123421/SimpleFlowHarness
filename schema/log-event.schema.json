@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.3.0/schema/log-event.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.4.0/schema/log-event.schema.json",
   "title": "sfh durable log event",
   "description": "One JSON object from a run directory's append-only log.jsonl. Readers must ignore unknown properties for forward compatibility.",
   "type": "object",
@@ -186,6 +186,27 @@
       "type": "integer",
       "minimum": 0,
       "description": "budget_carried: active run seconds the ancestor spent, counted against wall_clock_sec. Added in v1.3.0."
+    },
+    "outcome": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "complete",
+        "continue",
+        "retryable",
+        "fail",
+        null
+      ],
+      "description": "step_end: what this step's exit code was DECLARED to mean by its outcomes: table, or null when the flow declared nothing for that code. Persisted so a resumed run routes on the same answer the live one did instead of re-deriving it from an exit code sfh may already have normalized. Added in v1.4.0."
+    },
+    "outcome_label": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "step_end: the free-form label from that same entry. sfh records and compares it and never interprets it. Added in v1.4.0."
     }
   },
   "allOf": [

@@ -44,7 +44,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、展開、`PATH` 設定までを行います。
 実行前に [Shell版](installers/sfh-installer.sh) および [PowerShell版](installers/sfh-installer.ps1) の内容を確認できます。
 バージョン固定や設定変更オプション:
-- `SFH_VERSION=1.3.0`: 特定のバージョンに固定。
+- `SFH_VERSION=1.4.0`: 特定のバージョンに固定。
 - `SFH_INSTALL_DIR=/path/to/bin`: インストール先ディレクトリの指定。
 - `SFH_NO_MODIFY_PATH=1`: 永続的な `PATH` 変更を無効化。
 
@@ -267,6 +267,41 @@ steps:
 `rerun` が既定で、これまでの release と同じ挙動です。`stuck`（exit 4）と `fail`（exit 1）は何も起動せず、workspace と部分成果物をそのまま残し、`SFH_REPLAY_REFUSED` を返します。
 
 これは retry（同じ invocation の再試行）でも、fallback（別 profile）でも、route による再入場でも、完了済み step の結果の再利用でもありません。sfh は外部副作用について exactly-once を約束しません。約束するのは、黙って再実行しないことと、不確かな結果を成功と偽らないことです。
+
+### `outcomes:` — exit code は2つの事実を運んでいる（v1.4.0）
+
+「プロセスが正常に終わった」は transport の事実です。「仕事が終わった」は意味の事実で、それをどう綴るかを知っているのはあなただけです。sfh は前者しか読めなかったので、「正常に走ったが受け入れ基準はまだ満たしていない」で exit 2 を返す gate と、クラッシュして exit 2 になった gate を区別できませんでした。その結果 `retry_on: transient` の下で、意図的で正しく再現性のある答えのために重いスイートが再実行され得ました。
+
+```yaml
+- id: gate
+  cmd: ["./scripts/acceptance.sh"]
+  outcomes:
+    2:  {result: continue, label: acceptance_incomplete}
+    10: {result: retryable}
+    20: {result: fail}
+  route:
+    - {when_label_is: acceptance_incomplete, goto: implement}
+    - {goto: end}
+```
+
+| `result` | 意味 |
+|---|---|
+| `complete` | 仕事は終わった。exit code が何であれ step は成功 |
+| `continue` | step は役目を果たし、まだ続きがあると報告している。**失敗ではない**ので `on_error` は発火せず retry も検討されない |
+| `retryable` | text が何と言おうと再試行に値する失敗 |
+| `fail` | 最終的な失敗。`retry_on: transient` でも再試行しない |
+
+語彙は意図的に小さくドメイン非依存です。sfh が学ぶのは「続けるか、再試行するか、止めるか」だけ。ドメインの形をしたものはすべて `label` に入り、sfh はそれを保存し、`{{steps.<id>.label}}` で公開し、`when_label_is:` でルーティングし、`step_end` に記録し、**決して解釈しません**。sfh は「acceptance」が何かを知らないし、知る必要もありません。
+
+`when_label_is:` は「判定を散文から読み取る」ことの決定論的な代替でもあります。`when_last_line_is: PASS` は model が最終行をちょうどその token で終えることに依存しており、一言添えられただけで書式の理由で stuck になります。label は自分で書いた exit code の表から来ます。
+
+保証は3つです。
+
+- **entry の無い exit code は従来どおりの読みを保ちます。** ある code を宣言しても他の code については何も言いません。`outcomes:` を書かない flow は変わりません。
+- **宣言された outcome は retry の推測に上書きします**（足しません）。`retry_on: transient` は通常 provider 障害の text にマッチしますが、exit code の意味を宣言した以上、sfh はそれを疑いません。
+- **protocol の証拠は依然として優先します。** `outcomes:` は「走って報告したコマンド」を記述するものであり、structured protocol が完了しなかった turn を受け入れる免許ではありません。timeout・中断された step では参照されません。
+
+決して一致し得ない rule（どの entry も持たない label、どの entry も宣言していない outcome class）は `validate` のエラーであり、3時間走ったあとの驚きではありません。
 
 ### `--carry-budget-from` — flow 自体が間違っていたとき（v1.3.0）
 

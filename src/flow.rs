@@ -135,6 +135,135 @@ impl ExitConflict {
     }
 }
 
+/// What a particular exit code MEANS for this step.
+///
+/// An exit code carries two different facts at once and sfh could only read
+/// one. "The process ended cleanly" is a transport fact. "The work is done" is
+/// a semantic one, and only the flow author knows how this command spells it.
+/// A gate that exits 2 for "ran fine, the acceptance criteria are not met yet"
+/// was indistinguishable from one that exits 2 because it crashed - so sfh
+/// failed the step, and `retry_on: transient` could then re-run an expensive
+/// suite for a deliberate, correct, reproducible answer.
+///
+/// The vocabulary is deliberately tiny and domain-free. sfh never learns what
+/// "acceptance" or "review" or "incomplete" mean; it learns only whether to
+/// carry on, retry, or stop. Everything domain-shaped goes in `label`, which
+/// sfh stores, exposes and routes on without ever interpreting.
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeResult {
+    /// The work is done. The step succeeds however it exited.
+    Complete,
+    /// The step did its job and reports there is more to do. NOT a failure:
+    /// `on_error` does not fire and no retry is considered. Route on the label.
+    Continue,
+    /// A failure worth another attempt, whatever the text says. Under
+    /// `retry_on: transient` this retries; the declaration replaces the
+    /// needle-matching guess rather than adding to it.
+    Retryable,
+    /// A failure that is final. Never retried under `retry_on: transient`.
+    #[default]
+    Fail,
+}
+
+impl OutcomeResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutcomeResult::Complete => "complete",
+            OutcomeResult::Continue => "continue",
+            OutcomeResult::Retryable => "retryable",
+            OutcomeResult::Fail => "fail",
+        }
+    }
+
+    /// Whether a step ending this way counts as succeeding.
+    pub fn is_success(self) -> bool {
+        matches!(self, OutcomeResult::Complete | OutcomeResult::Continue)
+    }
+}
+
+/// An `outcomes:` key, written as a number or as a quoted number.
+///
+/// YAML gives an integer for `2:` and a string for `"2":`, and a flow written
+/// as JSON - which YAML is a superset of, and which is how a program
+/// generating a flow will most naturally emit one - can only produce the
+/// second, because JSON object keys are always strings. sfh exists to be
+/// driven by other programs, so both spellings have to mean the same thing.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ExitKey(i32);
+
+impl<'de> serde::Deserialize<'de> for ExitKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ExitKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an exit code, written as 2 or \"2\"")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<ExitKey, E> {
+                i32::try_from(v)
+                    .map(ExitKey)
+                    .map_err(|_| E::custom(format!("outcomes key {v} is not a possible exit code")))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ExitKey, E> {
+                i32::try_from(v)
+                    .map(ExitKey)
+                    .map_err(|_| E::custom(format!("outcomes key {v} is not a possible exit code")))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ExitKey, E> {
+                v.trim().parse().map(ExitKey).map_err(|_| {
+                    E::custom(format!(
+                        "outcomes key '{v}' is not an exit code - use the number the command exits with, e.g. 2"
+                    ))
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+fn de_outcomes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<i32, Outcome>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = BTreeMap<i32, Outcome>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of exit code to outcome")
+        }
+        // Walked pair by pair rather than collected into a map first: a map
+        // would silently keep the last of `2:` and `"2":`, which is the one
+        // case where the two spellings must NOT quietly agree. Only the author
+        // knows which they meant.
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut m: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(ExitKey(code)) = m.next_key::<ExitKey>()? {
+                let o: Outcome = m.next_value()?;
+                if out.insert(code, o).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "outcomes declares exit code {code} more than once"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(V)
+}
+
+/// One `exit code -> meaning` declaration.
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Outcome {
+    pub result: OutcomeResult,
+    /// A free-form name for this outcome. sfh stores it, exposes it as
+    /// `{{steps.<id>.label}}`, routes on it with `when_label_is:`, and records
+    /// it in the durable log - and never assigns it any meaning of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// How to treat a step whose effects may have happened even though sfh never
 /// recorded that it finished.
 ///
@@ -584,6 +713,15 @@ pub struct Step {
     /// Overrides `defaults.exit_conflict` for this step.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_conflict: Option<ExitConflict>,
+    /// What this step's own exit codes mean. An exit code with no entry here
+    /// keeps its historical reading exactly, so declaring one code says
+    /// nothing about the others.
+    #[serde(
+        default,
+        deserialize_with = "de_outcomes",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub outcomes: BTreeMap<i32, Outcome>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
@@ -714,6 +852,27 @@ pub struct Route {
     /// file that is missing (or a step that has none, like a fan-out group)
     /// never matches.
     pub when_stderr_matches: Option<String>,
+    /// Exact match against the label an `outcomes:` entry gave this step.
+    ///
+    /// The deterministic alternative to reading a verdict out of prose. A
+    /// `when_last_line_is: PASS` rule depends on the model ending its answer
+    /// on exactly that token and nothing else - one trailing space, one closing
+    /// remark, and the run goes to stuck for a formatting reason. A label comes
+    /// from the flow's own exit-code table, so it is whatever the flow said it
+    /// was. A step with no matching outcome has no label and never matches.
+    ///
+    /// `skip_serializing_if`, unlike the `when_*` fields that predate it: the
+    /// effective-config fingerprint is a serialization of `Flow`, so a field
+    /// that emits `null` for every rule changes the fingerprint of every flow
+    /// that has a `route:` at all - and upgrading sfh would make every existing
+    /// run dir unresumable ("a different effective configuration now") for no
+    /// reason but the upgrade. Same guarantee as `Step::outcomes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_label_is: Option<String>,
+    /// Equality against the outcome class sfh recorded: complete | continue |
+    /// retryable | fail. `skip_serializing_if` for the reason above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_outcome_is: Option<OutcomeResult>,
     /// Count the members of THIS step's fan-out that reported a given verdict.
     /// Only on a `parallel:`/`foreach:` step, and only alone in its rule (see
     /// validate). See `WhenMembers`.
@@ -732,6 +891,8 @@ impl Route {
             && self.when_last_line_matches.is_none()
             && self.when_exit.is_none()
             && self.when_stderr_matches.is_none()
+            && self.when_label_is.is_none()
+            && self.when_outcome_is.is_none()
             && self.when_members.is_none()
     }
 }
@@ -1906,6 +2067,75 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         for (i, r) in s.route.iter().enumerate() {
             check_goto(&format!("step '{}' route[{i}]", s.id), &r.goto)?;
             check_when_members(s, i, r)?;
+            // A rule that can never match is not a smaller version of one that
+            // can - it is a branch the author believes in and will never take.
+            // Catching it here costs nothing; catching it at run time costs
+            // whatever the guarded step was about to spend.
+            // A fan-out step's own recorded result is the GROUP composite: one
+            // exit for the whole lap, and no label, because the group ran no
+            // command. An `outcomes:` table on a foreach describes each ITEM's
+            // launch, which is useful and stays allowed - but a label rule
+            // reading the group would simply never match. Members are judged
+            // with when_members.
+            if (s.is_group() || s.is_foreach())
+                && (r.when_label_is.is_some() || r.when_outcome_is.is_some())
+            {
+                return Err(format!(
+                    "step '{}' route[{i}]: when_label_is/when_outcome_is read this step's OWN outcome, and a parallel:/foreach: step has none - it records the group composite. Judge the members with when_members, or put the rule on a single step",
+                    s.id
+                ));
+            }
+            if let Some(want) = &r.when_label_is {
+                if !s
+                    .outcomes
+                    .values()
+                    .any(|o| o.label.as_deref() == Some(want))
+                    && !want.contains("{{")
+                {
+                    return Err(format!(
+                        "step '{}' route[{i}]: when_label_is '{want}' can never match - no outcomes: entry on this step carries that label",
+                        s.id
+                    ));
+                }
+            }
+            if let Some(want) = r.when_outcome_is {
+                if !s.outcomes.values().any(|o| o.result == want) {
+                    return Err(format!(
+                        "step '{}' route[{i}]: when_outcome_is '{}' can never match - no outcomes: entry on this step declares that result",
+                        s.id,
+                        want.as_str()
+                    ));
+                }
+            }
+            // The same "a branch you believe in and will never take" test, for
+            // the predicate that reads the number rather than the meaning.
+            // `when_exit` compares against the NORMALIZED exit, and an
+            // `outcomes:` entry is exactly what rewrites it: a declared success
+            // makes the step's exit 0, and a declared failure on code 0 makes it
+            // 1. So `outcomes: {2: {result: continue}}` + `when_exit: 2` reads a
+            // number the step can no longer report - silently, and only at run
+            // time. A fan-out records the group composite rather than an item's
+            // code, so its table says nothing about the exit this rule sees.
+            if let Some(want) = r.when_exit {
+                if !s.is_group() && !s.is_foreach() {
+                    if let Some(o) = s.outcomes.get(&want) {
+                        if o.result.is_success() && want != 0 {
+                            return Err(format!(
+                                "step '{}' route[{i}]: when_exit {want} can never match - outcomes[{want}] declares '{}', which sfh records as exit 0. Route on when_outcome_is/when_label_is instead",
+                                s.id,
+                                o.result.as_str()
+                            ));
+                        }
+                        if !o.result.is_success() && want == 0 {
+                            return Err(format!(
+                                "step '{}' route[{i}]: when_exit 0 can never match - outcomes[0] declares '{}', which sfh records as exit 1",
+                                s.id,
+                                o.result.as_str()
+                            ));
+                        }
+                    }
+                }
+            }
             for rx in [
                 &r.when_matches,
                 &r.when_last_line_matches,
@@ -1967,6 +2197,43 @@ fn positive_u32(ctx: &str, value: Option<u32>) -> Result<(), String> {
     }
 }
 
+/// Everything about an `outcomes:` table that can be settled without running
+/// anything. All of it fails the flow: an exit-code table is the one place a
+/// typo silently changes what "done" means, and a run is exactly the wrong
+/// moment to discover that.
+fn check_outcomes(s: &Step) -> Result<(), String> {
+    for (code, o) in &s.outcomes {
+        let at = format!("step '{}' outcomes[{code}]", s.id);
+        if let Some(label) = &o.label {
+            if label.trim().is_empty() {
+                return Err(format!(
+                    "{at}: label is empty - omit it, or give it a name a route can match"
+                ));
+            }
+            if label.contains('\n') || label.contains('\r') {
+                return Err(format!(
+                    "{at}: label must be a single line, because it is compared for equality and recorded as one field"
+                ));
+            }
+        }
+        // Retrying a success is not a policy, it is a contradiction: the step
+        // would be re-run precisely because it worked.
+        if *code == 0 && o.result == OutcomeResult::Retryable {
+            return Err(format!(
+                "{at}: exit 0 cannot be retryable - a retry answers a failure, and this says the step succeeded"
+            ));
+        }
+        // sfh kills a step it decided to stop; -1 is its own marker for "no
+        // process produced this", not something a command can exit with.
+        if *code < 0 {
+            return Err(format!(
+                "{at}: exit codes below 0 are sfh's own markers for a step that never ran, so a flow cannot declare what they mean"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Everything about a `when_members` rule that can be settled without running
 /// anything. All of it fails the flow rather than warning: a route rule that
 /// cannot match is not a smaller version of one that can, it is a branch the
@@ -2000,6 +2267,8 @@ fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
         ("when_last_line_matches", r.when_last_line_matches.is_some()),
         ("when_exit", r.when_exit.is_some()),
         ("when_stderr_matches", r.when_stderr_matches.is_some()),
+        ("when_label_is", r.when_label_is.is_some()),
+        ("when_outcome_is", r.when_outcome_is.is_some()),
     ] {
         if present {
             return Err(format!(
@@ -2545,6 +2814,13 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
     // legacy-era resume restores the pre-1.0 write default instead (load_lenient).
     let require_access = !legacy;
     let sid = &s.id;
+    // Here rather than in `validate`'s top-level loop: a parallel: CHILD runs a
+    // command and honours its own `outcomes:` table exactly like a lone step, so
+    // it needs the same table checks. Checking only the outer loop let a child
+    // declare `0: {result: retryable}` - which forces its clean exit to 1 and
+    // then retries the step precisely because it worked - and a multi-line label
+    // that no route can ever equal, both with a clean `sfh validate`.
+    check_outcomes(s)?;
     positive_u64(&format!("step '{sid}'.timeout_sec"), s.timeout_sec)?;
     positive_u32(&format!("step '{sid}'.max_visits"), s.max_visits)?;
     positive_u64(
@@ -2599,6 +2875,12 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             || !s.env.is_empty()
             || !s.env_remove.is_empty()
             || s.allow_empty.is_some()
+            // A group runs no command of its own, so it has no exit code for a
+            // table to describe. Accepting one silently would leave a
+            // `when_label_is:` rule that validate approves - the label really
+            // is declared - and that can never match at run time, which is the
+            // worst of both answers.
+            || !s.outcomes.is_empty()
         {
             return Err(format!(
                 "step '{sid}': a parallel: group carries only id/max_parallel/route/on_error/max_visits/on_max_visits/notes (tool settings go on the children)"
@@ -3587,15 +3869,21 @@ mod tests {
     /// unresumable.
     ///
     /// `--resume` compares an effective-config fingerprint that is a
-    /// serialization of `Flow`. Every field added in v1.2 is therefore
+    /// serialization of `Flow`. Every field added since v1.2 is therefore
     /// `skip_serializing_if`-guarded, so a flow that uses none of them
     /// serializes to exactly the bytes 1.1 produced. This test pins the
-    /// property rather than the bytes: no v1.2 key may appear in the projection
-    /// of a flow that does not use it.
+    /// property rather than the bytes: no post-1.1 key may appear in the
+    /// projection of a flow that does not use it.
+    ///
+    /// The fixture carries a `route:` deliberately. A new `Route` field that
+    /// serializes `null` costs nothing to add and breaks EVERY existing run of
+    /// EVERY flow with a route - the widest possible blast radius - and a
+    /// fixture without routes cannot see it (v1.4.0's `when_label_is` /
+    /// `when_outcome_is` shipped unguarded for exactly that reason).
     #[test]
     fn a_flow_using_no_v1_2_keys_serializes_as_it_did_before_v1_2() {
         let f: Flow = yaml::from_str(
-            "name: legacy\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
+            "name: legacy\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    route:\n      - {when_last_line_is: hi, goto: b}\n      - {goto: end}\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
         )
         .unwrap();
         let json = f.effective_config_json().unwrap();
@@ -3608,6 +3896,9 @@ mod tests {
             "\"replay\"",
             "\"max_context_chars\"",
             "\"exit_conflict\"",
+            "\"outcomes\"",
+            "\"when_label_is\"",
+            "\"when_outcome_is\"",
         ] {
             assert!(
                 !json.contains(key),
@@ -3643,6 +3934,156 @@ mod tests {
         let silent: Flow =
             yaml::from_str("steps:\n  - id: a\n    tool: pi\n    prompt: x\n").unwrap();
         assert_eq!(silent.steps[0].exit_conflict(&silent), None);
+    }
+
+    #[test]
+    fn an_outcomes_table_is_checked_before_anything_runs() {
+        let ok: Result<Flow, _> = yaml::from_str(
+            "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: acceptance_incomplete}\n      10: {result: retryable}\n    route:\n      - {when_label_is: acceptance_incomplete, goto: end}\n      - {when_outcome_is: retryable, goto: fail}\n      - {goto: end}\n",
+        );
+        assert!(validate(&ok.unwrap(), false).is_ok());
+
+        // Each of these is a rule the author believes in and would never take,
+        // or a table entry that cannot mean what it says.
+        for (why, src) in [
+            (
+                "a label no outcome carries",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: incomplete}\n    route:\n      - {when_label_is: typo, goto: end}\n      - {goto: end}\n",
+            ),
+            (
+                "an outcome class no entry declares",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue}\n    route:\n      - {when_outcome_is: retryable, goto: end}\n      - {goto: end}\n",
+            ),
+            (
+                "retrying a success",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      0: {result: retryable}\n",
+            ),
+            (
+                "an empty label",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: \"  \"}\n",
+            ),
+            (
+                "sfh's own no-process marker",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      -1: {result: complete}\n",
+            ),
+            // A parallel: CHILD honours its own table at run time exactly like a
+            // lone step, so it gets the same checks. It used to get none: the
+            // table below made a clean `echo` exit 1 and then retried it
+            // *because* it had worked, and `sfh validate` said OK.
+            (
+                "a child retrying its own success",
+                "steps:\n  - id: fan\n    parallel:\n      - id: a\n        cmd: [\"echo\", \"hi\"]\n        outcomes:\n          0: {result: retryable}\n",
+            ),
+            (
+                "a child's multi-line label",
+                "steps:\n  - id: fan\n    parallel:\n      - id: a\n        cmd: [\"echo\", \"hi\"]\n        outcomes:\n          2: {result: continue, label: \"two\\nlines\"}\n",
+            ),
+            // `when_exit` reads the NORMALIZED exit, and an outcomes: entry is
+            // what normalizes it - so these two rules read a number the step can
+            // no longer report.
+            (
+                "when_exit on a code a declared success rewrites to 0",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: more}\n    route:\n      - {when_exit: 2, goto: end}\n      - {goto: end}\n",
+            ),
+            (
+                "when_exit 0 on a code a declared failure rewrites to 1",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      0: {result: fail}\n    route:\n      - {when_exit: 0, goto: end}\n      - {goto: end}\n",
+            ),
+        ] {
+            let f: Flow = yaml::from_str(src).expect("fixture parses");
+            assert!(validate(&f, false).is_err(), "{why} must be refused");
+        }
+
+        // ...but a declared failure leaves its own code alone, so reading it
+        // back with when_exit is exactly right and stays allowed.
+        let retryable: Flow = yaml::from_str(
+            "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    on_error: continue\n    outcomes:\n      10: {result: retryable}\n    route:\n      - {when_exit: 10, goto: end}\n      - {goto: end}\n",
+        )
+        .expect("fixture parses");
+        assert!(validate(&retryable, false).is_ok());
+    }
+
+    #[test]
+    fn an_outcomes_key_means_the_same_written_as_a_number_or_a_string() {
+        // A program generating a flow will most naturally emit JSON, where
+        // object keys are always strings - and YAML is a superset of JSON, so
+        // sfh parses that file. The two spellings have to agree.
+        let numeric: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      2: {result: continue, label: more}\n",
+        )
+        .unwrap();
+        let quoted: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      \"2\": {result: continue, label: more}\n",
+        )
+        .unwrap();
+        let json: Flow = yaml::from_str(
+            r#"{"steps":[{"id":"a","cmd":["echo","hi"],"outcomes":{"2":{"result":"continue","label":"more"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(numeric.steps[0].outcomes, quoted.steps[0].outcomes);
+        assert_eq!(numeric.steps[0].outcomes, json.steps[0].outcomes);
+        assert_eq!(
+            numeric.steps[0].outcomes.get(&2).unwrap().label.as_deref(),
+            Some("more")
+        );
+        // Two spellings of one code is a contradiction, not a merge.
+        assert!(yaml::from_str::<Flow>(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      2: {result: continue}\n      \"2\": {result: fail}\n",
+        )
+        .is_err());
+        // And a key that is not an exit code says so in those words.
+        let e = match yaml::from_str::<Flow>(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      ok: {result: continue}\n",
+        ) {
+            Ok(_) => panic!("a non-numeric outcomes key must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("is not an exit code"), "{e}");
+    }
+
+    #[test]
+    fn a_fan_out_step_has_no_outcome_of_its_own_to_route_on() {
+        // The trap this closes: the group records a COMPOSITE exit and no
+        // label, so a `when_label_is` rule whose label really is declared
+        // passes the "can it ever match" check and then never fires. Both
+        // halves of the answer were wrong at once.
+        let group = parse(
+            "name: t\nsteps:\n  - id: fan\n    outcomes:\n      2: {result: continue, label: partial}\n    parallel:\n      - {id: a, cmd: [\"echo\", \"hi\"]}\n",
+        )
+        .unwrap_err();
+        assert!(group.contains("carries only"), "{group}");
+
+        // A foreach's table describes each ITEM's launch, which is useful, so
+        // the table stays - only the rule that reads the group is refused.
+        let rule = parse(
+            "name: t\nvars: {i: \"a\"}\nsteps:\n  - id: each\n    foreach: {from: \"{{vars.i}}\", split: lines}\n    cmd: [\"echo\", \"{{item}}\"]\n    outcomes:\n      2: {result: continue, label: partial}\n    route:\n      - {when_label_is: partial, goto: end}\n      - {goto: end}\n",
+        )
+        .unwrap_err();
+        assert!(rule.contains("group composite"), "{rule}");
+        assert!(parse(
+            "name: t\nvars: {i: \"a\"}\nsteps:\n  - id: each\n    foreach: {from: \"{{vars.i}}\", split: lines}\n    cmd: [\"echo\", \"{{item}}\"]\n    outcomes:\n      2: {result: continue, label: partial}\n",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn an_outcome_class_says_only_whether_to_carry_on_retry_or_stop() {
+        // The vocabulary stays tiny and domain-free on purpose: everything
+        // domain-shaped belongs in the label, which sfh never interprets.
+        assert!(OutcomeResult::Complete.is_success());
+        assert!(OutcomeResult::Continue.is_success());
+        assert!(!OutcomeResult::Retryable.is_success());
+        assert!(!OutcomeResult::Fail.is_success());
+        assert_eq!(OutcomeResult::default(), OutcomeResult::Fail);
+        for r in [
+            OutcomeResult::Complete,
+            OutcomeResult::Continue,
+            OutcomeResult::Retryable,
+            OutcomeResult::Fail,
+        ] {
+            let round: OutcomeResult = yaml::from_str(r.as_str()).expect("round-trips");
+            assert_eq!(round, r);
+        }
     }
 
     #[test]

@@ -1454,6 +1454,16 @@ fn kill_tree(child: &mut Child) {
 }
 
 /// Classify a failure as transient (worth retrying) from the tool's own output.
+///
+/// Every needle below names a way a PROVIDER can fail: a rate limit, a 5xx, a
+/// dropped socket, a serving-side abort. That is what `retry_on: transient`
+/// exists for, and matching it against an AI CLI's own report is sound.
+///
+/// It is not sound against arbitrary program output, which is why the caller
+/// decides what counts as the tool's report (see `leaf`): a `cmd:` step's
+/// STDOUT is its RESULT - the test list, the diff, the JSON - and a test named
+/// `tcp_502_returns_error` failing deterministically is not a rate limit. sfh
+/// used to re-run the whole verification suite for exactly that reason.
 pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
     const NEEDLES: [&str; 22] = [
         "429",

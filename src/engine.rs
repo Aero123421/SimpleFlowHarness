@@ -599,6 +599,7 @@ fn precheck(
                 &r.when_last_line_is,
                 &r.when_last_line_matches,
                 &r.when_stderr_matches,
+                &r.when_label_is,
             ]
             .into_iter()
             .flatten()
@@ -1529,6 +1530,16 @@ fn load_resume_for_flow(
                         output_file: file,
                         exit,
                         stderr_file,
+                        outcome: v
+                            .get("outcome")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        label: v
+                            .get("outcome_label")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     },
                 );
                 if !is_child {
@@ -4198,6 +4209,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             output_file: d.out_file.display().to_string(),
                             exit: d.exit_code,
                             stderr_file: stderr_file_for(&d.out_file).display().to_string(),
+                            outcome: outcome_name(d),
+                            label: outcome_label(d),
                         },
                     );
                     if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
@@ -4747,6 +4760,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         output_file: d.out_file.display().to_string(),
                         exit: d.exit_code,
                         stderr_file: stderr_file_for(&d.out_file).display().to_string(),
+                        outcome: outcome_name(d),
+                        label: outcome_label(d),
                     },
                 );
                 let rt = d.chain_output.clone();
@@ -5549,9 +5564,34 @@ fn write_aggregate(
             output_file: gfile.display().to_string(),
             exit: if failed { 1 } else { 0 },
             stderr_file: String::new(),
+            // A fan-out group runs no command of its own, so it has no exit
+            // code for an `outcomes:` table to describe.
+            outcome: String::new(),
+            label: String::new(),
         },
     );
     Ok(())
+}
+
+/// The outcome class an `outcomes:` entry gave a finished leaf, as text.
+///
+/// Empty when the flow declared nothing for the code the step exited with,
+/// which is the ordinary case and the reason routing on it fails closed rather
+/// than matching a default.
+fn outcome_name(d: &leaf::LeafDone) -> String {
+    d.outcome
+        .as_ref()
+        .map(|(r, _)| r.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// The free-form label from that same entry. sfh stores and compares it and
+/// never interprets it.
+fn outcome_label(d: &leaf::LeafDone) -> String {
+    d.outcome
+        .as_ref()
+        .and_then(|(_, l)| l.clone())
+        .unwrap_or_default()
 }
 
 fn note_marker(step: &str, visit: u32, output: &str) -> String {
@@ -5778,6 +5818,9 @@ fn prepare_compact(
         // keeps its own adapter default rather than inheriting a licence the
         // flow granted to something else.
         exit_conflict: None,
+        // Same reasoning: the step's exit-code table describes the command that
+        // step runs, not the summarizer sfh launches on its behalf.
+        outcomes: BTreeMap::new(),
         retry: leaf::RetryCfg::default(),
         run_clock: Some(Arc::clone(run_clock)),
         quiet: *quiet,
@@ -5966,6 +6009,8 @@ fn dry_run(
                     output_file: format!("[[steps.{id}.output_file]]"),
                     exit: 0,
                     stderr_file: format!("[[steps.{id}.stderr_file]]"),
+                    outcome: format!("[[steps.{id}.outcome]]"),
+                    label: format!("[[steps.{id}.label]]"),
                 },
             )
         })
@@ -6185,6 +6230,16 @@ fn dry_run(
             }
             if let Some(c) = &r.when_stderr_matches {
                 cond.push(format!("stderr matches {c:?}"));
+            }
+            // A predicate missing from this list prints as "always", which is
+            // not a cosmetic slip: the plan then shows two unconditional rules
+            // on one step - a shape `validate` refuses - and the reader cannot
+            // see which branch the flow will actually take.
+            if let Some(c) = &r.when_label_is {
+                cond.push(format!("label is {c:?}"));
+            }
+            if let Some(c) = &r.when_outcome_is {
+                cond.push(format!("outcome is {}", c.as_str()));
             }
             if let Some(m) = &r.when_members {
                 let quantifier = match (m.all, m.at_least) {
@@ -6811,6 +6866,23 @@ fn evaluate_route(
             }
         }
         if matched {
+            if let Some(want) = &r.when_label_is {
+                // Rendered like the other text conditions, then compared for
+                // equality. A step with no declared outcome has no label, and
+                // an empty label never matches - fail closed, the same way
+                // when_exit does without a recorded output.
+                let want = template::render(want, ctx)?;
+                let got = ctx.outputs.get(&step.id).map(|o| o.label.as_str());
+                matched = !want.is_empty() && got == Some(want.as_str());
+            }
+        }
+        if matched {
+            if let Some(want) = r.when_outcome_is {
+                matched =
+                    ctx.outputs.get(&step.id).map(|o| o.outcome.as_str()) == Some(want.as_str());
+            }
+        }
+        if matched {
             if let Some(t) = &r.when_stderr_matches {
                 let t = template::render(t, ctx)?;
                 let rx = regex::Regex::new(&t)
@@ -6987,6 +7059,13 @@ fn log_step_end_with_next(
             "terminal_success": d.protocol.terminal_success,
             "final_message_seen": d.protocol.final_message_seen,
             "malformed_records": d.protocol.malformed_records,
+            // What this step's exit code was DECLARED to mean, when the flow
+            // said. Persisted so a resumed run routes on the same answer the
+            // live one did instead of re-deriving it from an exit code sfh may
+            // already have normalized. Null for the ordinary step, and for
+            // every run written before these keys existed.
+            "outcome": d.outcome.as_ref().map(|(r, _)| r.as_str()),
+            "outcome_label": d.outcome.as_ref().and_then(|(_, l)| l.clone()),
             // Which OS produced this step. A log is routinely read on a
             // different machine from the one that wrote it, and "it passes on
             // mine" is exactly the class of report this answers.
@@ -7284,6 +7363,8 @@ mod tests {
             when_last_line_is: when_last_line_is.map(String::from),
             when_last_line_matches: None,
             when_exit: None,
+            when_label_is: None,
+            when_outcome_is: None,
             when_stderr_matches: None,
             when_members: None,
             goto: "end".to_string(),
@@ -7353,6 +7434,8 @@ mod tests {
             output_file: String::new(),
             exit,
             stderr_file: stderr_file.to_string(),
+            outcome: String::new(),
+            label: String::new(),
         }
     }
 

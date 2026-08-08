@@ -5945,6 +5945,172 @@ contains "carry: so the fleet total is money spent, not money counted twice" \
 contains "carry: a failed run's envelope offers resume" '"resume"' carry-json.out
 contains "carry: and offers carrying the budget into a corrected flow" '"carry_budget"' carry-json.out
 
+# --- a command's stdout is its result, not a report about the harness --------
+# retry_on: transient scans for provider failures - rate limits, 5xx, dropped
+# sockets. Scanning a custom command's STDOUT for those reads its data as if it
+# were a statement about the run: a verification suite containing a case named
+# `tcp_502_returns_error` had its whole (expensive, deterministic) run repeated
+# on every genuine failure, for a match on the word 502 inside a test name.
+cat > transient.yaml <<'YAML'
+api_version: 1
+name: transient
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: verify
+    cmd: ["sh", "-c", "echo 'test tcp_502_returns_error ... FAILED'; echo '1 failed, 292 passed'; exit 2"]
+YAML
+"$SFH" run transient.yaml --runs-dir "$WORK_NATIVE/transient-runs" > transient.out 2>&1
+check "transient: a deterministic command failure still fails" 1 $?
+not_contains "transient: a test name mentioning 502 does not re-run the suite" \
+  "transient failure" transient.out
+TRANSIENT_RUNS="$(grep -cF '"event":"step_end"' "$(ls -d "$WORK"/transient-runs/*/ | head -1)"/log.jsonl)"
+check "transient: so the command ran exactly once" 1 "$TRANSIENT_RUNS"
+
+# stderr is still read for a command, because that is where a program reports
+# operational trouble - and that really is the transient case.
+cat > transient-net.yaml <<'YAML'
+api_version: 1
+name: transientnet
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: fetch
+    cmd: ["sh", "-c", "echo 'curl: (56) connection reset by peer' >&2; exit 7"]
+YAML
+"$SFH" run transient-net.yaml --runs-dir "$WORK_NATIVE/transient-net-runs" > transient-net.out 2>&1
+check "transient: a genuine network failure still fails after its retry" 1 $?
+contains "transient: and it really was retried" "transient failure" transient-net.out
+
+# A preset step's chain output IS the tool's own report, so it keeps being read.
+cat > transient-tool.yaml <<YAML
+api_version: 1
+name: transienttool
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: ask
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    prompt: "go"
+    args: ["--stub-exit", "1", "--stub-quote", "429 rate limit exceeded"]
+YAML
+"$SFH" run transient-tool.yaml --runs-dir "$WORK_NATIVE/transient-tool-runs" > transient-tool.out 2>&1
+contains "transient: a preset tool reporting a rate limit is still retried" \
+  "transient failure" transient-tool.out
+
+# --- outcomes: an exit code carries two facts and sfh could only read one ----
+# "The process ended cleanly" is transport. "The work is done" is semantics. A
+# gate that exits 2 for "ran fine, the acceptance criteria are not met yet" was
+# indistinguishable from one that exits 2 because it crashed, so sfh failed the
+# step - and under retry_on: transient could re-run an expensive suite for a
+# deliberate, correct, reproducible answer.
+cat > outcomes.yaml <<YAML
+api_version: 1
+name: outcomes
+defaults:
+  retry: {max: 2, backoff_sec: 1}
+  max_visits: 4
+steps:
+  - id: gate
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "GATE", "--stub-exit", "2"]
+    outcomes:
+      2: {result: continue, label: acceptance_incomplete}
+    route:
+      - {when_label_is: acceptance_incomplete, goto: review}
+      - {goto: end}
+  - id: review
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "REVIEWED"]
+    route: [{goto: end}]
+YAML
+"$SFH" run outcomes.yaml --runs-dir "$WORK_NATIVE/outcomes-runs" > outcomes.out 2>&1
+check "outcomes: a declared 'continue' is not a failure" 0 $?
+contains "outcomes: and the run carried on to the labelled route" "REVIEWED" outcomes.out
+not_contains "outcomes: a deliberate answer is never retried" "transient failure" outcomes.out
+OUT_RUN="$(ls -d "$WORK"/outcomes-runs/*/ | head -1)"
+# The claim "no retry was considered" is what this counts: `continue` is not a
+# failure, so the gate must have been launched exactly once even though the
+# flow allows two retries and the process exited non-zero.
+GATE_RUNS="$(grep -F '"step":"gate"' "$OUT_RUN/log.jsonl" | grep -cF '"event":"step_end"')"
+check "outcomes: so the gate ran exactly once" 1 "$GATE_RUNS"
+contains "outcomes: the class is durable in step_end" '"outcome":"continue"' "$OUT_RUN/log.jsonl"
+contains "outcomes: and so is the label sfh never interprets" \
+  '"outcome_label":"acceptance_incomplete"' "$OUT_RUN/log.jsonl"
+
+# The same exit code, undeclared, keeps its historical reading exactly. Written
+# out rather than sed-ed out of the flow above: `sed '/re/,+1d'` is a GNU
+# extension that BSD sed (the macOS leg of CI) rejects outright, which would
+# have left this check running against an empty file.
+cat > outcomes-bare.yaml <<YAML
+api_version: 1
+name: outcomes
+defaults:
+  retry: {max: 2, backoff_sec: 1}
+  max_visits: 4
+steps:
+  - id: gate
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "GATE", "--stub-exit", "2"]
+    route:
+      - {goto: end}
+  - id: review
+    cmd: ["$STUB_BIN", "--stub-plain", "--stub-last-line", "REVIEWED"]
+    route: [{goto: end}]
+YAML
+"$SFH" run outcomes-bare.yaml --runs-dir "$WORK_NATIVE/outcomes-bare-runs" -q > outcomes-bare.out 2>&1
+check "outcomes: without the table, exit 2 still fails the step" 1 $?
+
+# retryable replaces the needle guess rather than adding to it.
+cat > outcomes-retry.yaml <<YAML
+api_version: 1
+name: outcomesretry
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: fetch
+    cmd: ["sh", "-c", "echo 'deterministic bad input' >&2; exit 10"]
+    outcomes:
+      10: {result: retryable}
+YAML
+"$SFH" run outcomes-retry.yaml --runs-dir "$WORK_NATIVE/outcomes-retry-runs" > outcomes-retry.out 2>&1
+check "outcomes: a declared retryable still fails after its retries" 1 $?
+contains "outcomes: and it really was retried, with no needle in sight" \
+  "transient failure" outcomes-retry.out
+
+# ...and 'fail' means never, even when the text looks transient.
+cat > outcomes-final.yaml <<YAML
+api_version: 1
+name: outcomesfinal
+defaults:
+  retry: {max: 1, backoff_sec: 1}
+steps:
+  - id: fetch
+    cmd: ["sh", "-c", "echo 'connection reset by peer' >&2; exit 20"]
+    outcomes:
+      20: {result: fail}
+YAML
+"$SFH" run outcomes-final.yaml --runs-dir "$WORK_NATIVE/outcomes-final-runs" > outcomes-final.out 2>&1
+check "outcomes: a declared final failure fails" 1 $?
+not_contains "outcomes: and is not retried despite transient-looking stderr" \
+  "transient failure" outcomes-final.out
+
+# A rule that can never match is caught before anything is spent.
+cat > outcomes-bad.yaml <<'YAML'
+api_version: 1
+name: outcomesbad
+steps:
+  - id: gate
+    cmd: ["sh", "-c", "true"]
+    outcomes:
+      2: {result: continue, label: incomplete}
+    route:
+      - {when_label_is: typo, goto: end}
+      - {goto: end}
+YAML
+"$SFH" validate outcomes-bad.yaml > outcomes-bad.out 2>&1
+check "outcomes: a label no entry carries is a validation error" 2 $?
+contains "outcomes: and the error says it can never match" "can never match" outcomes-bad.out
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
