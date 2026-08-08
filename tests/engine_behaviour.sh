@@ -5743,6 +5743,34 @@ else
   fail=$((fail + 1))
 fi
 
+# --- the documented context_delivery: file pattern actually validates --------
+# v1.2.0 shipped `context_delivery: file` telling you to point the prompt at
+# {{context_file}}, and its own template precheck rejected both {{context}} and
+# {{context_file}} as unknown keys - so the documented pattern failed `validate`
+# and never reached a run. The runtime defines both unconditionally, and a
+# validator that refuses what the runtime accepts is as wrong as the reverse.
+cat > ctx-builtins.yaml <<YAML
+api_version: 1
+name: ctx-builtins
+contexts:
+  task: {inline: "do the thing"}
+steps:
+  - id: use_file
+    context: [task]
+    context_delivery: file
+    cmd: ["$STUB_BIN", "--stub-plain"]
+    prompt: "read {{context_file}}"
+  - id: use_inline
+    cmd: ["$STUB_BIN", "--stub-plain"]
+    prompt: "the context was: {{context}}"
+YAML
+"$SFH" validate ctx-builtins.yaml > ctx-b.out 2>&1
+check "context: {{context_file}} and {{context}} pass validation" 0 $?
+"$SFH" run ctx-builtins.yaml --runs-dir "$WORK_NATIVE/ctx-b-runs" -q > ctx-b-run.out 2>&1
+check "context: and the documented file-delivery pattern runs" 0 $?
+# A step naming no context still renders both, as the runtime always has.
+not_contains "context: no step failed on an unknown template key" "unknown template key" ctx-b.out
+
 echo
 echo "engine behaviour: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

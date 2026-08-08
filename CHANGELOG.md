@@ -58,6 +58,14 @@ v1.2.0を実運用へ投入して見つかった4件の穴を塞ぐrelease。新
   `&lt;`にします。触るのはこの4 tokenだけで、他の文字・記号・codeは1 byteも変わりま
   せん。何も削除しません。
 
+### `{{context_file}}` / `{{context}}` が validate を通るようになりました
+
+- v1.2.0は`context_delivery: file`を「promptから`{{context_file}}`を指せ」と文書化
+  しながら、自身のtemplate precheckが`context`と`context_file`をunknown keyとして
+  拒否していました。文書どおりのflowが`sfh validate`で落ち、runにも到達しません
+  でした。runtimeは両方を常に定義しています（contextを持たないstepでは空文字列）。
+  precheckをruntimeに揃えました。
+
 ### preflightが報告するpathが、実際に起動されるpathと一致するようになりました
 
 - `which()`はWindowsで拡張子なしの候補も返していましたが、実行側はそれを起動しません

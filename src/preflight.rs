@@ -284,17 +284,42 @@ fn probe_command(program: &str, steps: BTreeSet<String>) -> CommandReport {
             )],
         };
     }
+    let has_separator = program.contains('/') || program.contains('\\');
+    // A RELATIVE path is resolved by the OS against the process's working
+    // directory, and at run time that is the step's `cwd:` or the managed
+    // workspace - neither of which exists yet, and neither of which is
+    // preflight's own cwd. `./scripts/verify.sh` is perfectly correct for a
+    // flow whose steps run in a worktree, so checking it here would block a
+    // working flow for a fact preflight is in no position to know.
+    if has_separator && !Path::new(program).is_absolute() {
+        return CommandReport {
+            program: program.to_string(),
+            resolved_path: None,
+            steps,
+            templated: false,
+            blockers,
+            warnings: vec![format!(
+                "'{program}' ({where_}) is relative, so it resolves against the step's working directory at run time - preflight cannot check it from here"
+            )],
+        };
+    }
     let resolved_path = execute::which(program);
     match &resolved_path {
+        None if has_separator => blockers.push(format!(
+            "'{program}' ({where_}) does not exist - this flow cannot start without it"
+        )),
         None => blockers.push(format!(
             "'{program}' ({where_}) is not on PATH - this flow cannot start without it"
         )),
         Some(path) => {
-            // Only for a BARE name: PATH made this choice, not the flow author.
-            // A path or an explicit `wsl` invocation is a deliberate statement
-            // and sfh does not second-guess it.
-            let bare = !program.contains('/') && !program.contains('\\');
-            if bare && execute::is_wsl_launcher(path) {
+            // Only when PATH made the choice, and only for a name that asked
+            // for a shell. Writing `wsl` is a deliberate statement about which
+            // OS should run the command, and writing a full path is another;
+            // sfh second-guesses neither. Writing `bash` is not a statement
+            // about WSL at all - it is a request for a shell that PATH quietly
+            // answered with a different operating system.
+            let asked_for_a_shell = matches!(program, "bash" | "sh");
+            if !has_separator && asked_for_a_shell && execute::is_wsl_launcher(path) {
                 blockers.push(format!(
                     "'{program}' ({where_}) resolves to {path}, which starts WSL - a different \
                      operating system. It cannot read this checkout's Windows paths, and a git \
@@ -659,6 +684,45 @@ mod tests {
                 .iter()
                 .any(|b| b.contains("not on PATH") && b.contains("build, verify")),
             "{:?}",
+            c.blockers
+        );
+    }
+
+    #[test]
+    fn a_relative_cmd_program_is_not_judged_against_preflights_own_directory() {
+        // The step will run in its `cwd:` or in the managed workspace, neither
+        // of which exists yet. Blocking here would refuse a correct flow for a
+        // fact preflight is in no position to know.
+        for p in ["./scripts/verify.sh", "..\\tools\\build.cmd"] {
+            let c = probe_command(p, ["verify".to_string()].into_iter().collect());
+            assert!(c.blockers.is_empty(), "{p}: {:?}", c.blockers);
+            assert_eq!(c.warnings.len(), 1, "{p}: {:?}", c.warnings);
+            assert!(c.warnings[0].contains("relative"), "{:?}", c.warnings);
+        }
+        // An absolute path CAN be checked from here, so a missing one blocks.
+        let missing = if cfg!(windows) {
+            r"C:\definitely\not\here-9d3f.exe"
+        } else {
+            "/definitely/not/here-9d3f"
+        };
+        let c = probe_command(missing, ["verify".to_string()].into_iter().collect());
+        assert!(
+            c.blockers.iter().any(|b| b.contains("does not exist")),
+            "{:?}",
+            c.blockers
+        );
+    }
+
+    #[test]
+    fn only_a_bare_shell_name_is_refused_for_landing_on_the_wsl_launcher() {
+        // Asking for `wsl` is a deliberate statement about which OS should run
+        // the command. Asking for `bash` is not - it is a request for a shell
+        // that PATH quietly answered with a different operating system.
+        assert!(execute::is_wsl_launcher(r"C:\Windows\System32\wsl.exe"));
+        let c = probe_command("wsl", ["verify".to_string()].into_iter().collect());
+        assert!(
+            !c.blockers.iter().any(|b| b.contains("starts WSL")),
+            "an explicit wsl invocation must not be second-guessed: {:?}",
             c.blockers
         );
     }

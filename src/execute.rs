@@ -1287,12 +1287,20 @@ pub fn which(name: &str) -> Option<String> {
         return direct.is_file().then(|| name.to_string());
     }
     // The extension list has to be the one `resolve_program` uses at spawn
-    // time, or preflight reports a path the run would not actually launch. On
-    // Windows `Command::new` finds only `.exe`, and sfh's own resolver adds the
-    // npm shim extensions - but neither ever launches an extension-less file,
-    // so neither may report one.
+    // time, or preflight reports a path the run would not actually launch.
+    //
+    // On Windows that is a two-case rule, and collapsing it either way is
+    // wrong. A BARE name is completed with the npm shim extensions and never
+    // launched extension-less, so `bash` must not report a file called `bash`.
+    // A name that ALREADY carries an extension is handed to the OS verbatim,
+    // so `pwsh.exe` and `claude.cmd` are looked up as written - appending to
+    // them would find nothing and preflight would block a program that runs.
     let exts: &[&str] = if cfg!(windows) {
-        &[".exe", ".cmd", ".bat"]
+        if Path::new(name).extension().is_some() {
+            &[""]
+        } else {
+            &[".exe", ".cmd", ".bat"]
+        }
     } else {
         &[""]
     };
@@ -1516,6 +1524,20 @@ mod tests {
     // predicate is exercised directly rather than by pointing `which` at a
     // temporary directory - a test that reaches for `set_var("PATH", ...)`
     // corrupts whatever else is resolving a program at that moment.
+    #[test]
+    #[cfg(windows)]
+    fn a_program_name_that_already_carries_an_extension_is_looked_up_as_written() {
+        // `Command::new` hands such a name to the OS verbatim, so appending
+        // .exe/.cmd/.bat to it would find nothing and preflight would block a
+        // program that runs perfectly well. cmd.exe is always in System32,
+        // which is always on PATH.
+        assert!(
+            which("cmd.exe").is_some(),
+            "a name with an extension must resolve as written"
+        );
+        assert!(which("cmd").is_some(), "and a bare name still completes");
+    }
+
     #[test]
     fn a_path_candidate_the_os_would_not_exec_is_not_a_program() {
         let dir = std::env::temp_dir().join(format!("sfh-which-{}", std::process::id()));
