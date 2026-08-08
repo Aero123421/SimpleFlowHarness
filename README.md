@@ -42,7 +42,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 The installer detects your OS and architecture, verifies the SHA-256 checksum, extracts the binary, and updates your `PATH`.
 You can inspect the [Shell](installers/sfh-installer.sh) and [PowerShell](installers/sfh-installer.ps1) scripts prior to execution.
 To pin a specific version or customize installation behavior:
-- `SFH_VERSION=1.2.0`: Pin the target release version.
+- `SFH_VERSION=1.2.1`: Pin the target release version.
 - `SFH_INSTALL_DIR=/path/to/bin`: Specify a custom installation directory.
 - `SFH_NO_MODIFY_PATH=1`: Skip automatic `PATH` modifications.
 
@@ -266,6 +266,23 @@ steps:
 
 This is not retry (another attempt at the same invocation), not fallback (a different profile), not a route revisit, and not the reuse of a completed step's result. sfh does not promise exactly-once for external effects; it promises not to silently re-run one, and not to call an uncertain outcome a success.
 
+### `exit_conflict:` — when the exit code and the protocol disagree (v1.2.1)
+
+Some CLIs finish the work, write the answer, commit it, and then exit non-zero anyway — because an intermediate tool call failed somewhere in the middle. sfh holds proof that the turn completed (the documented terminal record, well formed, saying success) and the OS says the process failed. Only one of them can be right, and sfh will not guess.
+
+```yaml
+steps:
+  - id: implement
+    tool: pi
+    exit_conflict: trust_protocol   # fail (default) | trust_protocol
+```
+
+The default is `fail` for every adapter whose exit status is trustworthy — a non-zero exit fails the step, exactly as before. What changed in v1.2.1 is that sfh no longer stays quiet about the disagreement: the step's stderr, its error artifact and `sfh runs why` all say that the protocol certified the turn, and name this key.
+
+`trust_protocol` is deliberately narrow. It is consulted **only** where sfh has positive evidence — a recognised terminal record that is well formed and reports success. Raw text, an unknown status, a malformed envelope or a missing terminal record can never satisfy it, so it cannot turn a usage error printed on stdout into a successful step. Using it is listed in `sfh plan --json` under `unsafe_overrides`.
+
+Reach for it instead of the alternative that suggests itself under pressure: deleting the exit-code check from your flow so everything flows on to the next stage regardless. That is fail-open, and it lets a genuinely crashed step reach whatever reads its output next.
+
 ### Portable flows: `--profiles`
 
 A shared flow can name roles instead of tools, and let whoever runs it decide:
@@ -333,12 +350,15 @@ Failures carry a code whose meaning is fixed for all of v1.2.x — branch on the
 ```text
 sfh preflight  — free. Binary present? version? required flags still in --help?
                  which protocol, session support, cost coverage, access gaps?
+                 which binary is every cmd: step's program, by absolute path?
                  what workspace and context would this flow build?
 sfh doctor     — paid. Sends a real one-token prompt and checks sfh can still
                  parse the answer. The only way to catch protocol drift.
 ```
 
 `doctor` probes from an isolated scratch directory, so it reports on the adapter rather than on whatever instruction files happen to be in the directory you ran it from.
+
+Since v1.2.1 preflight also covers the programs your `cmd:` steps launch — the verification shell, the build, the test runner — which are usually the ones a flow leans on hardest. It **resolves** them and reports the absolute path each name lands on; it never runs them, because `--help` is safe to send to an adapter sfh ships support for and is not safe to send to an arbitrary program a flow names. A name that resolves to nothing is a blocker. On Windows, a bare `bash` that resolves to `System32\bash.exe` is refused outright: that is the WSL launcher, a different operating system that cannot read this checkout's paths or a worktree's `.git` file, so those commands fail in seconds for a reason that has nothing to do with your code. Write the shell you mean — `"C:\\Program Files\\Git\\bin\\bash.exe"` — and sfh says nothing.
 
 sfh pins **no minimum version** for any adapter. Rather than assert a floor it has not verified against each CLI's documentation and a live probe, `preflight` reports the installed version and says the requirement is unknown.
 

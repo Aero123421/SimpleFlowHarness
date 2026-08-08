@@ -1286,8 +1286,21 @@ pub fn which(name: &str) -> Option<String> {
     if name.contains('/') || name.contains('\\') {
         return direct.is_file().then(|| name.to_string());
     }
+    // The extension list has to be the one `resolve_program` uses at spawn
+    // time, or preflight reports a path the run would not actually launch.
+    //
+    // On Windows that is a two-case rule, and collapsing it either way is
+    // wrong. A BARE name is completed with the npm shim extensions and never
+    // launched extension-less, so `bash` must not report a file called `bash`.
+    // A name that ALREADY carries an extension is handed to the OS verbatim,
+    // so `pwsh.exe` and `claude.cmd` are looked up as written - appending to
+    // them would find nothing and preflight would block a program that runs.
     let exts: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".cmd", ".bat"]
+        if Path::new(name).extension().is_some() {
+            &[""]
+        } else {
+            &[".exe", ".cmd", ".bat"]
+        }
     } else {
         &[""]
     };
@@ -1295,12 +1308,55 @@ pub fn which(name: &str) -> Option<String> {
     for dir in std::env::split_paths(&paths) {
         for ext in exts {
             let cand = dir.join(format!("{name}{ext}"));
-            if cand.is_file() {
+            if is_executable_file(&cand) {
                 return Some(cand.to_string_lossy().into_owned());
             }
         }
     }
     None
+}
+
+/// A PATH candidate the OS would actually exec. On Unix `execvp` skips a file
+/// without the exec bit and keeps searching, so reporting the first readable
+/// match would name a file the run never runs.
+fn is_executable_file(p: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// True when a resolved path is the Windows WSL launcher rather than a shell
+/// that can run in this OS.
+///
+/// `%SystemRoot%\System32` sits near the front of PATH on every Windows box and
+/// ships `bash.exe`/`wsl.exe`, which start a Linux distribution. Git for Windows
+/// does not put its own `bash.exe` on PATH. So a flow that says `bash` on
+/// Windows gets WSL, where the repository's Windows paths are meaningless and a
+/// worktree's `.git` gitfile points somewhere that does not exist - the commands
+/// fail in seconds, for a reason that has nothing to do with the code under
+/// test, and the failure text flows on to whatever reads that step's output.
+///
+/// Takes the resolved path as text so the rule is testable on every platform.
+pub fn is_wsl_launcher(resolved_path: &str) -> bool {
+    let lower = resolved_path.to_ascii_lowercase().replace('/', "\\");
+    // sysnative and syswow64 are the same directory seen through the 32/64-bit
+    // redirector, so all three spellings have to count.
+    ["\\system32\\", "\\sysnative\\", "\\syswow64\\"]
+        .iter()
+        .any(|dir| lower.contains(dir))
+        && (lower.ends_with("\\bash.exe") || lower.ends_with("\\wsl.exe"))
 }
 
 /// Capture `<program> --version` (no AI call) for the run's provenance record.
@@ -1435,6 +1491,77 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_windows_wsl_launcher_is_recognised_wherever_it_is_spelled() {
+        // The exact path a bare `bash` resolves to on a stock Windows box.
+        for p in [
+            r"C:\Windows\System32\bash.exe",
+            r"c:\windows\system32\BASH.EXE",
+            r"C:/Windows/System32/bash.exe",
+            r"C:\Windows\Sysnative\wsl.exe",
+            r"C:\Windows\SysWOW64\bash.exe",
+        ] {
+            assert!(is_wsl_launcher(p), "{p} should be recognised as WSL");
+        }
+        // Real shells that can run in this OS, and unrelated System32 binaries,
+        // must not be caught: a false positive here blocks a working flow.
+        for p in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\msys64\usr\bin\bash.exe",
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Windows\System32\where.exe",
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/opt/system32-tools/bin/bash",
+        ] {
+            assert!(!is_wsl_launcher(p), "{p} must not be treated as WSL");
+        }
+    }
+
+    // PATH is process-global and these tests run in parallel, so the candidate
+    // predicate is exercised directly rather than by pointing `which` at a
+    // temporary directory - a test that reaches for `set_var("PATH", ...)`
+    // corrupts whatever else is resolving a program at that moment.
+    #[test]
+    #[cfg(windows)]
+    fn a_program_name_that_already_carries_an_extension_is_looked_up_as_written() {
+        // `Command::new` hands such a name to the OS verbatim, so appending
+        // .exe/.cmd/.bat to it would find nothing and preflight would block a
+        // program that runs perfectly well. cmd.exe is always in System32,
+        // which is always on PATH.
+        assert!(
+            which("cmd.exe").is_some(),
+            "a name with an extension must resolve as written"
+        );
+        assert!(which("cmd").is_some(), "and a bare name still completes");
+    }
+
+    #[test]
+    fn a_path_candidate_the_os_would_not_exec_is_not_a_program() {
+        let dir = std::env::temp_dir().join(format!("sfh-which-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sfh-which-probe");
+        std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Readable but not executable: execvp skips it and keeps searching,
+            // so reporting it would name a file the run never runs.
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!is_executable_file(&p));
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(is_executable_file(&p));
+        // A directory with a program's name is not a program.
+        let d = dir.join("sfh-which-dir");
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!is_executable_file(&d));
+        assert!(!is_executable_file(&dir.join("nothing-here")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_blocked_pipe_reader_does_not_hold_the_canonical_output_open() {

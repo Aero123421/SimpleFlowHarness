@@ -39,12 +39,47 @@ pub struct ToolReport {
     pub warnings: Vec<String>,
 }
 
+/// One program a `cmd:` step would launch, as preflight found it.
+///
+/// Deliberately thinner than a `ToolReport`: preflight RESOLVES a custom command
+/// and never runs it. `--help` and `--version` are safe to send to an adapter
+/// sfh ships support for; they are not safe to send to an arbitrary program a
+/// flow names, because `deploy.sh --help` may well deploy. Resolution answers
+/// the question that actually bit - "which binary is this name?" - without
+/// executing anything.
+pub struct CommandReport {
+    pub program: String,
+    pub resolved_path: Option<String>,
+    /// Step ids that launch this program, sorted.
+    pub steps: Vec<String>,
+    /// True when argv[0] carries a template placeholder, so no path can be
+    /// resolved until the run renders it.
+    pub templated: bool,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl CommandReport {
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "program": self.program,
+            "resolved_path": self.resolved_path,
+            "steps": self.steps,
+            "templated": self.templated,
+            "blockers": self.blockers,
+            "warnings": self.warnings,
+        })
+    }
+}
+
 /// Everything a preflight run concluded.
 pub struct Report {
     pub sfh_version: &'static str,
     pub flow_path: Option<String>,
     pub flow_name: Option<String>,
     pub tools: Vec<ToolReport>,
+    /// Programs launched by `cmd:` steps. Empty for a flowless survey.
+    pub commands: Vec<CommandReport>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
     /// Static, structural facts about the flow - filled in only when a flow was
@@ -54,7 +89,9 @@ pub struct Report {
 
 impl Report {
     pub fn ok(&self) -> bool {
-        self.blockers.is_empty() && self.tools.iter().all(|t| t.blockers.is_empty())
+        self.blockers.is_empty()
+            && self.tools.iter().all(|t| t.blockers.is_empty())
+            && self.commands.iter().all(|c| c.blockers.is_empty())
     }
 
     pub fn to_json(&self) -> serde_json::Value {
@@ -64,6 +101,7 @@ impl Report {
             "flow_name": self.flow_name,
             "ok": self.ok(),
             "tools": self.tools.iter().map(ToolReport::to_json).collect::<Vec<_>>(),
+            "commands": self.commands.iter().map(CommandReport::to_json).collect::<Vec<_>>(),
             "flow_facts": self.flow_facts,
             "blockers": self.blockers,
             "warnings": self.warnings,
@@ -91,6 +129,9 @@ impl ToolReport {
             "supports_resume": info.map(|i| i.supports_resume),
             "supports_fork": info.map(|i| i.supports_fork),
             "cost_coverage": info.map(|i| i.cost_coverage.as_str()),
+            // False means a certified-successful turn survives a non-zero exit
+            // by default; every other adapter needs `exit_conflict:` to say so.
+            "exit_code_trustworthy": info.map(|i| i.exit_code_trustworthy),
             "required_flags": info.map(|i| i.required_flags),
             "help_readable": self.help_readable,
             "missing_flags": self.missing_flags,
@@ -225,6 +266,81 @@ fn probe(tool: &str, program: &str, requested_access: Vec<String>, required: boo
     }
 }
 
+/// Resolve one `cmd:` program. Runs nothing.
+fn probe_command(program: &str, steps: BTreeSet<String>) -> CommandReport {
+    let steps: Vec<String> = steps.into_iter().collect();
+    let where_ = steps.join(", ");
+    let mut blockers = Vec::new();
+    let warnings = Vec::new();
+    if program.contains("{{") {
+        return CommandReport {
+            program: program.to_string(),
+            resolved_path: None,
+            steps,
+            templated: true,
+            blockers,
+            warnings: vec![format!(
+                "the program in {where_} is built by a template, so preflight cannot say which binary it will be"
+            )],
+        };
+    }
+    let has_separator = program.contains('/') || program.contains('\\');
+    // A RELATIVE path is resolved by the OS against the process's working
+    // directory, and at run time that is the step's `cwd:` or the managed
+    // workspace - neither of which exists yet, and neither of which is
+    // preflight's own cwd. `./scripts/verify.sh` is perfectly correct for a
+    // flow whose steps run in a worktree, so checking it here would block a
+    // working flow for a fact preflight is in no position to know.
+    if has_separator && !Path::new(program).is_absolute() {
+        return CommandReport {
+            program: program.to_string(),
+            resolved_path: None,
+            steps,
+            templated: false,
+            blockers,
+            warnings: vec![format!(
+                "'{program}' ({where_}) is relative, so it resolves against the step's working directory at run time - preflight cannot check it from here"
+            )],
+        };
+    }
+    let resolved_path = execute::which(program);
+    match &resolved_path {
+        None if has_separator => blockers.push(format!(
+            "'{program}' ({where_}) does not exist - this flow cannot start without it"
+        )),
+        None => blockers.push(format!(
+            "'{program}' ({where_}) is not on PATH - this flow cannot start without it"
+        )),
+        Some(path) => {
+            // Only when PATH made the choice, and only for a name that asked
+            // for a shell. Writing `wsl` is a deliberate statement about which
+            // OS should run the command, and writing a full path is another;
+            // sfh second-guesses neither. Writing `bash` is not a statement
+            // about WSL at all - it is a request for a shell that PATH quietly
+            // answered with a different operating system.
+            let asked_for_a_shell = matches!(program, "bash" | "sh");
+            if !has_separator && asked_for_a_shell && execute::is_wsl_launcher(path) {
+                blockers.push(format!(
+                    "'{program}' ({where_}) resolves to {path}, which starts WSL - a different \
+                     operating system. It cannot read this checkout's Windows paths, and a git \
+                     worktree's .git gitfile points somewhere that does not exist inside it, so \
+                     these commands fail in seconds for a reason unrelated to the code. Name the \
+                     shell you mean: \"C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe\" for Git for \
+                     Windows, or the full path to {path} if WSL really is the target."
+                ));
+            }
+        }
+    }
+    CommandReport {
+        program: program.to_string(),
+        resolved_path,
+        steps,
+        templated: false,
+        blockers,
+        warnings,
+    }
+}
+
 /// Preflight with no flow: report every preset's local availability.
 pub fn all_adapters() -> Report {
     let tools = flow::TOOLS
@@ -236,6 +352,7 @@ pub fn all_adapters() -> Report {
         flow_path: None,
         flow_name: None,
         tools,
+        commands: Vec::new(),
         blockers: Vec::new(),
         warnings: Vec::new(),
         flow_facts: None,
@@ -257,6 +374,7 @@ pub fn for_flow(path: &Path, root: &state::StateRoot, overlays: &[std::path::Pat
                 flow_path: Some(path.display().to_string()),
                 flow_name: None,
                 tools: Vec::new(),
+                commands: Vec::new(),
                 blockers: vec![e],
                 warnings: Vec::new(),
                 flow_facts: None,
@@ -281,6 +399,11 @@ pub fn for_flow(path: &Path, root: &state::StateRoot, overlays: &[std::path::Pat
     let tools = by_program
         .into_iter()
         .map(|((tool, program), access)| probe(&tool, &program, access.into_iter().collect(), true))
+        .collect::<Vec<_>>();
+    let commands = flow
+        .resolved_commands()
+        .into_iter()
+        .map(|(program, steps)| probe_command(&program, steps))
         .collect::<Vec<_>>();
 
     // Structural facts that need no process at all.
@@ -317,6 +440,7 @@ pub fn for_flow(path: &Path, root: &state::StateRoot, overlays: &[std::path::Pat
         flow_path: Some(path.display().to_string()),
         flow_name: flow.name.clone(),
         tools,
+        commands,
         blockers,
         warnings,
         flow_facts: Some(facts),
@@ -353,6 +477,11 @@ pub fn print_human(r: &Report) {
                 i.last_verified,
                 i.minimum_version.unwrap_or("unknown (not pinned)")
             );
+            if !i.exit_code_trustworthy {
+                println!(
+                    "     exit codes: documented as unreliable, so a certified terminal record wins"
+                );
+            }
             if !t.requested_access.is_empty() {
                 let levels = t
                     .requested_access
@@ -377,6 +506,25 @@ pub fn print_human(r: &Report) {
         }
         for w in &t.warnings {
             println!("     warning: {w}");
+        }
+        println!();
+    }
+    for c in &r.commands {
+        let where_ = if c.templated {
+            "built by a template, unresolvable before the run".to_string()
+        } else {
+            c.resolved_path
+                .clone()
+                .unwrap_or_else(|| "NOT FOUND on PATH".to_string())
+        };
+        println!("[cmd] {} -> {}", c.program, where_);
+        println!("      steps: {}", c.steps.join(", "));
+        println!("      resolved only; preflight never runs a custom command");
+        for b in &c.blockers {
+            println!("      BLOCKER: {b}");
+        }
+        for w in &c.warnings {
+            println!("      warning: {w}");
         }
         println!();
     }
@@ -496,6 +644,123 @@ mod tests {
                 "{tool} lists no required flags"
             );
         }
+    }
+
+    #[test]
+    fn agy_is_the_only_adapter_whose_exit_code_is_not_believed() {
+        // v1.2.0 hardcoded this as `matches!(p.parse, AgyJson)` in the
+        // execution layer. Moving it into adapter metadata must not move the
+        // line: every other preset still fails on a non-zero exit unless the
+        // flow declares otherwise.
+        for tool in flow::TOOLS {
+            let i = preset::adapter_info(tool).unwrap();
+            assert_eq!(
+                i.exit_code_trustworthy,
+                *tool != *"agy",
+                "{tool}'s exit-code trust changed"
+            );
+            assert_eq!(i.exit_code_trustworthy, preset::exit_code_trustworthy(tool));
+        }
+        // A custom `cmd:` has no adapter and no protocol; it keeps the strict
+        // reading, which is also the only safe answer for an unknown name.
+        assert!(preset::exit_code_trustworthy(""));
+        assert!(preset::exit_code_trustworthy(
+            "some-tool-sfh-never-heard-of"
+        ));
+    }
+
+    #[test]
+    fn a_missing_cmd_program_blocks_the_flow_and_names_the_steps_that_want_it() {
+        let c = probe_command(
+            "definitely-not-a-real-binary-9d3f",
+            ["verify".to_string(), "build".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        assert!(c.resolved_path.is_none());
+        assert_eq!(c.steps, vec!["build".to_string(), "verify".to_string()]);
+        assert!(
+            c.blockers
+                .iter()
+                .any(|b| b.contains("not on PATH") && b.contains("build, verify")),
+            "{:?}",
+            c.blockers
+        );
+    }
+
+    #[test]
+    fn a_relative_cmd_program_is_not_judged_against_preflights_own_directory() {
+        // The step will run in its `cwd:` or in the managed workspace, neither
+        // of which exists yet. Blocking here would refuse a correct flow for a
+        // fact preflight is in no position to know.
+        for p in ["./scripts/verify.sh", "..\\tools\\build.cmd"] {
+            let c = probe_command(p, ["verify".to_string()].into_iter().collect());
+            assert!(c.blockers.is_empty(), "{p}: {:?}", c.blockers);
+            assert_eq!(c.warnings.len(), 1, "{p}: {:?}", c.warnings);
+            assert!(c.warnings[0].contains("relative"), "{:?}", c.warnings);
+        }
+        // An absolute path CAN be checked from here, so a missing one blocks.
+        let missing = if cfg!(windows) {
+            r"C:\definitely\not\here-9d3f.exe"
+        } else {
+            "/definitely/not/here-9d3f"
+        };
+        let c = probe_command(missing, ["verify".to_string()].into_iter().collect());
+        assert!(
+            c.blockers.iter().any(|b| b.contains("does not exist")),
+            "{:?}",
+            c.blockers
+        );
+    }
+
+    #[test]
+    fn only_a_bare_shell_name_is_refused_for_landing_on_the_wsl_launcher() {
+        // Asking for `wsl` is a deliberate statement about which OS should run
+        // the command. Asking for `bash` is not - it is a request for a shell
+        // that PATH quietly answered with a different operating system.
+        assert!(execute::is_wsl_launcher(r"C:\Windows\System32\wsl.exe"));
+        let c = probe_command("wsl", ["verify".to_string()].into_iter().collect());
+        assert!(
+            !c.blockers.iter().any(|b| b.contains("starts WSL")),
+            "an explicit wsl invocation must not be second-guessed: {:?}",
+            c.blockers
+        );
+    }
+
+    #[test]
+    fn a_templated_program_is_reported_as_unresolvable_not_guessed_at() {
+        let c = probe_command(
+            "{{vars.shell}}",
+            ["verify".to_string()].into_iter().collect(),
+        );
+        assert!(c.templated);
+        assert!(c.resolved_path.is_none());
+        // Unknowable before the run is a warning, not a blocker: sfh has no
+        // grounds to refuse something it simply cannot see yet.
+        assert!(c.blockers.is_empty(), "{:?}", c.blockers);
+        assert_eq!(c.warnings.len(), 1);
+    }
+
+    #[test]
+    fn a_report_is_not_ok_while_any_command_is_blocked() {
+        let r = Report {
+            sfh_version: "test",
+            flow_path: None,
+            flow_name: None,
+            tools: Vec::new(),
+            commands: vec![probe_command(
+                "definitely-not-a-real-binary-9d3f",
+                ["verify".to_string()].into_iter().collect(),
+            )],
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+            flow_facts: None,
+        };
+        assert!(
+            !r.ok(),
+            "a cmd: step that cannot start must fail preflight like any other"
+        );
+        assert!(r.to_json()["commands"][0]["program"].is_string());
     }
 
     #[test]

@@ -2,6 +2,76 @@
 
 ## Unreleased
 
+## v1.2.1 — 2026-08-08
+
+v1.2.0を実運用へ投入して見つかった4件の穴を塞ぐrelease。新しいkeyを書かなければ
+既存flowの挙動は変わりません。`api_version: 1`も維持します。
+
+### exit codeとprotocol evidenceの衝突を、flowが宣言できるようにしました
+
+- **これは何が起きたか。** 最終回答を完成させ、cleanなcommitまで済ませたAI CLIが、
+  途中のtool callが1つ失敗していたためprocess exit=1を返しました。sfhはterminal
+  recordを受け取って成功をcertifyできていたのに、exit codeを理由にstepを落とし、
+  runがstuckで止まりました。回避手段が「flowからexit code判定を外す」しかなく、
+  それはfail-openです。
+- `exit_conflict: fail | trust_protocol`をstepと`defaults`に追加しました。
+  `trust_protocol`は、`certifies_success()`が真のとき — つまり文書化されたterminal
+  recordが存在し、壊れておらず、成功と述べているとき — に限りexit codeを覆します。
+  raw text、未知のstatus、壊れたenvelope、terminal欠落はこの条件を満たさないので、
+  stdoutへ出したusage errorが成功stepになることはありません。
+- 既定は全adapterで`fail`のままです。v1.2.0が唯一例外にしていたagyは、`matches!`の
+  ハードコードではなく`AdapterInfo::exit_code_trustworthy`というdataになりました。
+  挙動は同一です。
+- `trust_protocol`を使わない場合でも、**衝突が起きたことをsfhが黙らなくなりました。**
+  「exit Nだったが、tool自身のprotocolはこのturnを成功としてcertifyしている」旨と、
+  `exit_conflict:`という正しい対処、そして「exit code判定自体をやめるな」という但し
+  書きを、stepのstderr・error artifact・`sfh runs why`へ載せます。
+- `trust_protocol`は`sfh plan --json`の`unsafe_overrides`に出ます。
+
+### preflightが`cmd:`stepのprogramを見るようになりました
+
+- **これは何が起きたか。** Windowsで検証stepが`bash`と書かれており、PATH上先頭の
+  `%SystemRoot%\System32\bash.exe`（WSL launcher）へ解決していました。WSLは別OSなので
+  Windowsのworktreeも`.git` gitfileも読めず、全検証が5秒で落ちました。それでも
+  `sfh preflight`は「no blockers」と答えていました — 検査して通ったのではなく、
+  `resolved_tools()`が`cmd:`stepを対象外にしていたからです。
+- preflightが`cmd:`stepのprogramも解決し、絶対pathとそれを起動するstep idを報告する
+  ようになりました（`--json`では`commands`）。解決できないprogramはblockerです。
+- **解決するだけで、実行はしません。** `--help`/`--version`をadapterへ送るのは安全でも、
+  flowが名指しした任意のprogramへ送るのは安全ではありません（`deploy.sh --help`は
+  deployし得ます）。実際に問題だった問い — 「この名前はどのbinaryか」 — は解決だけで
+  答えられます。
+- bareな`bash`/`wsl`がWindowsのSystem32/Sysnative/SysWOW64へ解決した場合はblockerに
+  し、Git for Windows bashのpathを示します。PATHが選んだ場合のみで、flowが明示的に
+  full pathを書いた場合は何も言いません。
+- `cmd:`をstringで書いたstepは、flowが選んだshellではなくplatform shell（`sh`/`cmd`）
+  で走ることも報告します。
+
+### context bodyがsfhのdelimiterを偽装できた問題を塞ぎました
+
+- v1.2.0はcontextの**name**をescapeし、**body**をrawのまま埋めていました。bodyは
+  fileの中身かtemplateの描画結果であり、templateは前のstepのoutputを展開できます。
+  つまりmodelが書いたtextがbodyに入り得ました。`</sfh-context>`を含むbodyは自分の
+  blockを早期に閉じ、`<sfh-prompt>`を含むbodyは「ここからが実際の指示だ」とsfhが
+  宣言するsectionを偽造できました。
+- bundleのbodyと、prependされるprompt本体の両方で、4つのdelimiter tokenの先頭`<`を
+  `&lt;`にします。触るのはこの4 tokenだけで、他の文字・記号・codeは1 byteも変わりま
+  せん。何も削除しません。
+
+### `{{context_file}}` / `{{context}}` が validate を通るようになりました
+
+- v1.2.0は`context_delivery: file`を「promptから`{{context_file}}`を指せ」と文書化
+  しながら、自身のtemplate precheckが`context`と`context_file`をunknown keyとして
+  拒否していました。文書どおりのflowが`sfh validate`で落ち、runにも到達しません
+  でした。runtimeは両方を常に定義しています（contextを持たないstepでは空文字列）。
+  precheckをruntimeに揃えました。
+
+### preflightが報告するpathが、実際に起動されるpathと一致するようになりました
+
+- `which()`はWindowsで拡張子なしの候補も返していましたが、実行側はそれを起動しません
+  （`.exe`/`.cmd`/`.bat`のみ）。Unixではexec bitを見ていなかったため、`execvp`が読み
+  飛ばすfileを「これが起動される」と報告し得ました。両方を実行側の規則に揃えました。
+
 ## v1.2.0 — 2026-08-07
 
 sfhを「仕様が変わり得る外部CLI・AI CLIを、宣言された制御フロー、作業環境、入力

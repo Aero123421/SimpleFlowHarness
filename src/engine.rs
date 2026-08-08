@@ -413,6 +413,13 @@ fn precheck(
             "os",
             "prompt_file",
             "notes",
+            // v1.2's named context. The runtime defines both unconditionally
+            // (empty when the step named no context), and `context_delivery:
+            // file` is documented as "point the prompt at {{context_file}}" -
+            // which validate and run were both rejecting outright, because
+            // this list never learned about them.
+            "context",
+            "context_file",
             // The F5 budget snapshot. Listed here as well as in make_builtins
             // because this check is what decides whether `sfh validate`
             // accepts a key, and a validator that rejects what the runtime
@@ -5492,6 +5499,11 @@ fn prepare_compact(
         access: Some(preset::Access::Read),
         session_parent: None,
         allow_empty: false,
+        // A step's `exit_conflict:` is a statement about the tool that step
+        // launches. The summarizer may be a different tool entirely, so it
+        // keeps its own adapter default rather than inheriting a licence the
+        // flow granted to something else.
+        exit_conflict: None,
         retry: leaf::RetryCfg::default(),
         run_clock: Some(Arc::clone(run_clock)),
         quiet: *quiet,
