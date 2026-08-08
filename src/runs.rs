@@ -1174,4 +1174,141 @@ mod tests {
         assert_eq!(step.ok, 3);
         assert_eq!(step.failed, 1);
     }
+
+    // ---- P1-08: a run's cost fields must be individually correct, and a
+    // lineage total must be absent rather than wrong when an ancestor is
+    // gone ----
+
+    fn cost_fields_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-runs-cost-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn own_carried_and_budget_position_cost_fields_are_individually_correct() {
+        let base = cost_fields_test_dir("fields");
+
+        let ancestor = base.join("ancestor");
+        contain::mkdir_private(&ancestor).unwrap();
+        std::fs::write(ancestor.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &ancestor.join("meta.json"),
+            serde_json::json!({"cost_usd": 2.0}).to_string(),
+        )
+        .unwrap();
+
+        let child = base.join("child");
+        contain::mkdir_private(&child).unwrap();
+        std::fs::write(child.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &child.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 5.0,
+                "carried_budget": {"cost_usd": 2.0, "from": ancestor.display().to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let s = summary(&child, &[]);
+        assert_eq!(
+            s.budget_position_usd, 5.0,
+            "own + carried - what max_cost_usd is judged against"
+        );
+        assert_eq!(s.carried_cost_usd, 2.0, "what this run inherited");
+        assert_eq!(
+            s.own_cost_usd, 3.0,
+            "what this run itself spent: budget position minus carried"
+        );
+        assert_eq!(
+            s.cost_usd, 5.0,
+            "cost_usd is kept for existing consumers, identical to budget_position_usd"
+        );
+        assert_eq!(
+            s.lineage_cost_usd,
+            Some(5.0),
+            "the ancestor is present and readable, so the lineage total is resolvable"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lineage_cost_usd_is_absent_rather_than_wrong_when_an_ancestor_is_gone() {
+        let base = cost_fields_test_dir("gone-ancestor");
+        // Names an ancestor that was never created here, simulating `runs
+        // clean` having removed it after the carry that recorded it.
+        let cleaned_ancestor = base.join("cleaned-ancestor");
+
+        let child = base.join("child");
+        contain::mkdir_private(&child).unwrap();
+        std::fs::write(child.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &child.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 5.0,
+                "carried_budget": {"cost_usd": 2.0, "from": cleaned_ancestor.display().to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let s = summary(&child, &[]);
+        // The clamp still protects these three: they are durable in THIS
+        // run's own meta.json and do not need the ancestor to still exist.
+        assert_eq!(s.budget_position_usd, 5.0);
+        assert_eq!(s.carried_cost_usd, 2.0);
+        assert_eq!(s.own_cost_usd, 3.0);
+        // But the lineage total cannot be independently re-verified, so it
+        // must be absent rather than a value nothing backs (P1-08) - never
+        // silently substituted with budget_position_usd or a partial sum.
+        assert_eq!(s.lineage_cost_usd, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_hand_edited_carried_cost_cannot_exceed_the_runs_own_total_or_go_negative() {
+        let dir = cost_fields_test_dir("clamp");
+        std::fs::write(dir.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &dir.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 3.0,
+                // Hand-edited to claim MORE was carried than the run's own
+                // total: must clamp to 3.0, never turn into a refund via a
+                // negative own_cost_usd.
+                "carried_budget": {"cost_usd": 999.0, "from": "/nowhere"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let s = summary(&dir, &[]);
+        assert_eq!(s.carried_cost_usd, 3.0);
+        assert_eq!(s.own_cost_usd, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lineage_is_resolvable_refuses_a_cycle_instead_of_looping_forever() {
+        let base = cost_fields_test_dir("cycle");
+        let a = base.join("a");
+        let b = base.join("b");
+        contain::mkdir_private(&a).unwrap();
+        contain::mkdir_private(&b).unwrap();
+        contain::write_private_atomic(
+            &a.join("meta.json"),
+            serde_json::json!({"carried_budget": {"from": b.display().to_string()}}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &b.join("meta.json"),
+            serde_json::json!({"carried_budget": {"from": a.display().to_string()}}).to_string(),
+        )
+        .unwrap();
+        assert!(!lineage_is_resolvable(&a));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

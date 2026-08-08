@@ -1842,9 +1842,10 @@ fn load_resume_for_flow(
     //
     // Whichever of the three answers, `carried_elapsed` is still applied as
     // an unconditional FLOOR afterwards: what this run itself durably
-    // inherited via --carry-budget-from cannot be un-inherited by a source
-    // three levels removed going quiet (see the `budget_carried` handling
-    // above for why that value is a floor and not an addend here too).
+    // inherited via --carry-budget-from cannot be un-inherited by an
+    // earlier ancestor's record going quiet (see the `budget_carried`
+    // handling above for why that value is a floor and not an addend here
+    // too).
     let meta_elapsed_sec = contain::read_contained_opt(run_dir, "meta.json")?
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|meta| meta.get("elapsed_sec").and_then(|v| v.as_u64()));
@@ -5680,7 +5681,7 @@ fn stuck_step_exhausted_max_visits(run_dir: &Path) -> Option<String> {
 /// which question it answers.
 ///
 /// `argv` is present ONLY when `ok` is true: an unrunnable action is never
-/// hand a command to run verbatim (P1-09's central rule), but it is still
+/// handed a command to run verbatim (P1-09's central rule), but it is still
 /// reported - with `reason` and, when relevant, `requires` - so "nothing is
 /// runnable" is something the caller is TOLD, not left to infer from a
 /// shorter list.
@@ -5715,7 +5716,7 @@ fn diagnosed_action(
 /// for this envelope's `error`, the log's own last routing decision, and -
 /// for carry - the exact finality proof `--carry-budget-from` itself
 /// requires (`carry_source_is_final`, P1-02). An action this run cannot
-/// actually complete is never hand a command to run; only the diagnosis
+/// actually complete is never handed a command to run; only the diagnosis
 /// that explains why is.
 fn next_actions_for(
     state: &str,
@@ -9318,8 +9319,8 @@ mod tests {
     }
 
     #[test]
-    fn carry_still_refuses_a_terminal_looking_log_when_the_owning_process_cannot_be_confirmed_gone(
-    ) {
+    fn carry_still_refuses_a_terminal_looking_log_when_the_owning_process_cannot_be_confirmed_gone()
+    {
         let dir = carry_final_test_dir("ambiguous-owner");
         std::fs::write(
             dir.join("log.jsonl"),
@@ -9334,8 +9335,8 @@ mod tests {
     }
 
     #[test]
-    fn carry_refuses_a_source_that_status_json_says_is_still_running_even_if_its_log_has_a_run_end(
-    ) {
+    fn carry_refuses_a_source_that_status_json_says_is_still_running_even_if_its_log_has_a_run_end()
+    {
         let dir = carry_final_test_dir("still-running");
         // Deliberately contradictory: status.json must win when it can be
         // read, because it is the freshest signal there is - a stale-but-
@@ -9346,7 +9347,8 @@ mod tests {
             "{\"event\":\"run_end\",\"status\":\"ok\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":5}\n",
         )
         .unwrap();
-        let status = serde_json::json!({"state": "running", "pid": std::process::id(), "cost_usd": 1.0});
+        let status =
+            serde_json::json!({"state": "running", "pid": std::process::id(), "cost_usd": 1.0});
         contain::write_private_atomic(&dir.join("status.json"), status.to_string()).unwrap();
         let err = carry_source_is_final(&dir).unwrap_err();
         assert!(err.contains("still going"), "{err}");
@@ -9388,8 +9390,10 @@ mod tests {
 
     #[test]
     fn elapsed_restore_prefers_run_end_then_meta_then_status_then_the_carried_floor() {
-        let base = std::env::temp_dir()
-            .join(format!("sfh-elapsed-precedence-{}", contain::random_nonce()));
+        let base = std::env::temp_dir().join(format!(
+            "sfh-elapsed-precedence-{}",
+            contain::random_nonce()
+        ));
         contain::mkdir_private(&base).unwrap();
 
         // status.json only: the last-resort source.
@@ -9536,8 +9540,10 @@ mod tests {
     // them from the terminal state alone ----
 
     fn next_actions_test_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("sfh-next-actions-{tag}-{}", contain::random_nonce()));
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-next-actions-{tag}-{}",
+            contain::random_nonce()
+        ));
         contain::mkdir_private(&dir).unwrap();
         dir
     }
