@@ -735,6 +735,53 @@ fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
     }
 }
 
+/// Whether the process that most recently owned this run dir is verifiably
+/// gone, read directly from sfh-nonce rather than status.json. The two are
+/// consulted for different reasons: status.json is cheap and, when it can be
+/// read, already pairs the pid with a fresh heartbeat, which is the better
+/// signal (see `read_once`'s "wedged" handling one layer up in every
+/// caller). This function exists for the moment that fails: status.json
+/// missing, corrupt, or caught mid-write, with nothing else durable to ask
+/// (see the `--carry-budget-from` finality check in `engine::run`, the
+/// only caller).
+///
+/// `Ok(None)`: no usable nonce to check against - a legacy pre-nonce run,
+/// or a dry-run dir. There is nothing here to verify liveness from, so the
+/// caller must find its proof elsewhere (or refuse).
+///
+/// `Ok(Some(true))`: the recorded owner is confirmed gone - either its pid
+/// is not running at all, or a live pid at that exact number started at a
+/// different time than recorded, which means the OS handed the number to
+/// an unrelated process and the original is still gone (rev_break #8).
+///
+/// `Ok(Some(false))`: the recorded owner - or something that cannot be
+/// told apart from it - is still alive. This is also the answer when a
+/// live pid is found but the nonce records no start time to compare: an
+/// old pid-binding format did not record one, and pid_alive alone is
+/// advisory (see the module doc comment), so a live pid there is treated
+/// as possibly still the owner rather than confirmed dead - the same
+/// fail-closed default `wedged` uses when it cannot compute a verdict
+/// either.
+pub fn owner_verifiably_dead(dir: &Path) -> Result<Option<bool>, String> {
+    let raw = match contain::read_contained_opt(dir, "sfh-nonce")? {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return Ok(None),
+    };
+    let (pid, start) = match contain::parse_nonce(raw.trim())? {
+        contain::Nonce::Bound { pid, start, .. } => (pid, start),
+        // No pid recorded at all: a run from before pid binding existed.
+        // Nothing here to check liveness against.
+        contain::Nonce::Legacy { .. } => return Ok(None),
+    };
+    if !execute::pid_alive(pid) {
+        return Ok(Some(true));
+    }
+    Ok(match start {
+        None => Some(false),
+        Some(recorded) => Some(execute::pid_start_time(pid) != Some(recorded)),
+    })
+}
+
 /// Verify that a run directory genuinely belongs to sfh before killing its pid.
 /// Checks: (1) the nonce in status.json matches the nonce file in the run dir,
 /// (2) the pid recorded in the nonce file (when present) matches status.json,
@@ -1052,5 +1099,96 @@ pub fn wait(
             }
         }
         std::thread::sleep(interval);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sfh-watch-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn owner_verifiably_dead_reads_none_when_no_nonce_file_exists() {
+        // Nothing here to verify liveness from - the caller (the
+        // `--carry-budget-from` finality check) must find its proof
+        // elsewhere, or refuse. This must not be conflated with "confirmed
+        // dead": an absent nonce says nothing either way.
+        let dir = temp_dir("no-nonce");
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_reads_none_for_a_legacy_bare_nonce_with_no_pid() {
+        // A bare token predates pid binding entirely; there is no pid to ask
+        // the process table about.
+        let dir = temp_dir("legacy-nonce");
+        std::fs::write(dir.join("sfh-nonce"), "just-a-token").unwrap();
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_confirms_life_when_the_recorded_pid_and_start_time_are_still_current()
+    {
+        let dir = temp_dir("alive");
+        let pid = std::process::id();
+        let start = execute::pid_start_time(pid);
+        contain::write_nonce(&dir, pid, start, "tok").unwrap();
+        assert_eq!(
+            owner_verifiably_dead(&dir).unwrap(),
+            Some(false),
+            "the calling test process is definitely still running"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_treats_a_live_pid_with_no_recorded_start_as_unconfirmed() {
+        // The first pid-binding format recorded no start time. A live pid
+        // there cannot be told apart from the original owner - pid_alive
+        // alone is advisory (rev_break #8) - so this must fail closed the
+        // same way the "wedged" check does when it cannot compute a
+        // verdict: not proven dead.
+        let dir = temp_dir("alive-no-start");
+        contain::write_nonce(&dir, std::process::id(), None, "tok").unwrap();
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_confirms_death_when_a_live_pid_disagrees_with_the_recorded_start_time()
+    {
+        // The OS reusing a pid for an unrelated process is exactly what the
+        // recorded start time exists to catch (rev_break #8): the number is
+        // alive, but not as the process that owned this run.
+        let dir = temp_dir("reused-pid");
+        contain::write_nonce(&dir, std::process::id(), Some(1), "tok").unwrap();
+        assert_eq!(
+            owner_verifiably_dead(&dir).unwrap(),
+            Some(true),
+            "a live pid whose start time does not match the recording is a reused pid, not the original owner"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_verifiably_dead_confirms_death_when_the_recorded_pid_has_actually_exited() {
+        let dir = temp_dir("exited");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a trivial child");
+        let pid = child.id();
+        let start = execute::pid_start_time(pid);
+        child.wait().expect("wait for the child to exit");
+        contain::write_nonce(&dir, pid, start, "tok").unwrap();
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -985,6 +985,15 @@ fn load_resume_for_flow(
     // never as an addend, so it can restore a lost figure without ever
     // double-counting a present one.
     let mut carried_elapsed: u64 = 0;
+    // The most durable elapsed-time source there is (see the restore
+    // precedence at the end of this function): a `run_end` event is logged
+    // exactly once, at the true end of an attempt, and never rewritten
+    // afterwards - unlike status.json, which a detached resume deletes and
+    // reseeds at zero. A log spanning several attempts (a stuck run,
+    // resumed, then failing) can carry more than one of these; the latest
+    // describes the most recent attempt, so it wins (plain assignment, not
+    // a max: an attempt's own total already includes everything before it).
+    let mut run_end_elapsed: Option<u64> = None;
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
     // A completed leaf's chain may later be intentionally replaced by its
@@ -1109,17 +1118,19 @@ fn load_resume_for_flow(
                         }
                     }
                 }
-                // elapsed_sec is deliberately NOT ADDED: status.json records
-                // elapsed_before_attempt PLUS this attempt, so the carried
-                // seconds are normally already inside the value read at the
-                // end of this function, and adding them would double-count.
-                // Remembered as a floor instead, because "normally" is not
-                // "always": detach_run deletes a resumed run's status.json and
-                // seeds a zeroed replacement, so on `--resume <carried-run>
-                // --detach` the only surviving record of the inherited seconds
-                // is this event. Steps, cost and visits are all durable in the
-                // log; wall clock has to be too, or three of the four carried
-                // ceilings hold and the fourth silently resets.
+                // elapsed_sec is deliberately NOT ADDED: whichever of the
+                // three sources wins in the restore precedence at the end of
+                // this function (run_end, then meta.json, then status.json)
+                // records elapsed_before_attempt PLUS this attempt, so the
+                // carried seconds are normally already inside it, and adding
+                // them would double-count. Remembered as a floor instead,
+                // because "normally" is not "always": detach_run deletes a
+                // resumed run's status.json and seeds a zeroed replacement,
+                // so on `--resume <carried-run> --detach` the only surviving
+                // record of the inherited seconds may be this event. Steps,
+                // cost and visits are all durable in the log; wall clock has
+                // to be too, or three of the four carried ceilings hold and
+                // the fourth silently resets.
                 if let Some(secs) = v.get("elapsed_sec").and_then(|x| x.as_u64()) {
                     carried_elapsed = carried_elapsed.max(secs);
                 }
@@ -1742,7 +1753,9 @@ fn load_resume_for_flow(
                     st.workspace_checkpoint = Some(fp.to_string());
                 }
             }
-            "run_end" => {}
+            "run_end" => {
+                run_end_elapsed = v.get("elapsed_sec").and_then(|x| x.as_u64());
+            }
             _ => {}
         }
     }
@@ -1804,19 +1817,45 @@ fn load_resume_for_flow(
             }
         }
     }
-    if let Some(text) = contain::read_contained_opt(run_dir, "status.json")? {
-        if let Ok(status) = serde_json::from_str::<serde_json::Value>(&text) {
-            st.elapsed_sec = status
-                .get("elapsed_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-    }
-    // A run can never have been active for less time than it inherited. Where
-    // status.json survived it already includes these seconds and this changes
-    // nothing; where it was deleted or reseeded, this is what keeps a carried
-    // wall_clock_sec budget from quietly starting over.
-    st.elapsed_sec = st.elapsed_sec.max(carried_elapsed);
+    // ---- restore active time (P1-03) ----
+    // Three possible sources, consulted in this order - most durable first,
+    // and NEVER blended, because status.json's own elapsed already includes
+    // whatever came before it and adding a second source on top would
+    // double it:
+    //
+    // 1. `run_end_elapsed`, above: a run_end event, logged once at the true
+    //    end of an attempt and never rewritten. Most trusted because it is
+    //    both durable AND known-final.
+    // 2. meta.json's `elapsed_sec`: refreshed at that same final moment
+    //    (see the `meta_final` write in run_inner), so it normally agrees
+    //    with (1) exactly - it only falls behind when the attempt that
+    //    would have refreshed it was killed first, in which case it still
+    //    holds the value from the START of that attempt: a valid, if
+    //    stale, lower bound rather than the true total.
+    // 3. status.json's `elapsed_sec`: refreshed on every heartbeat, so the
+    //    freshest source for a run that crashed mid-attempt with neither of
+    //    the above - but the least durable of the three, because
+    //    detach_run deletes a resumed run's copy and seeds a zeroed
+    //    replacement before the child even starts (see the comment on
+    //    `carried_elapsed`, above, for the same durability gap encountered
+    //    one layer up).
+    //
+    // Whichever of the three answers, `carried_elapsed` is still applied as
+    // an unconditional FLOOR afterwards: what this run itself durably
+    // inherited via --carry-budget-from cannot be un-inherited by a source
+    // three levels removed going quiet (see the `budget_carried` handling
+    // above for why that value is a floor and not an addend here too).
+    let meta_elapsed_sec = contain::read_contained_opt(run_dir, "meta.json")?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|meta| meta.get("elapsed_sec").and_then(|v| v.as_u64()));
+    let status_elapsed_sec = contain::read_contained_opt(run_dir, "status.json")?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|status| status.get("elapsed_sec").and_then(|v| v.as_u64()));
+    st.elapsed_sec = run_end_elapsed
+        .or(meta_elapsed_sec)
+        .or(status_elapsed_sec)
+        .unwrap_or(0)
+        .max(carried_elapsed);
     Ok(st)
 }
 
@@ -2096,7 +2135,7 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
                 "run_id": run_dir.file_name().map(|n| n.to_string_lossy().into_owned()),
                 "run_dir": run_dir.display().to_string(),
                 "flow": abs(&opts.flow_path).display().to_string(),
-                "next_actions": next_actions_for("running", run_dir, &opts.flow_path),
+                "next_actions": next_actions_for("running", run_dir, &opts.flow_path, None),
             }),
         ));
         return Ok(0);
@@ -2483,6 +2522,102 @@ fn seed_status(path: &Path, s: &Status) -> Result<(), String> {
     }
 }
 
+/// Proof, read straight from the log, that an attempt reached a genuine
+/// stop. Returns `(saw_run_end, log_recovers_a_terminal_landing)`:
+///
+/// - `saw_run_end`: a durable `run_end` event exists anywhere in the log.
+///   It is the very last thing `run` ever logs for an attempt, written
+///   exactly once, only at a true stop, so its presence alone proves
+///   finality - see `carry_source_is_final`, the only caller that treats it
+///   that way.
+/// - `log_recovers_a_terminal_landing`: the log's own LAST recorded routing
+///   decision already lands on "end", "fail" or "stuck" - the only three
+///   positions a live run does not step away from - or it logged a
+///   `persistence_failure`, which ends the attempt immediately for the same
+///   reason. This is weaker than `saw_run_end` on its own (the process that
+///   reached it could in principle still be alive), so callers pair it with
+///   independent proof the owning process is gone.
+fn log_terminal_evidence(dir: &Path) -> Result<(bool, bool), String> {
+    let mut run_end = false;
+    let mut last_position_terminal = false;
+    let mut persistence_failure = false;
+    if let Some(text) = contain::read_contained_opt(dir, "log.jsonl")? {
+        for line in text.lines() {
+            // Same fail-safe skip load_resume_for_flow uses: a torn last line
+            // from a kill mid-write is evidence of nothing and must not be
+            // misread as proof of anything (fail-SAFE, not fail-open - see
+            // the matching comment there).
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            match v.get("event").and_then(|x| x.as_str()).unwrap_or("") {
+                "run_end" => run_end = true,
+                "persistence_failure" => persistence_failure = true,
+                "position" => {
+                    let next = v.get("next").and_then(|x| x.as_str()).unwrap_or("");
+                    last_position_terminal = matches!(next, "end" | "fail" | "stuck");
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((run_end, last_position_terminal || persistence_failure))
+}
+
+/// Whether `dir` is a run `--carry-budget-from` may trust as a source: the
+/// finality check, factored out of the carry closure in `run_inner` so it
+/// can also back the `carryable` field `next_actions_for` reports for a run
+/// that just ended (see there) - both questions are "can this run's numbers
+/// be trusted as final", asked at different times.
+///
+/// When status.json can be read, its resolved state decides this exactly as
+/// it always has: refuse a run that is "running", or "wedged" (dead-looking
+/// on disk while the SAME process that started it is still alive - see
+/// execute::pid_start_time). pid_alive alone is not enough here because pid
+/// reuse makes it advisory: a run SIGKILLed with `state: running` still on
+/// disk would read as alive forever the moment the OS handed its pid to
+/// something unrelated, and `sfh stop` would refuse to clear it, leaving no
+/// way to carry at all. The recorded start time is what tells the original
+/// process from a stranger wearing its pid (rev_break #8). Anything else
+/// status.json resolves to - done, failed, stuck, a confirmed dead, a
+/// deliberate stop - is trusted, same as before.
+///
+/// When status.json cannot be read at all - missing, corrupt, or caught
+/// mid-rewrite - that USED TO say nothing either way and carry anyway
+/// (P1-02: fail-open in exactly the case that matters, a source run still
+/// appending to its log). Proof now has to come from the log and the
+/// process table instead: a durable `run_end` settles it outright; short of
+/// that, the owning process must be independently confirmed gone (via the
+/// run dir's own sfh-nonce, since status.json is exactly what is
+/// unavailable here) AND the log's own last word must already be a
+/// terminal landing. Absent both, the carry is refused rather than
+/// assumed.
+fn carry_source_is_final(dir: &Path) -> Result<(), String> {
+    if let Ok(snap) = watch::read(dir) {
+        let wedged = snap.state == "dead"
+            && snap.pid_start.is_some()
+            && execute::pid_start_time(snap.pid) == snap.pid_start;
+        if snap.state == "running" || wedged {
+            return Err(format!(
+                "that run is still going, so its spend is not final yet. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
+                dir.display(), dir.display()
+            ));
+        }
+        return Ok(());
+    }
+    let (run_end, log_terminal) = log_terminal_evidence(dir)?;
+    if run_end {
+        return Ok(());
+    }
+    if log_terminal && matches!(watch::owner_verifiably_dead(dir)?, Some(true)) {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot confirm that run has finished - its status.json is missing or unreadable, and its log does not yet prove it reached a terminal state. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
+        dir.display(), dir.display()
+    ))
+}
+
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // `--runs-dir` keeps meaning exactly what it always meant, and with neither
     // flag the runs root is still `.sfh/runs`: every flow, script and CI job
@@ -2735,11 +2870,18 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // at. This is a decision handed back, not a failure.
                     let mut log = contain::append_private(&dir.join("log.jsonl"))
                         .map_err(|e| format!("cannot open log: {e}"))?;
+                    // Nothing ran this attempt, so the total active time is
+                    // exactly what was already restored - carried forward
+                    // rather than recomputed, for the same reason the other
+                    // three run_end sites now record it durably (P1-03):
+                    // this is the run's own strongest remaining source once
+                    // status.json goes missing or stale.
                     log_event(
                         &mut log,
                         json!({"ts": utc_stamp(), "event": "run_end", "state": word,
                                "exit": code, "error": why.clone(),
-                               "replay_refused": policy.as_str(), "step": u.step}),
+                               "replay_refused": policy.as_str(), "step": u.step,
+                               "elapsed_sec": resumed.elapsed_sec}),
                     )?;
                     mark_terminal_status(&dir, word, code, &why)?;
                     if opts.as_json {
@@ -2812,31 +2954,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // A run that is still spending has no final total. Carrying from it
         // would take a snapshot the ancestor immediately invalidates, and the
         // numbers in both runs would then be wrong in a way nothing downstream
-        // could detect.
-        //
-        // "Still going" already has one definition here and it is not
-        // `pid_alive` on its own: pid reuse makes that advisory (see
-        // execute::pid_alive), so a run SIGKILLed with `state: running` still
-        // on disk would read as alive forever the moment the OS handed its pid
-        // to something unrelated - and `sfh stop` would refuse to clear it,
-        // leaving no way to carry at all. Ask the same snapshot `sfh status`
-        // answers from, which pairs the pid with heartbeat freshness. A run
-        // whose heartbeat went stale while its process really is still the one
-        // that started it is the WEDGED case, also not final; the recorded
-        // start time is what tells it from a stranger wearing its pid
-        // (rev_break #8). An unreadable or absent status.json says nothing
-        // either way, and says it without blocking the carry.
-        if let Ok(snap) = watch::read(&dir) {
-            let wedged = snap.state == "dead"
-                && snap.pid_start.is_some()
-                && execute::pid_start_time(snap.pid) == snap.pid_start;
-            if snap.state == "running" || wedged {
-                return Err(format!(
-                    "--carry-budget-from {}: that run is still going, so its spend is not final yet. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
-                    dir.display(), dir.display(), dir.display()
-                ));
-            }
-        }
+        // could detect. See carry_source_is_final for exactly what "final"
+        // means and is proven from - in particular, an unreadable or absent
+        // status.json no longer carries anyway (P1-02): it used to say
+        // nothing either way and let the carry through regardless.
+        carry_source_is_final(&dir)
+            .map_err(|e| format!("--carry-budget-from {}: {e}", dir.display()))?;
         let prior = load_resume_for_flow(&dir, None)
             .map_err(|e| format!("--carry-budget-from {}: {e}", dir.display()))?;
         // A corrected flow may have renamed, split or removed steps. Laps
@@ -5161,15 +5284,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .or_else(|| last_success.clone().filter(nonempty))
             .or_else(|| last_executed.clone().filter(nonempty))
     };
+    // Shared by meta.json's final write and the run_end event just below it:
+    // the two are meant to agree exactly (P1-03's restore precedence relies
+    // on that - see load_resume_for_flow), so both read it from the same
+    // computation rather than two calls that could drift apart.
+    let final_elapsed_sec = elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs());
     let mut meta_final = meta.clone();
     if let Some(m) = meta_final.as_object_mut() {
         m.insert("finished_utc".into(), json!(utc_stamp()));
         m.insert("leaf_runs".into(), json!(total));
         m.insert("cost_usd".into(), json!(cost_usd));
-        m.insert(
-            "elapsed_sec".into(),
-            json!(elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs())),
-        );
+        m.insert("elapsed_sec".into(), json!(final_elapsed_sec));
         m.insert(
             "status".into(),
             json!(match &result {
@@ -5275,7 +5400,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         Ok(FlowEnd::Completed) => {
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
             let emit_id = opts.emit.clone().or(last_success);
             let emit_id =
@@ -5335,7 +5460,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             let msg = format!("routed to stuck after '{after}'");
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
             if opts.as_json {
                 finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg))?;
@@ -5372,7 +5497,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         Err(msg) => {
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
             if opts.as_json {
                 finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg))?;
@@ -5489,7 +5614,7 @@ fn emit_run_envelope(e: RunEnvelope<'_>) {
             "mode": w.mode.as_str(),
             "branch": w.branch,
         })),
-        "next_actions": next_actions_for(e.state, e.run_dir, e.flow),
+        "next_actions": next_actions_for(e.state, e.run_dir, e.flow, e.error),
     });
     match e.error {
         Some((code, msg)) => machine::emit(&machine::error_envelope(
@@ -5503,9 +5628,101 @@ fn emit_run_envelope(e: RunEnvelope<'_>) {
     }
 }
 
-/// Runnable follow-ups, as argv rather than prose, so a caller can act without
-/// parsing an instruction.
-fn next_actions_for(state: &str, run_dir: &Path, flow: &Path) -> Vec<serde_json::Value> {
+/// Whether resuming `run_dir` right now, unchanged, would walk straight back
+/// into the same `stuck`: true (naming the step) only when the log's LAST
+/// recorded routing decision reached "stuck" through `on_max_visits`
+/// (`PositionVia::MaxVisits`).
+///
+/// That step's visit counter is already at the flow's declared ceiling, and
+/// `--resume` restores it as-is - see the "stuck" arm of the `position`
+/// handling in `load_resume_for_flow`: resetting the counter there would
+/// quietly undo the limit the flow set, which is exactly the escape hatch
+/// on_max_visits exists to close. So re-entering the step on resume
+/// re-triggers on_max_visits immediately, without running anything or
+/// spending anything new: a provable dead end, not just a likely one.
+///
+/// Any OTHER route to stuck - an explicit `goto: stuck` rule, an on_error
+/// stuck, a budget landing - depends on what the step actually does or
+/// decides when it runs again, which resuming can legitimately change (a
+/// human fixed what it was stuck on, or the AI answers differently this
+/// time). Only max_visits exhaustion is deterministic enough to refuse
+/// resume over.
+fn stuck_step_exhausted_max_visits(run_dir: &Path) -> Option<String> {
+    let text = contain::read_contained_opt(run_dir, "log.jsonl")
+        .ok()
+        .flatten()?;
+    let mut exhausted: Option<String> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("event").and_then(|x| x.as_str()) != Some("position") {
+            continue;
+        }
+        // Reassigned on every position event, terminal or not, so the
+        // result reflects the LOG'S LAST word - a later, non-max_visits
+        // position (a resumed attempt that got past it) must clear an
+        // earlier max_visits landing, not leave it lingering.
+        exhausted = (v.get("via").and_then(|x| x.as_str()) == Some("max_visits")).then(|| {
+            v.get("after")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
+    }
+    exhausted
+}
+
+/// Build one diagnosed `resume` or `carry_budget` action. `ok_field` is
+/// "resumable" or "carryable" - the review's own names for the two
+/// diagnoses, kept as the literal JSON key so a caller reads exactly what
+/// was asked for rather than a generic "runnable" flag that does not say
+/// which question it answers.
+///
+/// `argv` is present ONLY when `ok` is true: an unrunnable action is never
+/// hand a command to run verbatim (P1-09's central rule), but it is still
+/// reported - with `reason` and, when relevant, `requires` - so "nothing is
+/// runnable" is something the caller is TOLD, not left to infer from a
+/// shorter list.
+fn diagnosed_action(
+    kind: &str,
+    ok_field: &str,
+    ok: bool,
+    reason: String,
+    requires: &[&str],
+    argv: Vec<String>,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("kind".into(), json!(kind));
+    m.insert(ok_field.to_string(), json!(ok));
+    m.insert("reason".into(), json!(reason));
+    m.insert("requires".into(), json!(requires));
+    if ok {
+        m.insert("argv".into(), json!(argv));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Runnable follow-ups, as argv rather than prose, so a caller can act
+/// without parsing an instruction - "why" (and, mid-run, "wait") always
+/// qualify, but `resume` and `carry_budget` do not just because the state is
+/// `failed` or `stuck`: a persistence failure is not resumable, a stuck run
+/// that exhausted max_visits sticks again the instant it is resumed, and a
+/// workspace or execution-closure problem needs a specific flag before
+/// resuming can work at all (P1-09). Each is diagnosed here rather than
+/// assumed from the state alone, using the same durable facts a human would
+/// have to go check by hand: the classified failure code already computed
+/// for this envelope's `error`, the log's own last routing decision, and -
+/// for carry - the exact finality proof `--carry-budget-from` itself
+/// requires (`carry_source_is_final`, P1-02). An action this run cannot
+/// actually complete is never hand a command to run; only the diagnosis
+/// that explains why is.
+fn next_actions_for(
+    state: &str,
+    run_dir: &Path,
+    flow: &Path,
+    error: Option<(machine::ErrorCode, &str)>,
+) -> Vec<serde_json::Value> {
     let rd = run_dir.display().to_string();
     let mut out = vec![machine::next_action(
         "why",
@@ -5526,25 +5743,97 @@ fn next_actions_for(state: &str, run_dir: &Path, flow: &Path) -> Vec<serde_json:
             ),
         ),
         "failed" | "stuck" => {
-            out.push(machine::next_action(
+            let (resumable, resume_reason, requires): (bool, String, Vec<&str>) = if state
+                == "stuck"
+            {
+                match stuck_step_exhausted_max_visits(run_dir) {
+                    Some(step) => (
+                        false,
+                        format!(
+                            "step '{step}' is stuck because it reached its declared max_visits; resuming walks back into the same step and sticks again immediately, without running anything. Raise max_visits (or change on_max_visits) in the flow, then resume."
+                        ),
+                        vec![],
+                    ),
+                    None => (
+                        true,
+                        "a human decision was requested; resuming continues from where the flow left off.".to_string(),
+                        vec![],
+                    ),
+                }
+            } else {
+                match error.map(|(c, _)| c) {
+                    Some(machine::ErrorCode::PersistenceFailure) => (
+                        false,
+                        "a required result could not be durably persisted, so this run is not resumable: replaying it risks re-running an effect whose completion cannot be verified. Verify the external side effect by hand, then start a fresh run.".to_string(),
+                        vec![],
+                    ),
+                    Some(machine::ErrorCode::WorkspaceMissing) => (
+                        false,
+                        "the managed workspace this run recorded no longer exists, so there is nothing here to resume into. Restore it, or start a fresh run.".to_string(),
+                        vec![],
+                    ),
+                    Some(machine::ErrorCode::WorkspaceDrift) => (
+                        true,
+                        "the managed workspace changed outside this run since its last checkpoint; --adopt-workspace accepts the current contents as the new baseline.".to_string(),
+                        vec!["--adopt-workspace"],
+                    ),
+                    Some(machine::ErrorCode::ExecutionClosureChanged) => (
+                        true,
+                        "the pinned execution inputs (profile, model, context or tool) changed since this run started; --force-resume accepts the change and continues.".to_string(),
+                        vec!["--force-resume"],
+                    ),
+                    _ => (
+                        true,
+                        "the run stopped before completing; resuming continues from the last durable checkpoint.".to_string(),
+                        vec![],
+                    ),
+                }
+            };
+            let mut resume_argv = vec![
+                "sfh".to_string(),
+                "run".into(),
+                flow.display().to_string(),
+                "--resume".into(),
+                rd.clone(),
+            ];
+            resume_argv.extend(requires.iter().map(|f| f.to_string()));
+            resume_argv.push("--json".into());
+            out.push(diagnosed_action(
                 "resume",
-                vec![
-                    "sfh".into(),
-                    "run".into(),
-                    flow.display().to_string(),
-                    "--resume".into(),
-                    rd.clone(),
-                    "--json".into(),
-                ],
+                "resumable",
+                resumable,
+                resume_reason,
+                &requires,
+                resume_argv,
             ));
-            // Offered alongside resume, not instead of it, because the two are
-            // answers to different diagnoses and only the reader knows which
-            // one they are looking at. A caller who concludes the FLOW was
-            // wrong cannot resume - correcting it invalidates the closure, as
-            // it should - and without this the only remaining move is a fresh
-            // run whose budget silently starts over.
-            out.push(machine::next_action(
+
+            // Offered alongside resume, not instead of it, because the two
+            // are answers to different diagnoses and only the reader knows
+            // which one they are looking at. A caller who concludes the FLOW
+            // was wrong cannot resume - correcting it invalidates the
+            // closure, as it should - and without this the only remaining
+            // move is a fresh run whose budget silently starts over. It
+            // depends on a DIFFERENT fact than resume does - not "can this
+            // run continue" but "is this run's spend final" - so it is
+            // diagnosed separately, via the same proof `--carry-budget-from`
+            // itself requires (P1-02). At the point this function is called
+            // that proof always succeeds (this run just wrote its own
+            // terminal status.json a few lines up), but it is still asked
+            // for rather than assumed: the two questions being answered by
+            // the same code, here and at the real carry attempt, is the
+            // point.
+            let carryable = carry_source_is_final(run_dir).is_ok();
+            let carry_reason = if carryable {
+                "this run's spend is final; a corrected flow can start fresh while keeping it on the books instead of silently resetting the budget.".to_string()
+            } else {
+                "this run's spend cannot yet be confirmed final, so carrying from it would risk a snapshot the source immediately invalidates.".to_string()
+            };
+            out.push(diagnosed_action(
                 "carry_budget",
+                "carryable",
+                carryable,
+                carry_reason,
+                &[],
                 vec![
                     "sfh".into(),
                     "run".into(),

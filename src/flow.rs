@@ -3576,10 +3576,17 @@ mod tests {
 
     #[test]
     fn fork_from_is_rejected_for_tools_without_a_headless_fork() {
-        let e = parse("name: t\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n  - id: b\n    tool: codex\n    access: read\n    fork_from: a\n    prompt: y\n").unwrap_err();
+        // agy, not codex. codex used to stand in for "cannot fork headlessly"
+        // because its fork was TUI-only; `codex exec fork` now exists and the
+        // adapter supports it (P1-07), so codex proves the opposite case. agy
+        // still has no headless fork at all - its adapter says so in as many
+        // words - which is what this test needs.
+        let e = parse("name: t\nsteps:\n  - id: a\n    tool: agy\n    access: read\n    prompt: x\n  - id: b\n    tool: agy\n    access: read\n    fork_from: a\n    prompt: y\n").unwrap_err();
         assert!(e.contains("cannot fork a session headlessly"), "{e}");
         // claude can fork
         assert!(parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    access: read\n    prompt: x\n  - id: b\n    tool: claude\n    access: read\n    fork_from: a\n    prompt: y\n").is_ok());
+        // and so, now, can codex
+        assert!(parse("name: t\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n  - id: b\n    tool: codex\n    access: read\n    fork_from: a\n    prompt: y\n").is_ok());
     }
 
     #[test]

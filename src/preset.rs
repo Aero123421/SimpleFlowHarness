@@ -8,8 +8,11 @@
 //! three things at once: a clean final message, the session id, and token/cost
 //! usage. Key per-tool facts encoded here:
 //! - codex: prompt on stdin via '-'; final text from --output-last-message;
-//!   `--json` stdout carries thread.started/turn.completed; `exec resume` has
-//!   no -s flag, so the sandbox is re-specified with -c sandbox_mode=...
+//!   `--json` stdout carries thread.started/turn.completed; `exec resume` and
+//!   `exec fork` (P1-07) both lack -s, so the sandbox is re-specified with
+//!   -c sandbox_mode=...; fork ships after this file's LAST_VERIFIED date, so
+//!   sfh additionally demands a live --help probe of the installed binary
+//!   before it will use it (see `codex_fork_confirmed`).
 //! - claude: prompt on stdin; --output-format json gives .result/.session_id/
 //!   .total_cost_usd; plan mode is only advisory, so read = dontAsk + --tools.
 //! - opencode: prompt on stdin; --auto is mandatory headless (an "ask" hangs
@@ -256,16 +259,24 @@ pub fn session_is_cwd_scoped(tool: &str) -> bool {
 }
 
 /// Fork resolution is more tolerant than resume: pi's --fork looks up the id
-/// project-locally then globally, and opencode session ids are global.
+/// project-locally then globally, and opencode session ids are global. codex
+/// stays out of this list for the same reason it is absent from
+/// `session_is_cwd_scoped`: sfh has no evidence that codex scopes a thread id
+/// to the directory it was created in, so treating a cwd change as risky here
+/// would warn about a danger nothing has shown to exist.
 pub fn fork_is_cwd_scoped(tool: &str) -> bool {
     matches!(tool, "claude" | "grok")
 }
 
 /// Tools that can branch a session headlessly into a NEW independent session.
-/// codex's `fork` is TUI-only and `exec resume` appends to the parent; agy has
-/// no fork at all.
+/// codex's `exec fork` (P1-07) joined this list after this file's
+/// LAST_VERIFIED baseline was pinned, so `true` here is only the adapter-wide
+/// half of the answer: `build_fork`'s codex arm additionally demands live
+/// proof from the installed binary before it actually emits anything (see
+/// `codex_fork_confirmed`) - this function alone is not permission to launch
+/// it. agy has no fork at all.
 pub fn supports_fork(tool: &str) -> bool {
-    matches!(tool, "claude" | "opencode" | "grok" | "pi")
+    matches!(tool, "claude" | "opencode" | "grok" | "pi" | "codex")
 }
 
 /// The executable a preset launches when no `bin:` overrides it. Every preset
@@ -281,7 +292,9 @@ pub fn default_program(tool: &str) -> String {
 /// Forking pays off because the child's prompt prefix is byte-identical to the
 /// parent's, so the provider's prompt cache can hit - but N children racing the
 /// first cache write all miss it. Measured on claude: one warm-up child first
-/// turned $0.0337 per child into $0.0026. Only claude showed a real saving.
+/// turned $0.0337 per child into $0.0026. Only claude showed a real saving;
+/// codex fork (P1-07) has never been run through this measurement and is left
+/// out rather than assumed to share claude's cache economics.
 pub fn fork_warmup_pays(tool: &str) -> bool {
     tool == "claude"
 }
@@ -332,6 +345,17 @@ pub enum Enforcement {
     /// access this level names - not just the specific tools, edits or
     /// commands sfh's preset happens to enumerate. See the enum doc comment
     /// for the bar this has to clear.
+    ///
+    /// No adapter clears this bar today: agy's P0-02 pass (the last of the
+    /// seven) found its `--mode` is the same bare, non-sandboxed switch as
+    /// every other downgraded adapter's, leaving `Sandboxed` (codex's real OS
+    /// sandbox) the only mechanism currently on the holistic side of the
+    /// line. The variant stays - removing it would silently drop `"enforced"`
+    /// from the `access_enforcement` vocabulary CHANGELOG v1.4.0 already
+    /// documented as machine-readable output, and a tool that closes a whole
+    /// access class through its own guarantee without an OS sandbox is a real
+    /// case this taxonomy still needs to be able to say.
+    #[allow(dead_code)]
     Enforced,
     /// Requested, but the tool's own defaults or config can widen it - or the
     /// preset only closes the surface its author enumerated (builtin tools),
@@ -524,7 +548,15 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
         "agy" => (
             "agy-json",
             Coverage::TokensOnly,
-            [Enforced, Enforced, BestEffort],
+            // P0-02: downgraded from Enforced. agy's builder pushes nothing
+            // for read/write but the bare --mode flag itself - no --tools-
+            // style allowlist, no sandbox flag - identical in shape to
+            // cursor's --mode plan (BestEffort) and to claude's plan mode,
+            // whose own gap text calls plan mode advisory. A mode switch is a
+            // request to agy's own permission system, not a demonstrated
+            // guarantee that it bounds the whole process, so nothing here
+            // clears the bar Enforced requires.
+            [BestEffort, BestEffort, BestEffort],
             &[
                 "--model",
                 "--effort",
@@ -539,6 +571,8 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
             &[
                 "exit codes are unreliable; sfh trusts the envelope's status field",
                 "no fork: a branch of an existing conversation is not available headlessly",
+                "--mode plan/accept-edits is a bare mode switch - no --tools-style allowlist and no sandbox flag back it, so its reach over an MCP server, a plugin, a hook or a subagent agy loads is undocumented",
+                "project- or user-level instruction files agy may read are not inspected or suppressed by any flag this preset passes",
             ],
             // P1-06: agy's own changelog documents structured print output
             // (the --output-format json envelope this preset's whole parse
@@ -1700,20 +1734,43 @@ pub fn build_resume(
     })
 }
 
+/// The token codex's own `--help` has to contain for sfh to trust `exec fork`
+/// on the installed binary (P1-07). Deliberately NOT folded into
+/// `AdapterInfo.required_flags`, which `preflight` checks on every run
+/// regardless of what the step asked for: a codex whose `--help` stays silent
+/// about `fork` is still a perfectly good codex for a fresh run or a
+/// `continue_from` resume, so refusing those too would be exactly the
+/// per-adapter-vs-per-capability mismatch this function exists to avoid.
+/// `None` (the caller could not read `--help` at all) is exactly as
+/// untrustworthy as help text that never mentions fork, so both fail closed
+/// the same way.
+fn codex_fork_confirmed(installed_help: Option<&str>) -> bool {
+    installed_help.is_some_and(|h| h.contains("fork"))
+}
+
 /// Build the command line to FORK a session: the child inherits the parent's
 /// history but writes to its own session, so N children can diverge from one
 /// context concurrently without corrupting each other or the parent.
 ///
-/// All four supporting tools refuse loudly (exit 1, before any model call) when
+/// Every supporting tool refuses loudly (exit 1, before any model call) when
 /// the parent id does not exist, so - unlike pi's create-or-resume --session-id -
 /// a fork cannot silently degrade into a cold session. The remaining risk is the
 /// fork flag being ignored, which the caller detects by requiring child != parent.
+///
+/// `installed_help` is the resolved binary's own `--help` output, when the
+/// caller could read it. It is consulted ONLY by codex's arm: `exec fork`
+/// shipped after this file's `LAST_VERIFIED` baseline, so `supports_fork`
+/// returning `true` for codex is an adapter-wide fact, not proof THIS
+/// installed build has ever heard of the subcommand - see
+/// `codex_fork_confirmed`. Every other tool's fork predates that baseline and
+/// ignores this argument.
 pub fn build_fork(
     tool: &str,
     parent_session_id: &str,
     child_session_id: &str,
     inp: PresetInput,
     paths: &BuildPaths,
+    installed_help: Option<&str>,
 ) -> Result<Built, String> {
     let mut a: Vec<String> = Vec::new();
     let mut warnings = Vec::new();
@@ -1721,9 +1778,76 @@ pub fn build_fork(
     let mut env_set = Vec::new();
     let parse;
     let delivery;
-    // opencode mints the child id itself; the others let sfh name it.
+    // opencode and codex mint the child id themselves; the others let sfh
+    // name it.
     let mut preassigned = Some(child_session_id.to_string());
     match tool {
+        "codex" => {
+            // sfh's belief that codex CAN fork is adapter-wide (supports_fork);
+            // whether THIS installed binary has ever heard of the subcommand
+            // is not, so launching blind risks the exact failure this gate
+            // exists to avoid: an older codex either erroring in a way sfh
+            // cannot tell apart from a real failure, or silently treating
+            // "fork" as an ordinary argument and spending a real turn on a
+            // request nobody made.
+            if !codex_fork_confirmed(installed_help) {
+                return Err(format!(
+                    "codex needs a build that recognises 'exec fork' to branch a session headlessly, and sfh {}. Run 'codex exec --help' yourself to check, upgrade codex if it is missing, or use continue_from to chain this step serially instead",
+                    if installed_help.is_some() {
+                        "could read its --help but it never mentions fork"
+                    } else {
+                        "could not confirm this from the installed binary"
+                    }
+                ));
+            }
+            push(&mut a, &["codex", "exec", "fork"]);
+            a.push(parent_session_id.to_string());
+            push(
+                &mut a,
+                &[
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-c",
+                    "approval_policy=\"never\"",
+                ],
+            );
+            if let Some(m) = &inp.model {
+                push(&mut a, &["-m"]);
+                a.push(m.clone());
+            }
+            if let Some(e) = &inp.effort {
+                push(&mut a, &["-c"]);
+                a.push(format!("model_reasoning_effort=\"{e}\""));
+            }
+            // Like `exec resume`, `exec fork` has no -s flag - rebuild the
+            // sandbox via -c instead of assuming the child inherits the
+            // parent's.
+            match inp.access {
+                Access::Read => {
+                    push(&mut a, &["-c"]);
+                    a.push("sandbox_mode=\"read-only\"".into());
+                }
+                Access::Write => {
+                    push(&mut a, &["-c"]);
+                    a.push("sandbox_mode=\"workspace-write\"".into());
+                }
+                Access::Full => push(&mut a, &["--dangerously-bypass-approvals-and-sandbox"]),
+            }
+            if inp.agent.is_some() {
+                warnings.push("codex preset ignores 'agent' (no --agent flag in exec)".into());
+            }
+            a.extend(inp.extra.iter().cloned());
+            push(&mut a, &["--output-last-message"]);
+            a.push(paths.last_msg.display().to_string());
+            push(&mut a, &["-"]);
+            // codex mints the child's session id itself and reports it via
+            // thread.started in the fork run's own JSONL, exactly like a
+            // fresh run - sfh cannot preassign it (codex is absent from
+            // wants_preassign for the same reason).
+            preassigned = None;
+            parse = OutputParse::CodexJsonl(paths.last_msg.to_path_buf());
+            delivery = Delivery::Stdin;
+        }
         "claude" => {
             push(&mut a, &["claude", "-p", "--output-format", "json", "-r"]);
             a.push(parent_session_id.to_string());
@@ -1780,7 +1904,7 @@ pub fn build_fork(
         other => {
             return Err(format!(
                 "tool '{other}' cannot fork a session headlessly (only {}); use continue_from to chain serially, or give this step its own context",
-                ["claude", "opencode", "grok", "pi"].join("/")
+                ["codex", "claude", "opencode", "grok", "pi"].join("/")
             ))
         }
     }
@@ -2144,6 +2268,11 @@ mod tests {
         assert!(!supports_fork("cursor"));
     }
 
+    /// codex's own `--help`, shaped enough to convince `codex_fork_confirmed`
+    /// that this installed build has heard of `exec fork` - used wherever a
+    /// test needs codex to actually clear the P1-07 capability gate.
+    const CODEX_HELP_WITH_FORK: &str = "usage: codex exec [OPTIONS] [PROMPT]\n\nSUBCOMMANDS:\n    resume    Resume a previous session\n    fork      Fork a previous session into a new one\n";
+
     #[test]
     fn fork_builds_a_child_session_for_every_supporting_tool() {
         let (l, p) = paths();
@@ -2151,18 +2280,28 @@ mod tests {
             last_msg: &l,
             prompt_file: &p,
         };
-        for t in ["claude", "opencode", "grok", "pi"] {
+        for t in ["claude", "opencode", "grok", "pi", "codex"] {
             assert!(supports_fork(t), "{t}");
-            let b = build_fork(t, "PARENT", "CHILD", inp(Access::Read, &[]), &bp).unwrap();
+            // codex additionally needs live proof the installed binary knows
+            // about `exec fork` (P1-07; see build_fork's codex arm) before it
+            // will build anything - every other tool's fork is unconditional
+            // once supports_fork says yes, so this argument is None for them.
+            let help = (t == "codex").then_some(CODEX_HELP_WITH_FORK);
+            let b = build_fork(t, "PARENT", "CHILD", inp(Access::Read, &[]), &bp, help).unwrap();
             assert!(
                 b.argv.iter().any(|x| x == "PARENT"),
                 "{t}: parent id missing"
             );
             match t {
-                // opencode mints the child id itself; it cannot be named.
+                // opencode and codex mint the child id themselves; it cannot
+                // be named up front the way claude/grok/pi's can.
                 "opencode" => {
                     assert!(b.preassigned_session.is_none());
                     assert!(b.argv.iter().any(|x| x == "--fork"));
+                }
+                "codex" => {
+                    assert!(b.preassigned_session.is_none());
+                    assert!(b.argv.windows(2).any(|w| w[0] == "exec" && w[1] == "fork"));
                 }
                 _ => {
                     assert_eq!(b.preassigned_session.as_deref(), Some("CHILD"), "{t}");
@@ -2172,19 +2311,100 @@ mod tests {
             // A fork must never be asserted to equal the parent session.
             assert!(b.expect_session.is_none(), "{t}");
         }
-        for t in ["codex", "agy", "cursor"] {
+        for t in ["agy", "cursor"] {
             assert!(!supports_fork(t), "{t}");
-            let e = build_fork(t, "P", "C", inp(Access::Read, &[]), &bp)
+            let e = build_fork(t, "P", "C", inp(Access::Read, &[]), &bp, None)
                 .err()
                 .unwrap();
             assert!(e.contains("cannot fork"), "{t}: {e}");
         }
     }
 
+    /// P1-07. `supports_fork("codex")` is an adapter-wide fact; it must not by
+    /// itself be enough to spend a real `exec fork` call. Neither a probe that
+    /// failed outright (`None`) nor one that succeeded but never mentions fork
+    /// (an old codex whose `--help` only knows about `resume`) is trusted, and
+    /// the refusal has to name what an operator can actually do about it.
+    #[test]
+    fn codex_fork_refuses_an_older_or_unknown_codex_and_says_what_to_do() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        for help in [
+            None,
+            Some("usage: codex exec resume [OPTIONS] SESSION_ID\n"),
+        ] {
+            let e = build_fork(
+                "codex",
+                "parent-1",
+                "child-1",
+                inp(Access::Read, &[]),
+                &bp,
+                help,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("help={help:?} must not be trusted to fork"));
+            assert!(e.contains("exec fork"), "{e}");
+            assert!(
+                e.contains("upgrade") && e.contains("continue_from"),
+                "the refusal must name what to do next: {e}"
+            );
+        }
+    }
+
+    /// P1-07. Once the capability gate clears, codex's fork argv has to
+    /// follow the same shape as its resume: the subcommand form (not
+    /// --session-id/-r, which codex does not have), no -s (rebuilt via -c),
+    /// and the prompt on stdin.
+    #[test]
+    fn codex_fork_rebuilds_the_sandbox_like_resume_and_reads_stdin() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        let b = build_fork(
+            "codex",
+            "parent-1",
+            "child-1",
+            inp(Access::Write, &[]),
+            &bp,
+            Some(CODEX_HELP_WITH_FORK),
+        )
+        .unwrap();
+        assert!(b.argv.windows(2).any(|w| w[0] == "exec" && w[1] == "fork"));
+        assert!(b.argv.iter().any(|x| x == "parent-1"), "{:?}", b.argv);
+        assert!(
+            !b.argv.iter().any(|x| x == "-s"),
+            "exec fork has no -s flag, same as exec resume: {:?}",
+            b.argv
+        );
+        assert!(b
+            .argv
+            .iter()
+            .any(|x| x == "sandbox_mode=\"workspace-write\""));
+        assert_eq!(
+            b.argv.last().unwrap(),
+            "-",
+            "codex reads the prompt from stdin"
+        );
+    }
+
+    #[test]
+    fn codex_is_not_cwd_scoped_for_fork_the_same_way_it_is_not_for_resume() {
+        // codex looks sessions up by thread id alone; see fork_is_cwd_scoped's
+        // and session_is_cwd_scoped's doc comments for why this is deliberate,
+        // not an oversight.
+        assert!(!fork_is_cwd_scoped("codex"));
+        assert!(!session_is_cwd_scoped("codex"));
+    }
+
     #[test]
     fn only_claude_warms_up_by_default() {
         assert!(fork_warmup_pays("claude"));
-        for t in ["opencode", "grok", "pi"] {
+        for t in ["opencode", "grok", "pi", "codex"] {
             assert!(!fork_warmup_pays(t), "{t} showed no measured saving");
         }
     }
@@ -2225,6 +2445,7 @@ mod tests {
                         last_msg: &l,
                         prompt_file: &p,
                     },
+                    None,
                 )
                 .unwrap()
                 .argv
@@ -2700,15 +2921,18 @@ mod tests {
     }
 
     /// P0-02. `Enforced` used to mean "sfh denied the builtin tools its
-    /// preset author enumerated"; the review found that bar too low for
-    /// five adapters, because none of the five denials reach MCP tools,
-    /// plugins, hooks, subagents or instruction files. Only a tool whose OWN
-    /// flag is documented to bound the entire process (codex's sandbox) or
-    /// whose single permission axis has no known uncovered sibling (agy, not
-    /// examined in this pass and left as it was) still earns it. This test
-    /// pins the corrected table so a future edit cannot silently re-claim
-    /// `Enforced` for an enumerated-denylist adapter without a reviewer
-    /// noticing the diff.
+    /// preset author enumerated"; the review found that bar too low for five
+    /// adapters, because none of the five denials reach MCP tools, plugins,
+    /// hooks, subagents or instruction files. agy was left at `Enforced` in
+    /// that first pass only because the review did not name it, not because
+    /// it was examined - a later pass applied the same bar and found agy's
+    /// `--mode` is the identical bare mode switch cursor's and claude's
+    /// already-downgraded modes are, so it joined them. Only a tool whose OWN
+    /// flag is documented to bound the entire process (codex's sandbox)
+    /// still earns `Enforced` today. This test pins the corrected table so a
+    /// future edit cannot silently re-claim `Enforced` for an
+    /// enumerated-denylist or bare-mode adapter without a reviewer noticing
+    /// the diff.
     #[test]
     fn enforced_is_reserved_for_a_holistic_guarantee_not_an_enumerated_denylist() {
         let expected: &[(&str, Enforcement, Enforcement, Enforcement)] = &[
@@ -2738,8 +2962,8 @@ mod tests {
             ),
             (
                 "agy",
-                Enforcement::Enforced,
-                Enforcement::Enforced,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
                 Enforcement::BestEffort,
             ),
             (
@@ -2790,6 +3014,7 @@ mod tests {
             ("claude", &["MCP", "plugin", "hook", "instruction"]),
             ("opencode", &["--auto", "task", "skill", "MCP", "plugin"]),
             ("grok", &["MCP", "sandbox", "auto-update", "plugin"]),
+            ("agy", &["MCP", "plugin", "hook", "instruction", "sandbox"]),
             ("pi", &["SYSTEM", "APPEND_SYSTEM", "AGENTS.md"]),
             ("cursor", &["MCP", "rule"]),
         ];
@@ -2923,6 +3148,10 @@ mod tests {
         for tool in crate::flow::TOOLS {
             let info = adapter_info(tool).unwrap();
             let mut emitted: Vec<String> = Vec::new();
+            // Only codex's fork arm consults this; every other tool ignores
+            // it, and passing it unconditionally is what lets this loop stay
+            // tool-agnostic instead of special-casing codex around itself.
+            let codex_help = (tool == "codex").then_some(CODEX_HELP_WITH_FORK);
             for access in [Access::Read, Access::Write, Access::Full] {
                 if let Ok(b) = build(tool, full_inp(access), &bp, Some("preassigned-id")) {
                     emitted.extend(long_flags(&b.argv));
@@ -2930,7 +3159,14 @@ mod tests {
                 if let Ok(b) = build_resume(tool, "resume-id", full_inp(access), &bp) {
                     emitted.extend(long_flags(&b.argv));
                 }
-                if let Ok(b) = build_fork(tool, "parent-id", "child-id", full_inp(access), &bp) {
+                if let Ok(b) = build_fork(
+                    tool,
+                    "parent-id",
+                    "child-id",
+                    full_inp(access),
+                    &bp,
+                    codex_help,
+                ) {
                     emitted.extend(long_flags(&b.argv));
                 }
             }

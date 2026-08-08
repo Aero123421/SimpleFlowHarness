@@ -283,6 +283,38 @@ fn fork_warmup_enabled(flow: &flow::Flow, tool: &str) -> bool {
     }
 }
 
+/// A bounded, best-effort read of the installed codex binary's own `--help`,
+/// consulted only to decide whether `exec fork` is safe to attempt (P1-07;
+/// see `preset::build_fork`'s codex arm and `preset::codex_fork_confirmed`).
+///
+/// Distinct from `preflight::read_help`: that one runs in an isolated scratch
+/// directory because preflight promises to make no model calls ever. This sits
+/// directly on the path to a real, paid fork, so the step's own resolved cwd -
+/// where that real invocation is about to run anyway - tells sfh nothing an
+/// isolated directory would not, and is simpler to reach from here.
+///
+/// Never fatal: a codex that cannot be probed at all is refused the exact same
+/// way a codex whose `--help` stayed silent about `fork` is - "sfh could not
+/// tell" and "sfh looked and it is not there" both fail closed, on purpose.
+fn codex_help_probe(program: &str, cwd: Option<&Path>) -> Option<String> {
+    let out = execute::run_cmd(
+        &execute::Invocation::Argv(vec![program.to_string(), "--help".to_string()]),
+        None,
+        cwd,
+        Some(Duration::from_secs(15)),
+        &[],
+        &[],
+        execute::Observe::default(),
+    )
+    .ok()?;
+    if out.timed_out {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (!text.trim().is_empty()).then_some(text)
+}
+
 pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
     let r = step.retry.or(flow.defaults.retry);
     let mode = match step
@@ -1012,7 +1044,30 @@ pub fn prepare_leaf(
                 });
                 if is_fork {
                     let child = gen_uuid();
-                    let mut b = preset::build_fork(&tool, &info.id, &child, inp, &paths)?;
+                    // codex's exec fork is new enough that supports_fork alone
+                    // is not permission to launch it (P1-07; see
+                    // preset::build_fork's codex arm): ask the installed
+                    // binary itself, right before spending anything on it.
+                    // Every other tool's fork has been real and stable long
+                    // enough that sfh trusts the adapter table without asking
+                    // again on every run.
+                    let codex_help = if tool == "codex" {
+                        let program = inp
+                            .bin
+                            .clone()
+                            .unwrap_or_else(|| preset::default_program(&tool));
+                        codex_help_probe(&program, cwd.as_deref())
+                    } else {
+                        None
+                    };
+                    let mut b = preset::build_fork(
+                        &tool,
+                        &info.id,
+                        &child,
+                        inp,
+                        &paths,
+                        codex_help.as_deref(),
+                    )?;
                     // Detect a fork flag that was ignored (the run would have
                     // appended to the shared parent) and, on pi, demand the
                     // positive proof it prints.
