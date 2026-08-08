@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.2.1/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.3.0/schema/flow.schema.json
 #
 # v1.2 concepts in one flow: a managed workspace, named context, declared
 # effects, an explicit replay policy, and profiles supplied from outside.

@@ -1,6 +1,6 @@
 use crate::{
     closure, contain, context, execute, flow, leaf, machine, preset, protocol, sha256, state,
-    template, workspace,
+    template, watch, workspace,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -48,6 +48,19 @@ pub struct RunOpts {
     /// changed and I mean it", and conflating them made a single flag waive
     /// two unrelated guarantees.
     pub adopt_workspace: bool,
+    /// Start a FRESH run that inherits an earlier run's spend: its visit
+    /// counts, total leaf runs, reported cost and active time.
+    ///
+    /// This is the case a resume cannot serve, by design. When a run stops and
+    /// the diagnosis is "the flow itself was wrong", fixing the flow is the
+    /// correct response - and it invalidates the effective-config fingerprint,
+    /// so `--resume` refuses, exactly as it should. What was left was a fresh
+    /// run whose counters all started at zero, so the budget already spent
+    /// simply vanished, and the only way to account for it was to edit the
+    /// ceilings in the flow by hand. Hand arithmetic is not accounting: it is
+    /// unverifiable, it is wrong the moment anyone loses count, and it leaves
+    /// no record that the second run was ever a continuation of the first.
+    pub carry_budget_from: Option<PathBuf>,
 }
 
 impl Default for RunOpts {
@@ -71,7 +84,71 @@ impl Default for RunOpts {
             as_json: false,
             save_plan: None,
             adopt_workspace: false,
+            carry_budget_from: None,
         }
+    }
+}
+
+/// What one run inherited from an earlier one, and from where.
+///
+/// Only spend is carried: counters, not results. Step outputs, sessions, the
+/// routing position and the workspace are all deliberately left behind, because
+/// the flow that produced them is not the flow about to run - that is the whole
+/// reason `--resume` refused and this exists.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CarriedBudget {
+    pub from: PathBuf,
+    /// Highest visit number reached per step id - the same shape `max_visits`
+    /// is enforced against, so a loop that had four laps left really has four
+    /// laps left. Only ids the NEW flow still defines are applied.
+    pub visits: BTreeMap<String, u32>,
+    /// Step ids the ancestor had visited that the corrected flow no longer
+    /// defines. Their laps cannot be enforced against anything, so they are
+    /// named rather than silently forgotten.
+    pub dropped: Vec<String>,
+    pub steps: u32,
+    pub cost_usd: f64,
+    pub elapsed_sec: u64,
+}
+
+impl CarriedBudget {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "from": self.from.display().to_string(),
+            "visits": self.visits,
+            "dropped_steps": self.dropped,
+            "steps": self.steps,
+            "cost_usd": self.cost_usd,
+            "elapsed_sec": self.elapsed_sec,
+        })
+    }
+
+    /// One line a human can check against the earlier run's own `runs why`.
+    fn summary(&self) -> String {
+        let laps = self
+            .visits
+            .iter()
+            .map(|(step, visit)| format!("{step}@{visit}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut s = format!(
+            "carried from {}: {} step run(s), ${:.4}, {}s active{}{}",
+            self.from.display(),
+            self.steps,
+            self.cost_usd,
+            self.elapsed_sec,
+            if laps.is_empty() { "" } else { ", visits " },
+            laps
+        );
+        if !self.dropped.is_empty() {
+            // Never silent: a dropped id means that step's laps are NOT being
+            // counted against anything in this run.
+            s.push_str(&format!(
+                " (not applied, no longer in the flow: {})",
+                self.dropped.join(", ")
+            ));
+        }
+        s
     }
 }
 
@@ -900,6 +977,13 @@ fn load_resume_for_flow(
     let log = contain::read_contained_opt(run_dir, "log.jsonl")?
         .ok_or_else(|| format!("cannot read {}/log.jsonl: file missing", run_dir.display()))?;
     let mut st = ResumeState::default();
+    // Active seconds this run INHERITED from an earlier one. Kept separate
+    // because the ordinary source of elapsed_sec is status.json, and that file
+    // is not durable the way the log is - a detached resume deletes it and
+    // seeds a zeroed replacement. Used as a FLOOR at the end of this function,
+    // never as an addend, so it can restore a lost figure without ever
+    // double-counting a present one.
+    let mut carried_elapsed: u64 = 0;
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
     // A completed leaf's chain may later be intentionally replaced by its
@@ -999,6 +1083,44 @@ fn load_resume_for_flow(
                         // old step hash can be checked.
                         pending_step_hashes.remove(&(step.clone(), visit));
                     }
+                }
+            }
+            // Spend this run inherited from an earlier one via
+            // --carry-budget-from. Folded in HERE, while reading the log in
+            // order, so it is the baseline the run's own step_end events then
+            // add to - and so it composes. Without this a second correction
+            // would silently forget the first run's spend, which is precisely
+            // the arithmetic the feature exists to stop anyone doing by hand.
+            // The event sits immediately after run_start, before any step ran,
+            // so the `.max(visit)` below can only ever raise these.
+            "budget_carried" => {
+                if let Some(n) = v.get("steps").and_then(|x| x.as_u64()) {
+                    st.total = st.total.saturating_add(n.min(u32::MAX as u64) as u32);
+                }
+                if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
+                    accumulate_cost(&mut st.cost_usd, c);
+                }
+                if let Some(visits) = v.get("visits").and_then(|x| x.as_object()) {
+                    for (step, visit) in visits {
+                        if let Some(n) = visit.as_u64() {
+                            let e = st.visits.entry(step.clone()).or_insert(0);
+                            *e = (*e).max(n.min(u32::MAX as u64) as u32);
+                        }
+                    }
+                }
+                // elapsed_sec is deliberately NOT ADDED: status.json records
+                // elapsed_before_attempt PLUS this attempt, so the carried
+                // seconds are normally already inside the value read at the
+                // end of this function, and adding them would double-count.
+                // Remembered as a floor instead, because "normally" is not
+                // "always": detach_run deletes a resumed run's status.json and
+                // seeds a zeroed replacement, so on `--resume <carried-run>
+                // --detach` the only surviving record of the inherited seconds
+                // is this event. Steps, cost and visits are all durable in the
+                // log; wall clock has to be too, or three of the four carried
+                // ceilings hold and the fourth silently resets.
+                if let Some(secs) = v.get("elapsed_sec").and_then(|x| x.as_u64()) {
+                    carried_elapsed = carried_elapsed.max(secs);
                 }
             }
             // A completed compactor is its own durable post-processing stage.
@@ -1679,6 +1801,11 @@ fn load_resume_for_flow(
                 .unwrap_or(0);
         }
     }
+    // A run can never have been active for less time than it inherited. Where
+    // status.json survived it already includes these seconds and this changes
+    // nothing; where it was deleted or reseeded, this is what keeps a carried
+    // wall_clock_sec budget from quietly starting over.
+    st.elapsed_sec = st.elapsed_sec.max(carried_elapsed);
     Ok(st)
 }
 
@@ -1839,6 +1966,13 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
     }
     if opts.adopt_workspace {
         args.push("--adopt-workspace".into());
+    }
+    // Absolute, like every other path here: the detached copy is started from
+    // a directory of the harness's choosing, and a relative ancestor would
+    // either miss or - worse - resolve to a different run.
+    if let Some(d) = &opts.carry_budget_from {
+        args.push("--carry-budget-from".into());
+        args.push(abs(d).display().to_string());
     }
     if opts.no_partial_emit {
         args.push("--no-partial-emit".into());
@@ -2645,6 +2779,114 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = abs(&d);
     }
+    // ---- inherit an earlier run's spend into this fresh one ----
+    // Resolved AFTER the run dir exists, because the ancestor has to be told
+    // apart from the run being started, and with no flow to check against: the
+    // ancestor ran a different flow, which is the premise of the whole feature.
+    let carry = (|| -> Result<Option<CarriedBudget>, String> {
+        let dir =
+            match &opts.carry_budget_from {
+                None => return Ok(None),
+                Some(_) if is_resume => return Err(
+                    "--carry-budget-from starts a NEW run that inherits an earlier run's spend; \
+                     --resume continues the earlier run itself. They answer different questions, \
+                     so pick one: resume when the flow is unchanged, carry when you had to fix it."
+                        .into(),
+                ),
+                Some(dir) => abs(dir),
+            };
+        if dir == run_dir {
+            return Err("--carry-budget-from cannot name the run it is starting".into());
+        }
+        // A run that is still spending has no final total. Carrying from it
+        // would take a snapshot the ancestor immediately invalidates, and the
+        // numbers in both runs would then be wrong in a way nothing downstream
+        // could detect.
+        //
+        // "Still going" already has one definition here and it is not
+        // `pid_alive` on its own: pid reuse makes that advisory (see
+        // execute::pid_alive), so a run SIGKILLed with `state: running` still
+        // on disk would read as alive forever the moment the OS handed its pid
+        // to something unrelated - and `sfh stop` would refuse to clear it,
+        // leaving no way to carry at all. Ask the same snapshot `sfh status`
+        // answers from, which pairs the pid with heartbeat freshness. A run
+        // whose heartbeat went stale while its process really is still the one
+        // that started it is the WEDGED case, also not final; the recorded
+        // start time is what tells it from a stranger wearing its pid
+        // (rev_break #8). An unreadable or absent status.json says nothing
+        // either way, and says it without blocking the carry.
+        if let Ok(snap) = watch::read(&dir) {
+            let wedged = snap.state == "dead"
+                && snap.pid_start.is_some()
+                && execute::pid_start_time(snap.pid) == snap.pid_start;
+            if snap.state == "running" || wedged {
+                return Err(format!(
+                    "--carry-budget-from {}: that run is still going, so its spend is not final yet. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
+                    dir.display(), dir.display(), dir.display()
+                ));
+            }
+        }
+        let prior = load_resume_for_flow(&dir, None)
+            .map_err(|e| format!("--carry-budget-from {}: {e}", dir.display()))?;
+        // A corrected flow may have renamed, split or removed steps. Laps
+        // are only enforceable against an id that still exists, so the two
+        // groups are separated and both are reported.
+        let (visits, mut dropped): (BTreeMap<String, u32>, Vec<String>) =
+            prior.visits.into_iter().fold(
+                (BTreeMap::new(), Vec::new()),
+                |(mut keep, mut drop), (step, visit)| {
+                    if flow.find_step(&step).is_some() {
+                        keep.insert(step, visit);
+                    } else {
+                        drop.push(step);
+                    }
+                    (keep, drop)
+                },
+            );
+        // `prior.visits` is a HashMap, so without this the dropped list -
+        // and therefore the message and the durable record - would come out
+        // in a different order on every run.
+        dropped.sort_unstable();
+        Ok(Some(CarriedBudget {
+            from: dir,
+            visits,
+            dropped,
+            steps: prior.total,
+            cost_usd: prior.cost_usd,
+            elapsed_sec: prior.elapsed_sec,
+        }))
+    })();
+    let carried = match carry {
+        Ok(c) => c,
+        Err(e) => {
+            // The run dir was created just above, and a carry that never got
+            // off the ground must not leave an empty one behind for `runs
+            // list`, `runs clean` and the next run's name counter to trip
+            // over. remove_dir, never remove_dir_all: nothing has been written
+            // into it yet, so a non-recursive delete does the whole job and
+            // can never grow into deleting a real run. A resumed dir and a
+            // --run-dir handed in by the detaching parent are not ours to
+            // remove.
+            if !is_resume && opts.run_dir.is_none() {
+                let _ = std::fs::remove_dir(&run_dir);
+            }
+            return Err(e);
+        }
+    };
+    if let Some(c) = &carried {
+        // Counters only. Nothing that would make this look like a resume:
+        // no outputs, no sessions, no routing position, no workspace.
+        resumed.total = c.steps;
+        resumed.cost_usd = c.cost_usd;
+        resumed.elapsed_sec = c.elapsed_sec;
+        resumed.visits = c.visits.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        // Said here rather than next to the durable event, so a `--dry-run`
+        // that never opens a log still tells the caller what this run would
+        // start with. Silence would make the flag look like a no-op.
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: {}", c.summary());
+        }
+    }
     // Defense-in-depth: even though `name` is charset-validated, confirm the
     // resolved run dir is actually under the runs root (guards symlink tricks).
     if !is_resume
@@ -3000,6 +3242,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         })),
         "unsafe_overrides": flow.unsafe_overrides(),
         "profile_overlays": opts.profiles.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        // Absent for a run that started from zero, which is nearly all of them.
+        "carried_budget": carried.as_ref().map(CarriedBudget::to_json),
     });
     let meta_text = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
@@ -3009,6 +3253,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         &mut log,
         json!({"ts": utc_stamp(), "event": "run_start", "sfh_version": VERSION, "resumed": is_resume, "flow_fingerprint": flow_fp, "effective_config_fingerprint": effective_config_fp}),
     )?;
+    // Written as its own durable event, immediately after run_start and before
+    // anything is launched. A run that began with someone else's spend on the
+    // clock must say so in its own log: otherwise the numbers in status.json
+    // are unexplainable, and there is nothing linking the second attempt at a
+    // piece of work to the first.
+    if let Some(c) = &carried {
+        let mut e = c.to_json();
+        e["ts"] = json!(utc_stamp());
+        e["event"] = json!("budget_carried");
+        log_event(&mut log, e)?;
+    }
 
     // ---- live status file + heartbeat so a parent agent can poll liveness ----
     // The run-level activity clock: every child's reader thread stores the
@@ -5179,17 +5434,36 @@ fn next_actions_for(state: &str, run_dir: &Path, flow: &Path) -> Vec<serde_json:
                 vec!["sfh".into(), "wait".into(), rd.clone(), "--json".into()],
             ),
         ),
-        "failed" | "stuck" => out.push(machine::next_action(
-            "resume",
-            vec![
-                "sfh".into(),
-                "run".into(),
-                flow.display().to_string(),
-                "--resume".into(),
-                rd,
-                "--json".into(),
-            ],
-        )),
+        "failed" | "stuck" => {
+            out.push(machine::next_action(
+                "resume",
+                vec![
+                    "sfh".into(),
+                    "run".into(),
+                    flow.display().to_string(),
+                    "--resume".into(),
+                    rd.clone(),
+                    "--json".into(),
+                ],
+            ));
+            // Offered alongside resume, not instead of it, because the two are
+            // answers to different diagnoses and only the reader knows which
+            // one they are looking at. A caller who concludes the FLOW was
+            // wrong cannot resume - correcting it invalidates the closure, as
+            // it should - and without this the only remaining move is a fresh
+            // run whose budget silently starts over.
+            out.push(machine::next_action(
+                "carry_budget",
+                vec![
+                    "sfh".into(),
+                    "run".into(),
+                    flow.display().to_string(),
+                    "--carry-budget-from".into(),
+                    rd,
+                    "--json".into(),
+                ],
+            ));
+        }
         _ => {}
     }
     out

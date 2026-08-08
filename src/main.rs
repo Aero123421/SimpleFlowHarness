@@ -65,6 +65,11 @@ RUN OPTIONS:
   --adopt-workspace   Resume even though the managed workspace changed, taking
                       its current contents as the new baseline. A DIFFERENT
                       question from --force-resume; neither implies the other.
+  --carry-budget-from <run-dir>
+                      Start a FRESH run that inherits that run's spend: step
+                      runs, visits, cost and active time. For when the flow had
+                      to be FIXED, so --resume rightly refuses, and the budget
+                      already spent would otherwise reset to zero.
   --no-partial-emit   On failure, do not print the best available output
   --dry-run           Render prompts/commands without executing anything
   -v, --verbose       Print full command lines
@@ -211,7 +216,7 @@ fn main() {
 
 fn cmd_help(command: &str) -> i32 {
     let usage = match command {
-        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--state-dir d] [--profiles file] [--run-dir d] [--detach] [--json] [--resume dir|--resume-latest] [--force-resume] [--adopt-workspace] [--no-partial-emit] [--dry-run] [-v|-q]\nCommand steps can read their fully rendered prompt from {{prompt_file}}.\n--force-resume waives the flow/closure check; --adopt-workspace waives the workspace check. They are separate.",
+        "run" => "sfh run <flow.yaml> [--var k=v] [--emit id] [--runs-dir d] [--state-dir d] [--profiles file] [--run-dir d] [--detach] [--json] [--resume dir|--resume-latest] [--force-resume] [--adopt-workspace] [--carry-budget-from dir] [--no-partial-emit] [--dry-run] [-v|-q]\nCommand steps can read their fully rendered prompt from {{prompt_file}}.\n--force-resume waives the flow/closure check; --adopt-workspace waives the workspace check. They are separate.\n--carry-budget-from starts a NEW run holding an earlier run's spend, for when the flow itself had to be fixed.",
         "plan" => "sfh plan <flow.yaml> [--var k=v] [--profiles file] [--state-dir d] [--save [dir]] [--json]\nResolves every command in an isolated temporary directory and executes nothing.\n--save keeps the rendered prompts, context bundles and machine plan for review.",
         "graph" => "sfh graph <flow.yaml> [--mermaid]",
         "config" => "sfh config show <flow.yaml> [--profiles file] [--show-secrets]",
@@ -296,6 +301,8 @@ fn cmd_run(rest: &[String]) -> i32 {
                 opts.adopt_workspace = true;
                 Ok(())
             }
+            "--carry-budget-from" => need(rest, &mut i, "--carry-budget-from")
+                .map(|v| opts.carry_budget_from = Some(PathBuf::from(v))),
             "--resume" => {
                 need(rest, &mut i, "--resume").map(|v| opts.resume = Some(PathBuf::from(v)))
             }
@@ -359,6 +366,11 @@ fn cmd_run(rest: &[String]) -> i32 {
     }
     if opts.adopt_workspace && opts.resume.is_none() && !opts.resume_latest {
         return usage_err("--adopt-workspace requires --resume or --resume-latest");
+    }
+    if opts.carry_budget_from.is_some() && (opts.resume.is_some() || opts.resume_latest) {
+        return usage_err(
+            "--carry-budget-from and --resume are different answers: resume continues the earlier run when the flow is unchanged, carry starts a new run when you had to fix the flow",
+        );
     }
     if opts.verbose && opts.quiet {
         return usage_err("--verbose and --quiet are mutually exclusive");
