@@ -4529,4 +4529,144 @@ steps:
         assert!(warnings.contains("api_version is omitted"), "{warnings}");
         assert!(warnings.contains("no catch-all"), "{warnings}");
     }
+
+    #[test]
+    fn replay_warnings_reaches_a_parallel_childs_own_rerun_policy() {
+        // The engine looks up an unfinished CHILD by id at resume time and
+        // applies THAT CHILD's own replay: policy, never its parent's - so a
+        // flow whose defaults are safe but whose child opts back into rerun on
+        // an external effect used to pass `plan` and `validate --strict` in
+        // total silence and then re-fire the side effect on the very next
+        // resume. This is the exact case the warning exists to catch.
+        let flow: Flow = yaml::from_str(
+            "defaults:\n  replay: {unfinished: stuck}\nsteps:\n  - id: fan\n    parallel:\n      - id: send\n        cmd: [\"external-send\"]\n        effects: external\n        replay: {unfinished: rerun}\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        let warnings = flow.replay_warnings();
+        // Only the child is flagged: the group's OWN policy is the safe
+        // `stuck` it inherits from defaults.replay, and must not also appear.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("step 'fan.send'"), "{warnings:?}");
+        assert!(warnings[0].contains("effects: external"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("replay.unfinished: rerun"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn replay_summary_lists_a_parallel_child_as_parent_dot_child() {
+        let flow: Flow = yaml::from_str(
+            "defaults:\n  replay: {unfinished: stuck}\nsteps:\n  - id: fan\n    parallel:\n      - id: send\n        cmd: [\"external-send\"]\n        effects: external\n        replay: {unfinished: rerun}\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        let summary = flow.replay_summary();
+        let steps = summary["steps"].as_array().expect("steps is an array");
+        // Both the group (its own composite policy) and the child (the policy
+        // the engine actually consults for THAT step id on resume) are
+        // listed - dropping either would hide a real decision from `plan`.
+        let names: Vec<&str> = steps.iter().filter_map(|s| s["step"].as_str()).collect();
+        assert!(names.contains(&"fan"), "{names:?}");
+        assert!(names.contains(&"fan.send"), "{names:?}");
+
+        let child = steps
+            .iter()
+            .find(|s| s["step"].as_str() == Some("fan.send"))
+            .expect("child listed in replay summary");
+        assert_eq!(child["unfinished"].as_str(), Some("rerun"));
+        assert_eq!(child["effects"].as_str(), Some("external"));
+        assert_eq!(child["risky"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn an_outcomes_key_must_be_written_in_the_canonical_form_the_schema_requires() {
+        // schema/flow.schema.json constrains this key to `^(0|[1-9][0-9]*)$` -
+        // plain decimal, no sign, no leading zero, no surrounding space. The
+        // runtime used to trim the string before parsing it, so a padded or
+        // signed key deserialized here and then failed that pattern: a flow an
+        // editor's schema check called invalid while sfh ran it anyway, or the
+        // reverse.
+        for bad in ["\" 2 \"", "\"+2\"", "\"02\"", "\"-1\""] {
+            let src = format!(
+                "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      {bad}: {{result: continue}}\n"
+            );
+            let e = yaml::from_str::<Flow>(&src)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"))
+                .to_string();
+            let quoted_key = format!("'{}'", bad.trim_matches('"'));
+            assert!(e.contains(&quoted_key), "{bad}: {e}");
+            assert!(e.contains("is not an exit code"), "{bad}: {e}");
+        }
+
+        // The canonical spellings keep working, including the "0" boundary.
+        let ok: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      \"0\": {result: complete}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ok.steps[0].outcomes.get(&0).unwrap().result,
+            OutcomeResult::Complete
+        );
+
+        // A negative BARE-INTEGER key takes a different path - YAML has
+        // already resolved it to a plain integer, so there is nothing left to
+        // canonicalize, and it deserializes fine - but it is refused later, by
+        // `check_outcomes` during validate, for a more specific reason than
+        // "not canonical": sfh reserves negative exit codes for its own
+        // marker. Runtime and Schema still agree on the end result for every
+        // negative spelling; they just disagree on which stage says so.
+        let negative = parse(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      -1: {result: complete}\n",
+        )
+        .unwrap_err();
+        assert!(negative.contains("never ran"), "{negative}");
+    }
+
+    #[test]
+    fn strict_mode_warns_when_outcomes_sits_on_a_preset_ai_step_but_stays_quiet_on_a_cmd_gate() {
+        // A bare AI CLI reviewer exits 0 whether its verdict was PASS or
+        // REVISE (examples/managed-loop.yaml routes on the reply TEXT for
+        // exactly this reason), so outcomes: - which reads the raw exit code -
+        // cannot tell the verdicts apart here, and a route that looks like it
+        // reads the label can never fire as written.
+        let preset: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: review\n    tool: claude\n    access: read\n    prompt: x\n    outcomes:\n      2: {result: continue, label: revise}\n",
+        )
+        .unwrap();
+        validate(&preset, false).unwrap();
+        let warnings = strict_warnings(&preset);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("step 'review'"), "{warnings:?}");
+        assert!(warnings[0].contains("claude"), "{warnings:?}");
+        assert!(warnings[0].contains("PASS"), "{warnings:?}");
+
+        // The identical table on a cmd: gate is exactly the deterministic
+        // case outcomes: exists for, so it earns no warning.
+        let gate: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: revise}\n",
+        )
+        .unwrap();
+        validate(&gate, false).unwrap();
+        assert!(
+            strict_warnings(&gate).is_empty(),
+            "{:?}",
+            strict_warnings(&gate)
+        );
+
+        // A parallel CHILD running a preset tool is caught the same way - the
+        // same fan-out blind spot replay_warnings had.
+        let child: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: fan\n    parallel:\n      - id: review\n        tool: claude\n        access: read\n        prompt: x\n        outcomes:\n          2: {result: continue, label: revise}\n",
+        )
+        .unwrap();
+        validate(&child, false).unwrap();
+        let warnings = strict_warnings(&child);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("step 'fan.review'"), "{warnings:?}");
+    }
 }
