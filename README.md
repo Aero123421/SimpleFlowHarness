@@ -459,7 +459,7 @@ Every run generates durable, append-only records inside `.sfh/runs/<run-id>/`:
 - `status.json`: Real-time status snapshot.
 - `execution-closure.json`: The hashed inputs this run is pinned to.
 - `workspace.json`: The managed workspace, when the flow asked for one.
-- `context-snapshot/` & `context-snapshot.json`: Every `kind: file` context, frozen once at run start so every step reads the same bytes instead of re-opening the declared path — editing the source file mid-run cannot change what a later step receives. A resumed run keeps the original snapshot rather than capturing a new one, even under `--force-resume`.
+- `context-snapshot/` & `context-snapshot.json`: Every `kind: file` context, frozen once at run start (neither is written when a flow declares none) so every step reads the same bytes instead of re-opening the declared path — editing the source file mid-run cannot change what a later step receives. A resumed run keeps the original snapshot rather than capturing a new one, even under `--force-resume`.
 - `<step_id>.context.txt` & `<step_id>.context.json`: The assembled context and its manifest, when the step named any.
 
 `{{steps.verify.output_file}}` names this same capped `.out.txt`, not a guarantee of the complete stream — sfh keeps no unbounded copy of raw stdout/stderr anywhere. When forwarding a command's verbose output into an AI prompt, prefer an explicit bound such as `{{steps.verify.output | tail:80 | truncate:8000}}` regardless. A step that needs its full output to survive past 32 MiB — a `cmd:` step wrapping a noisy build or test run, say — has to write it itself, to a file in the managed workspace or another artifact path of its own.

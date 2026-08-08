@@ -222,32 +222,6 @@ impl ToolReport {
     }
 }
 
-/// Extra CLI args and env vars to apply ONLY while probing a tool's own
-/// launcher (`--help`/`--version`) - never during a real run, whose argv and
-/// env already come from `preset::build`. Exists because a probe is still a
-/// real invocation, and some launchers treat ANY invocation as a chance to do
-/// more than answer - self-update, phone home, write a cache - which is
-/// exactly the side effect a free, offline check must not cause (P3-02).
-struct ProbeHardening {
-    extra_args: &'static [&'static str],
-    env_set: &'static [(&'static str, &'static str)],
-}
-
-/// Nothing is known here on purpose. Which tool needs which flag or env var
-/// to stay quiet on a probe is adapter-specific knowledge, and that
-/// knowledge belongs next to the rest of each adapter's command-line facts in
-/// `preset.rs` - not duplicated here, for the same reason preflight does not
-/// keep its own copy of what a `cmd:` program's flags mean. This is the seam:
-/// every tool probes as if it had no hardening today, which is the current
-/// behaviour and therefore always safe to default to. Swap the body below for
-/// a call to `preset::probe_hardening(tool)` once that table lands (P3-02).
-fn probe_hardening(_tool: &str) -> ProbeHardening {
-    ProbeHardening {
-        extra_args: &[],
-        env_set: &[],
-    }
-}
-
 /// Read a CLI's own `--help`. Bounded and never fatal: a tool that has no
 /// `--help`, prints it to stderr, or wants to talk to a terminal is reported as
 /// "help unreadable" rather than as a missing flag, because "sfh could not
@@ -258,9 +232,10 @@ fn probe_hardening(_tool: &str) -> ProbeHardening {
 /// is documented (see `doctor::run_probe`) to read project instruction files
 /// out of its working directory on a real run, and nothing here has verified
 /// `--help` is an exception. `tool` looks up any probe-only hardening
-/// (`probe_hardening`, P3-02).
+/// (`preset::probe_hardening`, P3-02) - the table itself lives there, next to
+/// the rest of each adapter's command-line facts, not here.
 fn read_help(program: &str, tool: &str, cwd: &Path) -> Option<String> {
-    let hardening = probe_hardening(tool);
+    let hardening = preset::probe_hardening(tool);
     let mut argv = vec![program.to_string(), "--help".to_string()];
     argv.extend(hardening.extra_args.iter().map(|s| s.to_string()));
     let env_set: Vec<(String, String)> = hardening
@@ -297,7 +272,7 @@ fn read_help(program: &str, tool: &str, cwd: &Path) -> Option<String> {
 /// cwd, which for `sfh preflight` is the operator's own project - the one
 /// place this probe must not run.
 fn probe_version_isolated(program: &str, tool: &str, cwd: &Path) -> Option<String> {
-    let hardening = probe_hardening(tool);
+    let hardening = preset::probe_hardening(tool);
     let mut argv = vec![program.to_string(), "--version".to_string()];
     argv.extend(hardening.extra_args.iter().map(|s| s.to_string()));
     let env_set: Vec<(String, String)> = hardening

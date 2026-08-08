@@ -3372,7 +3372,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // --force-resume's documented job is "let this run continue despite what
     // moved outside it", not "rebase this run onto the new inputs" - that is
     // what re-running from scratch is for, and a fresh run gets a fresh
-    // snapshot the ordinary way, from a fresh closure.
+    // snapshot the ordinary way, from a fresh closure. See
+    // `snapshot_and_persist_context` for why a flow with no `kind: file`
+    // context at all leaves no manifest behind on that fresh capture.
     let containment_now = context::Containment {
         flow_dir: &flow_dir,
         workspace: workspace_path.as_deref(),
@@ -3404,22 +3406,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
         }
     } else {
-        let snap = snapshot_file_contexts(&flow, &containment_now, &run_dir)?;
-        let manifest_text = serde_json::to_string_pretty(&json!({
-            "schema_version": 1,
-            "sources": snap.sources,
-        }))
-        .map_err(|e| format!("cannot serialize the context snapshot: {e}"))?;
-        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
-            .map_err(|e| format!("cannot persist context snapshot: {e}"))?;
-        // Recorded the same way the closure fingerprint is, right below the
-        // event that pins it, so "what this run actually read" is answerable
-        // from log.jsonl alone without also locating the manifest file.
-        log_event(
+        Some(snapshot_and_persist_context(
+            &flow,
+            &containment_now,
+            &run_dir,
             &mut log,
-            json!({"ts": utc_stamp(), "event": "context_snapshot", "sources": snap.sources}),
-        )?;
-        Some(snap.registry)
+        )?)
     };
     // Held for the rest of this run: every prepare_leaf call from here on
     // resolves its `kind: file` contexts through this pin instead of the
@@ -6890,6 +6882,18 @@ const CONTEXT_SNAPSHOT_MANIFEST: &str = "context-snapshot.json";
 struct ContextSnapshot {
     registry: HashMap<String, Option<PathBuf>>,
     sources: Vec<serde_json::Value>,
+    /// Whether the flow declared at least one `kind: file` context at all -
+    /// the same fact that already decides, below, whether this function
+    /// creates `CONTEXT_SNAPSHOT_DIR`. Deliberately NOT the same thing as
+    /// `sources` being non-empty: a source that WAS declared but failed
+    /// validation (a missing required file, a refused symlink) is deferred
+    /// rather than recorded - see the `Err` arm below - so `sources` stays
+    /// empty for that case too, and collapsing the two would make "this flow
+    /// asked for nothing" indistinguishable from "this flow asked for
+    /// something sfh could not get". `snapshot_and_persist_context` uses this
+    /// field, not `sources`, to decide whether a manifest is worth writing at
+    /// all.
+    has_file_contexts: bool,
 }
 
 /// Freeze every `kind: file` context this flow declares, once, so the rest of
@@ -6927,10 +6931,15 @@ fn snapshot_file_contexts(
         .iter()
         .filter(|(_, s)| matches!(s.kind(), Ok("file")))
         .collect();
+    let has_file_contexts = !file_contexts.is_empty();
     let mut registry: HashMap<String, Option<PathBuf>> = HashMap::new();
     let mut sources = Vec::new();
     if file_contexts.is_empty() {
-        return Ok(ContextSnapshot { registry, sources });
+        return Ok(ContextSnapshot {
+            registry,
+            sources,
+            has_file_contexts,
+        });
     }
     let snapshot_dir = run_dir.join(CONTEXT_SNAPSHOT_DIR);
     contain::mkdir_private(&snapshot_dir).map_err(|e| {
@@ -6973,7 +6982,62 @@ fn snapshot_file_contexts(
             Err(_) => {}
         }
     }
-    Ok(ContextSnapshot { registry, sources })
+    Ok(ContextSnapshot {
+        registry,
+        sources,
+        has_file_contexts,
+    })
+}
+
+/// Snapshot this flow's `kind: file` contexts at run start (see
+/// `snapshot_file_contexts`, immediately above) and persist the result for a
+/// later `--resume` to read back - UNLESS there is nothing to persist. A flow
+/// that declares no `kind: file` context at all always produces an empty
+/// registry and an empty `sources` list, and writing `CONTEXT_SNAPSHOT_MANIFEST`
+/// for that is a manifest that documents nothing, paid for with an atomic
+/// write and an fsync'd log line at the start of every single run - including
+/// the overwhelming majority of flows that never touch this feature.
+///
+/// Skipping it is safe on resume specifically BECAUSE there was nothing to
+/// pin: `ResumedSnapshot::NotPresent`'s own doc comment already treats "no
+/// manifest at all" and "a flow that declared no `kind: file` context" as
+/// the same, harmless case - both fall every step back to a live read. And a
+/// live read is exactly what a step in THIS run would already do: with no
+/// `kind: file` context declared, `context::build`'s snapshot lookup is never
+/// even consulted for a "file" kind here, so there is no pinned fact for a
+/// resume to disagree with in the first place. See
+/// `context::snapshot_lookup`'s doc comment for the underlying design fact
+/// this leans on - an empty pinned map and no pin at all are indistinguishable
+/// to any lookup, by construction.
+///
+/// Returns the registry to pin for the rest of THIS run either way - an empty
+/// one has the identical effect on `context::activate_snapshot` whether or
+/// not it is ever written down, so the guard the caller installs is
+/// unaffected by which branch below ran.
+fn snapshot_and_persist_context(
+    flow: &flow::Flow,
+    containment: &context::Containment,
+    run_dir: &Path,
+    log: &mut std::fs::File,
+) -> Result<HashMap<String, Option<PathBuf>>, String> {
+    let snap = snapshot_file_contexts(flow, containment, run_dir)?;
+    if snap.has_file_contexts {
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .map_err(|e| format!("cannot serialize the context snapshot: {e}"))?;
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .map_err(|e| format!("cannot persist context snapshot: {e}"))?;
+        // Recorded the same way the closure fingerprint is, right below the
+        // event that pins it, so "what this run actually read" is answerable
+        // from log.jsonl alone without also locating the manifest file.
+        log_event(
+            log,
+            json!({"ts": utc_stamp(), "event": "context_snapshot", "sources": snap.sources}),
+        )?;
+    }
+    Ok(snap.registry)
 }
 
 /// What a resumed run finds for the context snapshot the ORIGINAL attempt
@@ -7951,6 +8015,111 @@ mod tests {
             load_context_snapshot(&broken_run_dir).unwrap(),
             ResumedSnapshot::Corrupt(_)
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flow that declares no `contexts:` at all used to still get
+    /// `context-snapshot.json` written into its run dir - a manifest naming
+    /// zero sources, on every single run, paid for with an atomic write and
+    /// an fsync'd log line for a feature the flow never touches. This is the
+    /// exact scenario a live `sfh run` against such a flow reproduces; see
+    /// `snapshot_and_persist_context`'s doc comment for why skipping both
+    /// artifacts here is safe on a later `--resume`.
+    #[test]
+    fn a_flow_with_no_file_contexts_persists_no_snapshot_manifest_directory_or_log_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-snap-persist-empty-{}",
+            contain::random_nonce()
+        ));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        // No `contexts:` key whatsoever - `#[serde(default)]` gives `flow.contexts`
+        // an empty map, exactly like a flow author who never wrote the block.
+        let flow: flow::Flow =
+            serde_yaml_ng::from_str("name: t\nsteps:\n  - id: a\n    cmd: [\"echo\", \"x\"]\n")
+                .expect("test flow parses");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let mut log = std::fs::File::create(run_dir.join("log.jsonl")).unwrap();
+
+        let registry =
+            snapshot_and_persist_context(&flow, &containment, &run_dir, &mut log).unwrap();
+
+        assert!(registry.is_empty());
+        assert!(
+            !run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).exists(),
+            "a flow with nothing to pin must not leave a manifest naming zero sources"
+        );
+        assert!(
+            !run_dir.join(CONTEXT_SNAPSHOT_DIR).exists(),
+            "a flow with nothing to pin must not create the snapshot directory either"
+        );
+        drop(log);
+        let events: Vec<String> = std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            !events.contains(&"context_snapshot".to_string()),
+            "no event should be logged for a snapshot that pinned nothing: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the test above: a flow that DOES declare a `kind:
+    /// file` context must keep getting the manifest, the snapshot directory
+    /// and the log event exactly as before - this fix only removes the
+    /// artifacts for a run with nothing to pin, never for one that has
+    /// something.
+    #[test]
+    fn a_flow_with_a_file_context_still_persists_the_manifest_directory_and_log_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-snap-persist-nonempty-{}",
+            contain::random_nonce()
+        ));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "do the thing").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let mut log = std::fs::File::create(run_dir.join("log.jsonl")).unwrap();
+
+        let registry =
+            snapshot_and_persist_context(&flow, &containment, &run_dir, &mut log).unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(
+            run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).exists(),
+            "a flow that names a file context must still get a manifest"
+        );
+        assert!(
+            run_dir.join(CONTEXT_SNAPSHOT_DIR).is_dir(),
+            "the frozen copy must still land in the snapshot directory"
+        );
+        drop(log);
+        let events: Vec<String> = std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            events.contains(&"context_snapshot".to_string()),
+            "the run log must still record what this run pinned: {events:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

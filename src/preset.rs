@@ -687,6 +687,66 @@ pub fn exit_code_trustworthy(tool: &str) -> bool {
     tool != "agy"
 }
 
+/// Extra CLI args and env vars to apply ONLY while probing a tool's own
+/// launcher (`--help`/`--version`) - never during a real run, whose argv and
+/// env already come from `build`/`build_resume`/`build_fork`. `preflight`'s
+/// `read_help` and `probe_version_isolated` are the two call sites. A probe is
+/// still a real invocation, and some launchers treat ANY invocation as a
+/// chance to do more than answer - self-update, phone home, write a cache -
+/// which is exactly the side effect a free, offline check must not cause
+/// (P3-02).
+///
+/// This lives here, next to the rest of each adapter's command-line facts,
+/// for the same reason `required_flags` and `known_gaps` do rather than being
+/// duplicated in `preflight` - which flag or env var keeps a given CLI quiet
+/// is knowledge about that CLI, not about preflight.
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeHardening {
+    pub extra_args: &'static [&'static str],
+    pub env_set: &'static [(&'static str, &'static str)],
+}
+
+/// What sfh can actually confirm keeps a probe quiet, per tool - nothing
+/// more. An empty table is the correct, honest answer for an adapter whose
+/// probe-safe flags sfh has not verified, not a placeholder waiting to be
+/// filled in: `probe_hardening_resolves_for_every_tool_and_never_contradicts_a_declined_auto_update_gap`,
+/// below, pins that an empty table and a missing `known_gaps` entry about
+/// auto-update can never drift apart.
+///
+/// cursor is the one adapter with a confirmed entry. Its own builder
+/// (`build`/`build_resume`) already sends `--disable-auto-update` on every
+/// invocation, fresh or resumed, because cursor's launcher can otherwise pipe
+/// an installer into PowerShell mid-flow - see the comment at that call site.
+/// That risk is exactly as real on a bare `--help`/`--version` probe as it is
+/// on a scripted run, so the same, already-attested flag applies here too.
+/// `--disable-project-configs`, cursor's other hardening flag, is
+/// deliberately NOT repeated here: it suppresses a repo-supplied
+/// approval-mode override, which has nothing to do with self-update or phone
+/// home - the two concerns this seam exists for - and a bare `--help`/
+/// `--version` call never reaches an approval prompt in the first place, so
+/// adding it would be decoration, not hardening.
+///
+/// Every other adapter resolves to an empty table. In particular, grok is
+/// deliberately absent: the P0-02 review asked for a `--no-auto-update`-style
+/// flag on every scripted grok invocation, but nothing in this codebase's
+/// prior research confirms that flag's name for the pinned grok CLI (see
+/// `grok_does_not_claim_an_unconfirmed_auto_update_flag` in this module's
+/// tests, and grok's own `known_gaps` entry). Inventing one here to harden a
+/// probe would repeat exactly the failure that test exists to catch, just
+/// one call site removed from the one it already guards.
+pub fn probe_hardening(tool: &str) -> ProbeHardening {
+    match tool {
+        "cursor" => ProbeHardening {
+            extra_args: &["--disable-auto-update"],
+            env_set: &[],
+        },
+        _ => ProbeHardening {
+            extra_args: &[],
+            env_set: &[],
+        },
+    }
+}
+
 /// pi has no sandbox and no permission prompts: the only real lever is which
 /// tools get registered. Bare `pi` already has read+bash+edit+write.
 fn pi_tools(access: Access) -> &'static str {
@@ -3089,6 +3149,71 @@ mod tests {
             i.known_gaps.iter().any(|g| g.contains("auto-update")),
             "the declined flag must stay a named, tracked gap: {:?}",
             i.known_gaps
+        );
+    }
+
+    /// P3-02. `probe_hardening` and `known_gaps` are two independent
+    /// descriptions of the same underlying fact - whether sfh has actually
+    /// confirmed a flag that keeps a given tool's own launcher quiet - and
+    /// nothing forces them to stay in agreement as either table is edited on
+    /// its own. This pins both halves so they cannot quietly drift apart:
+    ///
+    /// - The seam resolves for every tool sfh ships (`flow::TOOLS`), never
+    ///   panicking on a tool preflight might actually ask it about.
+    /// - No tool may claim an auto-update-safe probe flag while its OWN
+    ///   known_gaps still says, in the same breath, that no such flag is
+    ///   confirmed - claiming and disclaiming the identical fact about the
+    ///   identical tool is a direct self-contradiction, not two honest views
+    ///   of it. Concretely, today: grok declines the probe-path flag (see
+    ///   `grok_does_not_claim_an_unconfirmed_auto_update_flag`, just above)
+    ///   and must keep naming the gap that explains why; cursor confirms
+    ///   one, both in its real argv and here, and must not also carry a
+    ///   "not confirmed" disclaimer for that same flag.
+    #[test]
+    fn probe_hardening_resolves_for_every_tool_and_never_contradicts_a_declined_auto_update_gap() {
+        for tool in crate::flow::TOOLS {
+            let hardening = probe_hardening(tool);
+            let claims_auto_update_flag = hardening
+                .extra_args
+                .iter()
+                .any(|a| a.contains("auto-update"));
+            let i = adapter_info(tool).expect("every flow::TOOLS entry has adapter metadata");
+            let gap_mentions_auto_update = i.known_gaps.iter().any(|g| g.contains("auto-update"));
+            assert!(
+                !(claims_auto_update_flag && gap_mentions_auto_update),
+                "{tool}: probe_hardening claims an auto-update-safe flag while known_gaps still \
+                 disclaims one - these describe the same fact and must not disagree: \
+                 extra_args={:?} known_gaps={:?}",
+                hardening.extra_args,
+                i.known_gaps
+            );
+        }
+
+        // The concrete case this seam exists to protect (P0-02 asked for a
+        // grok flag sfh could never confirm the name of): declining here
+        // must not quietly undo the tracked gap that already records why.
+        let grok = probe_hardening("grok");
+        assert!(
+            !grok.extra_args.iter().any(|a| a.contains("auto-update")),
+            "grok must keep declining an unconfirmed auto-update flag in the probe path too: {:?}",
+            grok.extra_args
+        );
+        assert!(
+            adapter_info("grok")
+                .unwrap()
+                .known_gaps
+                .iter()
+                .any(|g| g.contains("auto-update")),
+            "grok's declined flag must stay a named, tracked gap"
+        );
+
+        // The one adapter with a confirmed flag: the probe path reuses
+        // exactly what cursor's real argv already sends (see `build`).
+        let cursor = probe_hardening("cursor");
+        assert!(
+            cursor.extra_args.contains(&"--disable-auto-update"),
+            "cursor's confirmed --disable-auto-update should harden the probe path too: {:?}",
+            cursor.extra_args
         );
     }
 

@@ -444,7 +444,7 @@ sfh はどの adapter についても **minimum version を固定していませ
 - `status.json`: リアルタイムステータススナップショット
 - `execution-closure.json`: この run が固定された入力の hash
 - `workspace.json`: managed workspace（flow が要求した場合）
-- `context-snapshot/` & `context-snapshot.json`: 宣言された`kind: file` contextすべてを run 開始時に一度だけ凍結したコピー。以降どの step も宣言された path を再度開くのではなくこのコピーを読むため、run の途中で元の file を編集しても後続 step が受け取る内容は変わりません。resume した run は、`--force-resume` の下でも新しく取り直さず元の snapshot をそのまま使います。
+- `context-snapshot/` & `context-snapshot.json`: 宣言された`kind: file` contextすべてを run 開始時に一度だけ凍結したコピー（1つも宣言していない flow ではどちらも書かれません）。以降どの step も宣言された path を再度開くのではなくこのコピーを読むため、run の途中で元の file を編集しても後続 step が受け取る内容は変わりません。resume した run は、`--force-resume` の下でも新しく取り直さず元の snapshot をそのまま使います。
 - `<step_id>.context.txt` & `<step_id>.context.json`: 組み立てられた context とその manifest（step が context を指定した場合）
 
 `{{steps.verify.output_file}}` はこの同じサイズ制限済み`.out.txt`を指しており、完全なstreamを保証するものではありません。sfhはraw標準出力・標準エラー出力を無制限には保持しません。それでもコマンドの長い出力をAI promptへ渡す場合は、`{{steps.verify.output | tail:80 | truncate:8000}}`のように明示的に制限してください。32 MiBを超えて出力全体を残す必要があるstep — 騒がしいbuildやtest runnerを包む`cmd:` stepなど — は、managed workspace内のfileなど、自分自身のartifact先に出力を書き出してください。
