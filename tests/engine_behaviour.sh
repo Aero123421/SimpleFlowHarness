@@ -5563,7 +5563,30 @@ else
   pass=$((pass + 1))
 fi
 contains "preflight: it names the resolved binary" "$STUB_NAME" pf2.out
-contains "preflight: it reports the version it read" "sfh-session-stub 1.0.0" pf2.out
+# P0-05: `bin:` is an arbitrary path wearing a trusted tool's name, so the
+# default preflight resolves it and stops there - the same treatment a `cmd:`
+# step's program has always had, for the same reason. No version is read, and
+# the report has to SAY that rather than leave a silence that reads like a
+# check which came back clean.
+not_contains "preflight: an unprobed bin: override reports no version" "sfh-session-stub 1.0.0" pf2.out
+contains "preflight: it says the override was resolved but not run" "not probed" pf2.out
+contains "preflight: and names the flag that would run it" "--probe-binaries" pf2.out
+
+# Opting in runs it, and only then is the version really read. The stub answers
+# --version/--help before any of its side effects, so even a probed run must
+# leave the marker directory alone: "probed" and "asked to answer a prompt" are
+# different things, and this is the check that keeps them different.
+rm -rf PREFLIGHT-CALLED-MODEL
+SFH_STUB_MKDIR="$WORK_NATIVE/PREFLIGHT-CALLED-MODEL" "$SFH" preflight pfflow.yaml --probe-binaries > pf3.out 2> pf3.err
+check "preflight: --probe-binaries exits 0 when the override is a real adapter" 0 $?
+contains "preflight: with --probe-binaries it reports the version it read" "sfh-session-stub 1.0.0" pf3.out
+if [ -d PREFLIGHT-CALLED-MODEL ]; then
+  echo "FAIL - preflight: --probe-binaries asked the tool to answer a prompt"
+  fail=$((fail + 1))
+else
+  echo "ok   - preflight: --probe-binaries still made no model call"
+  pass=$((pass + 1))
+fi
 
 # --- profile overlays --------------------------------------------------------
 cat > ov-flow.yaml <<'YAML'
