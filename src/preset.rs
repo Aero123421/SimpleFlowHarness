@@ -412,17 +412,24 @@ impl AdapterInfo {
 /// The date the header of this module records as its live-verification point.
 pub const LAST_VERIFIED: &str = "2026-07-27";
 
+/// The per-tool literals `adapter_info` switches on, in the order they fill
+/// `AdapterInfo`: protocol, cost coverage, read/write/full enforcement,
+/// required flags, known gaps, and a documented minimum version (or `None`).
+/// Named so the match below reads as data, not a six-tuple clippy has to
+/// squint at.
+type AdapterFacts = (
+    &'static str,
+    Coverage,
+    [Enforcement; 3],
+    &'static [&'static str],
+    &'static [&'static str],
+    Option<&'static str>,
+);
+
 /// Metadata for one preset, or `None` for a name that is not a preset.
 pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
     use Enforcement::*;
-    let (protocol, cost, policy, flags, gaps, min_version): (
-        &'static str,
-        Coverage,
-        [Enforcement; 3],
-        &'static [&'static str],
-        &'static [&'static str],
-        Option<&'static str>,
-    ) = match tool {
+    let (protocol, cost, policy, flags, gaps, min_version): AdapterFacts = match tool {
         "codex" => (
             "codex-jsonl",
             Coverage::TokensOnly,
@@ -2691,17 +2698,213 @@ mod tests {
             );
         }
     }
-}
 
-#[cfg(test)]
-mod scratch_probe {
-    use super::*;
-
+    /// P0-02. `Enforced` used to mean "sfh denied the builtin tools its
+    /// preset author enumerated"; the review found that bar too low for
+    /// five adapters, because none of the five denials reach MCP tools,
+    /// plugins, hooks, subagents or instruction files. Only a tool whose OWN
+    /// flag is documented to bound the entire process (codex's sandbox) or
+    /// whose single permission axis has no known uncovered sibling (agy, not
+    /// examined in this pass and left as it was) still earns it. This test
+    /// pins the corrected table so a future edit cannot silently re-claim
+    /// `Enforced` for an enumerated-denylist adapter without a reviewer
+    /// noticing the diff.
     #[test]
-    fn dump_long_flags() {
-        let l = PathBuf::from("/tmp/last.txt");
-        let p = PathBuf::from("/tmp/p.txt");
-        let bp = BuildPaths { last_msg: &l, prompt_file: &p };
+    fn enforced_is_reserved_for_a_holistic_guarantee_not_an_enumerated_denylist() {
+        let expected: &[(&str, Enforcement, Enforcement, Enforcement)] = &[
+            (
+                "codex",
+                Enforcement::Sandboxed,
+                Enforcement::Sandboxed,
+                Enforcement::BestEffort,
+            ),
+            (
+                "claude",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "opencode",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "grok",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "agy",
+                Enforcement::Enforced,
+                Enforcement::Enforced,
+                Enforcement::BestEffort,
+            ),
+            (
+                "pi",
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+                Enforcement::BestEffort,
+            ),
+            (
+                "cursor",
+                Enforcement::BestEffort,
+                Enforcement::Unsupported,
+                Enforcement::BestEffort,
+            ),
+        ];
+        for (tool, read, write, full) in expected {
+            let i = adapter_info(tool).unwrap();
+            assert_eq!(i.enforcement(Access::Read), *read, "{tool} read");
+            assert_eq!(i.enforcement(Access::Write), *write, "{tool} write");
+            assert_eq!(i.enforcement(Access::Full), *full, "{tool} full");
+        }
+    }
+
+    /// P0-02. A gap list that is merely non-empty but generic ("some things
+    /// may not be covered") would pass a bare emptiness check and still tell
+    /// an operator nothing they could act on - and a copy-pasted list is the
+    /// same failure wearing a different tool name. Every adapter's list has
+    /// to name its own concrete uncovered surfaces, and no two adapters may
+    /// share one.
+    #[test]
+    fn known_gaps_name_concrete_surfaces_and_are_not_copy_pasted_across_adapters() {
+        let mut seen: Vec<(&str, &[&str])> = Vec::new();
+        for tool in crate::flow::TOOLS {
+            let i = adapter_info(tool).unwrap();
+            assert!(!i.known_gaps.is_empty(), "{tool} lists no known gaps");
+            for (other_tool, other_gaps) in &seen {
+                assert_ne!(
+                    i.known_gaps, *other_gaps,
+                    "{tool} and {other_tool} share an identical known_gaps list - that is a generic list wearing two names"
+                );
+            }
+            seen.push((tool, i.known_gaps));
+        }
+        // Spot-check that the concrete surfaces the P0-02 review named for
+        // each adapter actually made it into the list, so a future edit
+        // cannot quietly water these back down to something generic.
+        let must_mention: &[(&str, &[&str])] = &[
+            ("claude", &["MCP", "plugin", "hook", "instruction"]),
+            ("opencode", &["--auto", "task", "skill", "MCP", "plugin"]),
+            ("grok", &["MCP", "sandbox", "auto-update", "plugin"]),
+            ("pi", &["SYSTEM", "APPEND_SYSTEM", "AGENTS.md"]),
+            ("cursor", &["MCP", "rule"]),
+        ];
+        for (tool, needles) in must_mention {
+            let i = adapter_info(tool).unwrap();
+            let joined = i.known_gaps.join(" | ");
+            for needle in *needles {
+                assert!(
+                    joined.contains(needle),
+                    "{tool}'s known_gaps do not mention '{needle}': {joined}"
+                );
+            }
+        }
+    }
+
+    /// P0-02. Pi documents --no-context-files, and the concrete gap it closes
+    /// (AGENTS.md/CLAUDE.md loading unaudited into the prompt) applies to both
+    /// restrictive tiers, not read alone - see the comment in pi_common. full
+    /// is deliberately excluded: it already means the operator trusts pi with
+    /// everything, so suppressing normal project context there would be an
+    /// undocumented narrowing of the one tier meant to hold nothing back.
+    #[test]
+    fn pi_strict_presets_suppress_hidden_context_files() {
+        assert!(build_argv("pi", Access::Read)
+            .iter()
+            .any(|x| x == "--no-context-files"));
+        assert!(build_argv("pi", Access::Write)
+            .iter()
+            .any(|x| x == "--no-context-files"));
+        assert!(
+            !build_argv("pi", Access::Full)
+                .iter()
+                .any(|x| x == "--no-context-files"),
+            "full trusts pi with everything; suppressing context files there would be a silent narrowing"
+        );
+    }
+
+    /// P0-02. The review asked for --no-auto-update on every scripted grok
+    /// invocation, but nothing in this codebase's prior research (unlike
+    /// cursor's --disable-auto-update, which IS attested here) confirms that
+    /// flag's name for the pinned grok CLI. Inventing a plausible-looking
+    /// flag would repeat exactly the failure this whole fix is about: a
+    /// guarantee sfh claims but never verified. The gap stays open and named
+    /// in known_gaps instead, until someone confirms the real flag against
+    /// grok's own --help or documentation.
+    #[test]
+    fn grok_does_not_claim_an_unconfirmed_auto_update_flag() {
+        for access in [Access::Read, Access::Write, Access::Full] {
+            let argv = build_argv("grok", access);
+            assert!(
+                !argv.iter().any(|x| x.contains("auto-update")),
+                "grok argv claims an auto-update flag sfh never confirmed: {argv:?}"
+            );
+        }
+        let i = adapter_info("grok").unwrap();
+        assert!(
+            i.known_gaps.iter().any(|g| g.contains("auto-update")),
+            "the declined flag must stay a named, tracked gap: {:?}",
+            i.known_gaps
+        );
+    }
+
+    /// The other half of P1-06's drift problem, in the direction the sfh-side
+    /// test above cannot see.
+    ///
+    /// Preflight blocks a run when a flag an adapter needs is missing from the
+    /// binary's own `--help`. The shell suite points every preset at one stub
+    /// binary, so that stub's help text has to stay a superset of every
+    /// adapter's `required_flags` - and when the lists above were widened to
+    /// what the builders really emit, it silently stopped being one. The
+    /// failure that produces is maximally misleading: `tests/engine_behaviour.sh`
+    /// reports a missing flag on a CLI that never had one, and nothing points
+    /// at the fixture. Reading the stub's source here turns that into a unit
+    /// test failure naming the exact flag, next to the list that caused it.
+    #[test]
+    fn the_session_stub_advertises_every_flag_an_adapter_requires() {
+        // The stub is a separate binary, not part of this crate, so its source
+        // is read as text rather than linked against.
+        let stub = include_str!("../tests/stub/session_stub.rs");
+        let help = stub
+            .split_once("const STUB_HELP: &str = \"\\")
+            .expect("the stub still defines STUB_HELP")
+            .1
+            .split_once("\";")
+            .expect("STUB_HELP is still a single literal")
+            .0;
+        for tool in crate::flow::TOOLS {
+            let i = adapter_info(tool).unwrap();
+            for flag in i.required_flags {
+                assert!(
+                    help.split_whitespace().any(|w| w == *flag),
+                    "{tool} requires {flag}, which tests/stub/session_stub.rs's STUB_HELP does not advertise - preflight will block the shell suite with a missing-flag blocker that has nothing to do with the CLI"
+                );
+            }
+        }
+    }
+
+    /// P1-06. `required_flags` used to be hand-maintained and drifted from
+    /// what the builders actually emit, so preflight's `--help` drift check
+    /// could miss a flag the upstream CLI renamed or dropped simply because
+    /// nobody had added it to this list. This walks every builder (fresh,
+    /// resume, fork), every access level, with every optional field turned on
+    /// so conditional flags (--model, --agent, ...) actually appear, and
+    /// asserts every long ("--foo") flag emitted is named in that adapter's
+    /// required_flags. It deliberately ignores short flags (-s, -c, -p, ...)
+    /// and bare subcommands (exec, run): the drift this guards against is a
+    /// long flag silently going unlisted, and those are the ones `preflight`
+    /// is most likely to have never had a reason to name explicitly.
+    #[test]
+    fn required_flags_names_every_long_flag_a_builder_can_emit() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
         let full_inp = |access: Access| PresetInput {
             model: Some("test-model".to_string()),
             effort: Some("high".to_string()),
@@ -2711,29 +2914,69 @@ mod scratch_probe {
             bin: None,
             timeout_sec: Some(900),
         };
+        let long_flags = |argv: &[String]| -> Vec<String> {
+            argv.iter()
+                .filter(|a| a.starts_with("--"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         for tool in crate::flow::TOOLS {
             let info = adapter_info(tool).unwrap();
             let mut emitted: Vec<String> = Vec::new();
             for access in [Access::Read, Access::Write, Access::Full] {
                 if let Ok(b) = build(tool, full_inp(access), &bp, Some("preassigned-id")) {
-                    emitted.extend(b.argv.iter().filter(|a| a.starts_with("--")).cloned());
+                    emitted.extend(long_flags(&b.argv));
                 }
                 if let Ok(b) = build_resume(tool, "resume-id", full_inp(access), &bp) {
-                    emitted.extend(b.argv.iter().filter(|a| a.starts_with("--")).cloned());
+                    emitted.extend(long_flags(&b.argv));
                 }
                 if let Ok(b) = build_fork(tool, "parent-id", "child-id", full_inp(access), &bp) {
-                    emitted.extend(b.argv.iter().filter(|a| a.starts_with("--")).cloned());
+                    emitted.extend(long_flags(&b.argv));
                 }
             }
             emitted.sort();
             emitted.dedup();
-            let missing: Vec<&String> = emitted
-                .iter()
-                .filter(|f| !info.required_flags.contains(&f.as_str()))
-                .collect();
-            println!("TOOL {tool}: emitted={:?}", emitted);
-            println!("TOOL {tool}: required_flags={:?}", info.required_flags);
-            println!("TOOL {tool}: MISSING={:?}", missing);
+            for flag in &emitted {
+                assert!(
+                    info.required_flags.contains(&flag.as_str()),
+                    "{tool} emits '{flag}' but required_flags does not list it - preflight's --help drift check would miss it disappearing"
+                );
+            }
+        }
+    }
+
+    /// P1-06. The old rule ("every adapter's minimum_version is None") was a
+    /// stand-in for a stricter one: never claim a version floor sfh did not
+    /// verify. Agy's structured print output - the --output-format json
+    /// envelope this preset's entire parse path depends on - is documented in
+    /// agy's own changelog as shipping in 1.1.8, and LAST_VERIFIED here is
+    /// 1.0.8: a floor below what the feature needs is not a floor at all, so
+    /// 1.1.8 is pinned (with its source cited in the comment at the match
+    /// arm). Every OTHER adapter still has no such documented floor, so
+    /// `None` remains the honest answer for them - this test still fails if
+    /// any of them starts claiming one without the same kind of evidence.
+    ///
+    /// NOTE: `src/preflight.rs`'s `no_adapter_claims_a_minimum_version_it_never_verified`
+    /// asserts the OLD rule (every minimum is `None`) and will now fail on
+    /// agy; that file is out of scope for this change (see the accompanying
+    /// report) and needs the same "unless documented" rewrite this test gives
+    /// the invariant here.
+    #[test]
+    fn only_agy_pins_a_minimum_version_and_it_names_its_source() {
+        for tool in crate::flow::TOOLS {
+            let i = adapter_info(tool).unwrap();
+            if tool == "agy" {
+                assert_eq!(
+                    i.minimum_version,
+                    Some("1.1.8"),
+                    "agy's structured print output needs 1.1.8; pinning it stops sfh driving a build that cannot produce it"
+                );
+            } else {
+                assert_eq!(
+                    i.minimum_version, None,
+                    "{tool} pins a floor that is not documented anywhere sfh can point to"
+                );
+            }
         }
     }
 }

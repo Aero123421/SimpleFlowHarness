@@ -399,6 +399,15 @@ fn work(cfg: &Config) {
 /// the work a real invocation would. The flag list is the union of what sfh's
 /// adapters look for, so this one binary can stand in for whichever preset a
 /// test points it at.
+///
+/// It must stay a SUPERSET of every adapter's `required_flags` in
+/// `src/preset.rs`. Preflight blocks a run when a flag an adapter needs is
+/// absent from the binary's own `--help`, so a list that has fallen behind
+/// makes the shell suite fail as a missing flag rather than as the stale
+/// fixture it actually is. P1-06 expanded those lists to everything the
+/// builders really emit, and `required_flags_names_every_long_flag_a_builder_can_emit`
+/// keeps them honest on the sfh side; this constant is the test-fixture half
+/// of the same invariant and has to be widened whenever they are.
 const STUB_HELP: &str = "\
 usage: sfh-session-stub [options]
   exec --json --output-last-message -s -c
@@ -408,6 +417,12 @@ usage: sfh-session-stub [options]
   --mode --print-timeout
   --offline --tools
   --trust --disable-project-configs
+  --model --effort --thinking --reasoning-effort --variant
+  --allowedTools --deny --approve --no-approve --force
+  --dangerously-skip-permissions --dangerously-bypass-approvals-and-sandbox
+  --resume --fork --fork-session --conversation
+  --no-context-files --no-extensions --no-skills --no-prompt-templates
+  --color --skip-git-repo-check --disable-auto-update
 ";
 
 fn main() {
