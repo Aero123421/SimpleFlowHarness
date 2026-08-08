@@ -1989,6 +1989,20 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             // can - it is a branch the author believes in and will never take.
             // Catching it here costs nothing; catching it at run time costs
             // whatever the guarded step was about to spend.
+            // A fan-out step's own recorded result is the GROUP composite: one
+            // exit for the whole lap, and no label, because the group ran no
+            // command. An `outcomes:` table on a foreach describes each ITEM's
+            // launch, which is useful and stays allowed - but a label rule
+            // reading the group would simply never match. Members are judged
+            // with when_members.
+            if (s.is_group() || s.is_foreach())
+                && (r.when_label_is.is_some() || r.when_outcome_is.is_some())
+            {
+                return Err(format!(
+                    "step '{}' route[{i}]: when_label_is/when_outcome_is read this step's OWN outcome, and a parallel:/foreach: step has none - it records the group composite. Judge the members with when_members, or put the rule on a single step",
+                    s.id
+                ));
+            }
             if let Some(want) = &r.when_label_is {
                 if !s
                     .outcomes
@@ -2743,6 +2757,12 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             || !s.env.is_empty()
             || !s.env_remove.is_empty()
             || s.allow_empty.is_some()
+            // A group runs no command of its own, so it has no exit code for a
+            // table to describe. Accepting one silently would leave a
+            // `when_label_is:` rule that validate approves - the label really
+            // is declared - and that can never match at run time, which is the
+            // worst of both answers.
+            || !s.outcomes.is_empty()
         {
             return Err(format!(
                 "step '{sid}': a parallel: group carries only id/max_parallel/route/on_error/max_visits/on_max_visits/notes (tool settings go on the children)"
@@ -3824,6 +3844,31 @@ mod tests {
             let f: Flow = yaml::from_str(src).expect("fixture parses");
             assert!(validate(&f, false).is_err(), "{why} must be refused");
         }
+    }
+
+    #[test]
+    fn a_fan_out_step_has_no_outcome_of_its_own_to_route_on() {
+        // The trap this closes: the group records a COMPOSITE exit and no
+        // label, so a `when_label_is` rule whose label really is declared
+        // passes the "can it ever match" check and then never fires. Both
+        // halves of the answer were wrong at once.
+        let group = parse(
+            "name: t\nsteps:\n  - id: fan\n    outcomes:\n      2: {result: continue, label: partial}\n    parallel:\n      - {id: a, cmd: [\"echo\", \"hi\"]}\n",
+        )
+        .unwrap_err();
+        assert!(group.contains("carries only"), "{group}");
+
+        // A foreach's table describes each ITEM's launch, which is useful, so
+        // the table stays - only the rule that reads the group is refused.
+        let rule = parse(
+            "name: t\nvars: {i: \"a\"}\nsteps:\n  - id: each\n    foreach: {from: \"{{vars.i}}\", split: lines}\n    cmd: [\"echo\", \"{{item}}\"]\n    outcomes:\n      2: {result: continue, label: partial}\n    route:\n      - {when_label_is: partial, goto: end}\n      - {goto: end}\n",
+        )
+        .unwrap_err();
+        assert!(rule.contains("group composite"), "{rule}");
+        assert!(parse(
+            "name: t\nvars: {i: \"a\"}\nsteps:\n  - id: each\n    foreach: {from: \"{{vars.i}}\", split: lines}\n    cmd: [\"echo\", \"{{item}}\"]\n    outcomes:\n      2: {result: continue, label: partial}\n",
+        )
+        .is_ok());
     }
 
     #[test]
