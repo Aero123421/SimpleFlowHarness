@@ -56,6 +56,26 @@ zipで配られていたもので、`sfh` binaryの無い環境で作られ、�
   routeの表明ではありません。並べ替えれば黙って別の場所へ飛びます。`{goto: implement}`
   を明示しました。
 
+### 同梱linterが自分のreference flowに36件の警告を出していました
+
+packのREADMEは`lint_sfh_flow.py`を標準手順の6番目に置いています。そのlinterを
+pack自身の29本へ流すと、ERROR/WARNINGが36件出ました。**authorが警告を読まなくなる
+のはこの状態です。**
+
+- **SFH042 / SFH043はcycleの誤ったnodeを見ていました（34件）。** backward routeが
+  *指す先*のstepに`max_visits`と`on_max_visits`があるかを訊いていましたが、
+  review/fix loopは**戻る側**——繰り返し失敗したときに諦める対象そのもの——に上限を
+  置きます。結果として、正しくboundされている20本中17本に対して警告していました。
+  cycleはその上のどこか1nodeがboundされていれば有限です。backward routeを持つstep
+  自身も見るようにしました。**どこにも上限が無いcycleは今も報告します。**
+- **SFH030は正しい指摘でした（2件）。** `05-frontend-native-first.yaml`が
+  `npm run lint`と`npm test`をstring commandで書いており、platform shellへ渡ります。
+  portabilityを主張するpackのfrontend exampleがcmd.exeを必要とするのは筋が通らない
+  ので、argv listにしました。
+- 修正後、29本すべてがERROR/WARNINGゼロです。`tests/skills_checks.py`が
+  「上限の無いcycleは警告される」「戻る側のstepに置いた上限は有効」「同梱flowは
+  lint clean」の3点を固定します。ruleを元へ戻すと18件落ちます。
+
 ### CIに載せました
 
 - `examples/*.yaml`のglobは意図的にtop levelだけなので、放っておけばこれらは
