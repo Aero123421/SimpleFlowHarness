@@ -69,7 +69,7 @@ Use sfh-flow-review and return prioritized findings plus a corrected YAML.
 3. 各stepをdeterministic / nondeterministic / external effectへ分類する。
 4. workspace、context、evidence、budget、failure policyを決める。
 5. YAMLを書く。存在しないkeyを発明しない。
-6. tools/lint_sfh_flow.pyでheuristic lintする。
+6. skills/tools/lint_sfh_flow.pyでheuristic lintする。
 7. sfh validate --strictする。
 8. sfh preflight --jsonする。
 9. sfh plan --json --saveする。
@@ -81,13 +81,13 @@ Use sfh-flow-review and return prioritized findings plus a corrected YAML.
 Skill構造:
 
 ```bash
-python tools/validate_skills.py .
+python3 skills/tools/validate_skills.py skills
 ```
 
 sfh flowのheuristic lint:
 
 ```bash
-python tools/lint_sfh_flow.py path/to/flow.yaml
+python3 skills/tools/lint_sfh_flow.py path/to/flow.yaml
 ```
 
 実際のsfh v1.5で:
@@ -98,7 +98,7 @@ sfh preflight flow.yaml --json
 sfh plan flow.yaml --json --save --state-dir ~/.local/state/sfh
 ```
 
-`tools/lint_sfh_flow.py`はsfh本体のvalidatorを置き換えません。合法だが壊れやすい設計を早く見つける補助です。
+`skills/tools/lint_sfh_flow.py`はsfh本体のvalidatorを置き換えません。合法だが壊れやすい設計を早く見つける補助です。
 
 ## 重要な設計境界
 

@@ -160,11 +160,22 @@ def main() -> int:
             add(findings, "info", "SFH041", label, "exact AI trailer is a semantic fallback; add a catch-all to stuck and prefer a deterministic wrapper when possible")
         for target in sorted(set(backward_targets)):
             target_step = steps[positions[target]]
-            explicit = target_step.get("max_visits") is not None or (flow.get("defaults") or {}).get("max_visits") is not None
-            if not explicit:
-                add(findings, "warning", "SFH042", target, f"loop re-enters '{target}' but relies on the implicit visit default")
-            if target_step.get("on_max_visits") is None:
-                add(findings, "warning", "SFH043", target, f"loop re-enters '{target}' without an explicit on_max_visits handoff/stuck policy")
+            # A cycle is bounded if ANY node on it is bounded, not specifically
+            # the node the backward edge points at. Checking only the target
+            # made this rule fire on every review/fix loop in the bundled
+            # examples, where the bound sits on the fixer that jumps back -
+            # which is the natural place for it, since that is the step whose
+            # repeated failure is the thing worth giving up on.
+            defaults = flow.get("defaults") or {}
+            bounded = (
+                defaults.get("max_visits") is not None
+                or target_step.get("max_visits") is not None
+                or step.get("max_visits") is not None
+            )
+            if not bounded:
+                add(findings, "warning", "SFH042", target, f"loop through '{target}' relies on the implicit visit default; set max_visits on '{target}' or on '{label}'")
+            if target_step.get("on_max_visits") is None and step.get("on_max_visits") is None:
+                add(findings, "warning", "SFH043", target, f"loop through '{target}' has no explicit on_max_visits handoff/stuck policy on either '{target}' or '{label}'")
 
         for source in step.get("context") or []:
             if source not in (flow.get("contexts") or {}):

@@ -17,4 +17,4 @@ Primary entry points:
 - `sfh-flow-review` for auditing an existing flow.
 - Add the specialist skill matching the problem: loops, deterministic gates, context/workspace, failure recovery, CI, external tools/MCP, or eval-driven improvement.
 
-Validate the pack with `python tools/validate_skills.py .`. Validate generated flows with the installed sfh binary: `sfh validate --strict`, `sfh preflight --json`, and `sfh plan --json --save`.
+Validate the pack with `python3 skills/tools/validate_skills.py skills`. Validate generated flows with the installed sfh binary: `sfh validate --strict`, `sfh preflight --json`, and `sfh plan --json --save`.

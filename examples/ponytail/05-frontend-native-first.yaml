@@ -57,13 +57,13 @@ steps:
 
   - id: lint
     effects: workspace
-    cmd: "npm run lint"
+    cmd: ["npm", "run", "lint"]
     timeout_sec: 1200
     on_error: goto:fix
 
   - id: test
     effects: workspace
-    cmd: "npm test"
+    cmd: ["npm", "test"]
     timeout_sec: 1800
     on_error: goto:fix
 

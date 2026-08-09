@@ -184,6 +184,99 @@ class VersionClaims(unittest.TestCase):
                 self.assertEqual((int(found.group(1)), int(found.group(2))), (major, minor))
 
 
+UNBOUNDED_CYCLE = """api_version: 1
+name: unbounded
+workspace: {mode: current}
+steps:
+  - id: build
+    effects: read
+    cmd: ["true"]
+  - id: check
+    effects: read
+    cmd: ["true"]
+    route:
+      - {when_exit: 0, goto: end}
+      - {goto: build}
+"""
+
+BOUNDED_AT_THE_SOURCE = """api_version: 1
+name: bounded-at-source
+workspace: {mode: current}
+steps:
+  - id: build
+    effects: read
+    cmd: ["true"]
+  - id: check
+    effects: read
+    cmd: ["true"]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    route:
+      - {when_exit: 0, goto: end}
+      - {goto: build}
+"""
+
+
+def _has_pyyaml() -> bool:
+    try:
+        import yaml  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_pyyaml(), "the bundled linter needs PyYAML")
+class LoopBoundRule(unittest.TestCase):
+    """SFH042/SFH043 used to read the wrong node of the cycle.
+
+    The rule checked whether the step a backward route points AT carries
+    `max_visits`. A review/fix loop puts the bound on the fixer that jumps
+    back - the step whose repeated failure is what you would give up on - so
+    the rule fired on 17 of the 20 bundled flows while every one of them was
+    properly bounded. A linter that is wrong that often on its own reference
+    examples teaches authors to ignore it.
+    """
+
+    def lint(self, flow: str) -> str:
+        import subprocess
+        import sys
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "flow.yaml"
+            path.write_text(flow, encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(SKILLS / "tools/lint_sfh_flow.py"), str(path)],
+                capture_output=True,
+                text=True,
+            )
+            return proc.stdout
+
+    def test_a_cycle_with_no_bound_anywhere_is_still_reported(self) -> None:
+        output = self.lint(UNBOUNDED_CYCLE)
+        self.assertIn("SFH042", output)
+        self.assertIn("SFH043", output)
+
+    def test_a_bound_on_the_step_that_jumps_back_counts(self) -> None:
+        output = self.lint(BOUNDED_AT_THE_SOURCE)
+        self.assertNotIn("SFH042", output)
+        self.assertNotIn("SFH043", output)
+
+    def test_the_bundled_flows_are_clean(self) -> None:
+        # The pack's own README makes this linter step 6 of the standard
+        # authoring procedure, so its reference flows have to pass it.
+        flows = sorted(ROOT.glob("examples/ponytail/[0-9][0-9]-*.yaml"))
+        flows += sorted(SKILLS.glob("sfh-*/assets/*.yaml"))
+        self.assertTrue(flows)
+        for flow in flows:
+            with self.subTest(flow=flow.name):
+                output = self.lint(flow.read_text(encoding="utf-8"))
+                offenders = [
+                    line for line in output.splitlines() if line.startswith(("ERROR", "WARNING"))
+                ]
+                self.assertEqual(offenders, [])
+
+
 class BundledCopies(unittest.TestCase):
     def test_the_two_linter_copies_stay_identical(self) -> None:
         # sfh-flow-design ships its own copy so the skill is self-contained
