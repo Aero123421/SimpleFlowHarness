@@ -1,0 +1,86 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: do not hide a flake with sleeps/retries; make the race or nondeterminism legible.
+api_version: 1
+name: ponytail-flaky-test-root-cause
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  incident: {file: ./inputs/INCIDENT.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 30
+  max_prompt_chars: 110000
+  max_context_chars: 85000
+
+steps:
+  - id: diagnose
+    use: analyst
+    effects: read
+    context: [task, incident, project_rules, ponytail]
+    prompt: |
+      Diagnose the flaky test from code and evidence.
+      Identify shared mutable state, timing assumptions, unordered iteration,
+      leaked resources, environmental dependencies, or an incorrect test oracle.
+      Reject blind sleeps, arbitrary retry counts, and wider timeouts unless the
+      requirement itself is about time. Do not edit files.
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, incident, project_rules, ponytail]
+    prompt: |
+      Apply the smallest deterministic root-cause fix.
+
+      Diagnosis:
+      {{steps.diagnose.output | truncate:18000}}
+
+      Remove timing guesses where possible. Add or adjust only the focused test
+      evidence needed to prove the race or nondeterminism is gone.
+
+  - id: verify
+    effects: workspace
+    cmd: ["cargo", "test", "--release", "--locked"]
+    timeout_sec: 2400
+    on_error: goto:fix
+
+  - id: review
+    use: reviewer
+    effects: read
+    context: [task, incident, project_rules, correctness]
+    prompt: |
+      Review whether the flake's cause was removed rather than hidden.
+      Check cleanup, ordering, synchronization, and test determinism.
+      End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: fix}
+      - {goto: stuck}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, incident, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Resolve only the verified nondeterminism. Do not convert a real failure
+      into a passing test through retries, sleeps, ignored errors, or loosened assertions.
+    route:
+      - {goto: verify}

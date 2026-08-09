@@ -1,0 +1,127 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: decompose a large task, execute chunks sequentially in one workspace,
+# compact the aggregate handoff, and bound the correction loop.
+api_version: 1
+name: ponytail-sequential-chunked-build
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  backlog: {file: ./inputs/BACKLOG.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  planning: {file: ./prompts/planner.md}
+  harness: {file: ./prompts/harness-loop.md}
+  evaluator: {file: ./prompts/evaluator.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:18000}}
+
+profiles:
+  planner: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  builder_fallback: {tool: codex, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 80
+  max_parallel: 1
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+  wall_clock_sec: 21600
+  on_budget: goto:handoff
+  budget_reserve: {wall_clock_sec: 1200}
+
+steps:
+  - id: plan_chunks
+    use: planner
+    effects: read
+    context: [backlog, acceptance, project_rules, ponytail, planning, harness]
+    notes: append
+    prompt: |
+      Decompose the requested build into the fewest coherent chunks.
+      Output exactly one chunk per non-empty line, in dependency order.
+      Each line must be a self-contained instruction and deterministic check.
+      No heading, numbering, bullets, JSON, or commentary.
+
+  - id: build_chunks
+    use: builder
+    fallback: [builder_fallback]
+    effects: workspace
+    foreach:
+      from: "{{steps.plan_chunks.output}}"
+      split: lines
+    max_parallel: 1
+    context: [backlog, acceptance, project_rules, ponytail, harness]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    notes: append
+    compact:
+      when_over: 30000
+      use: planner
+      target_chars: 9000
+      max_input_chars: 80000
+      timeout_sec: 900
+    prompt: |
+      Implement only this chunk in the shared workspace:
+      {{item}}
+
+      Inspect the current workspace first; prior chunks may already provide what
+      this one needs. Keep the repository coherent and do not pre-build later chunks.
+
+  - id: verify
+    effects: read
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:repair
+
+  - id: review
+    use: reviewer
+    effects: read
+    context: [backlog, acceptance, project_rules, evaluator, harness]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Evaluate the complete current workspace against the requested end state.
+      The chunk list and aggregate report are navigation aids, not proof.
+
+      Chunks:
+      {{steps.plan_chunks.output | truncate:16000}}
+
+      Build handoff:
+      {{steps.build_chunks.output | truncate:16000}}
+
+      End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: repair}
+      - {goto: stuck}
+
+  - id: repair
+    use: builder
+    fallback: [builder_fallback]
+    effects: workspace
+    context: [backlog, acceptance, project_rules, ponytail, harness, latest_review]
+    max_visits: 4
+    on_max_visits: goto:handoff
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Repair the smallest set of current blockers. Do not restart the plan or
+      reimplement completed chunks.
+    route:
+      - {goto: verify}
+
+  - id: handoff
+    use: planner
+    effects: read
+    context: [backlog, acceptance, project_rules, harness, latest_review]
+    prompt: |
+      Record a compact handoff: chunks completed, current workspace state,
+      checks run, unresolved blockers, and the next smallest action.
+    route:
+      - {goto: stuck}

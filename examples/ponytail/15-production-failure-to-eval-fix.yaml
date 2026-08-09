@@ -1,0 +1,112 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: production evidence -> reproducible eval -> minimal fix -> regression suite.
+api_version: 1
+name: ponytail-production-failure-to-eval
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  incident: {file: ./inputs/INCIDENT.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  planning: {file: ./prompts/planner.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:18000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 36
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+
+steps:
+  - id: analyze_trace
+    use: analyst
+    effects: read
+    context: [incident, acceptance, project_rules, ponytail, planning]
+    prompt: |
+      Turn the production evidence into one scoped, reproducible failure.
+      Trace provenance from input through the incorrect result and identify the
+      narrowest eval/test that captures the practitioner or user correction.
+      Do not edit files.
+
+  - id: add_eval
+    use: builder
+    effects: workspace
+    context: [incident, acceptance, project_rules, ponytail]
+    prompt: |
+      Add the smallest regression eval or test that reproduces the real failure.
+      Do not implement the fix yet. Keep source evidence and expected correction
+      visible in the test.
+
+      Trace analysis:
+      {{steps.analyze_trace.output | truncate:18000}}
+
+  - id: prove_failure
+    effects: workspace
+    cmd: ["python", "-m", "pytest", "-q", "tests"]
+    timeout_sec: 1800
+    on_error: goto:implement
+    route:
+      # Exit 0 means the failure did NOT reproduce, so there is nothing to
+      # root-cause yet: stop rather than let a model invent a fix. Any other
+      # exit is the expected reproduction. The catch-all is written out because
+      # an implicit fall-through silently follows step order, and step order is
+      # exactly what an edit to this file is most likely to change.
+      - {when_exit: 0, goto: stuck}
+      - {goto: implement}
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [incident, acceptance, project_rules, ponytail]
+    prompt: |
+      Implement the smallest root-cause fix that makes the new eval pass without
+      teaching only the recorded example. Reuse the existing pipeline and preserve provenance.
+
+  - id: targeted_eval
+    effects: workspace
+    cmd: ["python", "-m", "pytest", "-q", "tests"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: full_regression
+    effects: workspace
+    cmd: ["python", "-m", "pytest", "-q"]
+    timeout_sec: 3600
+    on_error: goto:fix
+
+  - id: review
+    use: reviewer
+    effects: read
+    context: [incident, acceptance, project_rules, correctness]
+    prompt: |
+      Verify the production trace, regression eval, generalization, and current code.
+      End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: fix}
+      - {goto: stuck}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [incident, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Correct only the remaining regression or generalization blocker.
+      Do not add a broad framework around one production case.
+    route:
+      - {goto: targeted_eval}

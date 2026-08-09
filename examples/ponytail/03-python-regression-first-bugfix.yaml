@@ -1,0 +1,118 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: a small failing pytest check before the implementation.
+api_version: 1
+name: ponytail-python-regression-first
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  planning: {file: ./prompts/planner.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 30
+  max_parallel: 2
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+
+steps:
+  - id: analyze
+    use: analyst
+    effects: read
+    context: [task, acceptance, project_rules, ponytail, planning]
+    prompt: |
+      Trace the Python call path and identify the smallest stable regression
+      boundary. Prefer a plain pytest test over fixtures, factories, or a new
+      testing layer unless the repository already uses them. Do not edit files.
+
+  - id: add_test
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Add one regression test that exposes the defect. Do not implement the fix.
+      Reuse existing test helpers only when they make the test shorter and clearer.
+
+      Analysis:
+      {{steps.analyze.output | truncate:14000}}
+
+  - id: prove_failure
+    effects: workspace
+    cmd: ["python", "-m", "pytest", "-q"]
+    timeout_sec: 1200
+    on_error: goto:implement
+    route:
+      # Exit 0 means the failure did NOT reproduce, so there is nothing to
+      # root-cause yet: stop rather than let a model invent a fix. Any other
+      # exit is the expected reproduction. The catch-all is written out because
+      # an implicit fall-through silently follows step order, and step order is
+      # exactly what an edit to this file is most likely to change.
+      - {when_exit: 0, goto: stuck}
+      - {goto: implement}
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Implement the smallest root-cause fix that makes the new regression test
+      and existing suite pass. Prefer existing code, then Python's standard library.
+      Do not add a package for a few clear lines.
+
+  - id: verify
+    effects: workspace
+    cmd: ["python", "-m", "pytest", "-q"]
+    timeout_sec: 1200
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review behavior, edge cases, and regression coverage.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review only unnecessary Python complexity and dependency ownership.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Resolve the blocking findings without adding a framework, general-purpose
+      helper, or configuration surface that this bug does not require.
+    route:
+      - {goto: verify}

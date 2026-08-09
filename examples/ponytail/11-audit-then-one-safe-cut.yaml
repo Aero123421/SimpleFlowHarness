@@ -1,0 +1,116 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: audit broadly, but implement only one high-value, low-risk cut per run.
+api_version: 1
+name: ponytail-audit-one-safe-cut
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  auditor: {tool: codex, access: read}
+  selector: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 24
+  max_parallel: 2
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+
+steps:
+  - id: audit
+    use: auditor
+    effects: read
+    context: [task, project_rules, simplicity]
+    prompt: |
+      Audit the repository for over-engineering and rank concrete cuts.
+      Do not modify files. Keep the report factual and path-specific.
+
+  - id: choose
+    use: selector
+    effects: read
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Select exactly one finding from the audit that has high maintenance value,
+      low semantic risk, and a clear deterministic verification path.
+
+      Audit:
+      {{steps.audit.output | truncate:24000}}
+
+      If none is safe enough for an unattended change, explain why and end with:
+      DECISION: STOP
+
+      Otherwise describe the one selected cut and end with:
+      DECISION: APPLY
+    route:
+      - {when_last_line_is: "DECISION: STOP", goto: end}
+      - {when_last_line_is: "DECISION: APPLY", goto: implement}
+      - {goto: stuck}
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Apply only the selected cut. Do not opportunistically clean adjacent code.
+
+      Selected cut:
+      {{steps.choose.output | truncate:12000}}
+
+      Delete obsolete code and configuration rather than preserving dead compatibility.
+
+  - id: diff_check
+    effects: read
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Confirm behavior and compatibility remain intact.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Confirm this is one coherent reduction and no replacement complexity
+          was smuggled in.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 2
+    on_max_visits: goto:stuck
+    prompt: |
+      Repair only blockers caused by the selected cut. Do not expand into the
+      next audit finding.
+    route:
+      - {goto: diff_check}

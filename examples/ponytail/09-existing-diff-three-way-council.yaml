@@ -1,0 +1,61 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: correctness, security, and simplicity remain independent review dimensions.
+api_version: 1
+name: ponytail-existing-diff-three-way-council
+
+workspace:
+  mode: current
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  correctness: {file: ./prompts/correctness-review.md}
+  security: {file: ./prompts/security-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+
+profiles:
+  correctness_reviewer: {tool: codex, access: read}
+  security_reviewer: {tool: claude, access: read}
+  simplicity_reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 5
+  max_parallel: 3
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+
+steps:
+  - id: council
+    parallel:
+      - id: correctness
+        use: correctness_reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review the current diff for correctness and regression risk.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: security
+        use: security_reviewer
+        effects: read
+        context: [task, acceptance, project_rules, security]
+        on_error: continue
+        prompt: |
+          Review the current diff for security, containment, and data-loss risk.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity
+        use: simplicity_reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review the current diff only for over-engineering.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    max_parallel: 3
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: stuck}

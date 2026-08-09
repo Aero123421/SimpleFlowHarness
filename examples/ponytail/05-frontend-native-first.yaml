@@ -1,0 +1,103 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: prefer semantic HTML, CSS, and browser APIs before JavaScript or packages.
+api_version: 1
+name: ponytail-frontend-native-first
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  frontend_review: {file: ./prompts/frontend-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  planner: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 26
+  max_parallel: 2
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+
+steps:
+  - id: inspect
+    use: planner
+    effects: read
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Inspect the current frontend implementation and identify the smallest
+      native-first solution. Check semantic HTML, CSS, built-in controls,
+      form validation, browser APIs, and existing components before proposing
+      JavaScript or a package. Do not edit files.
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Implement the smallest accessible native-first solution.
+
+      Inspection:
+      {{steps.inspect.output | truncate:14000}}
+
+      Do not add a component library, state layer, custom widget, or dependency
+      when semantic HTML/CSS/browser behavior satisfies the acceptance criteria.
+
+  - id: lint
+    effects: workspace
+    cmd: "npm run lint"
+    timeout_sec: 1200
+    on_error: goto:fix
+
+  - id: test
+    effects: workspace
+    cmd: "npm test"
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: frontend_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, frontend_review]
+        on_error: continue
+        prompt: |
+          Review the current workspace for behavior, accessibility, and native use.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review only avoidable JavaScript, packages, wrappers, and speculative components.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Resolve the current blockers with the smallest accessible change.
+      Do not replace a native feature with custom code just to satisfy a review preference.
+    route:
+      - {goto: lint}
