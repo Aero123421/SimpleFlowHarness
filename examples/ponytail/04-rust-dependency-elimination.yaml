@@ -1,0 +1,104 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: remove an owned dependency when stdlib or existing code already covers it.
+api_version: 1
+name: ponytail-rust-dependency-elimination
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 24
+  max_parallel: 2
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+
+steps:
+  - id: survey
+    use: analyst
+    effects: read
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Audit the named or most relevant Rust dependency.
+      Find every use, feature flag, transitive role, platform caveat, and lockfile effect.
+      Compare it with existing repository helpers and the Rust standard library.
+      Recommend removal only when behavior and edge cases remain covered.
+      Do not edit files.
+
+  - id: remove
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Apply the smallest safe dependency removal described below.
+      Delete obsolete code and configuration rather than keeping compatibility
+      wrappers nobody needs. Preserve public behavior and platform support.
+
+      Survey:
+      {{steps.survey.output | truncate:18000}}
+
+  - id: format
+    effects: workspace
+    cmd: ["cargo", "fmt", "--all", "--", "--check"]
+    on_error: goto:fix
+
+  - id: test
+    effects: workspace
+    cmd: ["cargo", "test", "--release", "--locked"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Verify behavior, feature combinations, platform assumptions, and lockfile changes.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Confirm the dependency and redundant wrappers are actually gone and
+          that the replacement is smaller to own.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 2
+    on_max_visits: goto:stuck
+    prompt: |
+      Correct only blocking compatibility or simplification findings.
+      Do not reintroduce the removed dependency unless evidence proves the
+      standard-library or existing-code replacement is insufficient.
+    route:
+      - {goto: format}

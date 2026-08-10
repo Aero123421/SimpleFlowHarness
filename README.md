@@ -478,6 +478,8 @@ For complete reference material, explore:
 - Built-in syntax guide: Run `sfh guide` in your terminal.
 - CLI options: Run `sfh --help` or `sfh <command> --help`.
 - Sample workflows: Browse [examples/](examples/) (`research.yaml`, `hypotheses.yaml`, `parallel-ideas.yaml`, `managed-loop.yaml`, `workspace-smoke.yaml`).
+- Ready-made engineering flows: [examples/ponytail/](examples/ponytail/) — 20 flows for real repository work (regression-first bugfix, dependency elimination, independent review councils, migration dry runs, release-readiness gates). Point them at your own project with `--profiles`.
+- Writing flows with an AI: [skills/](skills/) — 9 [Agent Skills](https://agentskills.io/specification) that teach an authoring agent sfh's design rules. Install with `cp -R skills/sfh-* .agents/skills/`. These guide the AI that *writes* the YAML; sfh itself has no `skills:` key.
 - Project governance & policies:
   - [CONTRIBUTING.md](CONTRIBUTING.md)
   - [SECURITY.md](SECURITY.md)

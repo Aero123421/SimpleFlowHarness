@@ -1,0 +1,119 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: build and verify a migration, but stop for human approval before external effects.
+api_version: 1
+name: ponytail-database-migration-dry-run
+
+workspace:
+  mode: auto
+  cleanup: keep
+
+contexts:
+  migration: {file: ./inputs/MIGRATION.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  security: {file: ./prompts/security-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:20000}}
+
+profiles:
+  planner: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+  security_reviewer: {tool: claude, access: read}
+
+defaults:
+  max_total_steps: 30
+  max_parallel: 3
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+
+steps:
+  - id: plan
+    use: planner
+    effects: read
+    context: [migration, acceptance, project_rules, ponytail]
+    prompt: |
+      Design the smallest safe migration and rollback/recovery path.
+      Prefer database-native constraints and operations over application-side
+      emulation. Identify compatibility windows and the exact dry-run evidence.
+      Do not edit files and do not apply the migration.
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [migration, acceptance, project_rules, ponytail]
+    prompt: |
+      Implement migration files, tests, and dry-run support only.
+      Do not connect to or mutate production systems.
+
+      Plan:
+      {{steps.plan.output | truncate:18000}}
+
+  - id: dry_run
+    effects: workspace
+    replay: {unfinished: stuck}
+    cmd: ["python", "tools/migrate.py", "--dry-run"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness
+        use: reviewer
+        effects: read
+        context: [migration, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review schema/data correctness, compatibility, rollback, and dry-run evidence.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: security
+        use: security_reviewer
+        effects: read
+        context: [migration, acceptance, project_rules, security]
+        on_error: continue
+        prompt: |
+          Review credentials, destructive operations, privilege, data loss, and isolation.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity
+        use: reviewer
+        effects: read
+        context: [migration, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review for unnecessary migration framework, dual-write machinery,
+          flags, or layers not required by the stated compatibility window.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    max_parallel: 3
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: handoff
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [migration, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Resolve the blocking migration findings. Keep production application out of
+      this flow; only improve the committed migration and dry-run evidence.
+    route:
+      - {goto: dry_run}
+
+  - id: handoff
+    use: planner
+    effects: read
+    context: [migration, acceptance, project_rules]
+    prompt: |
+      Summarize the exact migration artifacts, dry-run result, recovery procedure,
+      and commands a human must review before applying any external effect.
+      Do not apply or publish anything.
+    route:
+      - {goto: stuck}

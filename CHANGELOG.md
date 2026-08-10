@@ -1,5 +1,130 @@
 # Changelog
 
+## v1.5.1 — 2026-08-09
+
+同梱物だけのreleaseです。**engineは1.5.0から1行も変わっていません。** flow fileの
+書き方も変わりません。
+
+20本の実務向けflowと9本のAgent Skillを取り込みました。どちらも外部packとして
+zipで配られていたもので、`sfh` binaryの無い環境で作られ、その旨をpack自身の
+`VALIDATION.md`が明記していました。repositoryへ入れて**初めて実物の`sfh`に通した
+ところ、schema検査では原理的に見えない欠陥が3種類出ました。** それを直したものが
+このreleaseです。
+
+### `examples/ponytail/` — 対象projectで回す20本のflow
+
+- primitiveの説明ではなく、既存codebaseに対する作業そのものを対象にしています。
+  regression-first bugfix、依存の削減、独立reviewer council、chunk分割した長時間
+  build、human gate付きmigration dry-run、release readiness loopなど。
+- 各flowは`inputs/`と`prompts/`を named context として自前で持ちます。Ponytailを
+  installしていなくても動きます。Ponytail本体の再配布ではなく、公開されている思想を
+  再構成した非公式の参考例です（`examples/ponytail/SOURCES.md`）。
+- 起動は**対象projectのGit repository root**からです。flow fileの置き場所とrunの
+  起点は別物で、context解決はflow fileからの相対なので、どこから起動しても同じ
+  bytesが渡ります。
+
+### `skills/` — flowを書くAIのための9本のAgent Skill
+
+- `sfh-flow-design`を中心に、loop engineering、deterministic gate、workspace/context、
+  failure recovery、CI監視、外部CLI/MCP連携、eval engineering、flow reviewを扱います。
+- **これはruntime機能ではありません。** sfhのflow formatに`skills:`キーは無く、追加も
+  していません。YAMLを*書く側*のAIへ渡す設計知識です。実行時のagentへ規則を渡したい
+  場合は、これまで通り`contexts:`で名前付きcontextとして固定してください。native
+  skillが読み込まれた証明をsfhは持てないので、correctnessに必須の規則をそこへ預ける
+  のは危険なままです。
+- `cp -R skills/sfh-* .agents/skills/` で導入します。packが元々書いていた
+  `cp -R skills/*` は、repositoryへ入れた結果pack自身のdocumentとtoolまで
+  client の skill directory へ撒くことになるので、対象を絞りました。
+
+### 実物の`sfh`に通して見つかった3件
+
+- **`goto:fix`はrouteではなくkey名でした。** `sfh-eval-engineering`の
+  `failure-to-regression.yaml`が`{when_label_is: reproduced, goto:fix}`と書いており、
+  空白が無いのでYAMLは`goto:fix`という名前のfieldとして読みます。この1本は
+  `--strict`以前に**plainな`sfh validate`が通りませんでした**。「YAMLとしてparseでき、
+  `steps`がlistである」ことを確認する検査では絶対に見つかりません。
+- **profile overlay 2本がsfhの受け付ける形ではありませんでした。** packの
+  `profiles.codex-pi.example.yaml`と`profiles.single-codex.example.yaml`は、profile名を
+  top levelのmappingとして並べており、`profiles:`でくるまれていません。sfhは
+  `unknown field 'planner', expected 'profiles'`で拒否します。packのREADMEが主要な
+  手順として案内している`--profiles`が、最初の1回で失敗する状態でした。packの検査は
+  「inline profileが存在すること」は見ていましたが、overlay file自体を適用しては
+  いませんでした。
+- **`prove_failure`のrouteに catch-all がありませんでした**（flow 02、03、15）。
+  `{when_exit: 0, goto: stuck}`だけなので、それ以外のexit codeは**file内で次に来る
+  stepへ暗黙に落ちます**。落ちる先は意図通りでしたが、それはstep順序の偶然であって
+  routeの表明ではありません。並べ替えれば黙って別の場所へ飛びます。`{goto: implement}`
+  を明示しました。
+
+### 同梱linterが自分のreference flowに36件の警告を出していました
+
+packのREADMEは`lint_sfh_flow.py`を標準手順の6番目に置いています。そのlinterを
+pack自身の29本へ流すと、ERROR/WARNINGが36件出ました。**authorが警告を読まなくなる
+のはこの状態です。**
+
+- **SFH042 / SFH043はcycleの誤ったnodeを見ていました（34件）。** backward routeが
+  *指す先*のstepに`max_visits`と`on_max_visits`があるかを訊いていましたが、
+  review/fix loopは**戻る側**——繰り返し失敗したときに諦める対象そのもの——に上限を
+  置きます。結果として、正しくboundされている20本中17本に対して警告していました。
+  cycleはその上のどこか1nodeがboundされていれば有限です。backward routeを持つstep
+  自身も見るようにしました。**どこにも上限が無いcycleは今も報告します。**
+- **SFH030は正しい指摘でした（2件）。** `05-frontend-native-first.yaml`が
+  `npm run lint`と`npm test`をstring commandで書いており、platform shellへ渡ります。
+  portabilityを主張するpackのfrontend exampleがcmd.exeを必要とするのは筋が通らない
+  ので、argv listにしました。
+- 修正後、29本すべてがERROR/WARNINGゼロです。`tests/skills_checks.py`が
+  「上限の無いcycleは警告される」「戻る側のstepに置いた上限は有効」「同梱flowは
+  lint clean」の3点を固定します。ruleを元へ戻すと18件落ちます。
+
+### CIに載せました
+
+- `examples/*.yaml`のglobは意図的にtop levelだけなので、放っておけばこれらは
+  検査されないまま出ていきます。`examples/ponytail/`と`skills/sfh-*/assets/`の
+  全YAMLを名指しで`sfh validate`にかけます。
+- overlayは**全flow × 全overlayの40通り**を検査します。「overlayがparseできる」ことと
+  「このflowへ適用できる」ことは別の主張で、READMEがしているのは後者だからです。
+  上の2件目はこの検査があれば最初から出ていました。
+- `tests/skills_checks.py`を追加しました。標準ライブラリのみです。SKILL.mdの
+  frontmatterとdirectory名の一致、参照先fileの存在、500行のprogressive disclosure
+  上限、catalogとdiskの一致、catalogのdescriptionがSKILL.mdと同じであること、
+  `lint_sfh_flow.py`の2つのcopyが同一であることを見ます。
+- version表明も検査対象です。両packは`target-sfh: "1.4.x"`とv1.4.0のschema URLを
+  宣言したまま1.5.1へ入りかけました。minor bumpのたびにこのtestが落ちます。
+  落ちたら「1.6のengineに対してこのskillはまだ正しいか」を人間が読み直す合図です。
+
+### `MANIFEST.json`は落としました
+
+- pack同梱の`MANIFEST.json`は全fileのsha256一覧です。zipの完全性を示すための
+  ものであって、gitがまさにその仕事をしているrepositoryの中では、**誰かがfileを
+  1文字直した瞬間に嘘になる表**にしかなりません。維持するなら再生成と検査の
+  仕組みが要り、それはgitの再実装です。削除しました。
+- hashを持たない`skills/skill-catalog.json`は残しています。こちらはclientが読む
+  実際のcatalogで、diskとの一致をtestで固定しました。
+
+### 意図的に残した`--strict`の指摘
+
+`validate --strict`はgateではなくadvisoryです。このrepository自身のtop-level
+example 18本のうち、strict cleanなのは4本だけです。取り込んだpackにも21件残って
+いますが、これは直さないという判断です。
+
+- **`workspace.mode: auto`（21件）。** `auto`は`sfh guide`が教える書き方で、
+  repository自身の`managed-loop.yaml`と`workspace-smoke.yaml`も同じ指摘を出します。
+  strictは「間違っている」ではなく「解決結果をplanに見えるようにした」と言っている
+  だけです。報告される解決結果——writer stepやloop visitが何個あってもrunあたり
+  worktreeは1つ——は、packのREADMEが約束している内容そのものです。
+- **`effects: external`のまま`replay.unfinished: rerun`（4件）。** web検索1件、
+  read-only MCP呼び出し1件、run IDとhead SHAで固定したCI観測1件、そして
+  `external-effect-safe.yaml`のstatus確認1件です。sfhはcommandの中身を読めないので、
+  resumeで再実行されうるexternal stepを一律に警告します。4件それぞれに、なぜ
+  「もう一度訊く」のが同じ質問なのか、どう変わったら`stuck`が正解になるのかを
+  commentで書きました。`external-effect-safe.yaml`はこの区別自体が主題のfileで、
+  変更を伴う`apply`は`stuck` + `retry_on: never`、読むだけの`verify`は`rerun`です。
+
+### そのほか
+
+- repository内の全flowの`$schema`固定を`v1.4.0`から`v1.5.0`へ更新しました。既存の
+  `examples/*.yaml` 5本も1.4.0のままでした。上のtestが今後これを固定します。
+
 ## v1.5.0 — 2026-08-08
 
 v1.4.0の深掘りreviewへの対応です。見つかった問題はengineの基本制御ではなく、

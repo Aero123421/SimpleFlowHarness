@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: read-only review of an existing working tree by independent specialists.
+api_version: 1
+name: ponytail-existing-diff-dual-review
+
+workspace:
+  mode: current
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  correctness: {file: ./prompts/correctness-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+
+profiles:
+  reviewer: {tool: codex, access: read}
+  second_reviewer: {tool: claude, access: read}
+
+defaults:
+  max_total_steps: 4
+  max_parallel: 2
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+
+steps:
+  - id: review
+    parallel:
+      - id: correctness_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review the existing uncommitted or committed diff in the current workspace.
+          Inspect the files directly. End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: second_reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review the same diff only for unnecessary complexity and owned surface area.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    max_parallel: 2
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: stuck}

@@ -1,0 +1,109 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: add or simplify a CLI behavior with stdlib parsing and minimal surface area.
+api_version: 1
+name: ponytail-rust-cli-simplification
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 26
+  max_parallel: 2
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+
+steps:
+  - id: map_cli
+    use: analyst
+    effects: read
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Map the existing CLI parsing, help, exit-code, stdout/stderr, and JSON contracts.
+      Identify the smallest place to make the requested change.
+      Prefer the existing parser or Rust standard library; do not introduce a
+      CLI framework unless the repository already uses it or the requirement proves a need.
+      Do not edit files.
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Implement the requested CLI change at the existing boundary.
+
+      CLI map:
+      {{steps.map_cli.output | truncate:16000}}
+
+      Preserve exit-code and machine-output contracts. Add one focused behavior
+      test rather than a new test harness.
+
+  - id: fmt
+    effects: workspace
+    cmd: ["cargo", "fmt", "--all", "--", "--check"]
+    on_error: goto:fix
+
+  - id: clippy
+    effects: workspace
+    cmd: ["cargo", "clippy", "--release", "--locked", "--all-targets", "--", "-D", "warnings"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: test
+    effects: workspace
+    cmd: ["cargo", "test", "--release", "--locked"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: contract_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review CLI compatibility, output streams, errors, help, and tests.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review for unnecessary parser abstractions, options, files, and dependencies.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Correct the blocking CLI findings without expanding the public surface.
+      Keep human and machine contracts explicit and small.
+    route:
+      - {goto: fmt}

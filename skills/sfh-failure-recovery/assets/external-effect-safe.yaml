@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+api_version: 1
+name: external-effect-with-human-recovery
+
+vars:
+  operation_id: replace-with-stable-idempotency-key
+
+workspace: {mode: current}
+
+steps:
+  - id: prepare
+    effects: read
+    cmd: ["external-cli", "plan", "--operation-id", "{{vars.operation_id}}"]
+    timeout_sec: 300
+    on_error: goto:handoff
+
+  - id: apply
+    effects: external
+    replay: {unfinished: stuck}
+    retry_on: never
+    cmd: ["external-cli", "apply", "--operation-id", "{{vars.operation_id}}"]
+    timeout_sec: 600
+    on_error: goto:handoff
+
+  - id: verify
+    effects: external
+    # The deliberate contrast with `apply` above. `apply` mutates, so it is
+    # `stuck` + `retry_on: never`: sfh cannot tell a crash before the write
+    # from a crash after it. `verify` only reads the operation's status, so
+    # asking twice is the same question. This is the whole point of the file:
+    # the replay policy follows what the step DOES, not which system it talks
+    # to. `validate --strict` flags both because it cannot read the command.
+    replay: {unfinished: rerun}
+    cmd: ["external-cli", "status", "--operation-id", "{{vars.operation_id}}"]
+    timeout_sec: 300
+    on_error: goto:handoff
+    route:
+      - {goto: end}
+
+  - id: handoff
+    tool: codex
+    access: read
+    effects: read
+    prompt: |
+      Read the prepare/apply/verify artifacts. Produce a handoff with the exact
+      operation id, what is proven, what is unknown, and the safe next probe.
+      Do not repeat or undo the external operation.
+    route:
+      - {goto: stuck}

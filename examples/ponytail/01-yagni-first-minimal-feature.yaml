@@ -1,0 +1,138 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: decide whether code is needed, then implement the smallest accepted change.
+api_version: 1
+name: ponytail-yagni-first-feature
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task:
+    file: ./inputs/TASK.md
+  acceptance:
+    file: ./inputs/ACCEPTANCE.md
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail:
+    file: ./prompts/ponytail-core.md
+  planning:
+    file: ./prompts/planner.md
+  correctness:
+    file: ./prompts/correctness-review.md
+  simplicity:
+    file: ./prompts/ponytail-review.md
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  planner:
+    tool: codex
+    access: read
+  builder:
+    tool: pi
+    access: write
+  reviewer:
+    tool: codex
+    access: read
+
+defaults:
+  max_total_steps: 24
+  max_parallel: 2
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+
+steps:
+  - id: decide
+    use: planner
+    effects: read
+    context: [task, acceptance, project_rules, ponytail, planning]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Determine whether the requested behavior already exists or can be satisfied
+      by configuration, documentation, deletion, or reuse without new implementation.
+
+      Inspect the current repository before deciding.
+      If no code change is required, explain the evidence briefly and end with:
+      DECISION: NO_CHANGE
+
+      If a code change is required, give the smallest dependency-ordered plan,
+      name the files and deterministic checks, and end with:
+      DECISION: BUILD
+
+      If the requirement is materially ambiguous, end with:
+      DECISION: UNCLEAR
+    route:
+      - {when_last_line_is: "DECISION: NO_CHANGE", goto: end}
+      - {when_last_line_is: "DECISION: BUILD", goto: implement}
+      - {goto: stuck}
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Implement the smallest correct change in the current workspace.
+
+      Approved plan:
+      {{steps.decide.output | truncate:16000}}
+
+      Reuse existing code first. Preserve every explicit requirement and safety
+      boundary. Add only the smallest regression check needed for non-trivial logic.
+      Do not create future-proofing that the task does not require.
+
+  - id: diff_check
+    effects: read
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        retry: {max: 1, backoff_sec: 5}
+        retry_on: transient
+        prompt: |
+          Independently review the current workspace and diff.
+          The implementer's plan is background only:
+          {{steps.decide.output | truncate:8000}}
+
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        retry: {max: 1, backoff_sec: 5}
+        retry_on: transient
+        prompt: |
+          Review the current diff only for unnecessary complexity.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    max_parallel: 2
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Repair only the blocking findings that still apply to the current workspace.
+      Verify each finding against the code before changing anything.
+      Keep the correction smaller than the defect and do not add speculative layers.
+    route:
+      - {goto: diff_check}

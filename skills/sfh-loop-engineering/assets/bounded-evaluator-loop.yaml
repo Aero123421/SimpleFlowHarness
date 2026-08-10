@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+api_version: 1
+name: bounded-independent-evaluator-loop
+
+workspace: {mode: auto, cleanup: keep}
+
+contexts:
+  task: {file: ./TASK.md}
+  acceptance: {file: ./ACCEPTANCE.md}
+  latest_evaluation:
+    template: |
+      {{steps.evaluate.output | optional | truncate:16000}}
+  verification:
+    template: |
+      exit={{steps.verify.exit | optional}}
+      stdout={{steps.verify.output_file | optional}}
+      stderr={{steps.verify.stderr_file | optional}}
+
+profiles:
+  writer: {tool: pi, access: write}
+  evaluator: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 36
+  wall_clock_sec: 10800
+  on_budget: goto:handoff
+  budget_reserve: {wall_clock_sec: 600}
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+
+steps:
+  - id: build
+    use: writer
+    effects: workspace
+    context: [task, acceptance, latest_evaluation]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Work from the current workspace. Implement one coherent pass. Do not claim
+      success; the following steps decide it.
+
+  - id: verify
+    effects: read
+    max_visits: 5
+    on_max_visits: goto:handoff
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:improve
+
+  - id: evaluate
+    use: evaluator
+    effects: read
+    max_visits: 5
+    on_max_visits: goto:handoff
+    context: [task, acceptance, verification]
+    prompt: |
+      Evaluate the current workspace independently against the fixed contract.
+      End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: improve}
+      - {goto: stuck}
+
+  - id: improve
+    use: writer
+    effects: workspace
+    context: [task, acceptance, latest_evaluation, verification]
+    max_visits: 4
+    on_max_visits: goto:handoff
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Close only the current blockers. Preserve accepted behavior and avoid a
+      broad rewrite.
+    route:
+      - {goto: verify}
+
+  - id: handoff
+    use: evaluator
+    effects: read
+    context: [task, acceptance, latest_evaluation, verification]
+    prompt: |
+      Write a durable handoff naming repeated blockers, verified facts, current
+      workspace state, and the next smallest action.
+    route:
+      - {goto: stuck}

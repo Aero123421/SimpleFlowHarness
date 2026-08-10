@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "skills": [
+    {
+      "name": "sfh-ci-monitoring",
+      "description": "Design SimpleFlowHarness YAML for triggering, locating, watching, diagnosing, and reacting to CI runs such as GitHub Actions. Use when a flow polls CI, waits for checks, repairs failures, downloads logs or artifacts, handles flaky/infrastructure failures, or must avoid monitoring the wrong run, looping forever, or blindly rerunning broken CI.\n",
+      "path": "skills/sfh-ci-monitoring/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-context-workspace",
+      "description": "Design SimpleFlowHarness workspaces, named context, profiles, sessions, and execution inputs. Use when deciding current versus managed worktree execution, preventing folder/worktree explosion, passing task or review artifacts to specific phases, separating reusable roles from models, preserving context across long loops, or making resume behavior reproducible.\n",
+      "path": "skills/sfh-context-workspace/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-deterministic-gates",
+      "description": "Design deterministic gates and routing in SimpleFlowHarness. Use when tests, builds, validators, CI conclusions, exact votes, exit codes, stderr patterns, outcomes, labels, or AI verdicts decide what happens next; when separating deterministic facts from nondeterministic model output; or when a flow retries, branches, or gets stuck for the wrong reason.\n",
+      "path": "skills/sfh-deterministic-gates/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-eval-engineering",
+      "description": "Turn failures, regressions, flaky behavior, weak prompts, and unsuccessful sfh runs into reusable evaluations and better harnesses. Use when improving a flow through evidence, creating regression-first repair loops, separating quality and regression suites, promoting repeated review feedback into deterministic checks or repository guidance, or diagnosing why an agent loop keeps failing.\n",
+      "path": "skills/sfh-eval-engineering/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-failure-recovery",
+      "description": "Design failure handling and recovery for SimpleFlowHarness flows. Use when choosing retry, retry_on, fallback, on_error, replay.unfinished, resume, force-resume, adopt-workspace, carry-budget-from, budget landing, timeout, stuck, or idempotency behavior; especially for external APIs, deployments, migrations, CI, and long-running AI work.\n",
+      "path": "skills/sfh-failure-recovery/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-flow-design",
+      "description": "Design, write, or refactor SimpleFlowHarness (sfh) YAML workflows. Use when turning a task, engineering process, review loop, CI process, research process, or tool chain into a stable sfh flow; when choosing steps, routes, workspaces, contexts, profiles, retries, budgets, and terminal states; or when an AI-authored sfh flow is vague, brittle, or uses invented syntax.\n",
+      "path": "skills/sfh-flow-design/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-flow-review",
+      "description": "Audit an existing SimpleFlowHarness YAML flow for correctness, stability, convergence, recovery, security boundaries, portability, context/workspace use, external-tool identity, CI monitoring, and AI usability. Use when reviewing an AI-authored flow, diagnosing a brittle loop, checking a flow before release, or producing prioritized fixes without running paid or mutating steps.\n",
+      "path": "skills/sfh-flow-review/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-loop-engineering",
+      "description": "Design stable, bounded SimpleFlowHarness loops: review/fix cycles, planner-builder-evaluator systems, long-running chunked work, multi-agent councils, and iterative improvement. Use when a route revisits a step, an AI must improve work over several laps, a run may last hours, or an existing sfh loop oscillates, repeats work, loses context, or never converges.\n",
+      "path": "skills/sfh-loop-engineering/SKILL.md",
+      "version": "1.0.0"
+    },
+    {
+      "name": "sfh-tool-integration",
+      "description": "Integrate external CLIs, web-search tools, HTTP APIs, repository tools, and MCP-enabled AI agents into SimpleFlowHarness YAML. Use when a flow fetches changing remote information, invokes `gh`, `curl`, search CLIs, or provider MCP tools, crosses a network or authorization boundary, or needs reliable artifacts, rate-limit handling, least privilege, and safe replay semantics.\n",
+      "path": "skills/sfh-tool-integration/SKILL.md",
+      "version": "1.0.0"
+    }
+  ]
+}

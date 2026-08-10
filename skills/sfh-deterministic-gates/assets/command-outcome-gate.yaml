@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+api_version: 1
+name: deterministic-outcome-gate
+
+workspace: {mode: current}
+
+steps:
+  # Replace scripts/acceptance_gate.py with a project-owned deterministic gate.
+  - id: gate
+    effects: read
+    max_visits: 4
+    on_max_visits: goto:stuck
+    cmd: ["python", "scripts/acceptance_gate.py"]
+    retry: {max: 2, backoff_sec: 5}
+    retry_on: transient
+    outcomes:
+      0:  {result: complete, label: accepted}
+      2:  {result: continue, label: incomplete}
+      10: {result: retryable, label: transport_error}
+      20: {result: continue, label: rejected}
+      30: {result: fail, label: invalid_response}
+    on_error: goto:gate_broken
+    route:
+      - {when_label_is: accepted, goto: end}
+      - {when_label_is: incomplete, goto: improve}
+      - {when_label_is: rejected, goto: improve}
+      - {goto: stuck}
+
+  - id: improve
+    tool: codex
+    access: write
+    effects: workspace
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Inspect the gate artifacts and current workspace. Make the smallest change
+      needed for the next deterministic gate run.
+    route:
+      - {goto: gate}
+
+  - id: gate_broken
+    tool: codex
+    access: read
+    effects: read
+    prompt: |
+      Diagnose why the gate itself failed. Do not edit files. Produce a concise
+      handoff with the exact command, stderr artifact, and next action.
+    route:
+      - {goto: stuck}

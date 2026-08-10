@@ -42,6 +42,23 @@ Maintainer scenarios:
   contributor's machine path, but still assume the sfh repository and relevant
   provider CLIs are available.
 
+## `ponytail/` — flows for real repository work
+
+`ponytail/` is a self-contained pack of 20 flows aimed at an existing codebase
+rather than at demonstrating a primitive: regression-first bugfixes, dependency
+elimination, independent review councils, chunked long builds, migration dry
+runs with a human gate, and release-readiness loops. Each carries its own
+`inputs/` and `prompts/` as named context, so the flows work without installing
+anything else.
+
+They are the exception to the "top-level only" rule above: CI validates every
+flow in `ponytail/` by name, and validates each one against both
+`profiles.*.example.yaml` overlays, because applying an overlay is a separate
+claim from parsing one.
+
+Run them from the target project, not from here — see
+[ponytail/README.md](ponytail/README.md).
+
 Every new flow should begin with:
 
 ```yaml

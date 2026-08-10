@@ -1,0 +1,65 @@
+# A profile overlay for this pack: --profiles takes one of these.
+#
+#   sfh validate 01-yagni-first-minimal-feature.yaml \
+#     --profiles profiles.codex-pi.example.yaml
+#
+# This is NOT a flow. Every name below must sit under `profiles:` - a bare
+# top-level mapping is rejected. Only the fields an overlay mentions are
+# replaced, and later --profiles files layer on top left to right, so a
+# machine-local file can override this one field by field.
+#
+# The role names are this pack's words, not sfh's: sfh attaches no meaning to
+# `planner` or `builder`. Reader roles get `access: read` so a reviewer cannot
+# quietly edit the code it is judging.
+profiles:
+  planner:
+    tool: codex
+    access: read
+
+  analyst:
+    tool: codex
+    access: read
+
+  auditor:
+    tool: codex
+    access: read
+
+  selector:
+    tool: codex
+    access: read
+
+  evaluator:
+    tool: codex
+    access: read
+
+  reviewer:
+    tool: codex
+    access: read
+
+  correctness_reviewer:
+    tool: codex
+    access: read
+
+  simplicity_reviewer:
+    tool: codex
+    access: read
+
+  second_reviewer:
+    tool: codex
+    access: read
+
+  security_reviewer:
+    tool: claude
+    access: read
+
+  builder:
+    tool: pi
+    access: write
+
+  maintainer:
+    tool: pi
+    access: write
+
+  builder_fallback:
+    tool: codex
+    access: write

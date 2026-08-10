@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+api_version: 1
+name: managed-context-separation
+
+workspace:
+  mode: auto
+  cleanup: keep
+
+contexts:
+  task: {file: ./TASK.md}
+  acceptance: {file: ./ACCEPTANCE.md}
+  implementation_rules: {file: ./IMPLEMENTATION.md}
+  review_rules: {file: ./REVIEW.md}
+  current_blockers:
+    template: |
+      {{steps.review.output | optional | truncate:12000}}
+
+profiles:
+  implementer: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+steps:
+  - id: implement
+    use: implementer
+    effects: workspace
+    context: [task, acceptance, implementation_rules, current_blockers]
+    prompt: |
+      Work from the current workspace. Implement the fixed task contract.
+
+  - id: verify
+    effects: read
+    max_visits: 4
+    on_max_visits: goto:stuck
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:fix
+
+  - id: review
+    use: reviewer
+    effects: read
+    max_visits: 4
+    on_max_visits: goto:stuck
+    context: [task, acceptance, review_rules]
+    prompt: |
+      Inspect current files and verification artifacts independently. End with
+      exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: fix}
+      - {goto: stuck}
+
+  - id: fix
+    use: implementer
+    effects: workspace
+    context: [task, acceptance, implementation_rules, current_blockers]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Close only current blockers in the existing workspace.
+    route:
+      - {goto: verify}

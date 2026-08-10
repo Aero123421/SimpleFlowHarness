@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "instructions": "Run each case several times because skill activation is nondeterministic. should_trigger names the expected skill.",
+  "cases": [
+    {
+      "prompt": "sfhで実装→テスト→レビュー→修正のYAMLを作って",
+      "should_trigger": [
+        "sfh-flow-design",
+        "sfh-loop-engineering"
+      ]
+    },
+    {
+      "prompt": "このSimpleFlowHarnessのflow.yamlをレビューして、壊れやすいループを直して",
+      "should_trigger": [
+        "sfh-flow-review",
+        "sfh-loop-engineering"
+      ]
+    },
+    {
+      "prompt": "cargo testの結果をAIに判定させずrouteしたい",
+      "should_trigger": [
+        "sfh-deterministic-gates"
+      ]
+    },
+    {
+      "prompt": "同じreview/fixを何度も回して収束しない",
+      "should_trigger": [
+        "sfh-loop-engineering"
+      ]
+    },
+    {
+      "prompt": "workspace:autoとcontextsをどう組み合わせる？",
+      "should_trigger": [
+        "sfh-context-workspace"
+      ]
+    },
+    {
+      "prompt": "外部API送信stepをクラッシュ後に二重実行したくない",
+      "should_trigger": [
+        "sfh-failure-recovery"
+      ]
+    },
+    {
+      "prompt": "GitHub Actionsの特定runを待って失敗なら診断するsfh YAML",
+      "should_trigger": [
+        "sfh-ci-monitoring",
+        "sfh-flow-design"
+      ]
+    },
+    {
+      "prompt": "web検索CLIのJSONを証拠として保存してからAIに要約させたい",
+      "should_trigger": [
+        "sfh-tool-integration"
+      ]
+    },
+    {
+      "prompt": "MCP経由でread-only調査するstepを安全に設計したい",
+      "should_trigger": [
+        "sfh-tool-integration",
+        "sfh-failure-recovery"
+      ]
+    },
+    {
+      "prompt": "本番障害を再現テストにしてから直すloopを作りたい",
+      "should_trigger": [
+        "sfh-eval-engineering",
+        "sfh-loop-engineering"
+      ]
+    },
+    {
+      "prompt": "普通のRust関数を実装して",
+      "should_trigger": []
+    },
+    {
+      "prompt": "GitHub Actions YAML自体を書いて",
+      "should_trigger": []
+    },
+    {
+      "prompt": "MCP serverをTypeScriptで実装して",
+      "should_trigger": []
+    },
+    {
+      "prompt": "PDFを要約して",
+      "should_trigger": []
+    }
+  ]
+}
