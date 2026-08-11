@@ -764,11 +764,62 @@ pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    if unsafe { libc::kill(pid as i32, 0) } == 0 {
-        return true;
-    }
-    // EPERM: it exists, it just is not ours to signal.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let signalable = if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        true
+    } else {
+        // EPERM: it exists, it just is not ours to signal.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    // A zombie answers kill(pid, 0) exactly as a live process does - the pid is
+    // still in the table, holding an exit status nobody has collected - but it
+    // is not running, and where PID 1 does not reap orphans it never will be.
+    // That host is not exotic: it is every container started without an init,
+    // which is precisely where a `--detach` run lives. Counting a zombie as
+    // alive made a SIGKILLed run read `running` until its heartbeat went stale,
+    // told `sfh stop` to verify ownership of a process whose /proc/<pid>/exe a
+    // zombie no longer has (so the stop was refused), and left
+    // `--carry-budget-from` refusing permanently (see `carry_source_is_final`).
+    signalable && !pid_is_zombie(pid)
+}
+
+/// Whether this pid names a process that has already exited and is only waiting
+/// for its parent to collect the status (state `Z`).
+///
+/// Linux: the state character is field 3 of /proc/<pid>/stat - the first token
+/// after the parenthesized `comm`, which may itself contain spaces and
+/// parentheses, so it is split off at the LAST ')' exactly as `pid_start_time`
+/// does with the same string.
+///
+/// Anything it cannot read answers `false`: "not provably a zombie". Liveness
+/// is only ever narrowed here by positive evidence, never widened by the
+/// absence of it, which keeps every caller's fail-closed reading intact.
+#[cfg(target_os = "linux")]
+fn pid_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some("Z")
+}
+
+/// macOS: `pbi_status` from PROC_PIDTBSDINFO; `SZOMB` (5) in <sys/proc.h>.
+#[cfg(target_os = "macos")]
+fn pid_is_zombie(pid: u32) -> bool {
+    const SZOMB: u32 = 5;
+    proc_bsdinfo(pid).is_some_and(|info| info.pbi_status == SZOMB)
+}
+
+/// Other Unix targets: procfs if it happens to be mounted, otherwise "cannot
+/// tell", which reads as not-a-zombie for the reason above.
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+fn pid_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some("Z")
 }
 
 /// The start time of a process, as an opaque u64 that is unique per pid on one
@@ -822,38 +873,40 @@ pub fn pid_start_time(pid: u32) -> Option<u64> {
     ticks.parse::<u64>().ok()
 }
 
-/// Start time of a process (macOS: proc_pidinfo(PROC_PIDTBSDINFO) ->
-/// pbi_start_tvsec/usec; there is no /proc).
+/// struct proc_bsdinfo from <sys/proc_info.h>; only the fields up to the start
+/// time are needed, but every preceding field must keep its exact type and
+/// width or the offsets of pbi_status and pbi_start_tvsec are wrong.
 #[cfg(target_os = "macos")]
-pub fn pid_start_time(pid: u32) -> Option<u64> {
-    // struct proc_bsdinfo from <sys/proc_info.h>; only the fields up to the
-    // start time are needed, but every preceding field must keep its exact
-    // type and width or the offset of pbi_start_tvsec is wrong.
-    #[repr(C)]
-    struct ProcBsdInfo {
-        pbi_flags: u32,
-        pbi_status: u32,
-        pbi_xstatus: u32,
-        pbi_pid: u32,
-        pbi_ppid: u32,
-        pbi_uid: u32,
-        pbi_gid: u32,
-        pbi_ruid: u32,
-        pbi_rgid: u32,
-        pbi_svuid: u32,
-        pbi_svgid: u32,
-        rfu_1: u32,
-        pbi_comm: [u8; 16], // MAXCOMLEN
-        pbi_name: [u8; 32], // 2 * MAXCOMLEN
-        pbi_nfiles: u32,
-        pbi_pgid: u32,
-        pbi_pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        pbi_nice: i32,
-        pbi_start_tvsec: u64,
-        pbi_start_tvusec: u64,
-    }
+#[repr(C)]
+struct ProcBsdInfo {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    pbi_comm: [u8; 16], // MAXCOMLEN
+    pbi_name: [u8; 32], // 2 * MAXCOMLEN
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+}
+
+/// One PROC_PIDTBSDINFO read, shared by the start-time and zombie checks so a
+/// single struct definition backs both (macOS has no /proc to parse instead).
+#[cfg(target_os = "macos")]
+fn proc_bsdinfo(pid: u32) -> Option<ProcBsdInfo> {
     extern "C" {
         fn proc_pidinfo(
             pid: libc::c_int,
@@ -881,6 +934,14 @@ pub fn pid_start_time(pid: u32) -> Option<u64> {
     if n < size {
         return None;
     }
+    Some(info)
+}
+
+/// Start time of a process (macOS: proc_pidinfo(PROC_PIDTBSDINFO) ->
+/// pbi_start_tvsec/usec; there is no /proc).
+#[cfg(target_os = "macos")]
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    let info = proc_bsdinfo(pid)?;
     Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
@@ -1501,6 +1562,49 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process that has exited but has not been reaped still answers
+    /// `kill(pid, 0)`, so `pid_alive` used to call it alive. Where PID 1 does
+    /// not reap orphans - every container started without an init, which is
+    /// where a `--detach` run lives - that answer never changed, and it is the
+    /// answer `sfh status`, `sfh stop` and `--carry-budget-from` are all built
+    /// on.
+    ///
+    /// Reaped here at the end rather than left behind: a test that leaks a
+    /// zombie into a suite which itself runs under a non-reaping init is the
+    /// bug it is testing for.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_is_not_alive_even_though_it_still_answers_signal_zero() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a child that exits at once");
+        let pid = child.id();
+        // Wait for the exit WITHOUT reaping, so the pid is a zombie held open
+        // by this process still owing it a wait().
+        for _ in 0..200 {
+            if pid_is_zombie(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            pid_is_zombie(pid),
+            "the child should be an unreaped zombie by now"
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "a zombie must still answer signal 0 - that is what made this a bug"
+        );
+        assert!(
+            !pid_alive(pid),
+            "a zombie is not running, so pid_alive must not say it is"
+        );
+        let _ = child.wait();
+    }
 
     #[test]
     fn the_windows_wsl_launcher_is_recognised_wherever_it_is_spelled() {
