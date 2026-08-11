@@ -803,23 +803,30 @@ fn pid_is_zombie(pid: u32) -> bool {
         == Some("Z")
 }
 
-/// macOS: `pbi_status` from PROC_PIDTBSDINFO; `SZOMB` (5) in <sys/proc.h>.
-#[cfg(target_os = "macos")]
-fn pid_is_zombie(pid: u32) -> bool {
-    const SZOMB: u32 = 5;
-    proc_bsdinfo(pid).is_some_and(|info| info.pbi_status == SZOMB)
-}
-
-/// Other Unix targets: procfs if it happens to be mounted, otherwise "cannot
-/// tell", which reads as not-a-zombie for the reason above.
-#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
-fn pid_is_zombie(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        == Some("Z")
+/// Every other Unix, macOS included: "cannot tell", which reads as
+/// not-a-zombie and so leaves liveness exactly as it was before this check
+/// existed.
+///
+/// Not a stub for want of trying. macOS cannot answer through `proc_pidinfo`
+/// at all - both BSD-info flavors reach the process through `proc_find`, which
+/// skips a `SZOMB` entry by design, so every flavor reports "no such process"
+/// for precisely the case being asked about. The call that does see zombies is
+/// the `KERN_PROC_PID` sysctl, and libc exposes neither `kinfo_proc` nor
+/// `extern_proc` on Apple targets: reading `p_stat` would mean hand-computing
+/// its offset inside a large layout-sensitive struct, and getting that wrong
+/// fails in the dangerous direction - a live process misread as dead lets
+/// `sfh stop` skip a real one and lets a carry run against a run still
+/// spending.
+///
+/// The trade is worth taking because the condition is not durable here. This
+/// bug needs a PID 1 that does not reap orphans; macOS's is launchd, which
+/// always does, so a detached run's zombie is collected in the moment rather
+/// than outliving the run. On Linux - where a container's PID 1 is routinely
+/// not an init at all - it is durable, and that is where the check is
+/// implemented.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_is_zombie(_pid: u32) -> bool {
+    false
 }
 
 /// The start time of a process, as an opaque u64 that is unique per pid on one
@@ -873,40 +880,38 @@ pub fn pid_start_time(pid: u32) -> Option<u64> {
     ticks.parse::<u64>().ok()
 }
 
-/// struct proc_bsdinfo from <sys/proc_info.h>; only the fields up to the start
-/// time are needed, but every preceding field must keep its exact type and
-/// width or the offsets of pbi_status and pbi_start_tvsec are wrong.
+/// Start time of a process (macOS: proc_pidinfo(PROC_PIDTBSDINFO) ->
+/// pbi_start_tvsec/usec; there is no /proc).
 #[cfg(target_os = "macos")]
-#[repr(C)]
-struct ProcBsdInfo {
-    pbi_flags: u32,
-    pbi_status: u32,
-    pbi_xstatus: u32,
-    pbi_pid: u32,
-    pbi_ppid: u32,
-    pbi_uid: u32,
-    pbi_gid: u32,
-    pbi_ruid: u32,
-    pbi_rgid: u32,
-    pbi_svuid: u32,
-    pbi_svgid: u32,
-    rfu_1: u32,
-    pbi_comm: [u8; 16], // MAXCOMLEN
-    pbi_name: [u8; 32], // 2 * MAXCOMLEN
-    pbi_nfiles: u32,
-    pbi_pgid: u32,
-    pbi_pjobc: u32,
-    e_tdev: u32,
-    e_tpgid: u32,
-    pbi_nice: i32,
-    pbi_start_tvsec: u64,
-    pbi_start_tvusec: u64,
-}
-
-/// One PROC_PIDTBSDINFO read, shared by the start-time and zombie checks so a
-/// single struct definition backs both (macOS has no /proc to parse instead).
-#[cfg(target_os = "macos")]
-fn proc_bsdinfo(pid: u32) -> Option<ProcBsdInfo> {
+pub fn pid_start_time(pid: u32) -> Option<u64> {
+    // struct proc_bsdinfo from <sys/proc_info.h>; only the fields up to the
+    // start time are needed, but every preceding field must keep its exact
+    // type and width or the offset of pbi_start_tvsec is wrong.
+    #[repr(C)]
+    struct ProcBsdInfo {
+        pbi_flags: u32,
+        pbi_status: u32,
+        pbi_xstatus: u32,
+        pbi_pid: u32,
+        pbi_ppid: u32,
+        pbi_uid: u32,
+        pbi_gid: u32,
+        pbi_ruid: u32,
+        pbi_rgid: u32,
+        pbi_svuid: u32,
+        pbi_svgid: u32,
+        rfu_1: u32,
+        pbi_comm: [u8; 16], // MAXCOMLEN
+        pbi_name: [u8; 32], // 2 * MAXCOMLEN
+        pbi_nfiles: u32,
+        pbi_pgid: u32,
+        pbi_pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    }
     extern "C" {
         fn proc_pidinfo(
             pid: libc::c_int,
@@ -934,14 +939,6 @@ fn proc_bsdinfo(pid: u32) -> Option<ProcBsdInfo> {
     if n < size {
         return None;
     }
-    Some(info)
-}
-
-/// Start time of a process (macOS: proc_pidinfo(PROC_PIDTBSDINFO) ->
-/// pbi_start_tvsec/usec; there is no /proc).
-#[cfg(target_os = "macos")]
-pub fn pid_start_time(pid: u32) -> Option<u64> {
-    let info = proc_bsdinfo(pid)?;
     Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
@@ -1573,7 +1570,14 @@ mod tests {
     /// Reaped here at the end rather than left behind: a test that leaks a
     /// zombie into a suite which itself runs under a non-reaping init is the
     /// bug it is testing for.
-    #[cfg(unix)]
+    ///
+    /// Linux only, because that is where `pid_is_zombie` can answer. macOS
+    /// reaches every process through `proc_find`, which skips a `SZOMB` entry
+    /// by design, so no `proc_pidinfo` flavor can see the state this asserts
+    /// on - see `pid_is_zombie` for why reading it the one way that works is
+    /// not worth the ABI assumption, and why the condition is not durable
+    /// under launchd anyway.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_zombie_is_not_alive_even_though_it_still_answers_signal_zero() {
         let mut child = Command::new("sh")
