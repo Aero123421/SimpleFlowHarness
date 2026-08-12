@@ -250,6 +250,19 @@ steps:
 
 context file は no-follow で読まれ、flow directory または workspace の内側に解決される必要があります。外を指す symlink は拒否されます。唯一の逃げ道は source ごとの `allow_external: true` で、使った事実は unsafe override として記録されます。`defaults.max_context_chars` を超える bundle は **何も起動する前に** 失敗します。sfh は要約もしませんし、収まるように source を落とすこともしません。何を落とすかは利用者の判断であり、template filter、`max_chars`、上流の `compact:` で表明してください。
 
+### 必須CLIバージョン
+
+flowを検証したadapterの範囲を、`defaults`、profile、stepのいずれかに宣言できます。stepがprofileより、profileがdefaultsより優先され、fallback profileは独立に解決されます。
+
+```yaml
+defaults:
+  tool: codex
+  access: read
+  require_version: ">=0.70.0, <1.0.0"  # 0.75.0 のような完全一致も可
+```
+
+実runは、run directoryの作成やflow stepの開始より前に、解決済みbinaryの隔離された`--version`を照合します。不一致または読めないversionは`SFH_CAPABILITY_UNAVAILABLE`です。`plan`はspawnゼロを保ち、宣言と`observed: null`だけを報告します。`preflight`は宣言と実測を並べます。任意の`bin:` overrideを単独preflightで測るには、任意programの実行を明示的に許可する`--probe-binaries`が必要です。
+
 ### replay policy
 
 step が開始されたのに終了を記録しなかった場合、resume が何をすべきか。sfh が「もう実行されたのか」を本当に知り得ない唯一のケースです。

@@ -49,6 +49,9 @@ pub struct Flow {
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     pub tool: Option<String>,
+    /// Exact or comma-separated comparator range checked before a run starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: Option<String>,
@@ -629,6 +632,8 @@ impl Defaults {
 pub struct Profile {
     pub tool: Option<String>,
     pub bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: Option<String>,
@@ -661,6 +666,9 @@ pub struct Step {
     pub tool: Option<String>,
     /// Executable path override for the preset tool (e.g. a specific codex.exe).
     pub bin: Option<String>,
+    /// Exact or comma-separated comparator range checked before a run starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_version: Option<String>,
     pub model: Option<String>,
     /// Reasoning effort. codex: model_reasoning_effort, claude: --effort,
     /// opencode: --variant, grok: --reasoning-effort, agy: --effort,
@@ -989,6 +997,7 @@ pub const DEFAULT_MAX_VISITS: u32 = 5;
 pub struct ResolvedTool {
     pub tool: String,
     pub bin: Option<String>,
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// The access level this launch asks for. Part of the identity because the
@@ -1013,6 +1022,7 @@ pub fn load(path: &Path) -> Result<Flow, String> {
 pub struct ProfileOverlay {
     pub tool: Option<String>,
     pub bin: Option<String>,
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: Option<String>,
@@ -1030,7 +1040,16 @@ impl ProfileOverlay {
         macro_rules! scalar {
             ($($f:ident),*) => { $( if let Some(v) = &self.$f { p.$f = Some(v.clone()); } )* };
         }
-        scalar!(tool, bin, model, effort, access, agent, cwd);
+        scalar!(
+            tool,
+            bin,
+            require_version,
+            model,
+            effort,
+            access,
+            agent,
+            cwd
+        );
         if let Some(v) = self.timeout_sec {
             p.timeout_sec = Some(v);
         }
@@ -1716,6 +1735,7 @@ impl Flow {
                         out.insert(ResolvedTool {
                             tool,
                             bin: e.bin,
+                            require_version: e.require_version,
                             model: e.model,
                             effort: e.effort,
                             access: vec![e.access.as_str().to_string()],
@@ -1728,6 +1748,7 @@ impl Flow {
                             out.insert(ResolvedTool {
                                 tool,
                                 bin: e.bin,
+                                require_version: e.require_version,
                                 model: e.model,
                                 effort: e.effort,
                                 access: vec![e.access.as_str().to_string()],
@@ -1743,6 +1764,7 @@ impl Flow {
                 if let Some(tool) = c.tool.clone().or_else(|| prof.and_then(|p| p.tool.clone())) {
                     out.insert(ResolvedTool {
                         bin: c.bin.clone().or_else(|| prof.and_then(|p| p.bin.clone())),
+                        require_version: prof.and_then(|p| p.require_version.clone()),
                         model: c
                             .model
                             .clone()
@@ -1925,6 +1947,10 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 return Err(format!("profile '{name}': access must be read/write/full"));
             }
         }
+        if let Some(requirement) = &p.require_version {
+            crate::version::validate_requirement(requirement)
+                .map_err(|error| format!("profile '{name}'.require_version: {error}"))?;
+        }
         positive_u64(&format!("profile '{name}'.timeout_sec"), p.timeout_sec)?;
     }
     if let Some(t) = &flow.defaults.tool {
@@ -1941,6 +1967,10 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 "defaults.access must be read/write/full, got '{a}'"
             ));
         }
+    }
+    if let Some(requirement) = &flow.defaults.require_version {
+        crate::version::validate_requirement(requirement)
+            .map_err(|error| format!("defaults.require_version: {error}"))?;
     }
     positive_u64("defaults.timeout_sec", flow.defaults.timeout_sec)?;
     positive_u32("defaults.max_visits", flow.defaults.max_visits)?;
@@ -3031,6 +3061,32 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
         &format!("step '{sid}'.max_prompt_chars"),
         s.max_prompt_chars,
     )?;
+    if let Some(requirement) = &s.require_version {
+        crate::version::validate_requirement(requirement)
+            .map_err(|error| format!("step '{sid}'.require_version: {error}"))?;
+        if s.cmd.is_some() {
+            return Err(format!(
+                "step '{sid}': require_version applies to preset tool steps, not cmd:"
+            ));
+        }
+    }
+    if s.cmd.is_none() {
+        for profile_override in
+            std::iter::once(None).chain(s.fallback.iter().map(|profile| Some(profile.as_str())))
+        {
+            let effective = crate::leaf::effective_with(flow, s, profile_override)?;
+            if effective.require_version.is_some()
+                && effective
+                    .bin
+                    .as_deref()
+                    .is_some_and(|bin| bin.contains("{{"))
+            {
+                return Err(format!(
+                    "step '{sid}': require_version needs a statically resolved bin; a templated bin cannot be verified before the run starts"
+                ));
+            }
+        }
+    }
     if is_child {
         if !s.route.is_empty() {
             return Err(format!(
@@ -3063,6 +3119,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             || s.agent.is_some()
             || s.compact.is_some()
             || s.bin.is_some()
+            || s.require_version.is_some()
             || s.effort.is_some()
             || s.access.is_some()
             || s.allow_access_override.is_some()
@@ -3416,6 +3473,18 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             if !TOOLS.contains(&t.as_str()) {
                 return Err(format!("step '{sid}': compact resolves unknown tool '{t}'"));
             }
+        }
+        let compact_profile = c.use_.as_ref().and_then(|u| flow.profiles.get(u));
+        let compact_requirement =
+            compact_profile.and_then(|profile| profile.require_version.as_ref());
+        let compact_bin = c
+            .bin
+            .as_ref()
+            .or_else(|| compact_profile.and_then(|profile| profile.bin.as_ref()));
+        if compact_requirement.is_some() && compact_bin.is_some_and(|bin| bin.contains("{{")) {
+            return Err(format!(
+                "step '{sid}': compact require_version needs a statically resolved bin; a templated bin cannot be verified before the run starts"
+            ));
         }
     }
     group_common(s)
@@ -4076,6 +4145,7 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "claude".to_string(),
             bin: Some("/opt/claude".into()),
+            require_version: None,
             model: Some("m1".into()),
             effort: Some("high".into()),
             access: vec!["write".into()],
@@ -4083,6 +4153,7 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "grok".to_string(),
             bin: Some("/opt/grok".into()),
+            require_version: None,
             model: None,
             effort: None,
             access: vec!["write".into()],
@@ -4090,6 +4161,7 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "codex".to_string(),
             bin: None,
+            require_version: None,
             model: None,
             effort: None,
             access: vec!["read".into()],
@@ -4098,12 +4170,54 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "opencode".to_string(),
             bin: Some("/opt/oc".into()),
+            require_version: None,
             model: None,
             effort: None,
             // A compact summarizer only ever reads the text it was handed.
             access: vec!["read".into()],
         }));
         assert_eq!(r.len(), 4, "{r:?}");
+    }
+
+    #[test]
+    fn required_version_resolves_step_then_profile_then_defaults_and_fallback_independently() {
+        let f: Flow = yaml::from_str(
+            "defaults: {tool: codex, access: read, require_version: '>=1.0'}\nprofiles:\n  primary: {tool: claude, require_version: '>=2.0'}\n  fallback: {tool: grok, require_version: '>=3.0'}\nsteps:\n  - id: inherited\n    use: primary\n    fallback: [fallback]\n    prompt: x\n  - id: overridden\n    require_version: '4.0.0'\n    prompt: y\n",
+        )
+        .unwrap();
+        validate(&f, false).unwrap();
+        let requirements: BTreeSet<_> = f
+            .resolved_tools()
+            .into_iter()
+            .filter_map(|tool| tool.require_version)
+            .collect();
+        assert_eq!(
+            requirements,
+            [">=2.0", ">=3.0", "4.0.0"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn malformed_required_version_is_rejected_during_static_validation() {
+        let f: Flow = yaml::from_str(
+            "defaults: {tool: codex, access: read, require_version: '>=1'}\nsteps:\n  - id: a\n    prompt: x\n",
+        )
+        .unwrap();
+        let error = validate(&f, false).unwrap_err();
+        assert!(error.contains("defaults.require_version"), "{error}");
+    }
+
+    #[test]
+    fn required_version_refuses_a_binary_that_is_only_known_after_rendering() {
+        let f: Flow = yaml::from_str(
+            "vars: {launcher: codex}\ndefaults: {tool: codex, access: read, require_version: '>=1.0'}\nsteps:\n  - id: a\n    bin: '{{vars.launcher}}'\n    prompt: x\n",
+        )
+        .unwrap();
+        let error = validate(&f, false).unwrap_err();
+        assert!(error.contains("statically resolved bin"), "{error}");
     }
 
     /// Upgrading sfh must not, by itself, make every existing run dir

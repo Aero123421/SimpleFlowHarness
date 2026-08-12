@@ -14,6 +14,7 @@ mod runs;
 mod sha256;
 mod state;
 mod template;
+mod version;
 mod watch;
 mod workspace;
 

@@ -180,6 +180,7 @@ impl LeafDone {
 pub struct Effective {
     pub tool: Option<String>,
     pub bin: Option<String>,
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: preset::Access,
@@ -247,6 +248,17 @@ pub fn effective_with(
             prof.bin.clone().or_else(|| step.bin.clone())
         } else {
             step.bin.clone().or_else(|| prof.bin.clone())
+        },
+        require_version: if profile_override.is_some() {
+            prof.require_version
+                .clone()
+                .or_else(|| step.require_version.clone())
+                .or_else(|| d.require_version.clone())
+        } else {
+            step.require_version
+                .clone()
+                .or_else(|| prof.require_version.clone())
+                .or_else(|| d.require_version.clone())
         },
         model,
         effort: step

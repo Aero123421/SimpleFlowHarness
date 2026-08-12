@@ -14,7 +14,7 @@ steps:
     prompt: "{{steps.build.stderr_file}}: read this file and fix the failure"
     route: [{goto: build}]
 ```
-This is the only form with exactly the same behavior on Windows, macOS, and Linux.
+This form behaves the same on every OS. Pin verified AI CLIs with `require_version: ">=1.2, <2.0"`; mismatch fails before any flow step.
 Use `sh -c` only to join multiple commands; on Windows it requires Git Bash.
 For long command input, pass the rendered prompt as `{{prompt_file}}` instead of shell quoting it.
 AI GOAL VERDICT — require exactly one final-line token and fail closed:

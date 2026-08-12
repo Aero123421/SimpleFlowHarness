@@ -1,6 +1,6 @@
 use crate::{
-    closure, contain, context, execute, flow, leaf, machine, preset, protocol, sha256, state,
-    template, watch, workspace,
+    closure, contain, context, execute, flow, leaf, machine, preflight, preset, protocol, sha256,
+    state, template, watch, workspace,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2741,6 +2741,54 @@ fn acquire_run_lease(
     Ok(lease)
 }
 
+fn verify_required_versions(flow: &flow::Flow) -> Result<(), String> {
+    let mut requirements: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for resolved in flow.resolved_tools() {
+        let Some(requirement) = resolved.require_version else {
+            continue;
+        };
+        let program = resolved
+            .bin
+            .unwrap_or_else(|| preset::default_program(&resolved.tool));
+        requirements
+            .entry((resolved.tool, program))
+            .or_default()
+            .insert(requirement);
+    }
+    for ((tool, program), requirements) in requirements {
+        let version = preflight::probe_version_for_run(&tool, &program).map_err(|error| {
+            format!(
+                "{}: cannot verify {tool} ({program}) before starting: {error}",
+                machine::ErrorCode::CapabilityUnavailable.as_str()
+            )
+        })?;
+        let observed = version.ok_or_else(|| {
+            format!(
+                "{}: {tool} ({program}) produced no usable --version output, so its require_version declaration cannot be verified",
+                machine::ErrorCode::CapabilityUnavailable.as_str()
+            )
+        })?;
+        for requirement in requirements {
+            match crate::version::satisfies(&requirement, &observed) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "{}: {tool} ({program}) reports {observed:?}, which does not satisfy require_version: {requirement}",
+                        machine::ErrorCode::CapabilityUnavailable.as_str()
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "{}: {tool} ({program}) cannot be checked against require_version: {requirement}: {error}",
+                        machine::ErrorCode::CapabilityUnavailable.as_str()
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // `--runs-dir` keeps meaning exactly what it always meant, and with neither
     // flag the runs root is still `.sfh/runs`: every flow, script and CI job
@@ -2873,6 +2921,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         tainted_vars.remove(k); // an explicit --var is the user's own value
     }
     precheck(&flow, &vars, &tainted_vars)?;
+    // `plan` has a strict spawn-zero contract and only reports declarations.
+    // A real run is already authorized to launch these programs; check their
+    // inert --version path before creating/mutating a run dir or starting any
+    // model process. Detached parents repeat this in the child after handoff,
+    // closing the update race between approval and execution.
+    if !opts.dry_run && resume_dir.is_none() {
+        verify_required_versions(&flow)?;
+    }
 
     // Which steps must produce resumable sessions (continue_from targets).
     let mut needed_sessions: HashSet<String> = HashSet::new();
@@ -2914,6 +2970,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         // here writes to the runs root, so its state is not this run's
         // concern (and the root may be absent or read-only by design).
         _run_lease = Some(acquire_run_lease(&dir, true, inherited_nonce.as_deref())?);
+        // Ownership comes first on resume: a duplicate resume must not get to
+        // execute even a declared binary's --version while the live owner is
+        // still working. This remains before log/status/workspace mutation and
+        // before any flow step.
+        verify_required_versions(&flow)?;
         resumed = load_resume_for_flow(&dir, Some(&flow))?;
         // Cross-check the recorded session access against the flow (which the
         // fingerprint check above verified is unchanged, unless --force-resume
@@ -5700,6 +5761,7 @@ fn run_failure_code(msg: &str) -> machine::ErrorCode {
         machine::ErrorCode::RunBusy,
         machine::ErrorCode::ReplayRefused,
         machine::ErrorCode::PersistenceFailure,
+        machine::ErrorCode::CapabilityUnavailable,
     ] {
         if msg.contains(code.as_str()) {
             return code;
@@ -6581,6 +6643,22 @@ fn dry_run(
         "workspace: {}",
         serde_json::to_string(&extras.workspace.to_json()).unwrap_or_default()
     );
+    for tool in flow
+        .resolved_tools()
+        .into_iter()
+        .filter(|tool| tool.require_version.is_some())
+    {
+        let program = tool
+            .bin
+            .clone()
+            .unwrap_or_else(|| preset::default_program(&tool.tool));
+        println!(
+            "required version: {} ({}) {}",
+            tool.tool,
+            program,
+            tool.require_version.as_deref().unwrap_or_default()
+        );
+    }
     // The one goto that never appears in any step's route:, so a reader of the
     // flow cannot see it by following the steps. Print it where the jump is
     // declared - at the top, with the flow, not against any step.
@@ -6923,6 +7001,14 @@ fn dry_run_json(
         "replay": flow.replay_summary(),
         "unsafe_overrides": flow.unsafe_overrides(),
         "static_max_leaves": flow.static_max_leaves(),
+        "required_versions": flow.resolved_tools().into_iter().filter_map(|tool| {
+            tool.require_version.map(|requirement| json!({
+                "tool": tool.tool,
+                "bin": tool.bin.unwrap_or_else(|| preset::default_program(&tool.tool)),
+                "requirement": requirement,
+                "observed": null,
+            }))
+        }).collect::<Vec<_>>(),
         "vars": vars,
         "steps": steps,
         "warnings": warnings,

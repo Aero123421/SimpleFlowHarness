@@ -48,6 +48,9 @@ pub struct ToolReport {
     /// or because `probe_state` is not `Probed` - check that field before
     /// reading a `None` here as "something is wrong with the tool".
     pub version: Option<String>,
+    /// Flow-level exact/range declarations applying to this program. Several
+    /// steps can share a binary while declaring different compatible ranges.
+    pub required_versions: Vec<String>,
     pub info: Option<preset::AdapterInfo>,
     /// Required flags that this binary's `--help` did not mention. Empty
     /// when help could not be read at all (see `help_readable`), or when
@@ -193,6 +196,7 @@ impl ToolReport {
             // `version: null` as a problem with the tool.
             "probe_state": self.probe_state.as_str(),
             "version": self.version,
+            "required_versions": self.required_versions,
             // Deliberately null: sfh does not pin a floor it has not verified
             // against the CLI's own documentation and a live probe.
             "minimum_version": info.and_then(|i| i.minimum_version),
@@ -219,6 +223,38 @@ impl ToolReport {
             "blockers": self.blockers,
             "warnings": self.warnings,
         })
+    }
+}
+
+fn version_requirement_blockers(
+    program: &str,
+    probe_state: ProbeState,
+    observed: Option<&str>,
+    required_versions: &[String],
+) -> Vec<String> {
+    if required_versions.is_empty() {
+        return Vec::new();
+    }
+    match (probe_state, observed) {
+        (ProbeState::Probed, Some(observed)) => required_versions
+            .iter()
+            .filter_map(|requirement| match crate::version::satisfies(requirement, observed) {
+                Ok(true) => None,
+                Ok(false) => Some(format!(
+                    "'{program}' reports {observed:?}, which does not satisfy require_version: {requirement}"
+                )),
+                Err(error) => Some(format!(
+                    "'{program}' cannot be checked against require_version: {requirement}: {error}"
+                )),
+            })
+            .collect(),
+        (ProbeState::Probed, None) => vec![format!(
+            "'{program}' produced no usable --version output, so require_version cannot be verified"
+        )],
+        (ProbeState::ResolvedNotProbed, _) => vec![format!(
+            "require_version cannot be verified without running '{program} --version'; pass --probe-binaries to authorize this bin: override probe"
+        )],
+        (ProbeState::NotFound, _) => Vec::new(),
     }
 }
 
@@ -290,7 +326,7 @@ fn probe_version_isolated(program: &str, tool: &str, cwd: &Path) -> Option<Strin
         execute::Observe::default(),
     )
     .ok()?;
-    if out.timed_out {
+    if out.timed_out || out.interrupted || out.exit_code != 0 {
         return None;
     }
     let text = String::from_utf8_lossy(if out.stdout.is_empty() {
@@ -328,6 +364,7 @@ fn probe(
     required: bool,
     probe_binaries: bool,
     probe_dir: Option<&Path>,
+    required_versions: Vec<String>,
 ) -> ToolReport {
     let info = preset::adapter_info(tool);
     let resolved_path = execute::which(program);
@@ -418,12 +455,19 @@ fn probe(
             ));
         }
     }
+    blockers.extend(version_requirement_blockers(
+        program,
+        probe_state,
+        version.as_deref(),
+        &required_versions,
+    ));
     ToolReport {
         tool: tool.to_string(),
         program: program.to_string(),
         resolved_path,
         probe_state,
         version,
+        required_versions,
         info,
         missing_flags,
         help_readable,
@@ -520,6 +564,7 @@ pub fn all_adapters(probe_dir: Option<&Path>, probe_binaries: bool) -> Report {
                 false,
                 probe_binaries,
                 probe_dir,
+                Vec::new(),
             )
         })
         .collect();
@@ -568,21 +613,24 @@ pub fn for_flow(
     let resolved = flow.resolved_tools();
     // Group the access levels a flow asks of each (tool, bin) pair, so one
     // probe covers every step that shares a binary.
-    let mut by_program: std::collections::BTreeMap<(String, String), BTreeSet<String>> =
-        Default::default();
+    let mut by_program: std::collections::BTreeMap<
+        (String, String),
+        (BTreeSet<String>, BTreeSet<String>),
+    > = Default::default();
     for r in &resolved {
         let program = r
             .bin
             .clone()
             .unwrap_or_else(|| preset::default_program(&r.tool));
-        by_program
-            .entry((r.tool.clone(), program))
-            .or_default()
-            .extend(r.access.iter().cloned());
+        let (access, requirements) = by_program.entry((r.tool.clone(), program)).or_default();
+        access.extend(r.access.iter().cloned());
+        if let Some(requirement) = &r.require_version {
+            requirements.insert(requirement.clone());
+        }
     }
     let tools = by_program
         .into_iter()
-        .map(|((tool, program), access)| {
+        .map(|((tool, program), (access, requirements))| {
             probe(
                 &tool,
                 &program,
@@ -590,6 +638,7 @@ pub fn for_flow(
                 true,
                 probe_binaries,
                 probe_dir,
+                requirements.into_iter().collect(),
             )
         })
         .collect::<Vec<_>>();
@@ -664,6 +713,9 @@ pub fn print_human(r: &Report) {
                 println!("     version: not probed (see warning below)")
             }
             (ProbeState::NotFound, _) => {}
+        }
+        if !t.required_versions.is_empty() {
+            println!("     required: {}", t.required_versions.join(", "));
         }
         if let Some(i) = &t.info {
             println!(
@@ -779,6 +831,17 @@ fn probe_scratch_dir() -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))
 }
 
+/// Run the same hardened, isolated version probe used by preflight, for the
+/// execution gate. Unlike a standalone preflight, a real run is already
+/// authorized to launch this exact program; only the harmless `--version`
+/// invocation happens here, before any flow step or model process.
+pub fn probe_version_for_run(tool: &str, program: &str) -> Result<Option<String>, String> {
+    let dir = probe_scratch_dir()?;
+    let version = probe_version_isolated(program, tool, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(version)
+}
+
 /// `sfh preflight [flow.yaml]`.
 pub fn run(
     flow_path: Option<&Path>,
@@ -848,6 +911,36 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_compares_required_and_observed_versions_fail_closed() {
+        let required = vec![">=1.2, <2.0".to_string()];
+        assert!(version_requirement_blockers(
+            "tool",
+            ProbeState::Probed,
+            Some("tool 1.5.0"),
+            &required,
+        )
+        .is_empty());
+        assert!(version_requirement_blockers(
+            "tool",
+            ProbeState::Probed,
+            Some("tool 2.0.0"),
+            &required,
+        )[0]
+        .contains("does not satisfy"));
+        assert!(
+            version_requirement_blockers("tool", ProbeState::Probed, None, &required,)[0]
+                .contains("cannot be verified")
+        );
+        assert!(version_requirement_blockers(
+            "custom-tool",
+            ProbeState::ResolvedNotProbed,
+            None,
+            &required,
+        )[0]
+        .contains("--probe-binaries"));
+    }
 
     #[test]
     fn a_flowless_preflight_covers_every_preset_and_calls_no_model() {
@@ -1035,6 +1128,7 @@ mod tests {
             true,
             false,
             None,
+            Vec::new(),
         );
         assert!(
             r.blockers.iter().any(|b| b.contains("access: write")),
@@ -1091,7 +1185,15 @@ mod tests {
 
         // tool: claude, bin: <script> - a non-default override, probed by
         // neither the caller nor a required binary check.
-        let r = probe("claude", &program, Vec::new(), false, false, Some(&dir));
+        let r = probe(
+            "claude",
+            &program,
+            Vec::new(),
+            false,
+            false,
+            Some(&dir),
+            Vec::new(),
+        );
 
         assert!(
             !marker.exists(),
@@ -1136,7 +1238,15 @@ mod tests {
         );
         let program = script.to_string_lossy().into_owned();
 
-        let r = probe("claude", &program, Vec::new(), false, true, Some(&dir));
+        let r = probe(
+            "claude",
+            &program,
+            Vec::new(),
+            false,
+            true,
+            Some(&dir),
+            Vec::new(),
+        );
 
         assert!(
             marker.exists(),
@@ -1165,8 +1275,24 @@ mod tests {
         write_executable_script(&script, "#!/bin/sh\nexit 0\n");
         let program = script.to_string_lossy().into_owned();
 
-        let not_probed = probe("claude", &program, Vec::new(), false, false, Some(&dir));
-        let probed = probe("claude", &program, Vec::new(), false, true, Some(&dir));
+        let not_probed = probe(
+            "claude",
+            &program,
+            Vec::new(),
+            false,
+            false,
+            Some(&dir),
+            Vec::new(),
+        );
+        let probed = probe(
+            "claude",
+            &program,
+            Vec::new(),
+            false,
+            true,
+            Some(&dir),
+            Vec::new(),
+        );
 
         // Both report no version - the exact ambiguity P0-05 found - but they
         // must not be the same fact.
@@ -1203,7 +1329,15 @@ mod tests {
         let program = script.to_string_lossy().into_owned();
         assert_eq!(preset::default_program(&program), program);
 
-        let r = probe(&program, &program, Vec::new(), false, false, Some(&dir));
+        let r = probe(
+            &program,
+            &program,
+            Vec::new(),
+            false,
+            false,
+            Some(&dir),
+            Vec::new(),
+        );
 
         assert!(
             marker.exists(),
@@ -1229,7 +1363,15 @@ mod tests {
         );
         let program = script.to_string_lossy().into_owned();
 
-        let r = probe(&program, &program, Vec::new(), false, false, Some(&dir));
+        let r = probe(
+            &program,
+            &program,
+            Vec::new(),
+            false,
+            false,
+            Some(&dir),
+            Vec::new(),
+        );
 
         assert_eq!(r.probe_state, ProbeState::Probed);
         assert!(

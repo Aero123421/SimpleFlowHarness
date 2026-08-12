@@ -248,6 +248,19 @@ The assembled bundle is saved as `<tag>.context.txt` with a manifest in `<tag>.c
 
 Context files are read no-follow and must resolve inside the flow directory or the workspace; a symlink pointing out of them is refused. `allow_external: true` on a source is the only way out, and using it is recorded as an unsafe override. A bundle over `defaults.max_context_chars` fails **before anything is spawned** — sfh never summarizes or drops sources to make it fit. What to leave out is your decision, expressed with a template filter, a `max_chars`, or an upstream `compact:`.
 
+### Required CLI versions
+
+Pin the adapter range a flow was verified against at `defaults`, profile, or step level. Step settings win over profile settings, which win over defaults; fallback profiles resolve independently.
+
+```yaml
+defaults:
+  tool: codex
+  access: read
+  require_version: ">=0.70.0, <1.0.0"  # exact versions such as 0.75.0 also work
+```
+
+A real run checks the resolved binary's isolated `--version` before creating the run directory or starting any flow step. A mismatch or unusable version fails with `SFH_CAPABILITY_UNAVAILABLE`. `plan` remains spawn-free and reports the declaration with `observed: null`; `preflight` shows declaration versus measurement. A custom `bin:` is only measured by standalone preflight with `--probe-binaries`, because preflight has not otherwise been authorized to execute an arbitrary override.
+
 ### Replay policy
 
 What a resume should do with a step that started and never recorded an end — the one case where sfh genuinely cannot know whether the work already happened.

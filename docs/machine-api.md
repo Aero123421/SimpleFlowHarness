@@ -84,7 +84,7 @@ allowed to be reworded at any time.
 | `SFH_WORKSPACE_UNOWNED` | A path sfh was asked to manage is not one it created. |
 | `SFH_REPLAY_REFUSED` | A replay policy refused to re-run an unfinished effect. |
 | `SFH_PERSISTENCE_FAILURE` | A required durable artifact could not be written. |
-| `SFH_CAPABILITY_UNAVAILABLE` | A capability the flow requires is not available here. |
+| `SFH_CAPABILITY_UNAVAILABLE` | A capability the flow requires is unavailable or unverifiable, including a failed `require_version` check. |
 
 ## Stability guarantee
 
