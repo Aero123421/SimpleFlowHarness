@@ -1,0 +1,111 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: keep the Ponytail minimalism, but never remove validation or containment.
+api_version: 1
+name: ponytail-python-trust-boundary-hardening
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  security: {file: ./prompts/security-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:20000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+  security_reviewer: {tool: claude, access: read}
+
+defaults:
+  max_total_steps: 34
+  max_parallel: 3
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+
+steps:
+  - id: threat_map
+    use: analyst
+    effects: read
+    context: [task, acceptance, project_rules, ponytail, security]
+    prompt: |
+      Map the trust boundary and the smallest enforceable control.
+      Identify untrusted inputs, privileged operations, canonicalization or
+      validation order, failure behavior, and existing helpers.
+      Do not propose a broad security framework when one boundary check is sufficient.
+      Do not edit files.
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Implement the smallest boundary fix described below.
+      Preserve fail-closed behavior and actionable errors.
+      Add one focused regression test for the exploit or unsafe state.
+
+      Threat map:
+      {{steps.threat_map.output | truncate:18000}}
+
+  - id: test
+    effects: workspace
+    cmd: ["python", "-m", "pytest", "-q"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review functionality, compatibility, and regression evidence.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: security_review
+        use: security_reviewer
+        effects: read
+        context: [task, acceptance, project_rules, security]
+        on_error: continue
+        prompt: |
+          Attempt to bypass the new boundary through alternate paths, encoding,
+          links, races, malformed values, and failure handling.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Check that the fix is placed at one shared boundary and did not grow
+          speculative security infrastructure.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    max_parallel: 3
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Resolve every verified security or correctness blocker.
+      Keep the boundary centralized. Do not shrink away a control merely because
+      it costs lines.
+    route:
+      - {goto: test}

@@ -1,10 +1,14 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.2/schema/log-event.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.4.0/schema/log-event.schema.json",
   "title": "sfh durable log event",
   "description": "One JSON object from a run directory's append-only log.jsonl. Readers must ignore unknown properties for forward compatibility.",
   "type": "object",
-  "required": ["schema_version", "ts", "event"],
+  "required": [
+    "schema_version",
+    "ts",
+    "event"
+  ],
   "additionalProperties": true,
   "properties": {
     "schema_version": {
@@ -32,32 +36,271 @@
         "postprocess_end",
         "max_visits",
         "budget_landing",
+        "budget_carried",
         "persistence_failure",
-        "run_end"
+        "run_end",
+        "context_snapshot"
       ]
     },
-    "step": { "type": "string" },
-    "parent": { "type": ["string", "null"] },
-    "visit": { "type": "integer", "minimum": 0 },
-    "next_fallback": { "type": ["string", "null"] },
-    "postprocess_pending": { "type": "boolean" },
-    "items_total": { "type": "integer", "minimum": 0 },
-    "items_hash": { "type": "string", "minLength": 1 },
-    "precompact_file": { "type": "string", "minLength": 1 },
-    "chain_file": { "type": ["string", "null"] },
-    "out_file": { "type": ["string", "null"] },
+    "step": {
+      "type": "string"
+    },
+    "parent": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "visit": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_fallback": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "postprocess_pending": {
+      "type": "boolean"
+    },
+    "items_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "items_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "precompact_file": {
+      "type": "string",
+      "minLength": 1
+    },
+    "chain_file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "out_file": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "output_hash": {
       "type": "string",
       "pattern": "^(?:[0-9a-f]{16}|[0-9a-f]{64})$"
     },
-    "marker": { "type": "string", "minLength": 1 },
-    "exit": { "type": "integer" },
-    "cost_usd": { "type": ["number", "null"], "minimum": 0 },
-    "error": { "type": ["string", "null"] }
+    "marker": {
+      "type": "string",
+      "minLength": 1
+    },
+    "exit": {
+      "type": "integer"
+    },
+    "cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "harness_diagnostic": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 503,
+      "description": "Bounded sfh-generated diagnosis for a leaf failure; never copied from tool-controlled stderr."
+    },
+    "protocol_expected": {
+      "type": "string",
+      "enum": [
+        "stdout",
+        "codex-jsonl",
+        "claude-json",
+        "opencode-ndjson",
+        "grok-json",
+        "agy-json",
+        "pi-jsonl",
+        "cursor-json"
+      ],
+      "description": "step_start: the machine-readable protocol this step's tool was asked for. `stdout` is a custom cmd: step, whose plain output is the contract. Added in v1.2.0; absent from older logs."
+    },
+    "protocol_state": {
+      "type": "string",
+      "enum": [
+        "plain",
+        "valid",
+        "missing_terminal",
+        "invalid"
+      ],
+      "description": "step_end: whether the structured protocol held end to end. `valid` means the tool's documented terminal record arrived; `missing_terminal` that the stream stopped before it; `invalid` that the output was not the documented shape. Only `plain` and `valid` may accompany a successful step. Added in v1.2.0; absent from older logs."
+    },
+    "terminal_seen": {
+      "type": "boolean",
+      "description": "step_end: the adapter's documented terminal record was present. Added in v1.2.0."
+    },
+    "terminal_success": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "step_end: the verdict the terminal record itself carried, or null when the adapter's terminal record carries none. Added in v1.2.0."
+    },
+    "final_message_seen": {
+      "type": "boolean",
+      "description": "step_end: a final assistant message was present in the protocol (or its side file). Added in v1.2.0."
+    },
+    "malformed_records": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "step_end: records in the structured stream that the adapter could not parse. Added in v1.2.0."
+    },
+    "from": {
+      "type": "string",
+      "description": "budget_carried: the run directory whose spend this run inherited via --carry-budget-from. Added in v1.3.0."
+    },
+    "visits": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "description": "budget_carried: the highest visit number reached per step id in the ancestor run, applied as this run's starting high-water mark so max_visits keeps counting where it left off. Only ids the current flow still defines appear. Added in v1.3.0."
+    },
+    "dropped_steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "budget_carried: step ids the ancestor had visited that this flow no longer defines, so their laps are counted in `steps` but enforced against no max_visits. Named rather than silently forgotten. Added in v1.3.0."
+    },
+    "elapsed_sec": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "budget_carried: active run seconds the ancestor spent, counted against wall_clock_sec. Added in v1.3.0. run_end: active run seconds this run itself spent, recorded durably so carry and resume no longer have to fall back to status.json's heartbeat (which can be stale or missing) to recover elapsed time. Added in v1.4.0; a run_end from before that carries no elapsed_sec."
+    },
+    "outcome": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "complete",
+        "continue",
+        "retryable",
+        "fail",
+        null
+      ],
+      "description": "step_end: what this step's exit code was DECLARED to mean by its outcomes: table, or null when the flow declared nothing for that code. Persisted so a resumed run routes on the same answer the live one did instead of re-deriving it from an exit code sfh may already have normalized. Added in v1.4.0."
+    },
+    "outcome_label": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "step_end: the free-form label from that same entry. sfh records and compares it and never interprets it. Added in v1.4.0."
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "source",
+          "state"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The contexts.<name> this source was declared under."
+          },
+          "source": {
+            "type": "string",
+            "description": "The declared file path, as written in the flow."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "captured",
+              "absent"
+            ],
+            "description": "captured: the file existed and was frozen into context-snapshot/. absent: an optional source that was not there at run start, so every step sees it as absent too."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "captured only: hash of the frozen bytes."
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "captured only: size of the frozen bytes."
+          },
+          "snapshot": {
+            "type": "string",
+            "description": "captured only: path to the frozen copy, relative to the run directory."
+          }
+        }
+      },
+      "description": "context_snapshot: one entry per kind: file context this flow declares, recorded once at run start so every step reads the SAME bytes instead of re-opening the declared path. Also written durably to context-snapshot.json. Added in v1.4.0."
+    }
   },
   "allOf": [
     {
-      "if": { "properties": { "event": { "const": "run_start" } } },
+      "$comment": "`steps` carries a different shape per event, so its type is stated per event rather than once for the whole document: members_restored names the member ids it restored, budget_carried counts the leaf runs it inherited. A single shared definition would have made one of the two writers invalid.",
+      "if": {
+        "properties": {
+          "event": {
+            "const": "members_restored"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "members_restored: fan-out member step ids a resume carried into the next lap instead of re-running."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "budget_carried"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "steps": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "budget_carried: leaf runs the ancestor already spent, added to this run's max_total_steps counter. Includes anything the ancestor itself carried, so repeated corrections compose. Added in v1.3.0."
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "run_start"
+          }
+        }
+      },
       "then": {
         "required": [
           "sfh_version",
@@ -68,11 +311,29 @@
       }
     },
     {
-      "if": { "properties": { "event": { "const": "step_start" } } },
-      "then": { "required": ["step", "visit", "cmd"] }
+      "if": {
+        "properties": {
+          "event": {
+            "const": "step_start"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "cmd"
+        ]
+      }
     },
     {
-      "if": { "properties": { "event": { "const": "step_end" } } },
+      "if": {
+        "properties": {
+          "event": {
+            "const": "step_end"
+          }
+        }
+      },
       "then": {
         "required": [
           "step",
@@ -86,33 +347,82 @@
       }
     },
     {
-      "if": { "properties": { "event": { "const": "foreach_start" } } },
-      "then": {
-        "required": ["step", "visit", "items_hash", "items_total"]
-      }
-    },
-    {
       "if": {
         "properties": {
-          "event": { "enum": ["group_start", "foreach_start", "aggregate_end"] }
+          "event": {
+            "const": "foreach_start"
+          }
         }
       },
-      "then": { "required": ["step", "visit"] }
-    },
-    {
-      "if": { "properties": { "event": { "const": "position" } } },
-      "then": { "required": ["after", "next", "via"] }
-    },
-    {
-      "if": { "properties": { "event": { "const": "compact_start" } } },
       "then": {
-        "required": ["step", "visit", "precompact_file"]
+        "required": [
+          "step",
+          "visit",
+          "items_hash",
+          "items_total"
+        ]
       }
     },
     {
       "if": {
         "properties": {
-          "event": { "enum": ["compact_end", "compact_failed"] }
+          "event": {
+            "enum": [
+              "group_start",
+              "foreach_start",
+              "aggregate_end"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "position"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "after",
+          "next",
+          "via"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "compact_start"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "precompact_file"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "enum": [
+              "compact_end",
+              "compact_failed"
+            ]
+          }
         }
       },
       "then": {
@@ -126,18 +436,67 @@
       }
     },
     {
-      "if": { "properties": { "event": { "const": "notes_end" } } },
-      "then": { "required": ["step", "visit", "marker"] }
-    },
-    {
-      "if": { "properties": { "event": { "const": "persistence_failure" } } },
+      "if": {
+        "properties": {
+          "event": {
+            "const": "notes_end"
+          }
+        }
+      },
       "then": {
-        "required": ["step", "visit", "error", "cost_usd"]
+        "required": [
+          "step",
+          "visit",
+          "marker"
+        ]
       }
     },
     {
-      "if": { "properties": { "event": { "const": "run_end" } } },
-      "then": { "required": ["status", "leaf_runs", "cost_usd"] }
+      "if": {
+        "properties": {
+          "event": {
+            "const": "persistence_failure"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "step",
+          "visit",
+          "error",
+          "cost_usd"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "run_end"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "leaf_runs",
+          "cost_usd"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "context_snapshot"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "sources"
+        ]
+      }
     }
   ]
 }

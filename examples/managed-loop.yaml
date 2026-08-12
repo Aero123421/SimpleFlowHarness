@@ -1,0 +1,117 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+#
+# v1.2 concepts in one flow: a managed workspace, named context, declared
+# effects, an explicit replay policy, and profiles supplied from outside.
+#
+# This is an EXAMPLE, not a workflow sfh knows about. `inspect`, `implement`,
+# `review` and `fix` are step ids this file happens to use; `judge` and `actor`
+# are profile names it happens to pick. sfh has no idea what a reviewer is - it
+# runs what you declare, in the workspace you declared, with the context you
+# named, and records what happened.
+#
+#   sfh preflight examples/managed-loop.yaml --profiles local.yaml
+#   sfh plan      examples/managed-loop.yaml --profiles local.yaml --save
+#   sfh run       examples/managed-loop.yaml --profiles local.yaml \
+#                 --state-dir ~/.local/state/sfh --json
+#
+# The profiles below are inline, so this file runs on its own. Anyone who wants
+# different tools replaces them from outside without editing (and therefore
+# re-fingerprinting) the flow:
+#
+#   sfh run examples/managed-loop.yaml --profiles examples/profiles/local.yaml
+#
+# An overlay replaces only the fields it mentions, and repeated --profiles files
+# layer in order. Writing `tool:` straight into a step still works exactly as it
+# always has - see examples/research.yaml. An overlay file is never required.
+
+api_version: 1
+name: managed-loop
+
+profiles:
+  judge:
+    tool: codex
+    access: read
+  actor:
+    tool: claude
+    access: write
+
+# Every step that may write shares ONE git worktree for the whole run, created
+# outside the repository and never inside it. Read-only steps see the writers'
+# changes because it is the same directory - that is the point of one workspace
+# per run rather than one per step. With this key removed, sfh creates nothing
+# and every step runs in the caller's cwd, exactly as before v1.2.
+workspace:
+  mode: auto
+  cleanup: auto
+
+# What each step is handed, by name, in a fixed order, hashed. sfh does not
+# interpret these names; it records where each piece came from so that after the
+# run you can answer "what did the model actually see".
+contexts:
+  task:
+    file: ./TASK.md
+  house_rules:
+    inline: |
+      Prefer the design that is already there.
+      If you change a public interface, say why.
+  latest_review:
+    # `optional` here is the template filter: on the first pass there is no
+    # review yet, and an empty context is correct rather than an error.
+    template: |
+      {{steps.review.output | optional}}
+
+defaults:
+  max_visits: 4
+  max_context_chars: 80000
+  replay:
+    # The default, and the behaviour of every release before v1.2: re-run a step
+    # that started and never recorded an end. Right for a computation; think
+    # twice for anything that reaches outside the workspace (see `publish`).
+    unfinished: rerun
+
+steps:
+  - id: inspect
+    use: judge
+    effects: read
+    context: [task, house_rules]
+    prompt: |
+      Read the current state of this workspace against the task above and
+      list the decisions that have to be made. Do not change anything.
+
+  - id: implement
+    use: actor
+    effects: workspace
+    context: [task, house_rules, latest_review]
+    prompt: |
+      Make the change. The workspace is the source of truth, not this prompt.
+
+      What the inspection found:
+      {{steps.inspect.output}}
+
+  - id: test
+    effects: workspace
+    cmd: ["cargo", "test", "--locked"]
+    on_error: goto:fix
+
+  - id: review
+    use: judge
+    effects: read
+    context: [task, house_rules]
+    prompt: |
+      Review the workspace and the test result independently of whoever wrote
+      them. End your reply with exactly PASS or REVISE on its own last line.
+    route:
+      - {when_last_line_is: PASS, goto: end}
+      - {when_last_line_is: REVISE, goto: fix}
+      # Anything else means the reviewer did not answer the question asked, and
+      # guessing which way it meant is exactly what sfh must not do.
+      - {goto: stuck}
+
+  - id: fix
+    use: actor
+    effects: workspace
+    context: [task, house_rules, latest_review]
+    prompt: |
+      Address the review. Change only what it asked for.
+    route:
+      - {goto: test}

@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.1.2/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
 # sfh フロー定義の例: リサーチ・パイプライン
 #   plan(計画) -> review_plan(レビュー、NGなら差し戻し)
 #   -> execute(実行) -> review_execute(レビュー、NGなら差し戻し) -> summarize(要約)
@@ -17,9 +17,9 @@ vars:
 
 # ツール構成はここを差し替えるだけ。マシン固有設定(bin:等)は ~/.sfh/profiles.yaml へ。
 profiles:
-  planner:  { tool: codex, effort: high }
+  planner:  { tool: codex, effort: high, access: read }
   reviewer: { tool: claude, access: read }
-  worker:   { tool: opencode }
+  worker:   { tool: opencode, access: write }
   cheap:    { tool: opencode, access: read }
 
 defaults:
@@ -30,10 +30,11 @@ defaults:
   wall_clock_sec: 7200
 
 steps:
-  # 1) プランナー: フルアクセスで下調べして調査計画を立てる
+  # 1) プランナー: 読取り権限で下調べして調査計画を立てる
   - id: plan
     use: planner
-    access: full
+    # plan → review_plan の差し戻しが収束しなければ、失敗で捨てず人へ返す。
+    on_max_visits: goto:stuck
     prompt: |
       あなたはリサーチプランナーです。次のテーマについて、必要ならWeb検索・ファイル調査を行い、
       実行可能な調査計画を作成してください。
@@ -64,7 +65,7 @@ steps:
       最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
     route:
       # 最終行の合格だけを通し、読めない判定は差し戻す
-      - when_last_line_contains: "VERDICT: OK"
+      - when_last_line_is: "VERDICT: OK"
         goto: execute
       - goto: plan
 
@@ -72,10 +73,9 @@ steps:
   #    巨大レポートは compact で自動要約してから下流に流す(原文は {{steps.execute.outputs}})。
   - id: execute
     use: worker
-    access: full
     # 上限は入場時に判定される。同じ上限の execute → review_execute ループでは
     # 毎周先に入場する execute が先に上限へ達するため、降格フックもここに置く。
-    on_max_visits: goto:summarize
+    on_max_visits: goto:stuck
     notes: append
     compact:
       when_over: 30000
@@ -106,7 +106,7 @@ steps:
 
       最後の行は必ず `VERDICT: OK` か `VERDICT: REVISE` のどちらか単独にしてください。
     route:
-      - when_last_line_contains: "VERDICT: OK"
+      - when_last_line_is: "VERDICT: OK"
         goto: summarize
       - goto: execute
 

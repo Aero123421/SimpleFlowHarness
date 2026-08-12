@@ -16,7 +16,7 @@ jobs:
   dependency-audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Advisories, licenses, bans, and sources
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
@@ -27,7 +27,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
@@ -38,6 +38,11 @@ jobs:
         run: cargo build --release --locked
       - name: Package
         run: cargo package --locked
+      - name: Distribution metadata checks
+        run: python3 tests/distribution_checks.py
+      - name: Unix installer syntax
+        shell: bash
+        run: sh -n installers/sfh-installer.sh
       - name: Smoke flows (no AI calls)
         shell: bash
         run: |
@@ -45,7 +50,46 @@ jobs:
           ./target/release/sfh --version
           ./target/release/sfh run examples/smoke.yaml -q
           ./target/release/sfh run examples/smoke-parallel.yaml -q
+          # Top-level example YAML files are flows. examples/profiles/ holds
+          # --profiles overlay files, which are not flows and are not validated
+          # as such.
           for f in examples/*.yaml; do ./target/release/sfh validate "$f"; done
+          # `validate` never opens a context file; `plan` does, and CONTRIBUTING
+          # already tells contributors to run both over every example. Only
+          # validate was gated, so examples/managed-loop.yaml shipped naming a
+          # context file that was not in the tree: it validated, and the very
+          # command the README points a new reader at (`sfh plan <example>`)
+          # failed on a clean checkout. Plan resolves in a temporary directory
+          # and starts no process.
+          for f in examples/*.yaml; do ./target/release/sfh plan "$f" > /dev/null; done
+          # The overlay must still parse, and must still apply cleanly to the
+          # flow that documents it.
+          ./target/release/sfh validate examples/managed-loop.yaml --profiles examples/profiles/local.yaml
+          ./target/release/sfh preflight --json > /dev/null
+      - name: Bundled flow packs (no AI calls)
+        shell: bash
+        run: |
+          set -e
+          # The examples/*.yaml glob above is deliberately top level, so these
+          # would otherwise ship unvalidated. Both packs arrived with a real
+          # defect that only the binary could see - a `goto:fix` that YAML read
+          # as a key name, and two profile overlays missing their `profiles:`
+          # wrapper, which made the pack's own documented --profiles command
+          # fail on the first try.
+          for f in examples/ponytail/[0-9][0-9]-*.yaml skills/sfh-*/assets/*.yaml; do
+            ./target/release/sfh validate "$f"
+          done
+          # profiles.*.example.yaml are overlays, not flows. Every flow is
+          # validated against every overlay the pack ships, because "the
+          # overlay parses" and "the overlay applies to this flow" are
+          # different claims and the README makes the second one.
+          for overlay in examples/ponytail/profiles.*.example.yaml; do
+            for f in examples/ponytail/[0-9][0-9]-*.yaml; do
+              ./target/release/sfh validate "$f" --profiles "$overlay"
+            done
+          done
+      - name: Agent Skills structure and version claims
+        run: python3 tests/skills_checks.py
       - name: Engine behaviour (fake tools, no AI calls)
         shell: bash
         run: bash tests/engine_behaviour.sh ./target/release/sfh
@@ -72,16 +116,22 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Build and package the way release.yml does
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: cargo build --release --locked
+      - name: Install and reject corrupted release
         shell: bash
-        run: |
-          cargo build --release --locked
-          mkdir pkg && cp target/release/sfh README.md README.en.md LICENSE pkg/
-          tar czf sfh-test.tar.gz -C pkg sfh README.md README.en.md LICENSE
-      - name: Extract exactly like the README says
-        shell: bash
-        run: |
-          mkdir extract && cd extract
-          tar xzf ../sfh-test.tar.gz sfh
-          ./sfh --version
+        run: bash tests/installer_unix.sh ./target/release/sfh
+
+  install-docs-windows:
+    # Keep the PowerShell checksum, extraction, PATH, and invocation sequence
+    # executable rather than leaving the most common install path as prose.
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: cargo build --release --locked
+      - name: Install and reject corrupted release
+        shell: pwsh
+        run: ./tests/installer_windows.ps1 -Binary ./target/release/sfh.exe

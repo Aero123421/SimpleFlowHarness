@@ -333,20 +333,32 @@ pub fn resolve(target: Option<&Path>, root: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// A failure answer for a watch command, in whichever form the caller asked
+/// for. In JSON mode this is an envelope, never a bare message: "sfh printed
+/// prose and exited 2" is exactly what a machine caller cannot act on.
+fn fail(as_json: bool, command: &str, code: crate::machine::ErrorCode, msg: &str) -> i32 {
+    if as_json {
+        crate::machine::emit(&crate::machine::error_envelope(
+            command,
+            code,
+            msg,
+            2,
+            serde_json::json!({"state": "usage_error", "terminal": true}),
+        ));
+    } else {
+        eprintln!("sfh: {msg}");
+    }
+    2
+}
+
 pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     let dir = match resolve(target, root) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("sfh: {e}");
-            return 2;
-        }
+        Err(e) => return fail(as_json, "status", crate::machine::ErrorCode::Usage, &e),
     };
     let snap = match read(&dir) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("sfh: {e}");
-            return 2;
-        }
+        Err(e) => return fail(as_json, "status", crate::machine::ErrorCode::Usage, &e),
     };
     // A terminal state an untrusted run dir asserts about itself is not reported
     // as fact: the same nonce authentication `sfh wait` and `sfh stop` run must
@@ -363,9 +375,11 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         }
     }
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        // Additive only: every field this command has ever emitted is still
+        // here and still means what it did. The common envelope header and
+        // `implicit_target` are new keys beside them, so a reader written
+        // against 1.1 keeps working unchanged.
+        let body = serde_json::json!({
                 "state": snap.state,
                 "reason": snap.reason,
                 "run_dir": snap.dir.display().to_string(),
@@ -386,9 +400,19 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 "emit_step": snap.emit_step,
                 "emit_file": snap.emit_file,
                 "error": snap.error,
-            }))
-            .unwrap_or_default()
-        );
+                "terminal": snap.terminal(),
+                "run_id": snap.dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+                // A caller that omitted the path got the NEWEST run, which may
+                // not be the one it started. Saying so is what lets an agent
+                // notice it is about to report on somebody else's run.
+                "implicit_target": target.is_none(),
+        });
+        crate::machine::emit(&crate::machine::envelope(
+            "status",
+            snap.state == "done",
+            snap.exit(),
+            body,
+        ));
         return snap.exit();
     }
 
@@ -415,22 +439,26 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     );
     println!("run dir: {}", snap.dir.display());
     match snap.state {
-        "running" => eprintln!(
+        // Human status is one ordered stdout document. Mixing the summary and
+        // its next-action hint across stdout/stderr lets log collectors splice
+        // the two streams in the middle of a path or line. Scripts should use
+        // `status --json`; the human form stays together here.
+        "running" => println!(
             "sfh: still running (pid {}); `sfh wait` blocks until it finishes",
             snap.pid
         ),
-        "done" => eprintln!(
+        "done" => println!(
             "sfh: result: sfh wait {}",
             execute::shell_quote(&snap.dir.display().to_string())
         ),
         // A stuck run is finished but not done with: the work is saved and
         // waiting on a human, so say how to pick it up again.
-        "stuck" => eprintln!(
+        "stuck" => println!(
             "sfh: this run stopped for a human decision. after fixing what it is stuck on: sfh run {} --resume {}",
             flow_arg(&snap.flow),
             execute::shell_quote(&snap.dir.display().to_string())
         ),
-        "stopped" | "dead" => eprintln!(
+        "stopped" | "dead" => println!(
             "sfh: this run was killed before it finished. resume with: sfh run {} --resume {}",
             flow_arg(&snap.flow),
             execute::shell_quote(&snap.dir.display().to_string())
@@ -442,20 +470,43 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
 
 /// Cancel a run: kill the process tree and record that it was deliberate, so a
 /// later `sfh status` says "stopped" rather than the ambiguous "dead".
-pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
+pub fn stop(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     let dir = match resolve(target, root) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("sfh: {e}");
-            return 2;
-        }
+        Err(e) => return fail(as_json, "stop", crate::machine::ErrorCode::Usage, &e),
     };
     let snap = match read(&dir) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("sfh: {e}");
-            return 2;
+        Err(e) => return fail(as_json, "stop", crate::machine::ErrorCode::Usage, &e),
+    };
+    // Every early return below reports through this, so JSON mode cannot end up
+    // with a bare message on stderr and nothing on stdout.
+    let answer = |ok: bool, code: i32, state: &str, note: &str| -> i32 {
+        if as_json {
+            let body = serde_json::json!({
+                "state": state,
+                "terminal": true,
+                "run_id": dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+                "run_dir": dir.display().to_string(),
+                "pid": snap.pid,
+                "implicit_target": target.is_none(),
+                "note": note,
+            });
+            if ok {
+                crate::machine::emit(&crate::machine::envelope("stop", true, code, body));
+            } else {
+                crate::machine::emit(&crate::machine::error_envelope(
+                    "stop",
+                    crate::machine::ErrorCode::Usage,
+                    note,
+                    code,
+                    body,
+                ));
+            }
+        } else {
+            eprintln!("sfh: {note}");
         }
+        code
     };
     // A stale heartbeat resolves the state to "dead", but when the pid is
     // still alive that is exactly the wedged process - or one that just came
@@ -465,12 +516,16 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
     // on this path either.
     let alive = execute::pid_alive(snap.pid);
     if snap.terminal() && !(snap.state == "dead" && alive) {
-        eprintln!(
-            "sfh: nothing to stop - this run is already '{}'. run dir: {}",
+        return answer(
+            true,
+            0,
             snap.state,
-            dir.display()
+            &format!(
+                "nothing to stop - this run is already '{}'. run dir: {}",
+                snap.state,
+                dir.display()
+            ),
         );
-        return 0;
     }
     if snap.state == "dead" && alive {
         eprintln!(
@@ -481,15 +536,24 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
         );
     }
     if !verify_run_ownership(&dir, &snap) {
-        return 1;
+        return answer(
+            false,
+            1,
+            snap.state,
+            "refusing to stop: this run dir's ownership could not be verified",
+        );
     }
     if !execute::kill_pid_tree(snap.pid) {
-        eprintln!(
-            "sfh: could not kill process {} (already gone?); check: sfh status {}",
-            snap.pid,
-            execute::shell_quote(&dir.display().to_string())
+        return answer(
+            false,
+            1,
+            snap.state,
+            &format!(
+                "could not kill process {} (already gone?); check: sfh status {}",
+                snap.pid,
+                execute::shell_quote(&dir.display().to_string())
+            ),
         );
-        return 1;
     }
     // The run dies without a chance to record anything, so write the verdict
     // here. Cost and progress stay as of the last heartbeat, which is honest:
@@ -499,50 +563,78 @@ pub fn stop(target: Option<&Path>, root: &Path) -> i32 {
     let text = match contain::read_contained_opt(&dir, "status.json") {
         Ok(Some(text)) => text,
         Ok(None) => {
-            eprintln!(
-                "sfh: killed pid {} but cannot record the stop: status.json disappeared",
-                snap.pid
-            );
-            return 1;
+            return answer(
+                false,
+                1,
+                "stopped",
+                &format!(
+                    "killed pid {} but cannot record the stop: status.json disappeared",
+                    snap.pid
+                ),
+            )
         }
         Err(e) => {
-            eprintln!(
-                "sfh: killed pid {} but cannot safely read status.json to record the stop: {e}",
-                snap.pid
-            );
-            return 1;
+            return answer(
+                false,
+                1,
+                "stopped",
+                &format!(
+                    "killed pid {} but cannot safely read status.json to record the stop: {e}",
+                    snap.pid
+                ),
+            )
         }
     };
     let mut v = match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "sfh: killed pid {} but cannot record the stop: unreadable status.json: {e}",
-                snap.pid
-            );
-            return 1;
+            return answer(
+                false,
+                1,
+                "stopped",
+                &format!(
+                    "killed pid {} but cannot record the stop: unreadable status.json: {e}",
+                    snap.pid
+                ),
+            )
         }
     };
     let Some(m) = v.as_object_mut() else {
-        eprintln!(
-            "sfh: killed pid {} but cannot record the stop: status.json is not an object",
-            snap.pid
+        return answer(
+            false,
+            1,
+            "stopped",
+            &format!(
+                "killed pid {} but cannot record the stop: status.json is not an object",
+                snap.pid
+            ),
         );
-        return 1;
     };
     m.insert("state".into(), serde_json::json!("stopped"));
     m.insert("exit_code".into(), serde_json::json!(1));
     m.insert("error".into(), serde_json::json!("cancelled by sfh stop"));
     let encoded = serde_json::to_string_pretty(&v).unwrap_or_default();
     if let Err(e) = contain::write_private_atomic(&sp, encoded) {
-        eprintln!(
-            "sfh: killed pid {} but cannot persist the stopped status: {e}",
-            snap.pid
+        return answer(
+            false,
+            1,
+            "stopped",
+            &format!(
+                "killed pid {} but cannot persist the stopped status: {e}",
+                snap.pid
+            ),
         );
-        return 1;
+    }
+    if as_json {
+        return answer(
+            true,
+            0,
+            "stopped",
+            &format!("killed pid {} and its children", snap.pid),
+        );
     }
     println!("stopped {}", dir.display());
-    eprintln!(
+    println!(
         "sfh: killed pid {} and its children. ${:.4} was spent before the stop. resume with: sfh run {} --resume {}",
         snap.pid,
         snap.cost_usd,
@@ -643,6 +735,53 @@ fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
     }
 }
 
+/// Whether the process that most recently owned this run dir is verifiably
+/// gone, read directly from sfh-nonce rather than status.json. The two are
+/// consulted for different reasons: status.json is cheap and, when it can be
+/// read, already pairs the pid with a fresh heartbeat, which is the better
+/// signal (see `read_once`'s "wedged" handling one layer up in every
+/// caller). This function exists for the moment that fails: status.json
+/// missing, corrupt, or caught mid-write, with nothing else durable to ask
+/// (see the `--carry-budget-from` finality check in `engine::run`, the
+/// only caller).
+///
+/// `Ok(None)`: no usable nonce to check against - a legacy pre-nonce run,
+/// or a dry-run dir. There is nothing here to verify liveness from, so the
+/// caller must find its proof elsewhere (or refuse).
+///
+/// `Ok(Some(true))`: the recorded owner is confirmed gone - either its pid
+/// is not running at all, or a live pid at that exact number started at a
+/// different time than recorded, which means the OS handed the number to
+/// an unrelated process and the original is still gone (rev_break #8).
+///
+/// `Ok(Some(false))`: the recorded owner - or something that cannot be
+/// told apart from it - is still alive. This is also the answer when a
+/// live pid is found but the nonce records no start time to compare: an
+/// old pid-binding format did not record one, and pid_alive alone is
+/// advisory (see the module doc comment), so a live pid there is treated
+/// as possibly still the owner rather than confirmed dead - the same
+/// fail-closed default `wedged` uses when it cannot compute a verdict
+/// either.
+pub fn owner_verifiably_dead(dir: &Path) -> Result<Option<bool>, String> {
+    let raw = match contain::read_contained_opt(dir, "sfh-nonce")? {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return Ok(None),
+    };
+    let (pid, start) = match contain::parse_nonce(raw.trim())? {
+        contain::Nonce::Bound { pid, start, .. } => (pid, start),
+        // No pid recorded at all: a run from before pid binding existed.
+        // Nothing here to check liveness against.
+        contain::Nonce::Legacy { .. } => return Ok(None),
+    };
+    if !execute::pid_alive(pid) {
+        return Ok(Some(true));
+    }
+    Ok(match start {
+        None => Some(false),
+        Some(recorded) => Some(execute::pid_start_time(pid) != Some(recorded)),
+    })
+}
+
 /// Verify that a run directory genuinely belongs to sfh before killing its pid.
 /// Checks: (1) the nonce in status.json matches the nonce file in the run dir,
 /// (2) the pid recorded in the nonce file (when present) matches status.json,
@@ -715,6 +854,23 @@ fn verify_run_ownership(dir: &Path, snap: &Snapshot) -> bool {
 /// the path for the read, leaving a window between check and use (rev_break #5).
 /// A violation is an error, not a silent skip, so `sfh wait` can exit non-zero
 /// instead of reporting success (S1-1).
+/// Read a recorded emit file for the JSON path, under exactly the containment
+/// `print_result` applies: a status.json an attacker can write must not turn
+/// `wait --json` into a file-read primitive either.
+fn read_emit_file(snap: &Snapshot, f: &str) -> Result<String, String> {
+    let fp = Path::new(f);
+    let fp = if fp.is_absolute() {
+        fp.to_path_buf()
+    } else {
+        snap.dir.join(fp)
+    };
+    match contain::read_contained_abs(&snap.dir, &fp) {
+        Ok(Some(t)) => Ok(t.trim_end().to_string()),
+        Ok(None) => Err(format!("'{f}' is missing")),
+        Err(e) => Err(format!("refused to read '{f}': {e}")),
+    }
+}
+
 fn print_result(snap: &Snapshot) -> Result<(), String> {
     let detached = snap.dir.join("detached.out.txt");
     match contain::read_contained_abs(&snap.dir, &detached) {
@@ -752,13 +908,11 @@ pub fn wait(
     timeout_sec: Option<u64>,
     interval_sec: u64,
     quiet: bool,
+    as_json: bool,
 ) -> i32 {
     let dir = match resolve(target, root) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("sfh: {e}");
-            return 2;
-        }
+        Err(e) => return fail(as_json, "wait", crate::machine::ErrorCode::Usage, &e),
     };
     let started = SystemTime::now();
     let interval = Duration::from_secs(interval_sec.max(1));
@@ -766,12 +920,63 @@ pub fn wait(
     loop {
         let snap = match read(&dir) {
             Ok(s) => s,
-            Err(e) => {
-                eprintln!("sfh: {e}");
-                return 2;
-            }
+            Err(e) => return fail(as_json, "wait", crate::machine::ErrorCode::Usage, &e),
         };
         if snap.terminal() {
+            if as_json {
+                // The nonce check happens for JSON callers too, and BEFORE any
+                // content is read: a run dir an attacker can write must not
+                // become a file-read primitive just because the caller asked
+                // for a machine answer.
+                if let Err(e) = nonce_consistent(&dir, &snap) {
+                    return fail(
+                        as_json,
+                        "wait",
+                        crate::machine::ErrorCode::PersistenceFailure,
+                        &format!(
+                            "refusing to report {} as '{}': {e}",
+                            dir.display(),
+                            snap.state
+                        ),
+                    );
+                }
+                let code = match snap.state {
+                    "done" => snap
+                        .exit_code
+                        .map(|c| i32::try_from(c).unwrap_or(1))
+                        .unwrap_or(0),
+                    _ => snap.exit(),
+                };
+                let result = snap
+                    .emit_file
+                    .as_deref()
+                    .and_then(|f| read_emit_file(&snap, f).ok());
+                let body = serde_json::json!({
+                    "state": snap.state,
+                    "terminal": true,
+                    "run_id": snap.dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    "run_dir": snap.dir.display().to_string(),
+                    "flow": snap.flow,
+                    "implicit_target": target.is_none(),
+                    "result": result,
+                    "result_step": snap.emit_step,
+                    "result_file": snap.emit_file,
+                    "cost_usd": snap.cost_usd,
+                    "steps_done": snap.steps_done,
+                });
+                if snap.state == "done" {
+                    crate::machine::emit(&crate::machine::envelope("wait", true, code, body));
+                } else {
+                    crate::machine::emit(&crate::machine::error_envelope(
+                        "wait",
+                        crate::machine::ErrorCode::FlowInvalid,
+                        snap.error.as_deref().unwrap_or("the run did not finish"),
+                        code,
+                        body,
+                    ));
+                }
+                return code;
+            }
             // Do not report anything an untrusted run dir asserted about
             // itself until the nonce backs it up - and for EVERY terminal
             // state, not just done. The check used to live inside the "done"
@@ -795,14 +1000,6 @@ pub fn wait(
                     if let Err(e) = print_result(&snap) {
                         eprintln!("sfh: {e}");
                         return 1;
-                    }
-                    if !quiet {
-                        eprintln!(
-                            "sfh: done. {} steps, ${:.4} reported. run dir: {}",
-                            snap.steps_done,
-                            snap.cost_usd,
-                            snap.dir.display()
-                        );
                     }
                 }
                 "failed" => {
@@ -870,6 +1067,30 @@ pub fn wait(
         if let Some(t) = timeout_sec {
             let elapsed = started.elapsed().map(|d| d.as_secs()).unwrap_or(0);
             if elapsed >= t {
+                if as_json {
+                    // A wait timeout is NOT a cancellation, and the envelope has
+                    // to say so plainly: the run is still going, and a caller
+                    // that read this as "it failed" would abandon live work.
+                    crate::machine::emit(&crate::machine::envelope(
+                        "wait",
+                        false,
+                        3,
+                        serde_json::json!({
+                            "state": "running",
+                            "terminal": false,
+                            "timed_out": true,
+                            "run_id": dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+                            "run_dir": dir.display().to_string(),
+                            "implicit_target": target.is_none(),
+                            "note": format!("still running after {t}s; the run is NOT cancelled"),
+                            "next_actions": [
+                                {"kind": "wait", "argv": ["sfh", "wait", &dir.display().to_string(), "--json"]},
+                                {"kind": "stop", "argv": ["sfh", "stop", &dir.display().to_string(), "--json"]},
+                            ],
+                        }),
+                    ));
+                    return 3;
+                }
                 eprintln!(
                     "sfh: still running after {t}s; the run is NOT cancelled. check: sfh status {}",
                     execute::shell_quote(&dir.display().to_string())
@@ -878,5 +1099,96 @@ pub fn wait(
             }
         }
         std::thread::sleep(interval);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sfh-watch-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn owner_verifiably_dead_reads_none_when_no_nonce_file_exists() {
+        // Nothing here to verify liveness from - the caller (the
+        // `--carry-budget-from` finality check) must find its proof
+        // elsewhere, or refuse. This must not be conflated with "confirmed
+        // dead": an absent nonce says nothing either way.
+        let dir = temp_dir("no-nonce");
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_reads_none_for_a_legacy_bare_nonce_with_no_pid() {
+        // A bare token predates pid binding entirely; there is no pid to ask
+        // the process table about.
+        let dir = temp_dir("legacy-nonce");
+        std::fs::write(dir.join("sfh-nonce"), "just-a-token").unwrap();
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_confirms_life_when_the_recorded_pid_and_start_time_are_still_current()
+    {
+        let dir = temp_dir("alive");
+        let pid = std::process::id();
+        let start = execute::pid_start_time(pid);
+        contain::write_nonce(&dir, pid, start, "tok").unwrap();
+        assert_eq!(
+            owner_verifiably_dead(&dir).unwrap(),
+            Some(false),
+            "the calling test process is definitely still running"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_treats_a_live_pid_with_no_recorded_start_as_unconfirmed() {
+        // The first pid-binding format recorded no start time. A live pid
+        // there cannot be told apart from the original owner - pid_alive
+        // alone is advisory (rev_break #8) - so this must fail closed the
+        // same way the "wedged" check does when it cannot compute a
+        // verdict: not proven dead.
+        let dir = temp_dir("alive-no-start");
+        contain::write_nonce(&dir, std::process::id(), None, "tok").unwrap();
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_verifiably_dead_confirms_death_when_a_live_pid_disagrees_with_the_recorded_start_time()
+    {
+        // The OS reusing a pid for an unrelated process is exactly what the
+        // recorded start time exists to catch (rev_break #8): the number is
+        // alive, but not as the process that owned this run.
+        let dir = temp_dir("reused-pid");
+        contain::write_nonce(&dir, std::process::id(), Some(1), "tok").unwrap();
+        assert_eq!(
+            owner_verifiably_dead(&dir).unwrap(),
+            Some(true),
+            "a live pid whose start time does not match the recording is a reused pid, not the original owner"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_verifiably_dead_confirms_death_when_the_recorded_pid_has_actually_exited() {
+        let dir = temp_dir("exited");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a trivial child");
+        let pid = child.id();
+        let start = execute::pid_start_time(pid);
+        child.wait().expect("wait for the child to exit");
+        contain::write_nonce(&dir, pid, start, "tok").unwrap();
+        assert_eq!(owner_verifiably_dead(&dir).unwrap(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

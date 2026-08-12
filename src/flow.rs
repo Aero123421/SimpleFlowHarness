@@ -17,6 +17,23 @@ pub struct Flow {
     /// Named bundles of tool settings referenced by steps via `use:`.
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    /// Where this run's side effects belong. Omitted (the default) keeps the
+    /// long-standing behaviour exactly: every step runs in the caller's cwd, or
+    /// in whatever `cwd:` resolves to, and sfh creates nothing.
+    ///
+    /// Every v1.2 key added to this file is `skip_serializing_if`-guarded. The
+    /// effective-config fingerprint is a serialization of this struct, and it
+    /// is what `--resume` compares; without the guard, merely UPGRADING sfh
+    /// would change the fingerprint of every flow ever written and make every
+    /// existing run dir unresumable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceConfig>,
+    /// Named context sources a step can pull in by name. sfh does not interpret
+    /// what a context MEANS - `task`, `review_rules`, `sources` are the flow
+    /// author's words - it only pins where each one came from, in what order,
+    /// and at what hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub contexts: BTreeMap<String, ContextSource>,
     pub steps: Vec<Step>,
     /// Set only by `load_lenient`, never by the YAML - it is the loader saying
     /// "this flow was accepted under the pre-1.0 rules so a 0.x run could be
@@ -72,6 +89,505 @@ pub struct Defaults {
     /// first one alone so the provider's prompt cache is warm before the rest
     /// start. auto (default: only where it measurably pays) | always | never.
     pub fork_warmup: Option<String>,
+    /// What a resume does with work that started but never recorded a durable
+    /// end. Omitted keeps the historical behaviour (`rerun`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Replay>,
+    /// Refuse to spawn when a step's assembled context bundle exceeds this many
+    /// characters. sfh never summarizes or silently drops context to fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_chars: Option<u64>,
+    /// What to do when a tool's own protocol certifies the turn as successful
+    /// but the process exits non-zero. Omitted keeps the adapter's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_conflict: Option<ExitConflict>,
+}
+
+/// How to resolve a disagreement between a tool's exit code and its own
+/// structured protocol.
+///
+/// This only ever applies where sfh has POSITIVE evidence of success:
+/// `ProtocolEvidence::certifies_success`, meaning the documented terminal
+/// record was found, it was well formed, and it said the turn succeeded. Raw
+/// text, an unknown status, a malformed envelope or a missing terminal record
+/// can never reach this decision, so `trust_protocol` cannot turn a usage error
+/// printed on stdout into a successful step.
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitConflict {
+    /// The exit code wins: the step fails. Correct wherever a CLI's exit status
+    /// is trustworthy, which is most of them.
+    #[default]
+    Fail,
+    /// The protocol wins: the step succeeds. Declare this for a CLI that is
+    /// known to exit non-zero for reasons that do not invalidate the answer -
+    /// for example one that returns 1 because some intermediate tool call
+    /// failed, after producing and committing a complete final result.
+    TrustProtocol,
+}
+
+impl ExitConflict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitConflict::Fail => "fail",
+            ExitConflict::TrustProtocol => "trust_protocol",
+        }
+    }
+}
+
+/// What a particular exit code MEANS for this step.
+///
+/// An exit code carries two different facts at once and sfh could only read
+/// one. "The process ended cleanly" is a transport fact. "The work is done" is
+/// a semantic one, and only the flow author knows how this command spells it.
+/// A gate that exits 2 for "ran fine, the acceptance criteria are not met yet"
+/// was indistinguishable from one that exits 2 because it crashed - so sfh
+/// failed the step, and `retry_on: transient` could then re-run an expensive
+/// suite for a deliberate, correct, reproducible answer.
+///
+/// The vocabulary is deliberately tiny and domain-free. sfh never learns what
+/// "acceptance" or "review" or "incomplete" mean; it learns only whether to
+/// carry on, retry, or stop. Everything domain-shaped goes in `label`, which
+/// sfh stores, exposes and routes on without ever interpreting.
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeResult {
+    /// The work is done. The step succeeds however it exited.
+    Complete,
+    /// The step did its job and reports there is more to do. NOT a failure:
+    /// `on_error` does not fire and no retry is considered. Route on the label.
+    Continue,
+    /// A failure worth another attempt, whatever the text says. Under
+    /// `retry_on: transient` this retries; the declaration replaces the
+    /// needle-matching guess rather than adding to it.
+    Retryable,
+    /// A failure that is final. Never retried under `retry_on: transient`.
+    #[default]
+    Fail,
+}
+
+impl OutcomeResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutcomeResult::Complete => "complete",
+            OutcomeResult::Continue => "continue",
+            OutcomeResult::Retryable => "retryable",
+            OutcomeResult::Fail => "fail",
+        }
+    }
+
+    /// Whether a step ending this way counts as succeeding.
+    pub fn is_success(self) -> bool {
+        matches!(self, OutcomeResult::Complete | OutcomeResult::Continue)
+    }
+}
+
+/// An `outcomes:` key, written as a number or as a quoted number.
+///
+/// YAML gives an integer for `2:` and a string for `"2":`, and a flow written
+/// as JSON - which YAML is a superset of, and which is how a program
+/// generating a flow will most naturally emit one - can only produce the
+/// second, because JSON object keys are always strings. sfh exists to be
+/// driven by other programs, so both spellings have to mean the same thing.
+///
+/// The quoted spelling is held to exactly the form
+/// `schema/flow.schema.json`'s `outcomes` key pattern accepts -
+/// `^(0|[1-9][0-9]*)$`: plain decimal, no sign, no leading zero, no
+/// surrounding whitespace. An earlier version trimmed the string and parsed
+/// what was left, so `" 2 "` (and `"+2"`, `"02"`) deserialized here but failed
+/// that pattern - a flow an editor's schema check called invalid while `sfh`
+/// ran it anyway, or the reverse. The bare-integer spelling needs no
+/// equivalent guard: YAML has already resolved `2` (or `-1`) to a plain
+/// integer by the time a visitor sees it, with no leftover spelling left to
+/// disagree about.
+///
+/// A negative key of either spelling is still refused, just not here: the
+/// Schema's pattern has no `-` branch at all, and a bare negative integer
+/// keeps deserializing (nothing left to canonicalize) but is refused by
+/// `check_outcomes` during `validate` - by name, not by pattern, because sfh
+/// reserves negative exit codes for its own "no process ran" marker. A
+/// negative QUOTED key never reaches that check: it already fails the
+/// canonical-form gate below, for the same reason the Schema rejects it.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ExitKey(i32);
+
+/// Whether an `outcomes:` key string is spelled exactly the way
+/// `schema/flow.schema.json`'s `outcomes` key pattern requires:
+/// `^(0|[1-9][0-9]*)$` - plain decimal, no sign, no leading zero, no
+/// surrounding whitespace.
+fn is_canonical_exit_key(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some('0') => chars.next().is_none(),
+        Some(c) if c.is_ascii_digit() => chars.all(|c| c.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ExitKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ExitKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an exit code, written as 2 or \"2\"")
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<ExitKey, E> {
+                i32::try_from(v)
+                    .map(ExitKey)
+                    .map_err(|_| E::custom(format!("outcomes key {v} is not a possible exit code")))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ExitKey, E> {
+                i32::try_from(v)
+                    .map(ExitKey)
+                    .map_err(|_| E::custom(format!("outcomes key {v} is not a possible exit code")))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ExitKey, E> {
+                // Canonical only, matched against the Schema's own pattern -
+                // no trim-and-parse, because trimming is exactly how " 2 "
+                // used to slip past sfh and then fail an editor's schema
+                // check (or the reverse: a key the Schema accepts and sfh
+                // does not).
+                if !is_canonical_exit_key(v) {
+                    return Err(E::custom(format!(
+                        "outcomes key '{v}' is not an exit code - write the canonical decimal form the command exits with: no sign, no leading zero, no surrounding space (e.g. 0 or 2, not \"+2\", \"02\" or \" 2 \")"
+                    )));
+                }
+                v.parse().map(ExitKey).map_err(|_| {
+                    E::custom(format!("outcomes key '{v}' is not a possible exit code"))
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+fn de_outcomes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<i32, Outcome>, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = BTreeMap<i32, Outcome>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of exit code to outcome")
+        }
+        // Walked pair by pair rather than collected into a map first: a map
+        // would silently keep the last of `2:` and `"2":`, which is the one
+        // case where the two spellings must NOT quietly agree. Only the author
+        // knows which they meant.
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut m: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(ExitKey(code)) = m.next_key::<ExitKey>()? {
+                let o: Outcome = m.next_value()?;
+                if out.insert(code, o).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "outcomes declares exit code {code} more than once"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(V)
+}
+
+/// One `exit code -> meaning` declaration.
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Outcome {
+    pub result: OutcomeResult,
+    /// A free-form name for this outcome. sfh stores it, exposes it as
+    /// `{{steps.<id>.label}}`, routes on it with `when_label_is:`, and records
+    /// it in the durable log - and never assigns it any meaning of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// How to treat a step whose effects may have happened even though sfh never
+/// recorded that it finished.
+///
+/// This is NOT retry (another attempt at the same invocation), NOT fallback
+/// (a different profile), NOT a route revisit, and NOT the reuse of a completed
+/// step's durable result. It is the narrower question a crash leaves behind:
+/// the step started, something may have happened out in the world, and no
+/// record says what.
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Replay {
+    /// rerun (default) | stuck | fail
+    pub unfinished: Option<ReplayPolicy>,
+}
+
+#[derive(Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayPolicy {
+    /// Run it again. Correct for a pure computation; a gamble for anything that
+    /// touched the world, which is why `validate --strict` says so.
+    #[default]
+    Rerun,
+    /// Stop with exit 4, keeping the workspace and partial artifacts, so a
+    /// human can decide. Nothing is launched.
+    Stuck,
+    /// Stop with exit 1. Nothing is launched.
+    Fail,
+}
+
+impl ReplayPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplayPolicy::Rerun => "rerun",
+            ReplayPolicy::Stuck => "stuck",
+            ReplayPolicy::Fail => "fail",
+        }
+    }
+}
+
+/// What a step is declared to touch. A user declaration, not an inference sfh
+/// makes about the work: it decides workspace selection, warnings and replay
+/// policy, and nothing else.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Effects {
+    /// Reads only. Safe to re-run, and needs no workspace of its own.
+    Read,
+    /// Writes inside the workspace.
+    Workspace,
+    /// Touches something outside it - a deploy, an API call, a message sent.
+    External,
+    /// Not declared and not inferable (the default for a custom `cmd:`).
+    Unknown,
+}
+
+impl Effects {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effects::Read => "read",
+            Effects::Workspace => "workspace",
+            Effects::External => "external",
+            Effects::Unknown => "unknown",
+        }
+    }
+
+    /// Whether this step might change the workspace or the world. `unknown`
+    /// counts: an undeclared custom command is treated as a potential writer,
+    /// because assuming otherwise is the assumption that loses work.
+    pub fn is_potential_writer(self) -> bool {
+        !matches!(self, Effects::Read)
+    }
+}
+
+/// Where a run's side effects live.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    /// current (default) | directory | git-worktree | auto
+    pub mode: Option<WorkspaceMode>,
+    /// The source directory or repository, resolved against the flow file.
+    /// Omitted, a `git-worktree` workspace branches the repository the CALLER
+    /// is standing in - which is where every step ran before v1.2 - and a
+    /// `directory` workspace requires this key outright.
+    pub root: Option<String>,
+    /// git-worktree only: the ref to branch from. Omitted means the repository's
+    /// HEAD at the moment the run starts.
+    pub base: Option<String>,
+    /// auto (default) | keep
+    pub cleanup: Option<WorkspaceCleanup>,
+    /// Allow a flow whose static shape lets two potential writers into the same
+    /// workspace at once. Off by default, and recorded as an unsafe override.
+    pub allow_concurrent_writers: Option<bool>,
+    /// Compare the workspace against its last durable checkpoint on resume.
+    /// Defaults to true.
+    pub verify_on_resume: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceMode {
+    /// The caller's cwd, exactly as every release before 1.2.
+    #[default]
+    Current,
+    /// A directory the user names. sfh does not create or delete it.
+    Directory,
+    /// A Git worktree sfh creates, owns and may clean up.
+    GitWorktree,
+    /// Decide from the flow's static shape alone (see `workspace_plan`).
+    Auto,
+}
+
+impl WorkspaceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceMode::Current => "current",
+            WorkspaceMode::Directory => "directory",
+            WorkspaceMode::GitWorktree => "git-worktree",
+            WorkspaceMode::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceCleanup {
+    /// Remove an sfh-owned worktree after a clean, successful run. Never
+    /// discards uncommitted work, and never deletes the branch.
+    #[default]
+    Auto,
+    /// Keep it whatever happened.
+    Keep,
+}
+
+impl WorkspaceCleanup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceCleanup::Auto => "auto",
+            WorkspaceCleanup::Keep => "keep",
+        }
+    }
+}
+
+impl WorkspaceConfig {
+    pub fn mode(&self) -> WorkspaceMode {
+        self.mode.unwrap_or_default()
+    }
+    pub fn cleanup(&self) -> WorkspaceCleanup {
+        self.cleanup.unwrap_or_default()
+    }
+    pub fn allow_concurrent_writers(&self) -> bool {
+        self.allow_concurrent_writers.unwrap_or(false)
+    }
+    pub fn verify_on_resume(&self) -> bool {
+        self.verify_on_resume.unwrap_or(true)
+    }
+}
+
+/// One named context. Exactly one of `file`, `inline` or `template` must be
+/// set: a source with two origins has no single answer to "where did this text
+/// come from", which is the whole point of naming it.
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSource {
+    /// A path, relative to the flow file unless absolute.
+    pub file: Option<String>,
+    /// Literal text written in the flow.
+    pub inline: Option<String>,
+    /// A template rendered with the same variables a prompt sees.
+    pub template: Option<String>,
+    /// Refuse this source if it exceeds this many characters.
+    pub max_chars: Option<u64>,
+    /// Explicit opt-in to reading a file outside the flow directory and the
+    /// resolved workspace. Recorded as an unsafe override wherever it is used.
+    pub allow_external: Option<bool>,
+    /// Tolerate a missing file instead of failing the step.
+    pub optional: Option<bool>,
+}
+
+impl ContextSource {
+    /// `Err` when the source is not exactly one thing.
+    pub fn kind(&self) -> Result<&'static str, String> {
+        match (
+            self.file.is_some(),
+            self.inline.is_some(),
+            self.template.is_some(),
+        ) {
+            (true, false, false) => Ok("file"),
+            (false, true, false) => Ok("inline"),
+            (false, false, true) => Ok("template"),
+            (false, false, false) => {
+                Err("needs exactly one of file:, inline: or template: (it has none)".into())
+            }
+            _ => Err(
+                "needs exactly one of file:, inline: or template: (it has more than one)".into(),
+            ),
+        }
+    }
+}
+
+/// How a step's assembled context reaches the tool.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextDelivery {
+    /// sfh puts a deterministic, delimited bundle in front of the prompt.
+    #[default]
+    Prepend,
+    /// The prompt is untouched; the bundle is a file the prompt can point at
+    /// with `{{context_file}}`.
+    File,
+}
+
+impl ContextDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextDelivery::Prepend => "prepend",
+            ContextDelivery::File => "file",
+        }
+    }
+}
+
+/// What `workspace:` resolves to for a given flow, decided without running
+/// anything. `plan`, `preflight` and the engine all read the same answer.
+#[derive(Clone, Debug)]
+pub struct WorkspacePlan {
+    /// What the flow asked for, before `auto` was resolved.
+    pub declared: WorkspaceMode,
+    /// What it resolved to.
+    pub resolved: WorkspaceMode,
+    pub root: Option<String>,
+    pub base: Option<String>,
+    pub cleanup: WorkspaceCleanup,
+    pub verify_on_resume: bool,
+    pub allow_concurrent_writers: bool,
+    /// True when a state root is required, because sfh would create something.
+    pub needs_state_root: bool,
+    pub potential_writers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl WorkspacePlan {
+    /// How many workspaces sfh will create for the whole run. One per run at
+    /// most in v1.2 - not one per step, and not one per visit.
+    pub fn managed_count(&self) -> u32 {
+        u32::from(self.resolved == WorkspaceMode::GitWorktree)
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "declared_mode": self.declared.as_str(),
+            "mode": self.resolved.as_str(),
+            "root": self.root,
+            "base": self.base,
+            "cleanup": self.cleanup.as_str(),
+            "verify_on_resume": self.verify_on_resume,
+            "allow_concurrent_writers": self.allow_concurrent_writers,
+            "managed_workspaces": self.managed_count(),
+            "potential_writers": self.potential_writers,
+            "warnings": self.warnings,
+        })
+    }
+}
+
+/// What each step would be handed, before anything runs.
+#[derive(Clone, Debug, Default)]
+pub struct ContextPlan {
+    /// (step id, context names, delivery)
+    pub steps: Vec<(String, Vec<String>, ContextDelivery)>,
+    /// (name, kind, source description, static size if knowable)
+    pub sources: Vec<(String, String, String, Option<u64>)>,
+    pub max_context_chars: Option<u64>,
+}
+
+impl ContextPlan {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "max_context_chars": self.max_context_chars,
+            "sources": self.sources.iter().map(|(name, kind, source, chars)| serde_json::json!({
+                "name": name, "kind": kind, "source": source, "chars": chars,
+            })).collect::<Vec<_>>(),
+            "steps": self.steps.iter().map(|(id, names, delivery)| serde_json::json!({
+                "step": id, "context": names, "context_delivery": delivery.as_str(),
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// How much of each ceiling `on_budget` keeps back for the landing chain. The
@@ -219,10 +735,92 @@ pub struct Step {
     pub fallback: Vec<String>,
     /// Accept an empty final message instead of failing the step.
     pub allow_empty: Option<bool>,
+    /// What this step touches: read | workspace | external | unknown. Omitted,
+    /// it is inferred from `access:` for a preset step and is `unknown` for a
+    /// custom `cmd:` - the conservative direction, since an undeclared command
+    /// may well write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Effects>,
+    /// Names from the flow's `contexts:` map, in the order they should appear.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    /// prepend (default) | file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_delivery: Option<ContextDelivery>,
+    /// Overrides `defaults.replay` for this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Replay>,
+    /// Overrides `defaults.exit_conflict` for this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_conflict: Option<ExitConflict>,
+    /// What this step's own exit codes mean. An exit code with no entry here
+    /// keeps its historical reading exactly, so declaring one code says
+    /// nothing about the others.
+    #[serde(
+        default,
+        deserialize_with = "de_outcomes",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub outcomes: BTreeMap<i32, Outcome>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub env_remove: Vec<String>,
+}
+
+impl Step {
+    /// The declared effects, or the inference the spec fixes for an omitted
+    /// declaration. sfh never guesses from the prompt or the command text -
+    /// only from what the flow already says.
+    pub fn effects(&self, flow: &Flow) -> Effects {
+        if let Some(e) = self.effects {
+            return e;
+        }
+        // A group is exactly as effectful as its most effectful member.
+        if let Some(children) = &self.parallel {
+            return children
+                .iter()
+                .map(|c| c.effects(flow))
+                .max_by_key(|e| match e {
+                    Effects::Read => 0,
+                    Effects::Workspace => 1,
+                    Effects::External => 2,
+                    Effects::Unknown => 3,
+                })
+                .unwrap_or(Effects::Read);
+        }
+        if self.cmd.is_some() {
+            // An undeclared command is a potential writer. Assuming otherwise
+            // is the assumption that silently loses somebody's work.
+            return Effects::Unknown;
+        }
+        match crate::leaf::effective(flow, self).map(|e| e.access) {
+            Ok(crate::preset::Access::Read) => Effects::Read,
+            Ok(_) => Effects::Workspace,
+            Err(_) => Effects::Unknown,
+        }
+    }
+
+    /// The replay policy in force for this step.
+    pub fn replay_policy(&self, flow: &Flow) -> ReplayPolicy {
+        self.replay
+            .and_then(|r| r.unfinished)
+            .or_else(|| flow.defaults.replay.and_then(|r| r.unfinished))
+            .unwrap_or_default()
+    }
+
+    pub fn context_delivery(&self) -> ContextDelivery {
+        self.context_delivery.unwrap_or_default()
+    }
+
+    /// What this step declares about exit-code/protocol disagreement, or `None`
+    /// when it declares nothing and the adapter's own default should stand.
+    /// Kept as an Option so "the flow said nothing" and "the flow said fail"
+    /// are distinguishable: only the latter overrides an adapter that is
+    /// documented to get its exit codes wrong.
+    pub fn exit_conflict(&self, flow: &Flow) -> Option<ExitConflict> {
+        self.exit_conflict.or(flow.defaults.exit_conflict)
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -294,6 +892,27 @@ pub struct Route {
     /// file that is missing (or a step that has none, like a fan-out group)
     /// never matches.
     pub when_stderr_matches: Option<String>,
+    /// Exact match against the label an `outcomes:` entry gave this step.
+    ///
+    /// The deterministic alternative to reading a verdict out of prose. A
+    /// `when_last_line_is: PASS` rule depends on the model ending its answer
+    /// on exactly that token and nothing else - one trailing space, one closing
+    /// remark, and the run goes to stuck for a formatting reason. A label comes
+    /// from the flow's own exit-code table, so it is whatever the flow said it
+    /// was. A step with no matching outcome has no label and never matches.
+    ///
+    /// `skip_serializing_if`, unlike the `when_*` fields that predate it: the
+    /// effective-config fingerprint is a serialization of `Flow`, so a field
+    /// that emits `null` for every rule changes the fingerprint of every flow
+    /// that has a `route:` at all - and upgrading sfh would make every existing
+    /// run dir unresumable ("a different effective configuration now") for no
+    /// reason but the upgrade. Same guarantee as `Step::outcomes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_label_is: Option<String>,
+    /// Equality against the outcome class sfh recorded: complete | continue |
+    /// retryable | fail. `skip_serializing_if` for the reason above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_outcome_is: Option<OutcomeResult>,
     /// Count the members of THIS step's fan-out that reported a given verdict.
     /// Only on a `parallel:`/`foreach:` step, and only alone in its rule (see
     /// validate). See `WhenMembers`.
@@ -312,6 +931,8 @@ impl Route {
             && self.when_last_line_matches.is_none()
             && self.when_exit.is_none()
             && self.when_stderr_matches.is_none()
+            && self.when_label_is.is_none()
+            && self.when_outcome_is.is_none()
             && self.when_members.is_none()
     }
 }
@@ -355,6 +976,13 @@ pub const TERMINALS: [&str; 3] = ["end", "fail", "stuck"];
 
 pub const TOOLS: [&str; 7] = ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"];
 
+/// Concurrency ceiling for a fan-out when neither the step nor defaults says.
+/// Mirrors the value the engine applies; kept here so static analysis and
+/// execution cannot drift apart about how many writers can be in flight.
+pub const DEFAULT_MAX_PARALLEL: u32 = 4;
+/// Times one step may be entered when neither the step nor defaults says.
+pub const DEFAULT_MAX_VISITS: u32 = 5;
+
 /// One concrete way a flow can launch a preset tool, as collected by
 /// `Flow::resolved_tools`. Ordered so a BTreeSet dedupes and sorts it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -363,15 +991,112 @@ pub struct ResolvedTool {
     pub bin: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The access level this launch asks for. Part of the identity because the
+    /// same tool at read and at full is two different things to report on, and
+    /// preflight has to name both.
+    pub access: Vec<String>,
 }
 
 pub fn load(path: &Path) -> Result<Flow, String> {
+    load_with_overlays(path, &[])
+}
+
+/// One profile as an overlay file writes it.
+///
+/// This is NOT `Profile`. An overlay has to distinguish "the file did not
+/// mention args" from "the file set args to the empty list", and a `Vec` with
+/// `#[serde(default)]` cannot: both deserialize to `vec![]`, so an overlay that
+/// said nothing about `args` would silently erase the flow's own. Every field
+/// here is an `Option`, and only the ones actually present are applied.
+#[derive(Deserialize, Serialize, Default, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileOverlay {
+    pub tool: Option<String>,
+    pub bin: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub access: Option<String>,
+    pub agent: Option<String>,
+    /// Present: replaces the profile's args entirely. Absent: keeps them.
+    pub args: Option<Vec<String>>,
+    pub cwd: Option<String>,
+    pub timeout_sec: Option<u64>,
+    /// Merged key by key. Removing a key is out of scope for v1.2.
+    pub env: Option<BTreeMap<String, String>>,
+}
+
+impl ProfileOverlay {
+    fn apply_to(&self, p: &mut Profile) {
+        macro_rules! scalar {
+            ($($f:ident),*) => { $( if let Some(v) = &self.$f { p.$f = Some(v.clone()); } )* };
+        }
+        scalar!(tool, bin, model, effort, access, agent, cwd);
+        if let Some(v) = self.timeout_sec {
+            p.timeout_sec = Some(v);
+        }
+        if let Some(args) = &self.args {
+            p.args = args.clone();
+        }
+        if let Some(env) = &self.env {
+            for (k, v) in env {
+                p.env.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
+/// Load a flow, then apply profile overlay files in order.
+///
+/// The point is a flow that stays portable: a shared flow says `use: judge`,
+/// and whoever runs it decides which CLI and which model a `judge` is, without
+/// editing (and therefore re-fingerprinting) the flow. Writing `tool:` straight
+/// into a step keeps working exactly as before - an overlay file is never
+/// required.
+///
+/// Precedence, highest first:
+///
+/// ```text
+/// step field  >  --profiles overlay  >  flow inline profile  >  ~/.sfh/profiles.yaml  >  defaults
+/// ```
+///
+/// Later `--profiles` files win over earlier ones, so a caller can layer a
+/// machine-local file on top of a team-shared one.
+pub fn load_with_overlays(path: &Path, overlays: &[std::path::PathBuf]) -> Result<Flow, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut flow: Flow = yaml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     merge_global_profiles(&mut flow)?;
+    apply_profile_overlays(&mut flow, overlays)?;
     validate(&flow, false)?;
     Ok(flow)
+}
+
+/// Read and apply overlay files. An overlay naming a profile the flow does not
+/// have creates it: that is how a flow can declare `use: judge` with no inline
+/// definition at all and let the caller supply one.
+pub fn apply_profile_overlays(
+    flow: &mut Flow,
+    overlays: &[std::path::PathBuf],
+) -> Result<(), String> {
+    for file in overlays {
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| format!("cannot read profile overlay {}: {e}", file.display()))?;
+        let parsed = yaml::from_str::<OverlayFile>(&text)
+            .map_err(|e| format!("{}: invalid profile overlay: {e}", file.display()))?;
+        for (name, overlay) in parsed.profiles {
+            overlay.apply_to(flow.profiles.entry(name).or_default());
+        }
+    }
+    Ok(())
+}
+
+/// An overlay file. `profiles:` may be the top level or nested under a
+/// `profiles:` key, because both spellings are what people actually write.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct OverlayFile {
+    #[serde(default)]
+    profiles: BTreeMap<String, ProfileOverlay>,
 }
 
 /// Load a flow for a --resume of an UNCHANGED run created by sfh 0.x, which
@@ -524,6 +1249,404 @@ impl Flow {
         Ok(out)
     }
 
+    /// The workspace decision, made from the flow's static shape alone.
+    ///
+    /// `auto` never reasons about what the work MEANS. It counts declared
+    /// effects: a flow whose every step only reads needs no workspace of its
+    /// own, and a flow with any potential writer gets exactly one managed
+    /// worktree for the whole run - not one per step, not one per visit.
+    pub fn workspace_plan(&self) -> Result<WorkspacePlan, String> {
+        let cfg = self.workspace.as_ref();
+        let declared = cfg.map(|c| c.mode()).unwrap_or(WorkspaceMode::Current);
+        let mut warnings = Vec::new();
+        let writers = self.potential_writers();
+        let resolved = match declared {
+            WorkspaceMode::Auto => {
+                if writers.is_empty() {
+                    // Nothing can write, so nothing needs isolating.
+                    WorkspaceMode::Current
+                } else {
+                    WorkspaceMode::GitWorktree
+                }
+            }
+            other => other,
+        };
+        // Two potential writers that can be in flight at once share one
+        // workspace, and sfh has no way to reconcile what they each did. The
+        // default is to refuse rather than to interleave them and hope.
+        //
+        // ONLY for a flow that opted into a workspace. A flow with no
+        // `workspace:` key gets no workspace from sfh at all - every step runs
+        // in the caller's cwd exactly as it did before v1.2 - so sfh has no
+        // basis to start refusing flows that have always worked. Introducing a
+        // new refusal for existing files is precisely what the compatibility
+        // rule forbids.
+        let concurrent = if cfg.is_some() {
+            self.concurrent_writer_groups()
+        } else {
+            Vec::new()
+        };
+        let allow_concurrent = cfg.map(|c| c.allow_concurrent_writers()).unwrap_or(false);
+        if !concurrent.is_empty() {
+            if allow_concurrent {
+                warnings.push(format!(
+                    "workspace.allow_concurrent_writers is set: {} run potential writers concurrently in ONE workspace, and sfh cannot tell their changes apart",
+                    concurrent.join(", ")
+                ));
+            } else {
+                return Err(format!(
+                    "step(s) {} fan out potential writers that would share one workspace at the same time. Declare `effects: read` on the members that only read, split the writers into sequential steps, or set `workspace.allow_concurrent_writers: true` to accept that sfh cannot separate their changes.",
+                    concurrent.join(", ")
+                ));
+            }
+        }
+        if resolved == WorkspaceMode::Directory && cfg.and_then(|c| c.root.as_ref()).is_none() {
+            return Err(
+                "workspace.mode: directory needs workspace.root to say which directory".into(),
+            );
+        }
+        if declared == WorkspaceMode::Auto && !writers.is_empty() {
+            warnings.push(format!(
+                "workspace.mode: auto resolved to one managed git worktree because {} may write",
+                writers.join(", ")
+            ));
+        }
+        Ok(WorkspacePlan {
+            declared,
+            resolved,
+            root: cfg.and_then(|c| c.root.clone()),
+            base: cfg.and_then(|c| c.base.clone()),
+            cleanup: cfg.map(|c| c.cleanup()).unwrap_or_default(),
+            verify_on_resume: cfg.map(|c| c.verify_on_resume()).unwrap_or(true),
+            allow_concurrent_writers: allow_concurrent,
+            needs_state_root: resolved == WorkspaceMode::GitWorktree,
+            potential_writers: writers,
+            warnings,
+        })
+    }
+
+    /// What every step's context resolves to, without reading a single byte of
+    /// a step's OUTPUT: only sources that are statically knowable are sized
+    /// here, so `plan` and `preflight` stay side-effect free.
+    pub fn context_plan(&self, flow_path: &Path) -> Result<ContextPlan, String> {
+        let flow_dir = flow_path.parent().unwrap_or(Path::new("."));
+        let mut plan = ContextPlan {
+            max_context_chars: self.defaults.max_context_chars,
+            ..Default::default()
+        };
+        for (name, source) in &self.contexts {
+            let kind = source
+                .kind()
+                .map_err(|e| format!("contexts.{name}: {e}"))?
+                .to_string();
+            let (described, chars) = match kind.as_str() {
+                "file" => {
+                    let raw = source.file.clone().unwrap_or_default();
+                    let resolved = crate::context::resolve_source_path(flow_dir, &raw);
+                    let size = std::fs::metadata(&resolved).ok().map(|m| m.len());
+                    (raw, size)
+                }
+                "inline" => (
+                    "<inline>".to_string(),
+                    source.inline.as_ref().map(|t| t.chars().count() as u64),
+                ),
+                // A template's size depends on run data that does not exist yet.
+                _ => ("<template>".to_string(), None),
+            };
+            plan.sources.push((name.clone(), kind, described, chars));
+        }
+        let mut record = |s: &Step| -> Result<(), String> {
+            for name in &s.context {
+                if !self.contexts.contains_key(name) {
+                    return Err(format!(
+                        "step '{}' asks for context '{name}', which is not defined in contexts:",
+                        s.id
+                    ));
+                }
+            }
+            if !s.context.is_empty() || s.context_delivery.is_some() {
+                plan.steps
+                    .push((s.id.clone(), s.context.clone(), s.context_delivery()));
+            }
+            Ok(())
+        };
+        for s in &self.steps {
+            record(s)?;
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    record(c)?;
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Step ids that may change the workspace or the world.
+    pub fn potential_writers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in &self.steps {
+            match &s.parallel {
+                Some(children) => {
+                    for c in children {
+                        if c.effects(self).is_potential_writer() {
+                            out.push(format!("{}.{}", s.id, c.id));
+                        }
+                    }
+                }
+                None => {
+                    if s.effects(self).is_potential_writer() {
+                        out.push(s.id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Fan-out steps that would put more than one potential writer in flight at
+    /// once. A `foreach:` over a writing body counts whenever its concurrency
+    /// ceiling is above one, because the item list is not known statically.
+    fn concurrent_writer_groups(&self) -> Vec<String> {
+        let cap = |s: &Step| {
+            s.max_parallel
+                .or(self.defaults.max_parallel)
+                .unwrap_or(DEFAULT_MAX_PARALLEL)
+        };
+        let mut out = Vec::new();
+        for s in &self.steps {
+            if let Some(children) = &s.parallel {
+                let writers = children
+                    .iter()
+                    .filter(|c| c.effects(self).is_potential_writer())
+                    .count();
+                if writers > 1 && cap(s) > 1 {
+                    out.push(s.id.clone());
+                }
+            } else if s.foreach.is_some() && s.effects(self).is_potential_writer() && cap(s) > 1 {
+                out.push(s.id.clone());
+            }
+        }
+        out
+    }
+
+    /// Every step in the flow, top-level and parallel children alike, paired
+    /// with a name a human (or a warning string) can be pointed at: a
+    /// top-level id alone, or `"{parent}.{child}"` for a member of a
+    /// `parallel:` group - the same form `potential_writers` already uses to
+    /// name a writer inside a fan-out.
+    ///
+    /// The shared walk every flow-wide step scan in this file should route
+    /// through, so a scan cannot silently regress into looking only at the
+    /// top level. `replay_summary` and `replay_warnings` used to loop over
+    /// `self.steps` alone and never see a parallel child at all - but at
+    /// resume time the engine looks up an unfinished CHILD by id and applies
+    /// THAT CHILD's own `replay:` policy, not its parent's. A fan-out member
+    /// with `effects: external` and `replay.unfinished: rerun` could re-fire a
+    /// side effect on resume while `plan` and `validate --strict` reported
+    /// nothing, because neither scan had ever looked at it.
+    ///
+    /// One level deep only: `validate_step` refuses to nest `parallel:` or
+    /// `foreach:` inside a `parallel:` child ("parallel/foreach cannot be
+    /// nested"), so a child never has grandchildren for this to miss.
+    fn all_steps(&self) -> Vec<(String, &Step)> {
+        let mut out = Vec::new();
+        for s in &self.steps {
+            out.push((s.id.clone(), s));
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    out.push((format!("{}.{}", s.id, c.id), c));
+                }
+            }
+        }
+        out
+    }
+
+    /// A per-step view of the replay policy, plus the cases `validate --strict`
+    /// and `plan` should point at: an effect that reaches outside the workspace
+    /// (or is not declared at all) is the one where re-running after a crash is
+    /// a real decision rather than a formality.
+    ///
+    /// Walks parallel children too (`all_steps`): a resumed run applies a
+    /// child's OWN `replay:` policy to that child, so a summary that stopped
+    /// at the group would show the parent's policy and hide the one that
+    /// actually governs the child on resume.
+    pub fn replay_summary(&self) -> serde_json::Value {
+        let mut steps = Vec::new();
+        for (name, s) in self.all_steps() {
+            let effects = s.effects(self);
+            let policy = s.replay_policy(self);
+            steps.push(serde_json::json!({
+                "step": name,
+                "effects": effects.as_str(),
+                "unfinished": policy.as_str(),
+                "risky": policy == ReplayPolicy::Rerun
+                    && matches!(effects, Effects::External | Effects::Unknown),
+            }));
+        }
+        serde_json::json!({
+            "default": self
+                .defaults
+                .replay
+                .and_then(|r| r.unfinished)
+                .unwrap_or_default()
+                .as_str(),
+            "steps": steps,
+        })
+    }
+
+    /// Warnings `validate --strict` emits about replay choices. Each names a
+    /// step whose unfinished work would be re-run even though the flow says it
+    /// may have already reached outside the workspace.
+    ///
+    /// Walks parallel children too (`all_steps`), and names a flagged child
+    /// `parent.child`: a child's `replay:` is resolved and applied
+    /// independently of its group on resume (see `all_steps`), so a
+    /// rerun-on-external child hiding inside a fan-out is exactly the case
+    /// this warning exists to catch, not an exception to it.
+    pub fn replay_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, s) in self.all_steps() {
+            let effects = s.effects(self);
+            if s.replay_policy(self) == ReplayPolicy::Rerun
+                && matches!(effects, Effects::External | Effects::Unknown)
+            {
+                out.push(format!(
+                    "step '{name}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. Set replay.unfinished: stuck (or fail) if that is not safe.",
+                    effects.as_str()
+                ));
+            }
+        }
+        out
+    }
+
+    /// Every explicitly accepted risk in this flow, by name. Recorded in the
+    /// plan, the execution closure and the run's meta so "we turned that off on
+    /// purpose" is visible after the fact.
+    pub fn unsafe_overrides(&self) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        if self
+            .workspace
+            .as_ref()
+            .map(|w| w.allow_concurrent_writers())
+            .unwrap_or(false)
+        {
+            out.insert("workspace.allow_concurrent_writers".to_string());
+        }
+        for (name, c) in &self.contexts {
+            if c.allow_external.unwrap_or(false) {
+                out.insert(format!("contexts.{name}.allow_external"));
+            }
+        }
+        if self.defaults.exit_conflict == Some(ExitConflict::TrustProtocol) {
+            out.insert(format!(
+                "defaults.exit_conflict={}",
+                ExitConflict::TrustProtocol.as_str()
+            ));
+        }
+        let mut note = |s: &Step| {
+            // Believing a protocol over a non-zero exit is narrow and evidence-
+            // gated, but it is still sfh overriding what the OS reported. It
+            // belongs in the same list a reviewer reads before a paid run.
+            if s.exit_conflict == Some(ExitConflict::TrustProtocol) {
+                out.insert(format!(
+                    "steps.{}.exit_conflict={}",
+                    s.id,
+                    ExitConflict::TrustProtocol.as_str()
+                ));
+            }
+            if s.unsafe_shell_template.unwrap_or(false) {
+                out.insert(format!("steps.{}.unsafe_shell_template", s.id));
+            }
+            if s.allow_dynamic_exec_paths.unwrap_or(false) {
+                out.insert(format!("steps.{}.allow_dynamic_exec_paths", s.id));
+            }
+            if s.allow_access_override.unwrap_or(false) {
+                out.insert(format!("steps.{}.allow_access_override", s.id));
+            }
+        };
+        for s in &self.steps {
+            note(s);
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    note(c);
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Every program a `cmd:` step would launch, mapped to the steps that
+    /// launch it.
+    ///
+    /// `resolved_tools` deliberately skips `cmd:` steps, because tool/fallback
+    /// resolution is a preset concept. That left the programs a flow leans on
+    /// hardest - the verification shell, the build, the test runner - as the
+    /// only ones preflight never looked at, so a `bash` that resolved to
+    /// something entirely different was reported as "no blockers".
+    ///
+    /// argv[0] carrying a `{{...}}` placeholder is not resolvable before the
+    /// run, and is reported as such rather than guessed at.
+    pub fn resolved_commands(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut note = |s: &Step| {
+            let program = match &s.cmd {
+                Some(Cmd::Argv(argv)) => argv.first().cloned(),
+                // A `cmd:` string is handed to the platform shell, never to a
+                // shell the flow chose. Naming it is the point: a flow that
+                // writes bash syntax into a `cmd:` string is running it under
+                // `sh` (or `cmd`), and that is worth seeing before the run.
+                Some(Cmd::Shell(_)) => Some(if cfg!(windows) { "cmd" } else { "sh" }.to_string()),
+                None => None,
+            };
+            if let Some(program) = program {
+                out.entry(program).or_default().insert(s.id.clone());
+            }
+        };
+        for s in &self.steps {
+            note(s);
+            if let Some(children) = &s.parallel {
+                for c in children {
+                    note(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// An upper bound on leaves this flow can execute, from its static shape.
+    ///
+    /// Deliberately a BOUND, not a prediction: a `foreach:` list is data, not
+    /// structure, so its item count is unknown here and is reported as such by
+    /// the `foreach_unbounded` flag rather than guessed at.
+    pub fn static_max_leaves(&self) -> serde_json::Value {
+        let visits = self.defaults.max_visits.unwrap_or(DEFAULT_MAX_VISITS);
+        let mut leaves_per_visit = 0u64;
+        let mut unbounded = Vec::new();
+        for s in &self.steps {
+            let per = match (&s.parallel, &s.foreach) {
+                (Some(children), _) => children.len() as u64,
+                (None, Some(_)) => {
+                    unbounded.push(s.id.clone());
+                    1
+                }
+                _ => 1,
+            };
+            // Each step may be revisited up to its own ceiling.
+            let step_visits = s.max_visits.unwrap_or(visits) as u64;
+            leaves_per_visit = leaves_per_visit.saturating_add(per.saturating_mul(step_visits));
+        }
+        serde_json::json!({
+            "max_leaves": self
+                .defaults
+                .max_total_steps
+                .map(u64::from)
+                .unwrap_or(leaves_per_visit)
+                .min(leaves_per_visit),
+            "bounded_by_max_total_steps": self.defaults.max_total_steps,
+            "foreach_unbounded": unbounded,
+        })
+    }
+
     /// All ids addressable from templates: top-level steps plus parallel children.
     pub fn step_ids(&self) -> HashSet<String> {
         let mut ids = HashSet::new();
@@ -595,6 +1718,7 @@ impl Flow {
                             bin: e.bin,
                             model: e.model,
                             effort: e.effort,
+                            access: vec![e.access.as_str().to_string()],
                         });
                     }
                 }
@@ -606,6 +1730,7 @@ impl Flow {
                                 bin: e.bin,
                                 model: e.model,
                                 effort: e.effort,
+                                access: vec![e.access.as_str().to_string()],
                             });
                         }
                     }
@@ -627,6 +1752,9 @@ impl Flow {
                             .clone()
                             .or_else(|| prof.and_then(|p| p.effort.clone())),
                         tool,
+                        // A compact summarizer only reads the text it was
+                        // handed; it never runs at a step's access level.
+                        access: vec![crate::preset::Access::Read.as_str().to_string()],
                     });
                 }
             }
@@ -1021,6 +2149,75 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         for (i, r) in s.route.iter().enumerate() {
             check_goto(&format!("step '{}' route[{i}]", s.id), &r.goto)?;
             check_when_members(s, i, r)?;
+            // A rule that can never match is not a smaller version of one that
+            // can - it is a branch the author believes in and will never take.
+            // Catching it here costs nothing; catching it at run time costs
+            // whatever the guarded step was about to spend.
+            // A fan-out step's own recorded result is the GROUP composite: one
+            // exit for the whole lap, and no label, because the group ran no
+            // command. An `outcomes:` table on a foreach describes each ITEM's
+            // launch, which is useful and stays allowed - but a label rule
+            // reading the group would simply never match. Members are judged
+            // with when_members.
+            if (s.is_group() || s.is_foreach())
+                && (r.when_label_is.is_some() || r.when_outcome_is.is_some())
+            {
+                return Err(format!(
+                    "step '{}' route[{i}]: when_label_is/when_outcome_is read this step's OWN outcome, and a parallel:/foreach: step has none - it records the group composite. Judge the members with when_members, or put the rule on a single step",
+                    s.id
+                ));
+            }
+            if let Some(want) = &r.when_label_is {
+                if !s
+                    .outcomes
+                    .values()
+                    .any(|o| o.label.as_deref() == Some(want))
+                    && !want.contains("{{")
+                {
+                    return Err(format!(
+                        "step '{}' route[{i}]: when_label_is '{want}' can never match - no outcomes: entry on this step carries that label",
+                        s.id
+                    ));
+                }
+            }
+            if let Some(want) = r.when_outcome_is {
+                if !s.outcomes.values().any(|o| o.result == want) {
+                    return Err(format!(
+                        "step '{}' route[{i}]: when_outcome_is '{}' can never match - no outcomes: entry on this step declares that result",
+                        s.id,
+                        want.as_str()
+                    ));
+                }
+            }
+            // The same "a branch you believe in and will never take" test, for
+            // the predicate that reads the number rather than the meaning.
+            // `when_exit` compares against the NORMALIZED exit, and an
+            // `outcomes:` entry is exactly what rewrites it: a declared success
+            // makes the step's exit 0, and a declared failure on code 0 makes it
+            // 1. So `outcomes: {2: {result: continue}}` + `when_exit: 2` reads a
+            // number the step can no longer report - silently, and only at run
+            // time. A fan-out records the group composite rather than an item's
+            // code, so its table says nothing about the exit this rule sees.
+            if let Some(want) = r.when_exit {
+                if !s.is_group() && !s.is_foreach() {
+                    if let Some(o) = s.outcomes.get(&want) {
+                        if o.result.is_success() && want != 0 {
+                            return Err(format!(
+                                "step '{}' route[{i}]: when_exit {want} can never match - outcomes[{want}] declares '{}', which sfh records as exit 0. Route on when_outcome_is/when_label_is instead",
+                                s.id,
+                                o.result.as_str()
+                            ));
+                        }
+                        if !o.result.is_success() && want == 0 {
+                            return Err(format!(
+                                "step '{}' route[{i}]: when_exit 0 can never match - outcomes[0] declares '{}', which sfh records as exit 1",
+                                s.id,
+                                o.result.as_str()
+                            ));
+                        }
+                    }
+                }
+            }
             for rx in [
                 &r.when_matches,
                 &r.when_last_line_matches,
@@ -1062,9 +2259,6 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             }
         }
     }
-    for warning in branch_fallthrough_warnings(flow) {
-        eprintln!("sfh: warning: {warning}");
-    }
     validate_session_dominance(flow)?;
     Ok(())
 }
@@ -1083,6 +2277,43 @@ fn positive_u32(ctx: &str, value: Option<u32>) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// Everything about an `outcomes:` table that can be settled without running
+/// anything. All of it fails the flow: an exit-code table is the one place a
+/// typo silently changes what "done" means, and a run is exactly the wrong
+/// moment to discover that.
+fn check_outcomes(s: &Step) -> Result<(), String> {
+    for (code, o) in &s.outcomes {
+        let at = format!("step '{}' outcomes[{code}]", s.id);
+        if let Some(label) = &o.label {
+            if label.trim().is_empty() {
+                return Err(format!(
+                    "{at}: label is empty - omit it, or give it a name a route can match"
+                ));
+            }
+            if label.contains('\n') || label.contains('\r') {
+                return Err(format!(
+                    "{at}: label must be a single line, because it is compared for equality and recorded as one field"
+                ));
+            }
+        }
+        // Retrying a success is not a policy, it is a contradiction: the step
+        // would be re-run precisely because it worked.
+        if *code == 0 && o.result == OutcomeResult::Retryable {
+            return Err(format!(
+                "{at}: exit 0 cannot be retryable - a retry answers a failure, and this says the step succeeded"
+            ));
+        }
+        // sfh kills a step it decided to stop; -1 is its own marker for "no
+        // process produced this", not something a command can exit with.
+        if *code < 0 {
+            return Err(format!(
+                "{at}: exit codes below 0 are sfh's own markers for a step that never ran, so a flow cannot declare what they mean"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Everything about a `when_members` rule that can be settled without running
@@ -1118,6 +2349,8 @@ fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
         ("when_last_line_matches", r.when_last_line_matches.is_some()),
         ("when_exit", r.when_exit.is_some()),
         ("when_stderr_matches", r.when_stderr_matches.is_some()),
+        ("when_label_is", r.when_label_is.is_some()),
+        ("when_outcome_is", r.when_outcome_is.is_some()),
     ] {
         if present {
             return Err(format!(
@@ -1178,7 +2411,17 @@ fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
     Ok(())
 }
 
-fn branch_fallthrough_warnings(flow: &Flow) -> Vec<String> {
+/// Warnings that matter when a flow is executed, rather than only under
+/// `validate --strict`. Callers decide whether their output mode should show
+/// them; validation itself stays side-effect free so `run -q` can actually be
+/// quiet and machine-readable commands are not polluted on stderr.
+///
+/// Deliberately walks only `flow.steps`, never parallel children: this reads
+/// `route:` chains between steps, and `validate_step` refuses `route:`
+/// entirely inside a `parallel:` child ("route: is not allowed inside
+/// parallel:"), so there is no child-level routing for a recursive walk to
+/// find.
+pub fn runtime_warnings(flow: &Flow) -> Vec<String> {
     let indices: std::collections::HashMap<&str, usize> = flow
         .steps
         .iter()
@@ -1223,7 +2466,7 @@ fn branch_fallthrough_warnings(flow: &Flow) -> Vec<String> {
 }
 
 pub fn strict_warnings(flow: &Flow) -> Vec<String> {
-    let mut warnings = branch_fallthrough_warnings(flow);
+    let mut warnings = runtime_warnings(flow);
     if flow.api_version.is_none() {
         warnings.push(
             "api_version is omitted; add `api_version: 1` so future format migrations are explicit"
@@ -1239,6 +2482,35 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
         }
     }
 
+    // `outcomes:` labels a step's own RAW exit code. That is deterministic for
+    // a `cmd:` gate or wrapper that chooses its exit status on purpose, but a
+    // bare preset AI CLI exits 0 whether its verdict was PASS or REVISE - the
+    // exit code carries no verdict for outcomes: to read. A when_label_is /
+    // when_outcome_is rule against it still passes the "can this ever match"
+    // check (the label really is declared), and then never fires at run time,
+    // which is silent in exactly the way `validate --strict` exists to catch.
+    // A warning, not a hard error: a wrapper around a preset tool that DOES
+    // encode its verdict in its own exit status is a legitimate use, and sfh
+    // cannot tell that apart from a naive one without running it. Walks
+    // parallel children too (`all_steps`): the same bare-CLI exit code applies
+    // to a fan-out member exactly as it does to a lone step.
+    for (name, s) in flow.all_steps() {
+        if s.outcomes.is_empty() {
+            continue;
+        }
+        if let Some(tool) = flow.step_tool(s) {
+            warnings.push(format!(
+                "step '{name}' declares outcomes: but runs preset tool '{tool}' rather than cmd: - outcomes: reads the process's raw exit code, and a bare AI CLI exits 0 whether its verdict was PASS or REVISE, so it cannot tell them apart here and a when_label_is/when_outcome_is rule against it can pass validate and then never fire. Only a gate command or a wrapper that inspects the answer and picks its own exit status can make outcomes: mean something on this step."
+            ));
+        }
+    }
+
+    // Everything from here reasons about the CONTROL-FLOW GRAPH between
+    // steps - route:/on_error:/on_max_visits: goto chains - which is a
+    // top-level-only concept for the same reason runtime_warnings above is:
+    // a parallel: child can never carry route: (validate_step refuses it), so
+    // it is neither a node this graph needs nor a source of an edge it could
+    // add.
     let n = flow.steps.len();
     let index: HashMap<&str, usize> = flow
         .steps
@@ -1659,6 +2931,13 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
     // legacy-era resume restores the pre-1.0 write default instead (load_lenient).
     let require_access = !legacy;
     let sid = &s.id;
+    // Here rather than in `validate`'s top-level loop: a parallel: CHILD runs a
+    // command and honours its own `outcomes:` table exactly like a lone step, so
+    // it needs the same table checks. Checking only the outer loop let a child
+    // declare `0: {result: retryable}` - which forces its clean exit to 1 and
+    // then retries the step precisely because it worked - and a multi-line label
+    // that no route can ever equal, both with a clean `sfh validate`.
+    check_outcomes(s)?;
     positive_u64(&format!("step '{sid}'.timeout_sec"), s.timeout_sec)?;
     positive_u32(&format!("step '{sid}'.max_visits"), s.max_visits)?;
     positive_u64(
@@ -1713,6 +2992,12 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             || !s.env.is_empty()
             || !s.env_remove.is_empty()
             || s.allow_empty.is_some()
+            // A group runs no command of its own, so it has no exit code for a
+            // table to describe. Accepting one silently would leave a
+            // `when_label_is:` rule that validate approves - the label really
+            // is declared - and that can never match at run time, which is the
+            // worst of both answers.
+            || !s.outcomes.is_empty()
         {
             return Err(format!(
                 "step '{sid}': a parallel: group carries only id/max_parallel/route/on_error/max_visits/on_max_visits/notes (tool settings go on the children)"
@@ -1984,7 +3269,8 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
         if let Some(t) = tool {
             if !crate::preset::supports_fork(&t) {
                 return Err(format!(
-                    "step '{sid}': tool '{t}' cannot fork a session headlessly (only claude/opencode/grok/pi can); use continue_from to chain this step serially, or drop fork_from and give it its own context"
+                    "step '{sid}': tool '{t}' cannot fork a session headlessly (only {} can); use continue_from to chain this step serially, or drop fork_from and give it its own context",
+                    crate::preset::forkable_list()
                 ));
             }
         }
@@ -2291,10 +3577,17 @@ mod tests {
 
     #[test]
     fn fork_from_is_rejected_for_tools_without_a_headless_fork() {
-        let e = parse("name: t\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n  - id: b\n    tool: codex\n    access: read\n    fork_from: a\n    prompt: y\n").unwrap_err();
+        // agy, not codex. codex used to stand in for "cannot fork headlessly"
+        // because its fork was TUI-only; `codex exec fork` now exists and the
+        // adapter supports it (P1-07), so codex proves the opposite case. agy
+        // still has no headless fork at all - its adapter says so in as many
+        // words - which is what this test needs.
+        let e = parse("name: t\nsteps:\n  - id: a\n    tool: agy\n    access: read\n    prompt: x\n  - id: b\n    tool: agy\n    access: read\n    fork_from: a\n    prompt: y\n").unwrap_err();
         assert!(e.contains("cannot fork a session headlessly"), "{e}");
         // claude can fork
         assert!(parse("name: t\nsteps:\n  - id: a\n    tool: claude\n    access: read\n    prompt: x\n  - id: b\n    tool: claude\n    access: read\n    fork_from: a\n    prompt: y\n").is_ok());
+        // and so, now, can codex
+        assert!(parse("name: t\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n  - id: b\n    tool: codex\n    access: read\n    fork_from: a\n    prompt: y\n").is_ok());
     }
 
     #[test]
@@ -2669,18 +3962,21 @@ mod tests {
             bin: Some("/opt/claude".into()),
             model: Some("m1".into()),
             effort: Some("high".into()),
+            access: vec!["write".into()],
         }));
         assert!(r.contains(&ResolvedTool {
             tool: "grok".to_string(),
             bin: Some("/opt/grok".into()),
             model: None,
             effort: None,
+            access: vec!["write".into()],
         }));
         assert!(r.contains(&ResolvedTool {
             tool: "codex".to_string(),
             bin: None,
             model: None,
             effort: None,
+            access: vec!["read".into()],
         }));
         // A compact summarizer is a real launch even on a cmd: step.
         assert!(r.contains(&ResolvedTool {
@@ -2688,8 +3984,266 @@ mod tests {
             bin: Some("/opt/oc".into()),
             model: None,
             effort: None,
+            // A compact summarizer only ever reads the text it was handed.
+            access: vec!["read".into()],
         }));
         assert_eq!(r.len(), 4, "{r:?}");
+    }
+
+    /// Upgrading sfh must not, by itself, make every existing run dir
+    /// unresumable.
+    ///
+    /// `--resume` compares an effective-config fingerprint that is a
+    /// serialization of `Flow`. Every field added since v1.2 is therefore
+    /// `skip_serializing_if`-guarded, so a flow that uses none of them
+    /// serializes to exactly the bytes 1.1 produced. This test pins the
+    /// property rather than the bytes: no post-1.1 key may appear in the
+    /// projection of a flow that does not use it.
+    ///
+    /// The fixture carries a `route:` deliberately. A new `Route` field that
+    /// serializes `null` costs nothing to add and breaks EVERY existing run of
+    /// EVERY flow with a route - the widest possible blast radius - and a
+    /// fixture without routes cannot see it (v1.4.0's `when_label_is` /
+    /// `when_outcome_is` shipped unguarded for exactly that reason).
+    #[test]
+    fn a_flow_using_no_v1_2_keys_serializes_as_it_did_before_v1_2() {
+        let f: Flow = yaml::from_str(
+            "name: legacy\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    route:\n      - {when_last_line_is: hi, goto: b}\n      - {goto: end}\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
+        )
+        .unwrap();
+        let json = f.effective_config_json().unwrap();
+        for key in [
+            "\"workspace\"",
+            "\"contexts\"",
+            "\"effects\"",
+            "\"context\"",
+            "\"context_delivery\"",
+            "\"replay\"",
+            "\"max_context_chars\"",
+            "\"exit_conflict\"",
+            "\"outcomes\"",
+            "\"when_label_is\"",
+            "\"when_outcome_is\"",
+        ] {
+            assert!(
+                !json.contains(key),
+                "{key} leaked into the fingerprint of a flow that never used it: {json}"
+            );
+        }
+        // And a flow that DOES use them is a different configuration, which is
+        // the whole point of the fingerprint.
+        let with: Flow = yaml::from_str(
+            "name: legacy\nworkspace: {mode: auto}\nsteps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n  - id: b\n    tool: codex\n    access: read\n    prompt: x\n",
+        )
+        .unwrap();
+        assert_ne!(json, with.effective_config_json().unwrap());
+    }
+
+    #[test]
+    fn exit_conflict_distinguishes_saying_nothing_from_saying_fail() {
+        let f: Flow = yaml::from_str(
+            "defaults: {exit_conflict: trust_protocol}\nsteps:\n  - id: a\n    tool: agy\n    prompt: x\n  - id: b\n    tool: agy\n    prompt: y\n    exit_conflict: fail\n  - id: c\n    tool: pi\n    prompt: z\n",
+        )
+        .unwrap();
+        let by = |id: &str| {
+            let s = f.steps.iter().find(|s| s.id == id).unwrap();
+            s.exit_conflict(&f)
+        };
+        assert_eq!(by("a"), Some(ExitConflict::TrustProtocol));
+        // A step may pull BACK to strict even where defaults loosened, and that
+        // has to be distinguishable from "nothing was declared" - otherwise it
+        // could not override agy's own default either.
+        assert_eq!(by("b"), Some(ExitConflict::Fail));
+        assert_eq!(by("c"), Some(ExitConflict::TrustProtocol));
+
+        let silent: Flow =
+            yaml::from_str("steps:\n  - id: a\n    tool: pi\n    prompt: x\n").unwrap();
+        assert_eq!(silent.steps[0].exit_conflict(&silent), None);
+    }
+
+    #[test]
+    fn an_outcomes_table_is_checked_before_anything_runs() {
+        let ok: Result<Flow, _> = yaml::from_str(
+            "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: acceptance_incomplete}\n      10: {result: retryable}\n    route:\n      - {when_label_is: acceptance_incomplete, goto: end}\n      - {when_outcome_is: retryable, goto: fail}\n      - {goto: end}\n",
+        );
+        assert!(validate(&ok.unwrap(), false).is_ok());
+
+        // Each of these is a rule the author believes in and would never take,
+        // or a table entry that cannot mean what it says.
+        for (why, src) in [
+            (
+                "a label no outcome carries",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: incomplete}\n    route:\n      - {when_label_is: typo, goto: end}\n      - {goto: end}\n",
+            ),
+            (
+                "an outcome class no entry declares",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue}\n    route:\n      - {when_outcome_is: retryable, goto: end}\n      - {goto: end}\n",
+            ),
+            (
+                "retrying a success",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      0: {result: retryable}\n",
+            ),
+            (
+                "an empty label",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: \"  \"}\n",
+            ),
+            (
+                "sfh's own no-process marker",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      -1: {result: complete}\n",
+            ),
+            // A parallel: CHILD honours its own table at run time exactly like a
+            // lone step, so it gets the same checks. It used to get none: the
+            // table below made a clean `echo` exit 1 and then retried it
+            // *because* it had worked, and `sfh validate` said OK.
+            (
+                "a child retrying its own success",
+                "steps:\n  - id: fan\n    parallel:\n      - id: a\n        cmd: [\"echo\", \"hi\"]\n        outcomes:\n          0: {result: retryable}\n",
+            ),
+            (
+                "a child's multi-line label",
+                "steps:\n  - id: fan\n    parallel:\n      - id: a\n        cmd: [\"echo\", \"hi\"]\n        outcomes:\n          2: {result: continue, label: \"two\\nlines\"}\n",
+            ),
+            // `when_exit` reads the NORMALIZED exit, and an outcomes: entry is
+            // what normalizes it - so these two rules read a number the step can
+            // no longer report.
+            (
+                "when_exit on a code a declared success rewrites to 0",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: more}\n    route:\n      - {when_exit: 2, goto: end}\n      - {goto: end}\n",
+            ),
+            (
+                "when_exit 0 on a code a declared failure rewrites to 1",
+                "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      0: {result: fail}\n    route:\n      - {when_exit: 0, goto: end}\n      - {goto: end}\n",
+            ),
+        ] {
+            let f: Flow = yaml::from_str(src).expect("fixture parses");
+            assert!(validate(&f, false).is_err(), "{why} must be refused");
+        }
+
+        // ...but a declared failure leaves its own code alone, so reading it
+        // back with when_exit is exactly right and stays allowed.
+        let retryable: Flow = yaml::from_str(
+            "steps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    on_error: continue\n    outcomes:\n      10: {result: retryable}\n    route:\n      - {when_exit: 10, goto: end}\n      - {goto: end}\n",
+        )
+        .expect("fixture parses");
+        assert!(validate(&retryable, false).is_ok());
+    }
+
+    #[test]
+    fn an_outcomes_key_means_the_same_written_as_a_number_or_a_string() {
+        // A program generating a flow will most naturally emit JSON, where
+        // object keys are always strings - and YAML is a superset of JSON, so
+        // sfh parses that file. The two spellings have to agree.
+        let numeric: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      2: {result: continue, label: more}\n",
+        )
+        .unwrap();
+        let quoted: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      \"2\": {result: continue, label: more}\n",
+        )
+        .unwrap();
+        let json: Flow = yaml::from_str(
+            r#"{"steps":[{"id":"a","cmd":["echo","hi"],"outcomes":{"2":{"result":"continue","label":"more"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(numeric.steps[0].outcomes, quoted.steps[0].outcomes);
+        assert_eq!(numeric.steps[0].outcomes, json.steps[0].outcomes);
+        assert_eq!(
+            numeric.steps[0].outcomes.get(&2).unwrap().label.as_deref(),
+            Some("more")
+        );
+        // Two spellings of one code is a contradiction, not a merge.
+        assert!(yaml::from_str::<Flow>(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      2: {result: continue}\n      \"2\": {result: fail}\n",
+        )
+        .is_err());
+        // And a key that is not an exit code says so in those words.
+        let e = match yaml::from_str::<Flow>(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      ok: {result: continue}\n",
+        ) {
+            Ok(_) => panic!("a non-numeric outcomes key must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("is not an exit code"), "{e}");
+    }
+
+    #[test]
+    fn a_fan_out_step_has_no_outcome_of_its_own_to_route_on() {
+        // The trap this closes: the group records a COMPOSITE exit and no
+        // label, so a `when_label_is` rule whose label really is declared
+        // passes the "can it ever match" check and then never fires. Both
+        // halves of the answer were wrong at once.
+        let group = parse(
+            "name: t\nsteps:\n  - id: fan\n    outcomes:\n      2: {result: continue, label: partial}\n    parallel:\n      - {id: a, cmd: [\"echo\", \"hi\"]}\n",
+        )
+        .unwrap_err();
+        assert!(group.contains("carries only"), "{group}");
+
+        // A foreach's table describes each ITEM's launch, which is useful, so
+        // the table stays - only the rule that reads the group is refused.
+        let rule = parse(
+            "name: t\nvars: {i: \"a\"}\nsteps:\n  - id: each\n    foreach: {from: \"{{vars.i}}\", split: lines}\n    cmd: [\"echo\", \"{{item}}\"]\n    outcomes:\n      2: {result: continue, label: partial}\n    route:\n      - {when_label_is: partial, goto: end}\n      - {goto: end}\n",
+        )
+        .unwrap_err();
+        assert!(rule.contains("group composite"), "{rule}");
+        assert!(parse(
+            "name: t\nvars: {i: \"a\"}\nsteps:\n  - id: each\n    foreach: {from: \"{{vars.i}}\", split: lines}\n    cmd: [\"echo\", \"{{item}}\"]\n    outcomes:\n      2: {result: continue, label: partial}\n",
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn an_outcome_class_says_only_whether_to_carry_on_retry_or_stop() {
+        // The vocabulary stays tiny and domain-free on purpose: everything
+        // domain-shaped belongs in the label, which sfh never interprets.
+        assert!(OutcomeResult::Complete.is_success());
+        assert!(OutcomeResult::Continue.is_success());
+        assert!(!OutcomeResult::Retryable.is_success());
+        assert!(!OutcomeResult::Fail.is_success());
+        assert_eq!(OutcomeResult::default(), OutcomeResult::Fail);
+        for r in [
+            OutcomeResult::Complete,
+            OutcomeResult::Continue,
+            OutcomeResult::Retryable,
+            OutcomeResult::Fail,
+        ] {
+            let round: OutcomeResult = yaml::from_str(r.as_str()).expect("round-trips");
+            assert_eq!(round, r);
+        }
+    }
+
+    #[test]
+    fn trusting_a_protocol_over_an_exit_code_is_listed_as_an_override() {
+        let f: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    tool: pi\n    prompt: x\n    exit_conflict: trust_protocol\n  - id: b\n    tool: pi\n    prompt: y\n    exit_conflict: fail\n",
+        )
+        .unwrap();
+        let o = f.unsafe_overrides();
+        assert!(
+            o.contains(&"steps.a.exit_conflict=trust_protocol".to_string()),
+            "{o:?}"
+        );
+        // Declaring the strict default is not an override of anything.
+        assert!(!o.iter().any(|s| s.starts_with("steps.b.")), "{o:?}");
+    }
+
+    #[test]
+    fn every_program_a_cmd_step_launches_is_visible_to_preflight() {
+        let f: Flow = yaml::from_str(
+            "steps:\n  - id: verify\n    cmd: [\"bash\", \"-lc\", \"cargo test\"]\n  - id: fan\n    parallel:\n      - id: fmt\n        cmd: [\"bash\", \"-lc\", \"cargo fmt --check\"]\n      - id: node\n        cmd: [\"pnpm\", \"test\"]\n  - id: agent\n    tool: codex\n    prompt: x\n  - id: line\n    cmd: \"echo hi\"\n",
+        )
+        .unwrap();
+        let c = f.resolved_commands();
+        // Both steps that launch bash are attributed to it, including the one
+        // nested in a parallel group - the shape that hid a bad `bin` before.
+        assert_eq!(
+            c.get("bash").map(|s| s.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["fmt".to_string(), "verify".to_string()])
+        );
+        assert!(c.contains_key("pnpm"));
+        // A preset step launches no command, and a `cmd:` STRING is run by the
+        // platform shell rather than by anything the flow named.
+        assert!(!c.contains_key("codex"));
+        assert!(c.contains_key(if cfg!(windows) { "cmd" } else { "sh" }));
     }
 
     #[test]
@@ -2735,7 +4289,7 @@ mod tests {
             "steps:\n  - id: choose\n    cmd: echo verdict\n    route:\n      - {when_last_line_is: MET, goto: met}\n      - {when_last_line_is: UNMET, goto: unmet}\n      - {when_last_line_is: UNCLEAR, goto: unclear}\n  - id: met\n    cmd: echo met\n  - id: unmet\n    cmd: echo unmet\n    route: [{goto: end}]\n  - id: unclear\n    cmd: echo unclear\n",
         )
         .unwrap();
-        let warnings = branch_fallthrough_warnings(&flow);
+        let warnings = runtime_warnings(&flow);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("step 'met'"), "{warnings:?}");
         assert!(warnings[0].contains("step 'unmet'"), "{warnings:?}");
@@ -2982,5 +4536,145 @@ steps:
         let warnings = strict_warnings(&flow).join("\n");
         assert!(warnings.contains("api_version is omitted"), "{warnings}");
         assert!(warnings.contains("no catch-all"), "{warnings}");
+    }
+
+    #[test]
+    fn replay_warnings_reaches_a_parallel_childs_own_rerun_policy() {
+        // The engine looks up an unfinished CHILD by id at resume time and
+        // applies THAT CHILD's own replay: policy, never its parent's - so a
+        // flow whose defaults are safe but whose child opts back into rerun on
+        // an external effect used to pass `plan` and `validate --strict` in
+        // total silence and then re-fire the side effect on the very next
+        // resume. This is the exact case the warning exists to catch.
+        let flow: Flow = yaml::from_str(
+            "defaults:\n  replay: {unfinished: stuck}\nsteps:\n  - id: fan\n    parallel:\n      - id: send\n        cmd: [\"external-send\"]\n        effects: external\n        replay: {unfinished: rerun}\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        let warnings = flow.replay_warnings();
+        // Only the child is flagged: the group's OWN policy is the safe
+        // `stuck` it inherits from defaults.replay, and must not also appear.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("step 'fan.send'"), "{warnings:?}");
+        assert!(warnings[0].contains("effects: external"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("replay.unfinished: rerun"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn replay_summary_lists_a_parallel_child_as_parent_dot_child() {
+        let flow: Flow = yaml::from_str(
+            "defaults:\n  replay: {unfinished: stuck}\nsteps:\n  - id: fan\n    parallel:\n      - id: send\n        cmd: [\"external-send\"]\n        effects: external\n        replay: {unfinished: rerun}\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        let summary = flow.replay_summary();
+        let steps = summary["steps"].as_array().expect("steps is an array");
+        // Both the group (its own composite policy) and the child (the policy
+        // the engine actually consults for THAT step id on resume) are
+        // listed - dropping either would hide a real decision from `plan`.
+        let names: Vec<&str> = steps.iter().filter_map(|s| s["step"].as_str()).collect();
+        assert!(names.contains(&"fan"), "{names:?}");
+        assert!(names.contains(&"fan.send"), "{names:?}");
+
+        let child = steps
+            .iter()
+            .find(|s| s["step"].as_str() == Some("fan.send"))
+            .expect("child listed in replay summary");
+        assert_eq!(child["unfinished"].as_str(), Some("rerun"));
+        assert_eq!(child["effects"].as_str(), Some("external"));
+        assert_eq!(child["risky"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn an_outcomes_key_must_be_written_in_the_canonical_form_the_schema_requires() {
+        // schema/flow.schema.json constrains this key to `^(0|[1-9][0-9]*)$` -
+        // plain decimal, no sign, no leading zero, no surrounding space. The
+        // runtime used to trim the string before parsing it, so a padded or
+        // signed key deserialized here and then failed that pattern: a flow an
+        // editor's schema check called invalid while sfh ran it anyway, or the
+        // reverse.
+        for bad in ["\" 2 \"", "\"+2\"", "\"02\"", "\"-1\""] {
+            let src = format!(
+                "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      {bad}: {{result: continue}}\n"
+            );
+            let e = yaml::from_str::<Flow>(&src)
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must be refused"))
+                .to_string();
+            let quoted_key = format!("'{}'", bad.trim_matches('"'));
+            assert!(e.contains(&quoted_key), "{bad}: {e}");
+            assert!(e.contains("is not an exit code"), "{bad}: {e}");
+        }
+
+        // The canonical spellings keep working, including the "0" boundary.
+        let ok: Flow = yaml::from_str(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      \"0\": {result: complete}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ok.steps[0].outcomes.get(&0).unwrap().result,
+            OutcomeResult::Complete
+        );
+
+        // A negative BARE-INTEGER key takes a different path - YAML has
+        // already resolved it to a plain integer, so there is nothing left to
+        // canonicalize, and it deserializes fine - but it is refused later, by
+        // `check_outcomes` during validate, for a more specific reason than
+        // "not canonical": sfh reserves negative exit codes for its own
+        // marker. Runtime and Schema still agree on the end result for every
+        // negative spelling; they just disagree on which stage says so.
+        let negative = parse(
+            "steps:\n  - id: a\n    cmd: [\"echo\", \"hi\"]\n    outcomes:\n      -1: {result: complete}\n",
+        )
+        .unwrap_err();
+        assert!(negative.contains("never ran"), "{negative}");
+    }
+
+    #[test]
+    fn strict_mode_warns_when_outcomes_sits_on_a_preset_ai_step_but_stays_quiet_on_a_cmd_gate() {
+        // A bare AI CLI reviewer exits 0 whether its verdict was PASS or
+        // REVISE (examples/managed-loop.yaml routes on the reply TEXT for
+        // exactly this reason), so outcomes: - which reads the raw exit code -
+        // cannot tell the verdicts apart here, and a route that looks like it
+        // reads the label can never fire as written.
+        let preset: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: review\n    tool: claude\n    access: read\n    prompt: x\n    outcomes:\n      2: {result: continue, label: revise}\n",
+        )
+        .unwrap();
+        validate(&preset, false).unwrap();
+        let warnings = strict_warnings(&preset);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("step 'review'"), "{warnings:?}");
+        assert!(warnings[0].contains("claude"), "{warnings:?}");
+        assert!(warnings[0].contains("PASS"), "{warnings:?}");
+
+        // The identical table on a cmd: gate is exactly the deterministic
+        // case outcomes: exists for, so it earns no warning.
+        let gate: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: gate\n    cmd: [\"sh\", \"-c\", \"true\"]\n    outcomes:\n      2: {result: continue, label: revise}\n",
+        )
+        .unwrap();
+        validate(&gate, false).unwrap();
+        assert!(
+            strict_warnings(&gate).is_empty(),
+            "{:?}",
+            strict_warnings(&gate)
+        );
+
+        // A parallel CHILD running a preset tool is caught the same way - the
+        // same fan-out blind spot replay_warnings had.
+        let child: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: fan\n    parallel:\n      - id: review\n        tool: claude\n        access: read\n        prompt: x\n        outcomes:\n          2: {result: continue, label: revise}\n",
+        )
+        .unwrap();
+        validate(&child, false).unwrap();
+        let warnings = strict_warnings(&child);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("step 'fan.review'"), "{warnings:?}");
     }
 }

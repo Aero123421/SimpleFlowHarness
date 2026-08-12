@@ -35,6 +35,7 @@ for f in examples/*.yaml; do
   ./target/release/sfh plan "$f"
 done
 cargo package --locked
+python3 tests/distribution_checks.py
 ```
 
 On Windows, run the shell suites from Git Bash. They contain no real AI calls;
@@ -66,3 +67,6 @@ Keep commits reviewable and explain:
 
 By contributing, you agree that your contribution is licensed under the MIT
 license in this repository.
+
+Maintainers cutting a release must also follow
+[the distribution-channel checklist](docs/distribution.md).

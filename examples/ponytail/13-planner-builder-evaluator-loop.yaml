@@ -1,0 +1,118 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: planner -> generator -> deterministic checks -> independent evaluator.
+api_version: 1
+name: ponytail-planner-builder-evaluator
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  planning: {file: ./prompts/planner.md}
+  evaluator: {file: ./prompts/evaluator.md}
+  harness: {file: ./prompts/harness-loop.md}
+  latest_evaluation:
+    template: |
+      {{steps.evaluate.output | optional | truncate:18000}}
+  verification:
+    template: |
+      stdout artifact: {{steps.verify.output_file | optional}}
+      stderr artifact: {{steps.verify.stderr_file | optional}}
+      exit: {{steps.verify.exit | optional}}
+
+profiles:
+  planner: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  evaluator: {tool: codex, access: read}
+  builder_fallback: {tool: codex, access: write}
+
+defaults:
+  max_total_steps: 40
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+  wall_clock_sec: 14400
+  on_budget: goto:handoff
+  budget_reserve: {wall_clock_sec: 900}
+
+steps:
+  - id: plan
+    use: planner
+    effects: read
+    context: [task, acceptance, project_rules, ponytail, planning, harness]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    notes: append
+    prompt: |
+      Produce a small, dependency-ordered execution plan.
+      Each chunk must name files, invariants, and a deterministic proof.
+      Do not edit files.
+
+  - id: build
+    use: builder
+    fallback: [builder_fallback]
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, harness]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Implement the current plan in the workspace. Prefer one coherent pass over
+      broad scaffolding. Keep the workspace buildable.
+
+      Plan:
+      {{steps.plan.output | truncate:20000}}
+
+  - id: verify
+    effects: read
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:improve
+
+  - id: evaluate
+    use: evaluator
+    effects: read
+    context: [task, acceptance, project_rules, evaluator, harness, verification]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Evaluate the current workspace independently. Inspect files and evidence;
+      do not trust the builder's confidence.
+
+      Plan:
+      {{steps.plan.output | truncate:12000}}
+
+      End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: improve}
+      - {goto: stuck}
+
+  - id: improve
+    use: builder
+    fallback: [builder_fallback]
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, harness, latest_evaluation]
+    max_visits: 4
+    on_max_visits: goto:handoff
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Apply the smallest correction that closes the evaluator's current blockers.
+      Do not rewrite working areas or create infrastructure to avoid one failure.
+    route:
+      - {goto: verify}
+
+  - id: handoff
+    use: planner
+    effects: read
+    context: [task, acceptance, project_rules, harness, latest_evaluation]
+    prompt: |
+      Produce a concise durable handoff from the current workspace:
+      completed facts, checks run, unresolved blockers, and the next exact action.
+      Do not modify files.
+    route:
+      - {goto: stuck}

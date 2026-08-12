@@ -18,6 +18,7 @@ set -u
 
 SFH="${1:?usage: verify_v1.sh /path/to/sfh}"
 [ -x "$SFH" ] || { echo "not executable: $SFH"; exit 2; }
+SUITE_DIR="$(cd "$(dirname "$0")" && pwd)"
 SFH="$(cd "$(dirname "$SFH")" && pwd)/$(basename "$SFH")"
 echo "verifying: $SFH"
 
@@ -35,6 +36,28 @@ sec()  { echo; echo "=== $* ==="; }
 count() { if [ -f "$1" ]; then grep -c "^$2\$" "$1" 2>/dev/null | head -1; else echo 0; fi; }
 # ls -d leaves a trailing slash; --resume wants the dir itself.
 newest() { ls -d "$1"/*/ 2>/dev/null | head -1 | sed 's:/*$::'; }
+
+# A preset stand-in that speaks the tool's real protocol. Since sfh 1.2 a preset
+# step must complete its documented machine protocol - a terminal record has to
+# arrive and raw stdout is never promoted to an answer - so `bin: "echo"` can no
+# longer stand in for claude at all, and the session-access checks below need a
+# stand-in that opens and reports a session for real. Same stub the engine
+# behaviour suite uses; a missing rustc is a loud failure, never a silent skip.
+STUB_NAME="sfh-session-stub"
+case "$(uname 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) STUB_NAME="sfh-session-stub.exe" ;;
+esac
+STUB="$WORK/$STUB_NAME"
+if ! rustc -O --edition 2021 -o "$STUB" "$SUITE_DIR/stub/session_stub.rs" > "$WORK/stub-build.log" 2>&1; then
+  echo "cannot build the session stub (needs rustc on PATH):"
+  sed -n '1,40p' "$WORK/stub-build.log"
+  exit 2
+fi
+if command -v cygpath > /dev/null 2>&1; then
+  STUB_BIN="$(cygpath -m "$STUB")"
+else
+  STUB_BIN="$STUB"
+fi
 
 # ---------------------------------------------------------------- 1. F-2
 # The expensive one. A parallel group that dies partway must not re-run the
@@ -394,7 +417,9 @@ fi
 #   F-1  key present but not a valid level                            -> refuse
 #   F-7  key present and valid but FORGED                             -> refuse
 # A fix that satisfies any one of these by collapsing the distinction breaks
-# another. `bin: "echo"` stands in for the CLI so no AI is called.
+# another. The session stub stands in for the CLI so no AI is called: since
+# sfh 1.2 a preset step must complete its tool's documented protocol, so the
+# stand-in has to actually speak claude's result envelope and report a session.
 #
 # Shape: low(read) -> gate(fails once, so the run stops with low's session
 # already recorded) -> cont(continue_from low). Tamper, then resume.
@@ -404,14 +429,14 @@ name: $(basename "$1" .yaml)
 steps:
   - id: low
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: $3
     prompt: "x"
   - id: gate
     cmd: ["sh", "-c", "if [ -f $2 ]; then echo ok; else touch $2; exit 5; fi"]
   - id: cont
     tool: claude
-    bin: "echo"
+    bin: "$STUB_BIN"
     access: $4
     continue_from: low
     prompt: "y"
@@ -429,9 +454,9 @@ make_legacy() { # make_legacy <run-dir> <also-drop-version?>
   fi
 }
 
-# Judge these by the REFUSAL MESSAGE, not the exit code. `bin: "echo"` reports
-# no session id, so every one of these resumes fails the separate F-11 "resume
-# unverified" check as well - and an exit-code test would happily call that a
+# Judge these by the REFUSAL MESSAGE, not the exit code. These resumes can fail
+# for reasons other than access (F-11 session verification, a tampered log that
+# no longer parses), and an exit-code test would happily call any of those a
 # blocked escalation. What is being measured is whether the ACCESS guard fired.
 blocked_by_access() { grep -qE "refusing to resume|no recorded access level" "$1"; }
 

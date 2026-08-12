@@ -1,0 +1,97 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: make documentation legible to future agents by reconciling it with reality.
+api_version: 1
+name: ponytail-docs-code-drift-repair
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  docs_review: {file: ./prompts/docs-review.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:18000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 22
+  max_parallel: 2
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+
+steps:
+  - id: inventory
+    use: analyst
+    effects: read
+    context: [task, acceptance, project_rules, docs_review]
+    prompt: |
+      Compare user-facing documentation and examples with actual code, CLI help,
+      schemas, tests, and defaults. Identify only concrete drift.
+      Prefer one canonical source plus links over repeated near-copies.
+      Do not edit files.
+
+  - id: repair
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Repair the documented drift below with the fewest maintained copies.
+      Update code only if the documented contract is explicitly the intended one;
+      otherwise update the documentation to match tested behavior.
+
+      Inventory:
+      {{steps.inventory.output | truncate:22000}}
+
+  - id: diff_check
+    effects: read
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: docs
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, docs_review]
+        on_error: continue
+        prompt: |
+          Verify commands, examples, versions, defaults, and limitations against
+          the repository itself.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: behavior
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Check that no code behavior or compatibility was accidentally changed
+          merely to make the documentation easier to write.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 2
+    on_max_visits: goto:stuck
+    prompt: |
+      Correct only the remaining documentation/behavior mismatch.
+      Delete duplication instead of keeping two authoritative explanations.
+    route:
+      - {goto: diff_check}

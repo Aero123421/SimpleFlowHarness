@@ -1,0 +1,134 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: deterministic release gates plus independent correctness and simplicity review.
+# This flow prepares evidence only; it does not tag, publish, merge, or discard work.
+api_version: 1
+name: ponytail-rust-release-readiness
+
+workspace:
+  mode: auto
+  cleanup: keep
+
+contexts:
+  release: {file: ./inputs/RELEASE.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  release_review: {file: ./prompts/release-review.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:22000}}
+  latest_failure:
+    template: |
+      fmt stderr: {{steps.fmt.stderr_file | optional}}
+      clippy stderr: {{steps.clippy.stderr_file | optional}}
+      test stderr: {{steps.test.stderr_file | optional}}
+      package stderr: {{steps.package.stderr_file | optional}}
+
+profiles:
+  maintainer: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+  security_reviewer: {tool: claude, access: read}
+
+defaults:
+  max_total_steps: 46
+  max_parallel: 3
+  max_prompt_chars: 130000
+  max_context_chars: 100000
+  wall_clock_sec: 14400
+  on_budget: goto:handoff
+  budget_reserve: {wall_clock_sec: 900}
+
+steps:
+  - id: fmt
+    effects: workspace
+    cmd: ["cargo", "fmt", "--all", "--", "--check"]
+    on_error: goto:fix
+
+  - id: clippy
+    effects: workspace
+    cmd: ["cargo", "clippy", "--release", "--locked", "--all-targets", "--", "-D", "warnings"]
+    timeout_sec: 2400
+    on_error: goto:fix
+
+  - id: test
+    effects: workspace
+    cmd: ["cargo", "test", "--release", "--locked"]
+    timeout_sec: 3600
+    on_error: goto:fix
+
+  - id: package
+    effects: workspace
+    cmd: ["cargo", "package", "--locked"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: release_contract
+        use: reviewer
+        effects: read
+        context: [release, acceptance, project_rules, release_review]
+        on_error: continue
+        prompt: |
+          Review version, changelog, schemas, examples, installers, artifacts,
+          compatibility notes, and clean-checkout reproducibility.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: correctness
+        use: reviewer
+        effects: read
+        context: [release, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review release-critical behavior and regression evidence.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity
+        use: security_reviewer
+        effects: read
+        context: [release, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review whether release work added speculative features, duplicate
+          documentation, compatibility wrappers, or unneeded dependencies.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    max_parallel: 3
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: summary
+      - {goto: fix}
+
+  - id: fix
+    use: maintainer
+    effects: workspace
+    context: [release, acceptance, project_rules, ponytail, latest_review, latest_failure]
+    max_visits: 4
+    on_max_visits: goto:handoff
+    prompt: |
+      Fix only current release blockers. Do not add product features or broad
+      refactors during release preparation.
+    route:
+      - {goto: fmt}
+
+  - id: summary
+    use: reviewer
+    effects: read
+    context: [release, acceptance, project_rules, release_review]
+    prompt: |
+      Produce a concise release evidence summary: exact commands passed,
+      versions/artifacts checked, remaining human approvals, and the commands
+      that would tag/publish after approval. Do not execute them.
+    route:
+      - {goto: end}
+
+  - id: handoff
+    use: reviewer
+    effects: read
+    context: [release, acceptance, project_rules, release_review, latest_review, latest_failure]
+    prompt: |
+      Produce a durable handoff naming the blockers, saved workspace, checks
+      already passed, and the next smallest action. Do not publish.
+    route:
+      - {goto: stuck}

@@ -1,5 +1,770 @@
 # Changelog
 
+## v1.5.1 — 2026-08-09
+
+同梱物だけのreleaseです。**engineは1.5.0から1行も変わっていません。** flow fileの
+書き方も変わりません。
+
+20本の実務向けflowと9本のAgent Skillを取り込みました。どちらも外部packとして
+zipで配られていたもので、`sfh` binaryの無い環境で作られ、その旨をpack自身の
+`VALIDATION.md`が明記していました。repositoryへ入れて**初めて実物の`sfh`に通した
+ところ、schema検査では原理的に見えない欠陥が3種類出ました。** それを直したものが
+このreleaseです。
+
+### `examples/ponytail/` — 対象projectで回す20本のflow
+
+- primitiveの説明ではなく、既存codebaseに対する作業そのものを対象にしています。
+  regression-first bugfix、依存の削減、独立reviewer council、chunk分割した長時間
+  build、human gate付きmigration dry-run、release readiness loopなど。
+- 各flowは`inputs/`と`prompts/`を named context として自前で持ちます。Ponytailを
+  installしていなくても動きます。Ponytail本体の再配布ではなく、公開されている思想を
+  再構成した非公式の参考例です（`examples/ponytail/SOURCES.md`）。
+- 起動は**対象projectのGit repository root**からです。flow fileの置き場所とrunの
+  起点は別物で、context解決はflow fileからの相対なので、どこから起動しても同じ
+  bytesが渡ります。
+
+### `skills/` — flowを書くAIのための9本のAgent Skill
+
+- `sfh-flow-design`を中心に、loop engineering、deterministic gate、workspace/context、
+  failure recovery、CI監視、外部CLI/MCP連携、eval engineering、flow reviewを扱います。
+- **これはruntime機能ではありません。** sfhのflow formatに`skills:`キーは無く、追加も
+  していません。YAMLを*書く側*のAIへ渡す設計知識です。実行時のagentへ規則を渡したい
+  場合は、これまで通り`contexts:`で名前付きcontextとして固定してください。native
+  skillが読み込まれた証明をsfhは持てないので、correctnessに必須の規則をそこへ預ける
+  のは危険なままです。
+- `cp -R skills/sfh-* .agents/skills/` で導入します。packが元々書いていた
+  `cp -R skills/*` は、repositoryへ入れた結果pack自身のdocumentとtoolまで
+  client の skill directory へ撒くことになるので、対象を絞りました。
+
+### 実物の`sfh`に通して見つかった3件
+
+- **`goto:fix`はrouteではなくkey名でした。** `sfh-eval-engineering`の
+  `failure-to-regression.yaml`が`{when_label_is: reproduced, goto:fix}`と書いており、
+  空白が無いのでYAMLは`goto:fix`という名前のfieldとして読みます。この1本は
+  `--strict`以前に**plainな`sfh validate`が通りませんでした**。「YAMLとしてparseでき、
+  `steps`がlistである」ことを確認する検査では絶対に見つかりません。
+- **profile overlay 2本がsfhの受け付ける形ではありませんでした。** packの
+  `profiles.codex-pi.example.yaml`と`profiles.single-codex.example.yaml`は、profile名を
+  top levelのmappingとして並べており、`profiles:`でくるまれていません。sfhは
+  `unknown field 'planner', expected 'profiles'`で拒否します。packのREADMEが主要な
+  手順として案内している`--profiles`が、最初の1回で失敗する状態でした。packの検査は
+  「inline profileが存在すること」は見ていましたが、overlay file自体を適用しては
+  いませんでした。
+- **`prove_failure`のrouteに catch-all がありませんでした**（flow 02、03、15）。
+  `{when_exit: 0, goto: stuck}`だけなので、それ以外のexit codeは**file内で次に来る
+  stepへ暗黙に落ちます**。落ちる先は意図通りでしたが、それはstep順序の偶然であって
+  routeの表明ではありません。並べ替えれば黙って別の場所へ飛びます。`{goto: implement}`
+  を明示しました。
+
+### 同梱linterが自分のreference flowに36件の警告を出していました
+
+packのREADMEは`lint_sfh_flow.py`を標準手順の6番目に置いています。そのlinterを
+pack自身の29本へ流すと、ERROR/WARNINGが36件出ました。**authorが警告を読まなくなる
+のはこの状態です。**
+
+- **SFH042 / SFH043はcycleの誤ったnodeを見ていました（34件）。** backward routeが
+  *指す先*のstepに`max_visits`と`on_max_visits`があるかを訊いていましたが、
+  review/fix loopは**戻る側**——繰り返し失敗したときに諦める対象そのもの——に上限を
+  置きます。結果として、正しくboundされている20本中17本に対して警告していました。
+  cycleはその上のどこか1nodeがboundされていれば有限です。backward routeを持つstep
+  自身も見るようにしました。**どこにも上限が無いcycleは今も報告します。**
+- **SFH030は正しい指摘でした（2件）。** `05-frontend-native-first.yaml`が
+  `npm run lint`と`npm test`をstring commandで書いており、platform shellへ渡ります。
+  portabilityを主張するpackのfrontend exampleがcmd.exeを必要とするのは筋が通らない
+  ので、argv listにしました。
+- 修正後、29本すべてがERROR/WARNINGゼロです。`tests/skills_checks.py`が
+  「上限の無いcycleは警告される」「戻る側のstepに置いた上限は有効」「同梱flowは
+  lint clean」の3点を固定します。ruleを元へ戻すと18件落ちます。
+
+### CIに載せました
+
+- `examples/*.yaml`のglobは意図的にtop levelだけなので、放っておけばこれらは
+  検査されないまま出ていきます。`examples/ponytail/`と`skills/sfh-*/assets/`の
+  全YAMLを名指しで`sfh validate`にかけます。
+- overlayは**全flow × 全overlayの40通り**を検査します。「overlayがparseできる」ことと
+  「このflowへ適用できる」ことは別の主張で、READMEがしているのは後者だからです。
+  上の2件目はこの検査があれば最初から出ていました。
+- `tests/skills_checks.py`を追加しました。標準ライブラリのみです。SKILL.mdの
+  frontmatterとdirectory名の一致、参照先fileの存在、500行のprogressive disclosure
+  上限、catalogとdiskの一致、catalogのdescriptionがSKILL.mdと同じであること、
+  `lint_sfh_flow.py`の2つのcopyが同一であることを見ます。
+- version表明も検査対象です。両packは`target-sfh: "1.4.x"`とv1.4.0のschema URLを
+  宣言したまま1.5.1へ入りかけました。minor bumpのたびにこのtestが落ちます。
+  落ちたら「1.6のengineに対してこのskillはまだ正しいか」を人間が読み直す合図です。
+
+### `MANIFEST.json`は落としました
+
+- pack同梱の`MANIFEST.json`は全fileのsha256一覧です。zipの完全性を示すための
+  ものであって、gitがまさにその仕事をしているrepositoryの中では、**誰かがfileを
+  1文字直した瞬間に嘘になる表**にしかなりません。維持するなら再生成と検査の
+  仕組みが要り、それはgitの再実装です。削除しました。
+- hashを持たない`skills/skill-catalog.json`は残しています。こちらはclientが読む
+  実際のcatalogで、diskとの一致をtestで固定しました。
+
+### 意図的に残した`--strict`の指摘
+
+`validate --strict`はgateではなくadvisoryです。このrepository自身のtop-level
+example 18本のうち、strict cleanなのは4本だけです。取り込んだpackにも21件残って
+いますが、これは直さないという判断です。
+
+- **`workspace.mode: auto`（21件）。** `auto`は`sfh guide`が教える書き方で、
+  repository自身の`managed-loop.yaml`と`workspace-smoke.yaml`も同じ指摘を出します。
+  strictは「間違っている」ではなく「解決結果をplanに見えるようにした」と言っている
+  だけです。報告される解決結果——writer stepやloop visitが何個あってもrunあたり
+  worktreeは1つ——は、packのREADMEが約束している内容そのものです。
+- **`effects: external`のまま`replay.unfinished: rerun`（4件）。** web検索1件、
+  read-only MCP呼び出し1件、run IDとhead SHAで固定したCI観測1件、そして
+  `external-effect-safe.yaml`のstatus確認1件です。sfhはcommandの中身を読めないので、
+  resumeで再実行されうるexternal stepを一律に警告します。4件それぞれに、なぜ
+  「もう一度訊く」のが同じ質問なのか、どう変わったら`stuck`が正解になるのかを
+  commentで書きました。`external-effect-safe.yaml`はこの区別自体が主題のfileで、
+  変更を伴う`apply`は`stuck` + `retry_on: never`、読むだけの`verify`は`rerun`です。
+
+### そのほか
+
+- repository内の全flowの`$schema`固定を`v1.4.0`から`v1.5.0`へ更新しました。既存の
+  `examples/*.yaml` 5本も1.4.0のままでした。上のtestが今後これを固定します。
+
+## v1.5.0 — 2026-08-08
+
+v1.4.0の深掘りreviewへの対応です。見つかった問題はengineの基本制御ではなく、
+**sfhと外の世界との境界**に集中していました。「sfhが何を保証したと言っているか」と
+「実際に保証できているか」がずれている箇所、と言い換えられます。
+
+flow fileの書き方は変わりません。既存flowはそのまま動きます。
+
+### `access:` が閉じていない範囲まで「enforced」と表示していました
+
+- **これは何が起きたか。** `AdapterInfo`はclaude/opencode/grok/piのread/writeを
+  `Enforced`と報告し、preflightがそれを表示し、SECURITY.mdもその表示に寄りかかって
+  いました。しかしpresetが実際に閉じていたのは**adapter作者が列挙したbuiltin tool
+  だけ**です。MCP toolは別のpermission名前空間、plugin・hook・skillはallowlistの
+  外側、instruction fileは無検査で読み込まれます。opencodeの`--auto`に至っては
+  **deny listが挙げなかった能力を承認します**。
+- `Enforced`の基準をenumのdoc commentに明文化しました。「CLI自身がそのaccess
+  class全体を閉じると保証するflagをsfhが渡している」ことであって、「presetが
+  たまたま知っていたtoolをdenyした」ではありません。
+- この基準に照らして claude / opencode / grok / pi / cursor / agy を
+  `BestEffort` へ下げました。実OS sandboxでprocessごと囲うcodexだけが
+  `Sandboxed`のまま残ります。**現在`Enforced`を名乗るadapterはありません。**
+- `known_gaps`は総論をやめ、adapterごとに閉じられていない面を名指しします。
+- piのstrict presetに`--no-context-files`を追加しました。read/writeの線引きは
+  「piがどのtoolを使ってよいか」であって「disk上のfileがinstructionを注入して
+  よいか」ではないので、制限側の2 tierとも抑止します。
+- **grokの`--no-auto-update`は追加していません。** pinしたgrok CLIでこのflag名を
+  確認できませんでした。確認できないflagを足すのは、この修正が正そうとしている
+  誤りそのものです。`known_gaps`に記録し、勝手に「直され」ないようtestで固定して
+  います。
+
+### 32 MiBを超えるstructured streamが、terminal recordごと落ちていました
+
+- **これは何が起きたか。** `OutputObserver`はstdoutを流れながら受け取れる設計で、
+  raw captureの32 MiB上限より手前に立っています。しかしsemantic observerを持って
+  いたのは**piだけ**でした。Codex JSONLもOpenCode NDJSONも、process終了後に
+  **上限で切られた**`stdout_clean`をparseしていました。
+- 結果として大きなstreamでは、terminal recordが消えて正常runがprotocol
+  invalidになり、session idが消えてresume/forkが迷子になり、usage recordが消えて
+  **costを過少計上**し、途中のerror recordが消えて失敗が成功として報告され得ました。
+- Codex JSONLとOpenCode NDJSONにもstreaming observerを付けました。行分割の共通部分は
+  `LineStreamObserver`に括り出し、record解釈だけadapterごとに残しています。同じ
+  accumulatorをstreaming pathと非streaming pathの両方が使うので、adapterごとの
+  意味論の実装は1つです。
+- 1 recordあたり16 MiBの上限を追加し、超過はfail-closedです。protocolが無制限に
+  bufferさせられる余地を残しません。
+
+### run途中でcontext fileを書き換えると、記録と実際に渡したものがずれました
+
+- **これは何が起きたか。** execution closureはrun開始時にcontext fileを**内容で**
+  pinします。ところがstep準備時の`context::build`は**元のpathを開き直して**いました。
+  両者をstep起動前に突き合わせる処理はありません。つまりanalyze stepのあとに
+  `TASK.md`を書き換えると、implement stepは新しい内容を読み、
+  `execution-closure.json`は古いhashのままです。resumeを待たずにprovenanceが壊れます。
+- run開始時に`kind: file`のcontextをrun dirへsnapshotし、**各stepはsnapshotを読みます**。
+  closureがpinしたbytesとmodelが見たbytesが、構造として同じものになります。
+- inline/templateは対象外です。templateは`{{steps.x.output}}`を参照でき、step
+  ごとに変わることが仕様なので、凍結してはいけません。
+- **resumeは`--force-resume`でも元のsnapshotを使い続けます。** closureは
+  write-onceなので、resume時に取り直すと「新しいbytesを、古いhashを記録したclosureの
+  下で凍結する」ことになり、この修正が消そうとしている食い違いを作り直してしまいます。
+- snapshotを書けない場合はpersistence failureです。live読み込みへ黙って戻ることは
+  しません。戻ることこそがこのbugだからです。
+
+### `preflight` が任意の `bin:` を実行していました
+
+- **これは何が起きたか。** `cmd:`のprogramをpreflightが**resolveするだけで実行しない**
+  理由は、code中にそう書いてあります —「`deploy.sh --help`はdeployしかねない」。
+  この理屈がpreset toolの`bin:` overrideには適用されていませんでした。`bin:`は任意の
+  pathを取れるので、`sfh preflight flow.yaml`が**そのflowの選んだprogramを実行**します。
+  未信頼のflowが安全か確かめるためのcommandが、まさにその確認の場でcodeを走らせて
+  いたことになります。AI生成flowに対して特に危険です。
+- 線引きはPATH上で解決したtool自身の既定launcherです。sfhが同梱supportしていて
+  `--help`/`--version`が無害だと確認済みのものだけを実行します。それ以外の`bin:`は
+  resolveするだけで、`--probe-binaries`を明示した場合にのみ実行します。
+- 沈黙が「問題なし」に読めてはいけないので、`ProbeState`が区別します。従来の
+  `version: null`は「実行したが読めなかった」と「そもそも実行していない」の両方を
+  意味していました。JSONは`probe_state`と`probe_binaries`を、人向け出力は
+  「not probed」と該当flagを示します。
+- 実行するprobeもisolated scratch directoryから走らせます（`doctor`と同じ理由です）。
+  作れない場合は何もprobeしません。「isolationなしでprobeした」にはしません。
+
+### parallel childのreplay policyが、warningから見えていませんでした
+
+- **これは何が起きたか。** `replay_summary`と`replay_warnings`はtop-level stepだけを
+  走査していました。一方runtimeは未完了のchildをidで引き、**そのchild自身の**policyを
+  適用します。したがって`effects: external` + `replay.unfinished: rerun`をchildに
+  書いたflowは、resumeで外部送信をやり直すのに、`plan`も`validate --strict`も
+  何も言いませんでした。重複した外部作用を止めるために書かれたwarningが、まさに
+  その場面で黙っていたわけです。
+- 走査を`all_steps`ひとつに集約し、childは`parent.child`という既存の命名で現れます。
+  他のstep走査も監査しました。多くは既に再帰済みで、再帰していないもの
+  （concurrency ceiling、control-flow graph）は`parallel:`内に`route:`や入れ子を
+  禁じているため正しく、その旨をコメントに残しました。
+
+### carry元の「終わっている」確認が、status.jsonを読めないときfail-openでした
+
+- **これは何が起きたか。** carryは`running`なsourceを拒否しますが、status.jsonが
+  無い・読めない場合は「どちらとも言えないので止めない」でした。まだlogへ
+  append中のrunからcarryでき、取ったsnapshotは直後に無効になり、双方の数字が
+  検出不能なまま狂います。
+- carryには**停止の積極的な証明**を要求します。durableな`run_end` eventがあるか、
+  run自身のnonceでowner processのdeathを確認したうえでlogの最終位置がterminalか。
+  拒否がないことは、もはや「はい」ではありません。
+
+### carryしたactive timeが、status.json頼みでした
+
+- **これは何が起きたか。** `run_end`はleaf_runsとcostを持つのにelapsedを持たず、
+  carry/resumeはwall-clockをstatus.jsonから復元していました。status.jsonが欠けたり
+  古かったりすると、A→B→Cの中間runの時間が消え、`wall_clock_sec`が実質resetします。
+- `run_end`に`elapsed_sec`を記録し、復元順序を
+  **`run_end` → `meta` → `status`** と明示して、使用箇所にその理由を書きました。
+
+### `runs list` の行とtotalが別の量でした
+
+- **これは何が起きたか。** 行の`cost_usd`は引き継ぎ込みのbudget position、totalは
+  引き継ぎ分を差し引いた額でした。行を足してもtotalにならず、どちらの数字も
+  「これは何の金額か」を名乗っていませんでした。
+- `own_cost_usd` / `carried_cost_usd` / `budget_position_usd` / `lineage_cost_usd`
+  を分離し、JSONとtable header双方で名乗らせます。`cost_usd`は
+  `budget_position_usd`のaliasとして**残します**（documentedでtestも参照しており、
+  値自体は変わらないため）。
+- `lineage_cost_usd`はancestorがcleanされていれば`null`です。部分和は出しません。
+  **lineageの合計行も出しません** — ancestorを共有する行を足すと二重計上になり、
+  それはこの分離が解こうとしているbugそのものです。
+
+### failed/stuck runが、実行できないactionを提示していました
+
+- **これは何が起きたか。** failed/stuckには`resume`と`carry_budget`が無条件で
+  並んでいました。persistence failureは再開できず、max-visitsで止まったrunは同じ
+  flowで再開すればまた止まり、closure/workspaceの問題には先に別のflagが要ります。
+  AI callerは`next_actions[].argv`をそのまま実行します。
+- 各actionをdiagnosisにしました。`resumable`/`carryable`、`reason`、先に必要な
+  `requires`を持ち、**実際に成功し得るときだけ`argv`が入ります**。max-visitsの
+  行き止まりはresumeを拒否し、workspace driftや変更されたclosureには該当flagを
+  argvへ畳み込みます。
+
+### codexがheadlessでforkできるようになりました
+
+- `codex exec fork`が存在するのに、sfhはcodexのforkをTUI専用として拒否していました。
+  branchが欲しいflowは直列に繋ぐか、cold sessionの費用を払うしかありませんでした。
+- adapter全体としてはforkを認めたうえで、`build_fork`のcodex armは**installed
+  binaryの`--help`にforkが現れることを確認するまで何も組み立てません**。証拠がない
+  場合と古い場合は同じく拒否します。既定は拒否で、supportは示される側です。
+- **version floorとしては表現していません。** `exec fork`がどのreleaseで入ったかを
+  示せる資料がなく、ここに数字を書けばそれは捏造です（grokのflagと同じ誤り）。
+  加えて`minimum_version`は報告されるだけで比較には使われないので、floorを置いても
+  何もgateしません。`--help` probeは数字を要らず、実際に起動を止めます。
+
+### adapter metadataとrequired_flags
+
+- `required_flags`は手書きで、builderが実際に出すflagから乖離していました。つまり
+  preflightの`--help` drift checkは、**列挙されていないflagが消えても気づけません**
+  でした。全builder・全access levelを歩いて照合するtestを追加したところ、全adapterで
+  不足が見つかったので補いました。
+- agyの`minimum_version`を`1.1.8`にpinしました。このpresetのparse pathが依存する
+  `--output-format json` envelopeは、agy自身のchangelogでそのreleaseとされています。
+  `LAST_VERIFIED`は動かしていません — 実CLIへのlive probeは行っていないためです。
+
+### machine JSON契約とdocumentの訂正
+
+- READMEは`output_file`を「32 MiB超のstreamの全文が残る場所」と説明していました。
+  実際にはcanonicalな`.out.txt`自体がbounded captureから書き戻されるので、全文は
+  どこにも残りません。structured protocolの最終回答と会計はstream全体から取られる
+  ので無事ですが、素の`cmd:` stepにその解釈はなく、記録される出力はまさにその
+  上限付きfileです。
+- 「すべての`--json` commandが同じenvelopeを返す」は事実ではありませんでした。
+  `validate`と`runs list|show|why`はenvelope以前のbare JSONです。どちらがどちらかを
+  両側で名指しし、`schema_version`の有無を実行時の見分け方として示しました。
+  移行は破壊的変更なので、意図した方向として記録するに留めています。
+- error code保証をv1.4.0 tag上で「v1.2.xの間」と書いていた4箇所を、実行時に読める
+  `schema_version`基準へ改めました。SECURITY.mdのsupported versionも同様です。
+- `docs/machine-api.md`を追加しました。
+
+### `outcomes:` の細かい2点
+
+- Schemaはcanonical decimalしか受け付けないのに、runtimeはtrimしてからparseして
+  いました。`" 2 "`や`"02"`はsfhでは動きEditorでは無効、という食い違いです。
+  runtimeもcanonical formを要求します。
+- preset AI stepに`outcomes:`が付いている場合、`validate --strict`がwarningを出します。
+  tableはraw exit codeを読みますが、素のAI CLIはPASSでもREVISEでもexit 0なので、
+  `when_label_is`は検証を通ったうえで**永久に発火しません**。errorではなくwarningです
+  — 回答を検査してexit statusを決めるwrapperは正当な使い方だからです。
+
+### 非UTF-8 filenameでworkspace fingerprintが失敗していました
+
+- `git ls-files -z`の`-z`は、git自身のC-quotingを**切る**指定です。したがってUnixでは
+  filenameが持ち得る任意のbyteが出てきます。lossy decodeしてから組み直したpathは
+  diskに存在しないため、`fingerprint`はそこにあるfileでErrを返し、そのworkspaceは
+  安全なresumeもcleanupも拒否され続けました。
+- 該当callだけraw bytesで扱います。symlink targetも同様で、こちらは結末がより
+  厄介でした — 不正byteだけが違う2つのtargetが同じhashになり、**link先の変更が
+  「変更なし」としてfingerprintされる**、この関数が絶対にやってはいけないことです。
+- filenameがすべて妥当なUTF-8のworkspaceは従来と同じpreimageになるので、既存の
+  checkpointは一致し続けます。
+
+### releaseの出所を追えるようにしました
+
+- tagは`v1.4.0`なのに`Cargo.toml`が`1.2.0`のsource archiveが配布され、archiveだけ
+  ではそれが分からず、reviewが別のtreeに対して行われました。
+- release workflowが`provenance.json`（version / tag / commit / archive sha256 /
+  生成時刻）をasset として発行します。tag・Cargo.toml・CHANGELOGの一致checkは従来
+  どおり、何かがbuildされる前に落ちます。`docs/distribution.md`に展開後の照合手順を
+  足しました。
+
+## v1.4.0 — 2026-08-08
+
+長時間運用のfeedbackから2件。どちらも「sfhが答えを症状として読んでいた」という
+同じ形の問題です。新しいkeyを書かなければ既存flowの挙動は変わりません。
+
+### `outcomes:` — exit codeは2つの事実を運んでいる
+
+- **これは何が起きたか。** 「正常に走ったが受け入れ基準はまだ満たしていない」で
+  exit 2を返すgateと、クラッシュしてexit 2になったgateを、sfhは区別できません
+  でした。前者はstepの失敗として扱われ、`retry_on: transient`の下では**意図的で
+  正しく再現性のある答えのために重いテストスイートが再実行**され得ました。
+- `outcomes:`はstep自身のexit codeが何を意味するかを宣言します。keyは**生の
+  process exit code**です。
+
+  ```yaml
+  outcomes:
+    2:  {result: continue, label: acceptance_incomplete}
+    10: {result: retryable}
+    20: {result: fail}
+  ```
+- `result`の語彙は意図的に小さく、ドメイン非依存です。`complete`（仕事は終わった）、
+  `continue`（役目は果たした、まだ続きがある — **失敗ではない**ので`on_error`は
+  発火せずretryも検討されない）、`retryable`（textが何と言おうと再試行に値する）、
+  `fail`（最終的な失敗、`transient`でも再試行しない）。sfhが学ぶのは「続けるか、
+  再試行するか、止めるか」だけです。
+- ドメインの形をしたものはすべて`label`に入ります。sfhはそれを保存し、
+  `{{steps.<id>.label}}`で公開し、`when_label_is:`でルーティングし、`step_end`に
+  記録し、**決して解釈しません**。sfhは「acceptance」が何かを知りません。
+- `when_label_is:` / `when_outcome_is:`をrouteに追加しました。前者は「判定を散文
+  から読み取る」ことの決定論的な代替です。`when_last_line_is: PASS`はmodelが最終行を
+  ちょうどそのtokenで終えることに依存しており、一言添えられただけで書式の理由で
+  stuckになります。
+- 保証3つ: entryの無いexit codeは**従来どおりの読みを保つ**／宣言されたoutcomeは
+  retryの推測に**上書きする**（足さない）／**protocolの証拠は依然として優先する**
+  （structured protocolが完了しなかったturnを受け入れる免許ではなく、timeout・
+  中断されたstepでは参照されない）。
+- 決して一致し得ないrule（どのentryも持たないlabel、どのentryも宣言していない
+  outcome class）、`0: {result: retryable}`、空のlabel、負のexit codeは
+  `validate`のエラーです。3時間走ったあとの驚きではありません。
+
+### `retry_on: transient` がコマンドのstdoutを症状として読まなくなりました
+
+- **これは何が起きたか。** transient判定のneedleは`429` `502` `rate limit`
+  `connection reset`など22個で、すべて**provider障害**を指す語です。preset stepなら
+  tool自身の報告なので正しい。しかし`cmd:` stepのstdoutは**結果データ**です。
+  検証スイートに`tcp_502_returns_error`というテストが含まれているだけで、
+  決定論的な失敗のたびにスイート全体が再実行されていました。テスト名の中の`502`
+  への一致で、数分の計算と2回目の請求が発生します。
+- `cmd:` stepのstdoutは走査しなくなりました。stderrは引き続き見ます。プログラムが
+  運用上の問題を報告するのはそこで、`curl`の"connection reset by peer"はまさに
+  transientそのものだからです。preset stepは変更なしです（chain outputはtool自身の
+  報告なので）。
+
+## v1.3.0 — 2026-08-08
+
+v1.2.1のすべての修正に加えて、そのv1.2.1のきっかけになった事例が残していた
+最後の穴を塞ぎます。新しいflow keyはありません。既存flowの挙動も変わりません。
+
+### `--carry-budget-from`: flowを直したあとも、使った予算を持ち越せるようになりました
+
+- **これは何が起きたか。** runが止まり、原因が「flow自体が間違っていた」だった
+  とき、flowを直すのが正しい対応です。ところが直すとeffective-config
+  fingerprintとexecution closureが変わるので、`--resume`は正しく拒否します。
+  残された手段は「新しいrunを始める」だけで、そのrunのcounterはすべてゼロから
+  始まります。つまり**すでに使った予算が消えます**。実際の運用では、flowの上限を
+  手で書き換えて（「1回消費済みなので残り9回」）辻褄を合わせることになりました。
+  手計算は会計ではありません。検証できず、数え間違えた瞬間に壊れ、2回目のrunが
+  1回目の続きだったという記録もどこにも残りません。
+- `sfh run <flow> --carry-budget-from <run-dir>` は**新しいrun**を開始し、
+  そのrunに先行runの支出を引き継がせます:
+  - `max_total_steps` に対するleaf run数
+  - `max_visits` に対する**step単位の訪問回数の最大値**（loopの残り回数がそのまま
+    残り回数として効きます）
+  - `max_cost_usd` に対する報告済みcost
+  - `wall_clock_sec` に対するactive時間
+- **引き継ぐのはcounterだけです。** step outputもsessionもrouting位置もworkspaceも
+  引き継ぎません。それらを作ったflowは、これから走るflowではないからです。
+  `--resume`が拒否した理由がまさにそれです。両者は別の問いなので、同時指定は
+  usage errorにしています。
+- **合成します。** 引き継いだrunからさらに引き継ぐと、最初のrunの支出も残ります。
+  2回目の修正で1回目の支出が黙って消えるのは、この機能が手作業から取り上げようと
+  しているまさにその算術なので、`budget_carried` eventはlog読み取り時に
+  baselineとして畳み込まれます。
+- **記録が残ります。** `budget_carried` durable event、`meta.json`の
+  `carried_budget`、そして人間向けの1行。corrected flowがもう定義していないstep id
+  は「適用できなかった」と**名指しで**報告します（黙って忘れません）。
+- 止まったrunのJSON envelopeは `resume` と `carry_budget` の**両方**をnext actionと
+  して出します。flowが悪かったのか世界が悪かったのかを知っているのは読み手だけ
+  だからです。
+- **二重計上しません。** 引き継いだrunの `cost_usd` は先行runの支出を含みます
+  （`max_cost_usd` はその値で判定されるので当然です）が、先行run自身の行にも同じ
+  金額が載っています。`sfh runs list` の `total_cost_usd` は各runの
+  `carried_cost_usd` を差し引いて合計するので、hopを重ねても実際に払った額のまま
+  です。`sfh runs show` は引き継いだ分を1行で明示します。
+- 引き継いだactive時間も `budget_carried` eventから復元できます。`status.json` は
+  detachした`--resume`で作り直されるため、そこだけを頼りにすると
+  `wall_clock_sec` の引き継ぎだけが静かにゼロに戻っていました。
+
+## v1.2.1 — 2026-08-08
+
+v1.2.0を実運用へ投入して見つかった4件の穴を塞ぐrelease。新しいkeyを書かなければ
+既存flowの挙動は変わりません。`api_version: 1`も維持します。
+
+### exit codeとprotocol evidenceの衝突を、flowが宣言できるようにしました
+
+- **これは何が起きたか。** 最終回答を完成させ、cleanなcommitまで済ませたAI CLIが、
+  途中のtool callが1つ失敗していたためprocess exit=1を返しました。sfhはterminal
+  recordを受け取って成功をcertifyできていたのに、exit codeを理由にstepを落とし、
+  runがstuckで止まりました。回避手段が「flowからexit code判定を外す」しかなく、
+  それはfail-openです。
+- `exit_conflict: fail | trust_protocol`をstepと`defaults`に追加しました。
+  `trust_protocol`は、`certifies_success()`が真のとき — つまり文書化されたterminal
+  recordが存在し、壊れておらず、成功と述べているとき — に限りexit codeを覆します。
+  raw text、未知のstatus、壊れたenvelope、terminal欠落はこの条件を満たさないので、
+  stdoutへ出したusage errorが成功stepになることはありません。
+- 既定は全adapterで`fail`のままです。v1.2.0が唯一例外にしていたagyは、`matches!`の
+  ハードコードではなく`AdapterInfo::exit_code_trustworthy`というdataになりました。
+  挙動は同一です。
+- `trust_protocol`を使わない場合でも、**衝突が起きたことをsfhが黙らなくなりました。**
+  「exit Nだったが、tool自身のprotocolはこのturnを成功としてcertifyしている」旨と、
+  `exit_conflict:`という正しい対処、そして「exit code判定自体をやめるな」という但し
+  書きを、stepのstderr・error artifact・`sfh runs why`へ載せます。
+- `trust_protocol`は`sfh plan --json`の`unsafe_overrides`に出ます。
+
+### preflightが`cmd:`stepのprogramを見るようになりました
+
+- **これは何が起きたか。** Windowsで検証stepが`bash`と書かれており、PATH上先頭の
+  `%SystemRoot%\System32\bash.exe`（WSL launcher）へ解決していました。WSLは別OSなので
+  Windowsのworktreeも`.git` gitfileも読めず、全検証が5秒で落ちました。それでも
+  `sfh preflight`は「no blockers」と答えていました — 検査して通ったのではなく、
+  `resolved_tools()`が`cmd:`stepを対象外にしていたからです。
+- preflightが`cmd:`stepのprogramも解決し、絶対pathとそれを起動するstep idを報告する
+  ようになりました（`--json`では`commands`）。解決できないprogramはblockerです。
+- **解決するだけで、実行はしません。** `--help`/`--version`をadapterへ送るのは安全でも、
+  flowが名指しした任意のprogramへ送るのは安全ではありません（`deploy.sh --help`は
+  deployし得ます）。実際に問題だった問い — 「この名前はどのbinaryか」 — は解決だけで
+  答えられます。
+- bareな`bash`/`wsl`がWindowsのSystem32/Sysnative/SysWOW64へ解決した場合はblockerに
+  し、Git for Windows bashのpathを示します。PATHが選んだ場合のみで、flowが明示的に
+  full pathを書いた場合は何も言いません。
+- `cmd:`をstringで書いたstepは、flowが選んだshellではなくplatform shell（`sh`/`cmd`）
+  で走ることも報告します。
+
+### context bodyがsfhのdelimiterを偽装できた問題を塞ぎました
+
+- v1.2.0はcontextの**name**をescapeし、**body**をrawのまま埋めていました。bodyは
+  fileの中身かtemplateの描画結果であり、templateは前のstepのoutputを展開できます。
+  つまりmodelが書いたtextがbodyに入り得ました。`</sfh-context>`を含むbodyは自分の
+  blockを早期に閉じ、`<sfh-prompt>`を含むbodyは「ここからが実際の指示だ」とsfhが
+  宣言するsectionを偽造できました。
+- bundleのbodyと、prependされるprompt本体の両方で、4つのdelimiter tokenの先頭`<`を
+  `&lt;`にします。触るのはこの4 tokenだけで、他の文字・記号・codeは1 byteも変わりま
+  せん。何も削除しません。
+
+### `{{context_file}}` / `{{context}}` が validate を通るようになりました
+
+- v1.2.0は`context_delivery: file`を「promptから`{{context_file}}`を指せ」と文書化
+  しながら、自身のtemplate precheckが`context`と`context_file`をunknown keyとして
+  拒否していました。文書どおりのflowが`sfh validate`で落ち、runにも到達しません
+  でした。runtimeは両方を常に定義しています（contextを持たないstepでは空文字列）。
+  precheckをruntimeに揃えました。
+
+### preflightが報告するpathが、実際に起動されるpathと一致するようになりました
+
+- `which()`はWindowsで拡張子なしの候補も返していましたが、実行側はそれを起動しません
+  （`.exe`/`.cmd`/`.bat`のみ）。Unixではexec bitを見ていなかったため、`execvp`が読み
+  飛ばすfileを「これが起動される」と報告し得ました。両方を実行側の規則に揃えました。
+
+## v1.2.0 — 2026-08-07
+
+sfhを「仕様が変わり得る外部CLI・AI CLIを、宣言された制御フロー、作業環境、入力
+文脈、権限、証拠、再開規則のもとで実行する汎用durable harness」として定義し直し、
+その定義に足りていなかった実行基盤を追加したreleaseです。
+
+新しいkeyを一つも書かなければ、既存flowの挙動は変わりません。同じcwd、同じruns
+root、同じstdout、同じroute、同じresume semanticsです。`api_version: 1`も維持します。
+
+### 構造化protocolのfail-closed（意図した厳格化）
+
+- preset toolは、そのCLIが文書化しているmachine-readable protocolを最後まで完了
+  しなければならなくなりました。terminal recordが届かなかったstreamや、文書化され
+  た形ではないstdoutは、`text`として下流へ渡されずstepの失敗になります。
+  新設の`src/protocol.rs`が`ProtocolState`（plain/valid/missing_terminal/invalid）と、
+  terminal recordの有無・verdict・final message・malformed record数をevidenceとして
+  保持し、実行層はtextではなくこのevidenceから判断します。
+- **agyの偽の成功を修正しました。** 非ゼロexitを成功へ補正する経路が「textが空で
+  なく、失敗と明示されていない」だけで発火し、agyのparserはenvelopeを解釈できない
+  ときrawなstdoutをそのtextとして返していました。この2つが噛み合うと、usage errorを
+  stdoutへ出してexit 1したinvocationが、usage messageを回答とする成功stepになり得ま
+  した。非ゼロexitを0へ補正できるのは、adapterが認識した正規のterminal success record
+  がある場合だけになりました。raw text、未知のstatus、壊れたenvelope、terminal欠落の
+  いずれもこの条件を満たしません。補正の適用範囲も、exit codeが信頼できないと文書化
+  されている唯一のadapterであるagyに限定しました。
+- 7つのpreset parser全てがterminal recordを要求します。protocolが完了しなかった理由は
+  sfh自身が生成したbounded diagnosticとしてstderr、stepのerror artifact、`step_end`、
+  `sfh runs why`に載ります。custom `cmd:`は`ProtocolState::Plain`で、従来のstdout契約の
+  ままです。
+- **1.1でraw textのまま成功していたrunは、1.2では失敗します。** これはbug fixであり、
+  互換維持の対象外です。
+
+### 権限configとpromptの漏洩
+
+- opencodeのpermission configを`format!`ではなく`serde_json`で構築するようにしました。
+  agent名はflow dataなので、quote・backslash・control characterを含み得ます。文字列
+  連結では、opencodeが破棄する不正なJSON（=deny ruleが黙って消える）か、攻撃者が選んだ
+  構造のどちらかを生み出せました。
+- argvでpromptを渡すadapterでは、そのargv要素をdurable logへ書かなくなりました。
+  子processには実物が渡り、記録には`<prompt chars=N sha256=...>`が残ります。binary
+  path、flag、model、access、cwdなど診断に必要な情報はそのままです。
+
+### AI向けmachine interface
+
+- `run` / `plan` / `wait` / `stop` / `status` / `preflight` / `workspaces` に`--json`。
+  共通envelope（`schema_version` / `command` / `ok` / `state` / `terminal` / `exit_code` /
+  `run_id` / `run_dir` / `error` / `warnings` / `next_actions`）を返します。
+- JSONモードのstdoutはenvelopeだけです。進捗・warning・plan headerはstderrへ、結果は
+  envelope内の`result` / `result_file`へ移しました。設定エラーでもprose ではなくenvelope
+  を返します。ここはmachine callerがparseできないと一番困る場面だからです。
+- 失敗には、v1.2.x内で意味が変わらないcodeが付きます: `SFH_USAGE` / `SFH_FLOW_INVALID` /
+  `SFH_PROTOCOL_INVALID` / `SFH_TERMINAL_MISSING` / `SFH_SESSION_UNVERIFIED` /
+  `SFH_EXECUTION_CLOSURE_CHANGED` / `SFH_WORKSPACE_MISSING` / `SFH_WORKSPACE_DRIFT` /
+  `SFH_WORKSPACE_BUSY` / `SFH_WORKSPACE_UNOWNED` / `SFH_REPLAY_REFUSED` /
+  `SFH_PERSISTENCE_FAILURE` / `SFH_CAPABILITY_UNAVAILABLE`。
+- detached runは`"terminal": false`のhandleと、答えを待つargvを返します。path省略で
+  最新runを選んだ場合は`"implicit_target": true`を必ず返します。
+- `status --json`は追加fieldのみで、従来のfieldと意味は変わりません。
+
+### preflight（無料の事前確認）
+
+- `sfh preflight [flow.yaml] [--profiles f] [--state-dir d] [--json]`を追加しました。
+  model呼び出しを一切行わず、flowが実際に起動するtool/bin variantだけを調べます:
+  binaryの所在とversion、adapterが依存するflagがそのCLIの`--help`に残っているか、
+  protocol、resume/fork対応、cost coverage、access levelごとの強制度
+  （sandboxed/enforced/best-effort/unsupported）、既知のgap、そしてこのflowが作る
+  workspace・contextとstatic leaf上限です。
+- adapterの`minimum_version`はどれも設定していません。各CLIの公式文書とlive probeで
+  確認していない下限を主張する代わりに、preflightはインストール済みversionを表示し、
+  要件は不明であると述べます。
+- `doctor`は従来どおりreal callを行いますが、隔離したscratch directoryから実行される
+  ようになりました。実行した場所のinstruction fileを読まず、そこへ書き込むこともあり
+  ません。外部CLIへ渡すpathは全てabsoluteになりました。
+
+### managed workspace
+
+- `workspace:`（`mode: current|directory|git-worktree|auto`、`root` / `base` /
+  `cleanup` / `allow_concurrent_writers` / `verify_on_resume`）と、stepごとの
+  `effects: read|workspace|external|unknown`を追加しました。
+- `auto`は仕事の意味を推測せず、宣言された`effects`だけから決めます。全stepがreadなら
+  workspaceを作りません。書き得るstepが1つでもあれば、run全体で**1個**のgit worktreeを
+  作ります。step数にもvisit数にも依存しません。
+- worktreeはbranch元repositoryの外側（`--state-dir`配下、またはplatformのuser-state
+  directory）に`sfh/<flow>/<run-id>` branchで作られます。呼び出し元のcheckoutは変更
+  されません。
+- **sfhは自分が作ったpathしか削除しません。** ownership markerとrun manifestのnonceが
+  一致した場合だけで、しかも削除直前に再確認します。**未コミットの変更を自動的に破棄
+  することはありません。** dirtyなworkspaceはrunの結果に関わらず保持され、branchも削除
+  されません。failed/stuck/stopped/deadのrunは常にworkspaceを残します。
+- resumeではworkspaceのfingerprint（HEAD、index差分、working tree差分、untracked file
+  全件のhash、submodule状態）を最後のdurable checkpointと比較します。未完了stepで説明
+  できない差分は拒否し、`--adopt-workspace`で明示的に採用できます。`--force-resume`とは
+  別の問いで、片方がもう片方を免除しません。
+- `sfh workspaces list|show|clean|remove`を追加しました。`remove --discard`が、sfhで
+  未コミットの変更が失われ得る唯一の経路です。
+
+### named context
+
+- top-levelの`contexts:`（`file` / `inline` / `template`、`max_chars` /
+  `allow_external` / `optional`）と、stepの`context:` / `context_delivery:`を追加。
+- 決定的な順序と区切りでbundleを組み立て、`<tag>.context.txt`と、各sourceの出所・hash・
+  サイズを記録した`<tag>.context.json`を保存します。durable logにはhashだけが載ります。
+- context fileはno-followで読まれ、flow directoryまたはworkspaceの内側に解決される必要
+  があります。外を指すsymlinkは拒否され、`allow_external: true`が唯一の逃げ道です。
+- `defaults.max_context_chars`超過は**何も起動する前に**失敗します。sfhは要約もしませんし、
+  収まるようにsourceを落とすこともしません。
+- `{{context}}`と`{{context_file}}`をbuiltinとして公開しました。
+
+### execution closure
+
+- flow本体、実効config、profile overlay、context fileの中身、tool version、workspaceの
+  modeとbase commit、unsafe overrideの集合をcanonical JSONのSHA-256で固定し、
+  `execution-closure.json`と`meta.json`へ記録します。
+- resume時に差があれば既定で拒否し、動いたentryを名指しします。`--force-resume`で明示的に
+  受け入れると`force_resume` eventが残ります。
+- fileはpathではなく**中身**で固定し、CRLFはLFへ畳みます。同じflowを別のpathや別の
+  checkoutからresumeしても同一と判定されます。flow fingerprintが元々採っていた方針と
+  同じです。
+
+### 再利用可能なflow: profile overlay
+
+- `--profiles <file>`（繰り返し可、後勝ち）を`run` / `plan` / `validate` / `preflight` /
+  `config show`に追加しました。共有flowが`use: judge`とだけ書き、実行する人がtool・model・
+  binを外から決められます。
+- overlayは書かれたfieldだけを置き換えます。`args`は指定があれば置換・なければ維持、
+  `env`はkey単位でmerge。優先順位は step field > overlay > flow inline profile >
+  `~/.sfh/profiles.yaml` > defaults。stepに直接`tool:`を書く従来の書き方はそのままです。
+
+### replay policy
+
+- `defaults.replay.unfinished`とstepごとの`replay.unfinished`（`rerun|stuck|fail`）を
+  追加しました。開始されたのに終了を記録しなかったstepを、resumeがどう扱うかの宣言です。
+- 既定は従来と同じ`rerun`です。`stuck`（exit 4）と`fail`（exit 1）は何も起動せず、
+  workspaceと部分成果物を残して`SFH_REPLAY_REFUSED`を返します。
+- `effects: external|unknown`かつ`rerun`のstepは`validate --strict`と`plan`がwarningを
+  出します。retry・fallback・visit・完了済みstepの再利用とは別物です。
+
+### state root
+
+- `--state-dir <dir>` / `SFH_STATE_DIR`を追加し、`runs` / `workspaces` / `plans` /
+  `doctor`を1つの根の下に置けるようにしました。
+- `--runs-dir`は従来どおりrun artifactsだけを移し、どちらも指定しなければrunは今までどおり
+  `.sfh/runs`に落ちます。state rootのないmanaged workspaceはplatformのuser-state directory
+  （`$XDG_STATE_HOME/sfh`、`$HOME/.local/state/sfh`、`%LOCALAPPDATA%\sfh`）へfallbackし、
+  それも決められない場合はrepository内へ黙って書く代わりにerrorになります。
+
+### 証拠とdiagnostics
+
+- `step_start`に`protocol_expected` / `context_hash` / `context_file` / `workspace_id`、
+  `step_end`に`protocol_state` / `terminal_seen` / `terminal_success` /
+  `final_message_seen` / `malformed_records`を追加しました。いずれも追加のみで、既存
+  eventの意味と型は変わりません。
+- 新event: `execution_closure` / `workspace_created` / `workspace_checkpoint` /
+  `workspace_adopted` / `workspace_cleanup` / `force_resume`。
+- `sfh runs why --json`が`protocol_failure`を構造化して返します。
+- `plan --json`がworkspace plan、context plan、execution closure、replay policy、
+  unsafe override、static leaf上限、redactedなinvocationを返します。
+  `plan --save [dir]`で、renderされたprompt・context bundle・machine planを保存して
+  実行前に確認できます。
+
+### 互換性と移行
+
+- 新しいkeyを使わない既存flowは、cwd・runs root・stdout・route・resume semanticsとも
+  従来どおりです。`api_version: 1`のままです。
+- v0.x / v1.0 / v1.1のrun fixtureは従来どおり読めます。新fieldのない古いlogでも
+  `status` / `show` / `why`は動きます。
+- `--force-resume`の既存のaccess fail-closed挙動は弱めていません。
+- 唯一意図的に壊した挙動は、上記のprotocol fail-closedです。
+
+### 非scope
+
+subflow、writerごとのworkspace自動fork、自動merge/PR/conflict解決、named resource
+semaphore、first-class secret provider、`access`のcapability lattice置換、typed JSON
+route、`await:`、replay `probe`、container/remote workspace、自動context要約、
+background GC、frozen `run --plan`、native session rollover、role予約語は
+v1.2.0のscope外です。今回のdata modelは、これらを後付けできる中立的な名前と構造に
+しています。
+
+## v1.1.5 — 2026-08-07
+
+### 構造化streamの完全性
+
+- Piの`--mode json`をpipe reader上で逐次解析し、raw transcriptが32 MiBを超えても
+  末尾のassistant最終回答、session marker、全assistant messageのtoken・costを失わないようにした。
+  transport logの大半を占める`message_update`がcapture上限へ達しても、正常なReviewerを
+  「final messageなし」と誤判定せず、予算を過少計上しない。
+- raw stdout/stderr artifactは無制限にdiskへ書かず、32 MiBを超えた場合に先頭16 MiBと
+  末尾16 MiBを省略marker付きで保持する方式へ変更した。session headerとterminal event/errorを
+  同時に調査でき、途中経過だけを残して末尾を捨てる旧挙動を廃止した。
+- 1件のPi JSONL recordが16 MiBを超えて安全に逐次解析できない場合は、最終回答・会計を
+  推測せずstepをfail-closedにする。sfh自身が生成したbounded診断を`step_end`へ記録し、
+  `sfh runs why`から具体的な停止理由を確認できるようにした。
+
+### 回帰検証とドキュメント
+
+- 34 MiB超の有効なPi streamを3 OSのengine suiteで実行し、末尾verdict、前後のusage/cost、
+  head+tail artifactをproduction経路で検証するstandalone stubを追加した。raw captureとsemantic
+  observerの単体境界、16 MiB単一recordのfail-closed診断も回帰テストに含めた。
+- 長いcommand出力をAI promptへ渡す際は`tail`/`truncate` filterで明示的に制限し、全文は
+  `output_file`から読む運用を日英READMEへ追記した。
+- 英語版を標準の`README.md`、日本語版を`README.ja.md`へ整理した。
+  初見利用者向けの導入・最小フロー・主要概念に絞り、詳細仕様はCLIヘルプ、
+  `sfh guide`、examples、公開Schemaへ段階的に案内する構成へ短縮した。
+
+## v1.1.4 — 2026-07-30
+
+### 1コマンド導入
+
+- macOS / Linux向け`sfh-installer.sh`とWindows向け`sfh-installer.ps1`を
+  Release assetとして追加した。OS・CPUと最新assetを自動選択し、同梱SHA-256を
+  照合してからユーザー領域へatomicに導入する。既定ではPATHも設定し、再実行による
+  更新、`SFH_VERSION`でのversion固定、`SFH_INSTALL_DIR`、
+  `SFH_NO_MODIFY_PATH`にも対応する。
+- Windows installerは検証済みファイルのMark-of-the-Webを解除し、arm64環境では
+  Windowsのx64互換実行を明示して既存x64 buildを選ぶ。Unix installerは
+  Linux/macOSのx64/arm64を判定し、bash/zsh/fishを含むPATH永続化を扱う。
+- 日英READMEの入口を公式ワンライナーとHomebrewへ整理した。手動・
+  オフライン用のbinary/checksumとGit source buildは代替経路として維持する。
+
+### パッケージマネージャとリリース契約
+
+- 4つのUnix platformのRelease checksumを唯一の入力として、Homebrew Formulaを
+  生成する決定的なrendererを追加した。version、download URL、hashの手書き転記をなくした。
+- Release workflowはbinary build完了後にinstaller、Formulaと
+  各checksumを生成し、binaryと同じGitHub Releaseへまとめて公開する。
+- CIは3 OSで公式installerを実際のrelease形式に対して実行し、PATHから起動できることと、
+  1 byteでも改変されたarchiveをSHA-256不一致として拒否することを検証する。
+  FormulaのRuby構文、欠損・不正checksum、version path traversalも検査する。
+
+## v1.1.3 — 2026-07-30
+
+### CLI と出力契約
+
+- `sfh help <command>` と、引数の後ろに置いた `--help` を一貫して扱い、
+  `run --help` から高度な `--run-dir` と `{{prompt_file}}` を発見できるようにした。
+  `runs list --help` などの二段subcommandは固有のusageを維持する。
+- `sfh plan -q/-v`、`sfh status -q`、`sfh stop -q` のように、受理しても動作を
+  変えなかったoptionを黙って無視せず、通常のunknown flagとして拒否する。
+- 人向けの`status`と成功した`stop`は、要約と次の操作を一つの順序付きstdout文書へ
+  まとめた。成功した`wait`はフロー結果だけをstdoutへ返し、完了footerを別streamへ
+  後置しない。自動処理向けの`status --json`契約は変更しない。
+- detachはrun dirをflushしてから診断を出し、quiet設定をbackground childへも引き継ぐ。
+  空の`runs list`が`$-0.0000`を表示する問題、`--limit`のエラーが`-n`を名乗る問題、
+  `--older-than 30dd`を30日として受理する問題も修正した。成功した`runs list/clean`の
+  人向けレポートもstdout内で完結する。
+
+### 複雑フローの一貫性
+
+- `foreach.split: json`は入力全体のJSONを優先し、説明文を含む場合は最後の完全で
+  parse可能な配列を採用する。引用番号`[1]`、旧draft、JSON文字列内の括弧、
+  nested array/objectを壊さず、最終構造化回答を決定的にfan-outする。
+- 連続分岐のfallthrough警告をvalidationの副作用から分離し、通常runでは一度だけ、
+  quiet runでは出さないようにした。`validate` / `validate --strict`は従来どおり
+  問題を可視化・厳格化できる。
+- 同梱`research.yaml`は調査・計画をread、成果物作成をwriteへ最小化し、
+  verdictを完全一致で分岐する。反復上限では不完全な要約へ進まず`stuck`で人へ返す。
+
+### インストールとOSS品質
+
+- Release assetと同梱SHA-256を検証し、WindowsはユーザーPATH、Unixは
+  `~/.local/bin`へ導入する手順を日英READMEへ追加した。Rust経由の導入もrelease tagへ
+  pinし、古い`sfh`がPATHで優先される場合の確認方法を明記した。
+- 英語READMEに終了コード、machine-readable status、waitのstdout契約を追加し、
+  日本語READMEと利用者向けの運用情報を揃えた。
+- CIでLinux/macOSのchecksum付き展開に加え、Windows PowerShellのchecksum・展開・
+  PATH経由起動も実行する。公開Schemaと同梱例のversion URLをv1.1.3へ更新した。
+
 ## v1.1.2 — 2026-07-30
 
 ### 複雑フローの安全性

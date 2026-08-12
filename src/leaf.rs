@@ -1,3 +1,5 @@
+use crate::execute::OutputObserver;
+use crate::protocol::{self, ProtocolEvidence, ProtocolState};
 use crate::{contain, execute, flow, preset, template};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -114,6 +116,16 @@ pub struct Prepared {
     /// Set when continue_from / fork_from resolved to a recorded session.
     pub session_parent: Option<SessionParent>,
     pub allow_empty: bool,
+    /// Hash of the assembled context bundle, or None when the step named none.
+    /// Recorded in `step_start` so a reader can tell two visits apart by what
+    /// they were handed, without the log carrying the content itself.
+    pub context_hash: Option<String>,
+    pub context_file: Option<PathBuf>,
+    /// What the flow declared about exit-code/protocol disagreement, or None to
+    /// keep the adapter's own default.
+    pub exit_conflict: Option<flow::ExitConflict>,
+    /// This step's `outcomes:` table, keyed by raw process exit code.
+    pub outcomes: BTreeMap<i32, flow::Outcome>,
     pub retry: RetryCfg,
     /// Run-level activity clock every child of this run touches when it writes
     /// anything, so `status.json` can say how long the whole run has been quiet.
@@ -142,10 +154,20 @@ pub struct LeafDone {
     pub access: Option<preset::Access>,
     pub usage: preset::Usage,
     pub cmd: String,
+    /// Bounded sfh-generated diagnosis for machine-readable `runs why` output.
+    /// Tool-controlled stderr is never copied here.
+    pub harness_diagnostic: Option<String>,
     /// A required run artifact could not be persisted. This is not an ordinary
     /// tool failure that on_error/fallback may ignore: without the artifact a
     /// later resume cannot reconstruct what happened.
     pub persistence_error: Option<String>,
+    /// The `outcomes:` entry that matched this step's raw process exit, if any.
+    /// `None` means the flow declared nothing for that code and the historical
+    /// reading stands.
+    pub outcome: Option<(flow::OutcomeResult, Option<String>)>,
+    /// What the structured protocol proved, recorded in `step_end` so a reader
+    /// can tell "the tool failed" from "sfh could not verify that it finished".
+    pub protocol: ProtocolEvidence,
 }
 
 impl LeafDone {
@@ -261,6 +283,38 @@ fn fork_warmup_enabled(flow: &flow::Flow, tool: &str) -> bool {
     }
 }
 
+/// A bounded, best-effort read of the installed codex binary's own `--help`,
+/// consulted only to decide whether `exec fork` is safe to attempt (P1-07;
+/// see `preset::build_fork`'s codex arm and `preset::codex_fork_confirmed`).
+///
+/// Distinct from `preflight::read_help`: that one runs in an isolated scratch
+/// directory because preflight promises to make no model calls ever. This sits
+/// directly on the path to a real, paid fork, so the step's own resolved cwd -
+/// where that real invocation is about to run anyway - tells sfh nothing an
+/// isolated directory would not, and is simpler to reach from here.
+///
+/// Never fatal: a codex that cannot be probed at all is refused the exact same
+/// way a codex whose `--help` stayed silent about `fork` is - "sfh could not
+/// tell" and "sfh looked and it is not there" both fail closed, on purpose.
+fn codex_help_probe(program: &str, cwd: Option<&Path>) -> Option<String> {
+    let out = execute::run_cmd(
+        &execute::Invocation::Argv(vec![program.to_string(), "--help".to_string()]),
+        None,
+        cwd,
+        Some(Duration::from_secs(15)),
+        &[],
+        &[],
+        execute::Observe::default(),
+    )
+    .ok()?;
+    if out.timed_out {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (!text.trim().is_empty()).then_some(text)
+}
+
 pub fn retry_cfg(flow: &flow::Flow, step: &flow::Step) -> RetryCfg {
     let r = step.retry.or(flow.defaults.retry);
     let mode = match step
@@ -352,6 +406,11 @@ pub struct PrepCtx<'a> {
     pub wall_deadline: Option<std::time::Instant>,
     /// Spend and time as of now, exposed to templates as `{{budget.*}}`.
     pub budget: BudgetVars,
+    /// The managed workspace this run's steps execute in, when the flow asked
+    /// for one. A step's own `cwd:` still wins - it is a deliberate statement
+    /// about where THAT step belongs - but everything else runs here instead of
+    /// in the caller's directory.
+    pub workspace: Option<&'a Path>,
     pub quiet: bool,
     pub verbose: bool,
 }
@@ -624,7 +683,52 @@ pub fn prepare_leaf(
     profile_override: Option<&str>,
 ) -> Result<Prepared, String> {
     let prompt_file = cx.run_dir.join(format!("{tag}.prompt.txt"));
-    let builtins = make_builtins(cx, &step.id, visit, &prompt_file, extras);
+    let context_file = cx.run_dir.join(format!("{tag}.context.txt"));
+    // The context bundle is assembled BEFORE the prompt, because `{{context}}`
+    // and `{{context_file}}` are builtins a prompt may reference. A `template:`
+    // context is rendered with the same variables a prompt sees, minus those
+    // two - a context that referred to itself would have no fixed point.
+    let bundle = if step.context.is_empty() {
+        crate::context::Bundle::default()
+    } else {
+        let inner_builtins = make_builtins(cx, &step.id, visit, &prompt_file, extras);
+        let inner = template::Ctx {
+            vars: cx.vars,
+            outputs: cx.outputs,
+            step_ids: cx.step_ids,
+            builtins: inner_builtins,
+        };
+        let containment = crate::context::Containment {
+            flow_dir: cx.flow_dir,
+            workspace: cx.workspace,
+        };
+        crate::context::build(
+            cx.flow,
+            &step.context,
+            &containment,
+            cx.flow.defaults.max_context_chars,
+            &mut |t| template::render(t, &inner),
+        )
+        .map_err(|e| format!("step '{}': {e}", step.id))?
+    };
+    if !bundle.is_empty() {
+        contain::write_private(&context_file, &bundle.text)
+            .map_err(|e| format!("cannot write {}: {e}", context_file.display()))?;
+        let manifest = serde_json::to_string_pretty(&bundle.manifest(&step.id, visit))
+            .map_err(|e| format!("cannot serialize the context manifest: {e}"))?;
+        contain::write_private(&cx.run_dir.join(format!("{tag}.context.json")), manifest)
+            .map_err(|e| format!("cannot write the context manifest: {e}"))?;
+    }
+    let mut builtins = make_builtins(cx, &step.id, visit, &prompt_file, extras);
+    builtins.insert("context".into(), bundle.text.clone());
+    builtins.insert(
+        "context_file".into(),
+        if bundle.is_empty() {
+            String::new()
+        } else {
+            context_file.display().to_string()
+        },
+    );
     let ctx = template::Ctx {
         vars: cx.vars,
         outputs: cx.outputs,
@@ -638,6 +742,15 @@ pub fn prepare_leaf(
     let prompt = match &step.prompt {
         Some(p) => Some(rend("prompt", p)?),
         None => None,
+    };
+    // `prepend` puts the bundle in front of the prompt; `file` leaves the
+    // prompt exactly as written and expects it to point at {{context_file}}.
+    // A step with no context: list gets neither, byte for byte as before.
+    let prompt = match (&prompt, step.context_delivery()) {
+        (Some(p), flow::ContextDelivery::Prepend) if !bundle.is_empty() => {
+            Some(crate::context::prepend(&bundle, p))
+        }
+        _ => prompt,
     };
     if let Some(p) = &prompt {
         if p.trim().is_empty() {
@@ -690,9 +803,14 @@ pub fn prepare_leaf(
     for a in &eff.args {
         args.push(rend("args", a)?);
     }
+    // A step's own `cwd:` is an explicit statement and always wins. Otherwise a
+    // managed workspace supplies the directory, which is the whole point of
+    // having one: the run's side effects land there instead of in whatever
+    // directory the caller happened to be standing in. With no workspace this
+    // stays `None` and the child inherits sfh's cwd, exactly as before v1.2.
     let cwd = match &eff.cwd {
         Some(c) => Some(PathBuf::from(rend_exec("cwd", c)?)),
-        None => None,
+        None => cx.workspace.map(PathBuf::from),
     };
     let timeout_sec = eff.timeout_sec;
 
@@ -926,7 +1044,30 @@ pub fn prepare_leaf(
                 });
                 if is_fork {
                     let child = gen_uuid();
-                    let mut b = preset::build_fork(&tool, &info.id, &child, inp, &paths)?;
+                    // codex's exec fork is new enough that supports_fork alone
+                    // is not permission to launch it (P1-07; see
+                    // preset::build_fork's codex arm): ask the installed
+                    // binary itself, right before spending anything on it.
+                    // Every other tool's fork has been real and stable long
+                    // enough that sfh trusts the adapter table without asking
+                    // again on every run.
+                    let codex_help = if tool == "codex" {
+                        let program = inp
+                            .bin
+                            .clone()
+                            .unwrap_or_else(|| preset::default_program(&tool));
+                        codex_help_probe(&program, cwd.as_deref())
+                    } else {
+                        None
+                    };
+                    let mut b = preset::build_fork(
+                        &tool,
+                        &info.id,
+                        &child,
+                        inp,
+                        &paths,
+                        codex_help.as_deref(),
+                    )?;
                     // Detect a fork flag that was ignored (the run would have
                     // appended to the shared parent) and, on pi, demand the
                     // positive proof it prints.
@@ -1047,7 +1188,11 @@ pub fn prepare_leaf(
             match inv {
                 execute::Invocation::Argv(mut v) => {
                     v.push(p);
-                    (execute::Invocation::Argv(v), None)
+                    // The prompt is now the last argv element and must never be
+                    // written down: the run dir outlives the run and the text
+                    // can carry anything a template pulled in (spec P0-04).
+                    let last = v.len() - 1;
+                    (execute::Invocation::Argv(v).redact_argv(vec![last]), None)
                 }
                 s => (s, None),
             }
@@ -1081,6 +1226,10 @@ pub fn prepare_leaf(
         session_parent,
         // Custom commands may legitimately print nothing; agent steps may not.
         allow_empty: step.allow_empty.unwrap_or(!is_preset),
+        context_hash: (!bundle.is_empty()).then(|| bundle.hash.clone()),
+        context_file: (!bundle.is_empty()).then_some(context_file),
+        exit_conflict: step.exit_conflict(cx.flow),
+        outcomes: step.outcomes.clone(),
         retry: retry_cfg(cx.flow, step),
         run_clock: cx.run_clock.cloned(),
         quiet: cx.quiet,
@@ -1107,6 +1256,11 @@ pub struct ParsedOut {
     pub usage: preset::Usage,
     /// In-band failure the exit code may not reflect.
     pub failed: bool,
+    /// What the structured protocol actually proved. A preset step whose
+    /// evidence does not permit success fails even when the process exited 0,
+    /// and a non-zero exit is never corrected to 0 without a positively
+    /// identified terminal success record (spec P0-01/P0-02).
+    pub evidence: protocol::ProtocolEvidence,
 }
 
 /// What a resumed or forked run has to prove about the session it landed in.
@@ -1219,52 +1373,64 @@ pub fn parse_output(
     stderr: &str,
     run_dir: Option<&Path>,
 ) -> Result<ParsedOut, String> {
-    Ok(match parse {
-        preset::OutputParse::Stdout => ParsedOut {
-            text: stdout.trim().to_string(),
-            ..Default::default()
-        },
-        preset::OutputParse::CodexJsonl(f) => {
-            let mut o = parse_codex_jsonl(stdout);
-            let file_text = match run_dir {
-                Some(base) => contain::read_contained_abs(base, f)
-                    .map(|t| t.unwrap_or_default())
-                    .map_err(|e| format!("refusing to read the codex last-message file: {e}"))?,
-                None => std::fs::read_to_string(f).unwrap_or_default(),
-            };
-            if !file_text.trim().is_empty() {
-                o.text = file_text.trim().to_string();
-            } else if o.text.is_empty() {
-                o.text = stdout.trim().to_string();
+    let o = match parse {
+        preset::OutputParse::Stdout => {
+            let text = stdout.trim().to_string();
+            let final_message_seen = !text.is_empty();
+            ParsedOut {
+                text,
+                evidence: ProtocolEvidence {
+                    final_message_seen,
+                    ..ProtocolEvidence::plain()
+                },
+                ..Default::default()
             }
-            if o.session.is_none() {
-                o.session = codex_session_from_stderr(stderr);
-            }
-            o
         }
+        preset::OutputParse::CodexJsonl(_) => parse_codex_jsonl(stdout),
         preset::OutputParse::ClaudeJson => parse_claude_json(stdout),
         preset::OutputParse::OpencodeNdjson => parse_opencode_ndjson(stdout),
         preset::OutputParse::GrokJson => parse_grok_json(stdout),
         preset::OutputParse::AgyJson => parse_agy_json(stdout),
         preset::OutputParse::PiJsonl => parse_pi_jsonl(stdout),
         preset::OutputParse::CursorJson => parse_cursor_json(stdout),
-    })
+    };
+    finish_parsed(parse, o, stderr, run_dir)
+}
+
+/// Whatever a parsed stream needs beyond its own records, applied the same
+/// way regardless of whether those records came from a streaming observer
+/// reading the complete pipe or from the non-streaming `stdout.lines()` parse
+/// above. Today that is only codex, whose authoritative answer lives in an
+/// external file (see `finish_codex_jsonl`); every other adapter's records
+/// are already a complete answer on their own.
+fn finish_parsed(
+    parse: &preset::OutputParse,
+    o: ParsedOut,
+    stderr: &str,
+    run_dir: Option<&Path>,
+) -> Result<ParsedOut, String> {
+    match parse {
+        preset::OutputParse::CodexJsonl(f) => finish_codex_jsonl(o, stderr, run_dir, f),
+        _ => Ok(o),
+    }
 }
 
 /// cursor-agent --output-format json: one result envelope. A model/API failure
 /// emits NO envelope at all and exits non-zero, and `is_error` is always false,
-/// so absence of the line is the failure signal - not that field.
+/// so absence of the documented `{"type":"result"}` line is the failure signal -
+/// not that field. Any other trailing JSON object (a progress record, a config
+/// dump) is NOT a result and must not be read as one.
 fn parse_cursor_json(stdout: &str) -> ParsedOut {
     let mut o = ParsedOut::default();
-    let t = stdout.trim();
-    let Some(v) = t
-        .lines()
-        .rev()
-        .find_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
-    else {
-        o.text = t.to_string();
-        o.failed = !t.is_empty();
-        return o;
+    let v = match single_envelope(stdout, "cursor-agent", &|v| {
+        v.get("type").and_then(|x| x.as_str()) == Some("result")
+    }) {
+        Ok(v) => v,
+        Err(evidence) => {
+            o.failed = true;
+            o.evidence = evidence;
+            return o;
+        }
     };
     o.text = v
         .get("result")
@@ -1281,43 +1447,78 @@ fn parse_cursor_json(stdout: &str) -> ParsedOut {
         o.usage.input_tokens = num(u.get("inputTokens"));
         o.usage.output_tokens = num(u.get("outputTokens"));
     }
-    if v.get("subtype").and_then(|x| x.as_str()) == Some("error") {
-        o.failed = true;
+    // The documented subtypes are `success` and `error`; anything else is an
+    // envelope shape sfh does not know how to read a verdict out of.
+    match v.get("subtype").and_then(|x| x.as_str()) {
+        Some("success") | None => {
+            o.evidence.protocol = ProtocolState::Valid;
+            o.evidence.terminal_seen = true;
+            o.evidence.terminal_success = Some(true);
+            o.evidence.final_message_seen = !o.text.is_empty();
+        }
+        Some("error") => {
+            o.failed = true;
+            o.evidence.protocol = ProtocolState::Valid;
+            o.evidence.terminal_seen = true;
+            o.evidence.terminal_success = Some(false);
+        }
+        Some(other) => {
+            o.failed = true;
+            o.text.clear();
+            o.evidence = ProtocolEvidence::invalid(format!(
+                "cursor-agent reported the unrecognised result subtype '{other}'; sfh will not guess whether the turn succeeded"
+            ));
+        }
     }
     o
 }
 
-/// pi --mode json: JSONL. Line 1 is the session header; each turn ends with a
-/// message_end. Usage is per message, so it is summed across the run.
-fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
-    let mut o = ParsedOut::default();
-    let (mut inp, mut outp) = (0u64, 0u64);
-    let mut reported_usage = preset::Usage::default();
-    let mut saw_usage = false;
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
+/// pi --mode json is a potentially very large JSONL event stream. Keep its
+/// semantic state separately from the bounded raw transcript: the session is
+/// at the beginning, usage is spread across assistant message_end events, and
+/// the only authoritative final answer is normally at the very end.
+#[derive(Default)]
+struct PiJsonlAccumulator {
+    parsed: ParsedOut,
+    input_tokens: u64,
+    output_tokens: u64,
+    reported_usage: preset::Usage,
+    saw_usage: bool,
+    malformed: u32,
+}
+
+impl LineRecords for PiJsonlAccumulator {
+    const TOOL: &'static str = "pi";
+    const SHAPE: &'static str = "JSONL";
+
+    fn push_line(&mut self, line: &[u8]) {
+        if line.iter().all(|b| b.is_ascii_whitespace()) {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            self.malformed = self.malformed.saturating_add(1);
+            return;
         };
         match v.get("type").and_then(|x| x.as_str()) {
             Some("session") => {
-                o.session = v.get("id").and_then(|x| x.as_str()).map(String::from);
-                o.session_marker = v
+                self.parsed.session = v.get("id").and_then(|x| x.as_str()).map(String::from);
+                self.parsed.session_marker = v
                     .get("timestamp")
                     .and_then(|x| x.as_str())
                     .map(String::from);
-                // Present only on a forked session: the parent's file path.
-                o.session_parent = v
+                self.parsed.session_parent = v
                     .get("parentSession")
                     .and_then(|x| x.as_str())
                     .map(String::from);
             }
             Some("message_end") => {
-                let Some(m) = v.get("message") else { continue };
+                let Some(m) = v.get("message") else { return };
                 if m.get("role").and_then(|x| x.as_str()) != Some("assistant") {
-                    continue;
+                    return;
                 }
-                // Later assistant messages replace earlier ones (auto-retry).
-                o.text = m
+                // Later assistant messages replace earlier ones (tool-use
+                // turns and provider retries). Only text blocks are chain data.
+                self.parsed.text = m
                     .get("content")
                     .and_then(|c| c.as_array())
                     .map(|blocks| {
@@ -1331,38 +1532,227 @@ fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                // JSON mode exits 0 even when the model run failed.
-                match m.get("stopReason").and_then(|x| x.as_str()) {
-                    Some("error") | Some("aborted") => o.failed = true,
-                    _ => {}
+                // An assistant message_end is pi's terminal record for a turn.
+                // Later ones replace earlier ones, so the verdict is the last
+                // one's, not a sticky OR of every turn.
+                self.parsed.evidence.terminal_seen = true;
+                self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
+                if matches!(
+                    m.get("stopReason").and_then(|x| x.as_str()),
+                    Some("error") | Some("aborted")
+                ) {
+                    self.parsed.failed = true;
+                    self.parsed.evidence.terminal_success = Some(false);
+                } else {
+                    self.parsed.evidence.terminal_success = Some(true);
                 }
                 if let Some(u) = m.get("usage") {
-                    saw_usage = true;
-                    inp = inp.saturating_add(u.get("input").and_then(|x| x.as_u64()).unwrap_or(0));
-                    outp =
-                        outp.saturating_add(u.get("output").and_then(|x| x.as_u64()).unwrap_or(0));
+                    self.saw_usage = true;
+                    self.input_tokens = self
+                        .input_tokens
+                        .saturating_add(u.get("input").and_then(|x| x.as_u64()).unwrap_or(0));
+                    self.output_tokens = self
+                        .output_tokens
+                        .saturating_add(u.get("output").and_then(|x| x.as_u64()).unwrap_or(0));
                     if let Some(cost) = u
                         .get("cost")
                         .and_then(|c| c.get("total"))
                         .and_then(|x| x.as_f64())
                     {
-                        reported_usage.add_reported_cost(cost);
+                        self.reported_usage.add_reported_cost(cost);
                     }
                 }
             }
             _ => {}
         }
     }
-    if saw_usage {
-        o.usage.input_tokens = Some(inp);
-        o.usage.output_tokens = Some(outp);
-        if reported_usage.cost_usd.is_none() {
-            reported_usage.cost_usd = Some(0.0);
+
+    fn finish(mut self) -> ParsedOut {
+        if self.saw_usage {
+            self.parsed.usage.input_tokens = Some(self.input_tokens);
+            self.parsed.usage.output_tokens = Some(self.output_tokens);
+            if self.reported_usage.cost_usd.is_none() {
+                self.reported_usage.cost_usd = Some(0.0);
+            }
+            self.parsed.usage.cost_usd = self.reported_usage.cost_usd;
+            self.parsed.usage.invalid_cost = self.reported_usage.invalid_cost;
         }
-        o.usage.cost_usd = reported_usage.cost_usd;
-        o.usage.invalid_cost = reported_usage.invalid_cost;
+        let malformed = self.malformed;
+        finish_stream_evidence(&mut self.parsed, Self::TOOL, malformed, Self::SHAPE);
+        self.parsed
     }
-    o
+}
+
+/// A single line-delimited JSON record is bounded independently of the whole
+/// transcript, for every adapter that speaks this shape (pi JSONL, codex
+/// JSONL, opencode NDJSON). Real records are normally KiB; allowing 16 MiB -
+/// the same ceiling `MAX_ENVELOPE_BYTES` gives the single-envelope adapters,
+/// for the same reason - covers a large tool result while still stopping an
+/// unterminated or malicious line from turning streaming parsing back into
+/// unbounded memory growth. Exceeding it fails the run closed: `finish` below
+/// reports the whole stream as invalid rather than silently dropping just the
+/// one oversized record and carrying on with a gap in the accounting.
+const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// What one line-delimited stdout protocol does with a complete record. The
+/// boundary tracking that turns a raw byte stream into records - a chunk
+/// split mid-line, an unterminated final line, the per-record ceiling above -
+/// is identical for pi/codex/opencode; only THIS is adapter-specific, and it
+/// is also exactly what each adapter's non-streaming `stdout.lines()` parser
+/// already does line by line, so `LineBuffer` below backs both paths with the
+/// same accumulator type instead of two implementations drifting apart.
+trait LineRecords: Default + Send {
+    /// Named only so this adapter's oversized-record / poisoned-lock
+    /// diagnostics read like the ones `finish_stream_evidence` already
+    /// produces for a malformed or incomplete stream.
+    const TOOL: &'static str;
+    const SHAPE: &'static str;
+
+    /// `line` never contains a trailing `\r` or `\n`.
+    fn push_line(&mut self, line: &[u8]);
+    fn finish(self) -> ParsedOut;
+}
+
+/// Incremental line splitting shared by every streaming line-delimited
+/// observer. A pipe read can end anywhere - mid-record, mid-newline, or
+/// exactly on a line break - and the child can also exit with an
+/// unterminated final line still buffered, so the boundary has to survive
+/// across calls to `feed`.
+struct LineBuffer<R: LineRecords> {
+    records: R,
+    pending: Vec<u8>,
+    discarding_oversized_line: bool,
+    oversized_line: bool,
+}
+
+impl<R: LineRecords> Default for LineBuffer<R> {
+    fn default() -> Self {
+        LineBuffer {
+            records: R::default(),
+            pending: Vec::new(),
+            discarding_oversized_line: false,
+            oversized_line: false,
+        }
+    }
+}
+
+impl<R: LineRecords> LineBuffer<R> {
+    fn feed(&mut self, chunk: &[u8]) {
+        for segment in chunk.split_inclusive(|b| *b == b'\n') {
+            let ends_line = segment.last() == Some(&b'\n');
+            if self.discarding_oversized_line {
+                if ends_line {
+                    self.discarding_oversized_line = false;
+                }
+                continue;
+            }
+            if self.pending.len().saturating_add(segment.len()) > MAX_JSONL_LINE_BYTES {
+                self.pending.clear();
+                self.oversized_line = true;
+                self.discarding_oversized_line = !ends_line;
+                continue;
+            }
+            self.pending.extend_from_slice(segment);
+            if ends_line {
+                let line = std::mem::take(&mut self.pending);
+                self.records.push_line(trim_ascii_line(&line));
+            }
+        }
+    }
+
+    /// A process that dies mid-record leaves an unterminated final line in
+    /// `pending`. The newline is a delimiter, not payload, so that line is
+    /// still a complete record and must be flushed - not silently dropped -
+    /// before the result is read out. Returns whether any record was ever
+    /// discarded for exceeding `MAX_JSONL_LINE_BYTES`.
+    fn finish_pending(&mut self) -> bool {
+        if !self.pending.is_empty() && !self.discarding_oversized_line {
+            let line = std::mem::take(&mut self.pending);
+            self.records.push_line(trim_ascii_line(&line));
+        }
+        self.oversized_line || self.discarding_oversized_line
+    }
+}
+
+/// `OutputObserver` for any line-delimited JSON stream. This runs on the pipe
+/// reader thread and sees every byte before the raw-capture bound in
+/// execute.rs applies, so the record `R` accumulates is built from the
+/// complete stream rather than from a possibly-truncated capture (P0-03).
+struct LineStreamObserver<R: LineRecords> {
+    state: Mutex<LineBuffer<R>>,
+}
+
+impl<R: LineRecords> Default for LineStreamObserver<R> {
+    fn default() -> Self {
+        LineStreamObserver {
+            state: Mutex::new(LineBuffer::default()),
+        }
+    }
+}
+
+impl<R: LineRecords> OutputObserver for LineStreamObserver<R> {
+    fn observe(&self, chunk: &[u8]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.feed(chunk);
+    }
+}
+
+impl<R: LineRecords> LineStreamObserver<R> {
+    fn finish(&self) -> (ParsedOut, Option<String>) {
+        let Ok(mut state) = self.state.lock() else {
+            let why = format!(
+                "{} {} semantic observer lock was poisoned",
+                R::TOOL,
+                R::SHAPE
+            );
+            return (
+                ParsedOut {
+                    failed: true,
+                    evidence: ProtocolEvidence::invalid(why.clone()),
+                    ..Default::default()
+                },
+                Some(why),
+            );
+        };
+        let oversized = state.finish_pending();
+        let mut parsed = std::mem::take(&mut state.records).finish();
+        let diagnostic = if oversized {
+            let why = format!(
+                "{} {} contained a record larger than {} MiB; final output and accounting cannot be verified",
+                R::TOOL,
+                R::SHAPE,
+                MAX_JSONL_LINE_BYTES / 1024 / 1024
+            );
+            parsed.failed = true;
+            parsed.evidence = ProtocolEvidence::invalid(why.clone());
+            Some(why)
+        } else {
+            parsed.evidence.diagnostic.clone()
+        };
+        (parsed, diagnostic)
+    }
+}
+
+/// pi --mode json streamed as it arrives, instead of reparsed from the bounded
+/// raw capture after the process exits.
+type PiStreamObserver = LineStreamObserver<PiJsonlAccumulator>;
+
+fn trim_ascii_line(mut line: &[u8]) -> &[u8] {
+    while line.last().is_some_and(|b| matches!(b, b'\r' | b'\n')) {
+        line = &line[..line.len() - 1];
+    }
+    line
+}
+
+/// Non-streaming parser used by doctor/tests and as a compatibility fallback.
+fn parse_pi_jsonl(stdout: &str) -> ParsedOut {
+    let mut accumulator = PiJsonlAccumulator::default();
+    for line in stdout.lines() {
+        accumulator.push_line(line.as_bytes());
+    }
+    accumulator.finish()
 }
 
 /// Execute one prepared leaf, honouring its retry policy.
@@ -1400,9 +1790,34 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
             // wrong for "the pipe went dead 38 minutes ago" (B-12). The idle
             // clock separates them: silence longer than hang_after_sec is a
             // hang, and a hang is exactly the kind of failure a retry fixes.
+            // A declared outcome replaces the guess entirely. Needle-matching
+            // exists because sfh usually cannot know why a step failed; when
+            // the flow has said, guessing on top of that is not caution, it is
+            // sfh overruling a statement it asked for.
+            RetryMode::Transient if done.outcome.is_some() => {
+                matches!(done.outcome, Some((flow::OutcomeResult::Retryable, _)))
+            }
             RetryMode::Transient => {
-                (!done.timed_out
-                    && execute::is_transient_failure(&done.stderr_clean, &done.chain_output))
+                // A PRESET step's chain output is the tool's own report, so a
+                // rate limit or a serving abort in it really does describe how
+                // this attempt failed. A custom `cmd:` step's stdout is its
+                // RESULT - the test list, the diff, the JSON it was asked to
+                // produce - and scanning that for provider needles reads the
+                // command's data as if it were a statement about the harness.
+                //
+                // A verification step whose suite contains a case named
+                // `tcp_502_returns_error` was therefore re-run in full on every
+                // deterministic failure: minutes of compute and a second bill,
+                // for a match on the word 502 inside a test name. stderr is
+                // still read for both, because that is where a command reports
+                // operational trouble - `curl` writing "connection reset" is
+                // exactly the transient case, and it goes there.
+                let tool_report = if done.tool.is_some() {
+                    done.chain_output.as_str()
+                } else {
+                    ""
+                };
+                (!done.timed_out && execute::is_transient_failure(&done.stderr_clean, tool_report))
                     || (done.timed_out && done.idle_ms >= cfg.hang_after_sec.saturating_mul(1000))
             }
         };
@@ -1435,6 +1850,53 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
             std::thread::sleep(Duration::from_millis(200));
         }
         attempt += 1;
+    }
+}
+
+/// Which streaming semantic observer (if any) a step's declared protocol
+/// wires up. pi/codex/opencode are the line-delimited adapters, each capable
+/// of an event stream larger than the 32 MiB raw-capture bound, so each gets
+/// an `execute::OutputObserver` that reads its terminal record, session id,
+/// and usage/cost off the complete stream instead of off `stdout_clean`,
+/// which that bound may have gapped in the middle (P0-03). Every other
+/// adapter's documented shape is a single envelope well under that bound, so
+/// it is still read back from `stdout_clean` after the process exits.
+enum StreamObserver {
+    Pi(Arc<PiStreamObserver>),
+    Codex(Arc<CodexStreamObserver>),
+    Opencode(Arc<OpencodeStreamObserver>),
+}
+
+impl StreamObserver {
+    fn for_parse(parse: &preset::OutputParse) -> Option<Self> {
+        match parse {
+            preset::OutputParse::PiJsonl => {
+                Some(StreamObserver::Pi(Arc::new(PiStreamObserver::default())))
+            }
+            preset::OutputParse::CodexJsonl(_) => Some(StreamObserver::Codex(Arc::new(
+                CodexStreamObserver::default(),
+            ))),
+            preset::OutputParse::OpencodeNdjson => Some(StreamObserver::Opencode(Arc::new(
+                OpencodeStreamObserver::default(),
+            ))),
+            _ => None,
+        }
+    }
+
+    fn as_output_observer(&self) -> Arc<dyn execute::OutputObserver> {
+        match self {
+            StreamObserver::Pi(o) => Arc::clone(o) as Arc<dyn execute::OutputObserver>,
+            StreamObserver::Codex(o) => Arc::clone(o) as Arc<dyn execute::OutputObserver>,
+            StreamObserver::Opencode(o) => Arc::clone(o) as Arc<dyn execute::OutputObserver>,
+        }
+    }
+
+    fn finish(&self) -> (ParsedOut, Option<String>) {
+        match self {
+            StreamObserver::Pi(o) => o.finish(),
+            StreamObserver::Codex(o) => o.finish(),
+            StreamObserver::Opencode(o) => o.finish(),
+        }
     }
 }
 
@@ -1520,10 +1982,15 @@ fn exec_once(p: Prepared) -> LeafDone {
             access: p.access,
             usage: preset::Usage::default(),
             cmd: cmd_desc,
+            harness_diagnostic: Some(why.clone()),
             // No `step_end` may certify completion when an artifact path is
             // unsafe. The engine treats this like any other durability error
             // and aborts the run without recording a reusable completion.
             persistence_error: Some(why.clone()),
+            // Nothing ran, so there is no exit code for an `outcomes:` table
+            // to describe.
+            outcome: None,
+            protocol: ProtocolEvidence::default(),
         };
     }
     // Compute the remaining wall budget at the last possible point before
@@ -1565,9 +2032,20 @@ fn exec_once(p: Prepared) -> LeafDone {
             access: p.access,
             usage: preset::Usage::default(),
             cmd: cmd_desc,
+            harness_diagnostic: Some(why.into()),
             persistence_error,
+            outcome: None,
+            protocol: ProtocolEvidence::default(),
         };
     }
+    // pi/codex/opencode can each emit an event transcript larger than the raw
+    // capture bound. Parse semantic records for whichever one this step
+    // speaks on the pipe reader thread, so the raw artifact's bounded capture
+    // cannot discard the terminal answer or later usage/cost reports (P0-03).
+    let stream_observer = StreamObserver::for_parse(&p.parse);
+    let stdout_observer = stream_observer
+        .as_ref()
+        .map(|observer| observer.as_output_observer());
     let outcome = match execute::run_cmd(
         &p.inv,
         p.stdin_payload,
@@ -1579,6 +2057,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             // Tee to the step's out file so a long step is observable while it
             // runs; the cleaned text replaces it once the child exits.
             tee: Some(p.out_file.clone()),
+            stdout_observer,
             run_clock: p.run_clock.clone(),
         },
     ) {
@@ -1601,7 +2080,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 idle_ms: 0,
                 attempts: 1,
                 chain_output: String::new(),
-                stderr_clean: e,
+                stderr_clean: e.clone(),
                 out_file: p.out_file,
                 session_id: None,
                 session_marker: None,
@@ -1610,12 +2089,22 @@ fn exec_once(p: Prepared) -> LeafDone {
                 access: p.access,
                 usage: preset::Usage::default(),
                 cmd: cmd_desc,
+                harness_diagnostic: Some(format!("failed to spawn tool: {e}")),
                 persistence_error,
+                outcome: None,
+                protocol: ProtocolEvidence::default(),
             };
         }
     };
     let stdout_clean = clean_text(&outcome.stdout);
     let mut stderr_clean = clean_text(&outcome.stderr);
+    let stream_result = stream_observer.as_ref().map(|observer| observer.finish());
+    let mut harness_diagnostic = stream_result
+        .as_ref()
+        .and_then(|(_, diagnostic)| diagnostic.clone());
+    if let Some(diagnostic) = &harness_diagnostic {
+        stderr_clean.push_str(&format!("\nsfh: {diagnostic}\n"));
+    }
     let mut persistence_error = None;
     if let Err(e) = contain::write_private_atomic(&p.out_file, &stdout_clean) {
         persistence_error = Some(format!(
@@ -1632,23 +2121,44 @@ fn exec_once(p: Prepared) -> LeafDone {
         });
     }
 
-    let mut parsed = match parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)) {
-        Ok(o) => o,
-        Err(e) => {
-            // A containment violation reading the tool's artifact is a failure
-            // of this step, not empty output (rev_break #4).
-            stderr_clean.push_str(&format!("\nsfh: {e}\n"));
-            if let Err(write_err) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
-                persistence_error.get_or_insert_with(|| {
-                    format!(
-                        "cannot persist required stderr artifact {}: {write_err}",
-                        p.err_file.display()
-                    )
-                });
+    // `stdout_clean` is the bounded, head+tail raw ARTIFACT (see MAX_CAPTURE in
+    // execute.rs); `stream_result`, when there is one, is the SEMANTIC state a
+    // streaming observer already built from the complete pipe, before that
+    // bound applied. These are deliberately kept as two different values
+    // instead of one "parsed output" derived from whichever text survived
+    // truncation: a run whose transcript blew past the raw-capture bound must
+    // not be failed or degraded on that account alone when its observer saw
+    // every byte, so `parsed` below is built from `stream_result` whenever one
+    // exists and `stdout_clean` is never consulted for it. Both cases still
+    // route through the same `finish_parsed` step `parse_output` uses, so a
+    // large codex run and a small one resolve the file/session fallback
+    // identically.
+    let mut parsed = {
+        let result = match stream_result {
+            Some((observed, _)) => {
+                finish_parsed(&p.parse, observed, &stderr_clean, Some(&p.run_dir))
             }
-            ParsedOut {
-                failed: true,
-                ..Default::default()
+            None => parse_output(&p.parse, &stdout_clean, &stderr_clean, Some(&p.run_dir)),
+        };
+        match result {
+            Ok(o) => o,
+            Err(e) => {
+                // A containment violation reading the tool's artifact is a failure
+                // of this step, not empty output (rev_break #4).
+                stderr_clean.push_str(&format!("\nsfh: {e}\n"));
+                harness_diagnostic = Some(e.clone());
+                if let Err(write_err) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+                    persistence_error.get_or_insert_with(|| {
+                        format!(
+                            "cannot persist required stderr artifact {}: {write_err}",
+                            p.err_file.display()
+                        )
+                    });
+                }
+                ParsedOut {
+                    failed: true,
+                    ..Default::default()
+                }
             }
         }
     };
@@ -1666,17 +2176,145 @@ fn exec_once(p: Prepared) -> LeafDone {
         }
     }
     let mut exit_code = outcome.exit_code;
-    // Several tools report success/failure in-band and get the exit code wrong.
-    if parsed.failed && exit_code == 0 {
-        exit_code = 1;
-    } else if !parsed.failed
-        && exit_code != 0
-        && !outcome.timed_out
-        && !parsed.text.is_empty()
-        && matches!(p.parse, preset::OutputParse::AgyJson)
-    {
-        exit_code = 0;
+    // Several tools report success/failure in-band and get the exit code wrong,
+    // in BOTH directions. The two corrections are not symmetric:
+    //
+    //  - a documented in-band failure always beats a zero exit, and
+    //  - a non-zero exit is only ever excused by a positively identified
+    //    terminal SUCCESS record (spec P0-01).
+    //
+    // Before v1.2 the second correction fired for agy on "non-empty text and
+    // nothing said it failed", and agy's parser handed raw stdout back as that
+    // text whenever it could not parse an envelope. A usage error printed to
+    // stdout with exit 1 therefore became a successful step whose answer was
+    // the usage message. `certifies_success` cannot be satisfied by raw text,
+    // an unknown status, a malformed envelope or a missing terminal record.
+    //
+    // Which way the second correction falls is the flow's call, not a hardcoded
+    // adapter list: v1.2.0 excused only agy, and a CLI that exits 1 because
+    // some intermediate tool call failed - after producing and committing a
+    // complete final answer - had no way to say so except to stop checking exit
+    // codes at all, which is fail-open. `exit_conflict: trust_protocol` is the
+    // narrow, declared alternative, and it still cannot fire without positive
+    // evidence of success. The default stays `fail` for every tool whose exit
+    // status is trustworthy, so no existing flow changes meaning.
+    // An incomplete structured protocol is recorded FIRST, whichever way the
+    // exit code lands. "The tool failed" and "sfh could not verify that the
+    // tool finished" are different diagnoses, and only one of them tells a user
+    // that the CLI's output shape has drifted out from under their flow.
+    // Custom `cmd:` steps are ProtocolState::Plain and keep their long-standing
+    // stdout contract untouched.
+    let protocol_failure = (!outcome.timed_out && !parsed.evidence.allows_success())
+        .then(|| {
+            parsed
+                .evidence
+                .failure_reason(p.tool.as_deref().unwrap_or("the tool"))
+        })
+        .flatten();
+    if let Some(why) = &protocol_failure {
+        stderr_clean.push_str(&format!("\nsfh: {why}\n"));
+        harness_diagnostic.get_or_insert_with(|| why.clone());
+        if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+            persistence_error.get_or_insert_with(|| {
+                format!(
+                    "cannot persist required stderr artifact {}: {e}",
+                    p.err_file.display()
+                )
+            });
+        }
     }
+    // What this step's own exit code MEANS, if the flow said. Read from the RAW
+    // process exit, before any correction: `outcomes: {2: ...}` is a statement
+    // about what the command prints on its way out, and a table that shifted
+    // under sfh's own adjustments would mean something different from what it
+    // says.
+    //
+    // Deliberately gated on the protocol first. A declared outcome describes a
+    // command that RAN and reported; it is not a licence to accept a turn whose
+    // structured protocol never completed. Fail-closed keeps precedence, so a
+    // preset step whose stream died mid-answer cannot be relabelled "complete"
+    // by an exit-code table.
+    //
+    // `!parsed.failed` belongs in that gate too, and not only as a restatement
+    // of the protocol test. A containment violation reading the tool's artifact
+    // (`parse_output` Err, rev_break #4) reports itself as `failed: true` with
+    // DEFAULT evidence - and the default protocol state is `Plain`, which
+    // allows success - so `protocol_failure` is None there. Without this term a
+    // codex step carrying any `outcomes:` entry for the code it exited with
+    // turned "refusing to read the codex last-message file: it is a symlink"
+    // into a green step with empty output, which is precisely the fail-open the
+    // artifact check exists to prevent.
+    let declared = (protocol_failure.is_none()
+        && !parsed.failed
+        && !outcome.timed_out
+        && !outcome.interrupted)
+        .then(|| p.outcomes.get(&outcome.exit_code))
+        .flatten()
+        .cloned();
+    if let Some(d) = &declared {
+        if d.result.is_success() {
+            // "Ran fine, there is more to do" is not a failure, and must not be
+            // read as one: no on_error, no retry, no partial-emit path.
+            exit_code = 0;
+        } else if exit_code == 0 {
+            // A flow that calls exit 0 a failure is unusual but coherent, and
+            // saying so must actually fail the step.
+            exit_code = 1;
+        }
+    }
+    // "The flow said nothing" and "the flow said fail" are different: only the
+    // second may override an adapter documented to get its exit codes wrong.
+    let trust_protocol = match p.exit_conflict {
+        Some(flow::ExitConflict::TrustProtocol) => true,
+        Some(flow::ExitConflict::Fail) => false,
+        None => !preset::exit_code_trustworthy(p.tool.as_deref().unwrap_or("")),
+    };
+    // Neither correction may run over a step that was killed or that said, in
+    // its own protocol, that it failed. A terminal success record can arrive
+    // and the process still be cut down afterwards by `sfh stop` or Ctrl-C -
+    // reporting that as a completed step would turn "a human stopped this" into
+    // "this finished", which is the one thing a stopped run must never say.
+    if declared.is_some() {
+        // The flow has spoken about this exit code. Neither the in-band failure
+        // fold nor the exit_conflict correction gets a second opinion.
+    } else if (parsed.failed || protocol_failure.is_some()) && exit_code == 0 {
+        exit_code = 1;
+    } else if exit_code != 0
+        && !outcome.timed_out
+        && !outcome.interrupted
+        && !parsed.failed
+        && parsed.evidence.certifies_success()
+    {
+        if trust_protocol {
+            exit_code = 0;
+        } else {
+            // The step still fails - but silently reporting only the exit code
+            // hides that sfh held proof of a completed turn, which is the one
+            // fact that tells a user whether to reach for `exit_conflict:` or
+            // to go looking for a real failure.
+            let why = format!(
+                "{} exited {} but its own protocol certified this turn as successful \
+                 (terminal record found, status success). sfh failed the step because an \
+                 exit code is a failure unless the flow says otherwise. If this tool is \
+                 known to exit non-zero without invalidating its answer, declare \
+                 `exit_conflict: trust_protocol` on the step or in defaults - do not stop \
+                 checking exit codes.",
+                p.tool.as_deref().unwrap_or("the tool"),
+                outcome.exit_code
+            );
+            stderr_clean.push_str(&format!("\nsfh: {why}\n"));
+            harness_diagnostic.get_or_insert(why);
+            if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
+                persistence_error.get_or_insert_with(|| {
+                    format!(
+                        "cannot persist required stderr artifact {}: {e}",
+                        p.err_file.display()
+                    )
+                });
+            }
+        }
+    }
+    let protocol_evidence = parsed.evidence.clone();
     let chain_output = parsed.text.clone();
 
     let mut session_id = if exit_code == 0 && !outcome.timed_out {
@@ -1705,6 +2343,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         };
         if let Some(why) = check_session(&expect, &parsed, &chain_output) {
             exit_code = 1;
+            harness_diagnostic = Some(why.trim().trim_start_matches("sfh: ").to_string());
             if !why.starts_with("\nsfh: the tool exited successfully") {
                 session_id = None;
             }
@@ -1729,6 +2368,7 @@ fn exec_once(p: Prepared) -> LeafDone {
     }
     if let Some(e) = &persistence_error {
         exit_code = -1;
+        harness_diagnostic = Some(e.clone());
         stderr_clean.push_str(&format!("\nsfh: {e}\n"));
     }
 
@@ -1750,6 +2390,22 @@ fn exec_once(p: Prepared) -> LeafDone {
     }
     LeafDone {
         tag: p.tag,
+        // The only site where a process really ran, so the only one that can
+        // carry what its exit code was declared to mean.
+        //
+        // A declared SUCCESS is dropped when the step did not, in the end,
+        // succeed. Checks that run AFTER the table is read can still fail the
+        // step - session identity on a resume, an empty answer under
+        // allow_empty: false, an unpersistable artifact - and recording
+        // "complete" for a step sfh failed is worse than recording nothing: the
+        // label is exposed as {{steps.<id>.label}} and matched by
+        // `when_label_is:`, so an `on_error: continue` probe routed down the
+        // success branch of a step that failed. A `retryable`/`fail`
+        // declaration claims no success and is kept as-is, which is also what
+        // the retry decision in exec_leaf reads.
+        outcome: declared
+            .filter(|d| !d.result.is_success() || exit_code == 0)
+            .map(|d| (d.result, d.label)),
         exit_code,
         timed_out: outcome.timed_out,
         interrupted: outcome.interrupted,
@@ -1766,7 +2422,9 @@ fn exec_once(p: Prepared) -> LeafDone {
         access: p.access,
         usage: parsed.usage,
         cmd: cmd_desc,
+        harness_diagnostic,
         persistence_error,
+        protocol: protocol_evidence,
     }
 }
 
@@ -1812,32 +2470,60 @@ fn num(v: Option<&serde_json::Value>) -> Option<u64> {
     v.and_then(|x| x.as_u64())
 }
 
-/// codex --json: JSONL events. thread.started carries the session id,
-/// turn.completed the usage; the final text comes from --output-last-message.
-fn parse_codex_jsonl(stdout: &str) -> ParsedOut {
-    let mut o = ParsedOut::default();
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
+/// codex --json is a potentially very large JSONL event stream - the same
+/// shape of problem as pi: thread.started (the session id) arrives near the
+/// start, and turn.completed/turn.failed (the documented terminal record and
+/// its usage) arrives at the end. Kept as its own accumulator so the
+/// streaming observer below and the non-streaming `parse_codex_jsonl`
+/// fallback build identical state one line at a time; only how the lines
+/// ARRIVE differs between them.
+///
+/// `turn.completed` / `turn.failed` is codex's documented terminal record. A
+/// stream that stops before one of them describes a turn nobody can say
+/// finished, so it is `missing_terminal` rather than "whatever text we saw".
+#[derive(Default)]
+struct CodexJsonlAccumulator {
+    parsed: ParsedOut,
+    malformed: u32,
+}
+
+impl LineRecords for CodexJsonlAccumulator {
+    const TOOL: &'static str = "codex";
+    const SHAPE: &'static str = "JSONL";
+
+    fn push_line(&mut self, line: &[u8]) {
+        if line.trim_ascii().is_empty() {
+            return;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            self.malformed = self.malformed.saturating_add(1);
+            return;
         };
         match v.get("type").and_then(|x| x.as_str()) {
             Some("thread.started") => {
                 if let Some(id) = v.get("thread_id").and_then(|x| x.as_str()) {
-                    o.session = Some(id.to_string());
+                    self.parsed.session = Some(id.to_string());
                 }
             }
             Some("turn.completed") => {
+                self.parsed.evidence.terminal_seen = true;
+                self.parsed.evidence.terminal_success = Some(true);
                 if let Some(u) = v.get("usage") {
-                    o.usage.input_tokens = num(u.get("input_tokens"));
-                    o.usage.output_tokens = num(u.get("output_tokens"));
+                    self.parsed.usage.input_tokens = num(u.get("input_tokens"));
+                    self.parsed.usage.output_tokens = num(u.get("output_tokens"));
                 }
             }
-            Some("turn.failed") => o.failed = true,
+            Some("turn.failed") => {
+                self.parsed.failed = true;
+                self.parsed.evidence.terminal_seen = true;
+                self.parsed.evidence.terminal_success = Some(false);
+            }
             Some("item.completed") => {
                 if let Some(item) = v.get("item") {
                     if item.get("type").and_then(|x| x.as_str()) == Some("agent_message") {
                         if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
-                            o.text = t.trim().to_string();
+                            self.parsed.text = t.trim().to_string();
+                            self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
                         }
                     }
                 }
@@ -1845,23 +2531,183 @@ fn parse_codex_jsonl(stdout: &str) -> ParsedOut {
             _ => {}
         }
     }
-    o
+
+    fn finish(mut self) -> ParsedOut {
+        let malformed = self.malformed;
+        finish_stream_evidence(&mut self.parsed, Self::TOOL, malformed, Self::SHAPE);
+        self.parsed
+    }
+}
+
+/// codex --json streamed as it arrives, instead of reparsed from the bounded
+/// raw capture after the process exits.
+type CodexStreamObserver = LineStreamObserver<CodexJsonlAccumulator>;
+
+/// Non-streaming parser used by doctor and as a compatibility fallback; see
+/// `CodexJsonlAccumulator` for the per-record semantics.
+fn parse_codex_jsonl(stdout: &str) -> ParsedOut {
+    let mut acc = CodexJsonlAccumulator::default();
+    for line in stdout.lines() {
+        acc.push_line(line.as_bytes());
+    }
+    acc.finish()
+}
+
+/// codex's authoritative final answer is --output-last-message, not the JSONL
+/// event stream: the file holds exactly what the model's turn produced, and
+/// `item.completed`'s agent_message text (captured above) is only a fallback
+/// for when the file comes back empty. Raw stdout is NOT a third fallback:
+/// codex stdout is the JSONL event log, and handing it on as an answer is
+/// exactly the fail-open the protocol contract exists to stop.
+///
+/// Applied identically whether `o`'s records came from the streaming observer
+/// (a run over the raw-capture bound) or from `parse_codex_jsonl` (the
+/// non-streaming fallback): the JSONL state and this file read are two
+/// independent facts about the same run, not alternate paths that happen to
+/// land in the same place.
+fn finish_codex_jsonl(
+    mut o: ParsedOut,
+    stderr: &str,
+    run_dir: Option<&Path>,
+    last_message: &Path,
+) -> Result<ParsedOut, String> {
+    let file_text = match run_dir {
+        Some(base) => contain::read_contained_abs(base, last_message)
+            .map(|t| t.unwrap_or_default())
+            .map_err(|e| format!("refusing to read the codex last-message file: {e}"))?,
+        None => std::fs::read_to_string(last_message).unwrap_or_default(),
+    };
+    if !file_text.trim().is_empty() {
+        o.text = file_text.trim().to_string();
+        o.evidence.final_message_seen = true;
+    }
+    if o.session.is_none() {
+        o.session = codex_session_from_stderr(stderr);
+    }
+    Ok(o)
+}
+
+/// Shared close-out for the line-oriented adapters: a stream that carried a
+/// record sfh could not parse is not the documented format, and one that never
+/// reached its terminal record cannot be certified as a finished turn.
+fn finish_stream_evidence(o: &mut ParsedOut, tool: &str, malformed: u32, shape: &str) {
+    o.evidence.malformed_records = malformed;
+    if malformed > 0 {
+        o.evidence.protocol = ProtocolState::Invalid;
+        o.evidence.diagnostic = Some(format!(
+            "{tool} {shape} stdout contained {malformed} record(s) sfh could not parse; the machine-readable protocol did not hold, so its output is not a usable answer"
+        ));
+    } else if o.evidence.terminal_seen {
+        o.evidence.protocol = ProtocolState::Valid;
+    } else {
+        o.evidence.protocol = ProtocolState::MissingTerminal;
+        o.evidence.diagnostic = Some(format!(
+            "{tool} {shape} stdout ended without its documented terminal record, so sfh cannot tell whether the turn finished"
+        ));
+    }
+}
+
+/// A record size beyond which a "single envelope" adapter is no longer being
+/// parsed incrementally in any meaningful sense. The stream adapters have their
+/// own per-record cap; this is the equivalent hard stop for the ones that are
+/// documented to print exactly one JSON document (spec 5.3).
+const MAX_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Locate the documented terminal envelope of a single-document adapter.
+///
+/// The tool is documented to print one JSON value. Try that first, so a
+/// pretty-printed object (grok) is read as the single document it is; only when
+/// that fails is the output treated as lines, and then every non-blank line
+/// that is not JSON is a record the adapter never promised - the stream is not
+/// the documented format and no text from it may be handed on as an answer.
+fn single_envelope(
+    stdout: &str,
+    tool: &str,
+    is_terminal: &dyn Fn(&serde_json::Value) -> bool,
+) -> Result<serde_json::Value, ProtocolEvidence> {
+    let t = stdout.trim();
+    if t.len() > MAX_ENVELOPE_BYTES {
+        return Err(ProtocolEvidence::invalid(format!(
+            "{tool} produced more than {} MiB of stdout for a single-envelope protocol; sfh will not guess the final answer or the accounting from it",
+            MAX_ENVELOPE_BYTES / 1024 / 1024
+        )));
+    }
+    if t.is_empty() {
+        return Err(ProtocolEvidence {
+            protocol: ProtocolState::MissingTerminal,
+            diagnostic: Some(format!(
+                "{tool} produced no output at all, so its documented result envelope is missing"
+            )),
+            ..Default::default()
+        });
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        if is_terminal(&v) {
+            return Ok(v);
+        }
+        return Err(ProtocolEvidence {
+            protocol: ProtocolState::MissingTerminal,
+            diagnostic: Some(format!(
+                "{tool} printed JSON that is not its documented result envelope, so sfh cannot tell whether the turn finished"
+            )),
+            ..Default::default()
+        });
+    }
+    let mut malformed = 0u32;
+    let mut terminal = None;
+    for line in t.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => {
+                if is_terminal(&v) {
+                    terminal = Some(v);
+                }
+            }
+            Err(_) => malformed = malformed.saturating_add(1),
+        }
+    }
+    // Several of these CLIs print a human banner before the envelope
+    // (cursor-agent's "Using worktree: ..."), which is a form they officially
+    // emit, so it is not by itself a broken protocol - the envelope still has
+    // to be there. When it is NOT there, the leftover text is not promoted to
+    // an answer: that is the fail-open this contract removes.
+    match terminal {
+        Some(v) => Ok(v),
+        None if malformed > 0 => Err(ProtocolEvidence {
+            protocol: ProtocolState::Invalid,
+            malformed_records: malformed,
+            diagnostic: Some(format!(
+                "{tool} stdout held {malformed} record(s) that are not its documented machine-readable output and no result envelope; sfh will not treat that text as the answer"
+            )),
+            ..Default::default()
+        }),
+        None => Err(ProtocolEvidence {
+            protocol: ProtocolState::MissingTerminal,
+            diagnostic: Some(format!(
+                "{tool} never printed its documented result envelope, so sfh cannot tell whether the turn finished"
+            )),
+            ..Default::default()
+        }),
+    }
 }
 
 /// claude --output-format json: one envelope with .result/.session_id/.total_cost_usd.
+/// The documented terminal record is `{"type":"result", ...}`; `is_error`
+/// carries its verdict.
 fn parse_claude_json(stdout: &str) -> ParsedOut {
     let mut o = ParsedOut::default();
-    let t = stdout.trim();
-    let Some(v) = serde_json::from_str::<serde_json::Value>(t)
-        .ok()
-        .or_else(|| {
-            t.lines()
-                .rev()
-                .find_map(|l| serde_json::from_str(l.trim()).ok())
-        })
-    else {
-        o.text = t.to_string();
-        return o;
+    let v = match single_envelope(stdout, "claude", &|v| {
+        v.get("type").and_then(|x| x.as_str()) == Some("result")
+    }) {
+        Ok(v) => v,
+        Err(evidence) => {
+            o.failed = true;
+            o.evidence = evidence;
+            return o;
+        }
     };
     o.text = v
         .get("result")
@@ -1879,21 +2725,47 @@ fn parse_claude_json(stdout: &str) -> ParsedOut {
         o.usage.output_tokens = num(u.get("output_tokens"));
     }
     o.failed = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+    o.evidence.protocol = ProtocolState::Valid;
+    o.evidence.terminal_seen = true;
+    o.evidence.terminal_success = Some(!o.failed);
+    o.evidence.final_message_seen = !o.text.is_empty();
     o
 }
 
-/// opencode --format json: NDJSON events; final answer = concat of `text` events
-/// belonging to the last message (dedupe by part id, keep last occurrence).
-fn parse_opencode_ndjson(stdout: &str) -> ParsedOut {
-    let mut o = ParsedOut::default();
-    let mut texts: Vec<(String, String, String)> = Vec::new(); // (part_id, message_id, text)
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
+/// opencode --format json is NDJSON that can run just as large as codex/pi's
+/// streams: the session id arrives on the early events, text parts stream in
+/// incrementally (dedupe by part id, keep the last occurrence), and the
+/// terminal step_finish/finish/error record - and its usage - arrives at the
+/// end. Same accumulator/observer split as codex and pi, for the same reason.
+#[derive(Default)]
+struct OpencodeNdjsonAccumulator {
+    parsed: ParsedOut,
+    /// (part_id, message_id, text), in order of each part id's first
+    /// appearance; a later update to an existing id replaces its text in
+    /// place rather than moving it, matching how opencode streams edits to a
+    /// part it already sent.
+    texts: Vec<(String, String, String)>,
+    malformed: u32,
+}
+
+impl LineRecords for OpencodeNdjsonAccumulator {
+    const TOOL: &'static str = "opencode";
+    const SHAPE: &'static str = "NDJSON";
+
+    fn push_line(&mut self, line: &[u8]) {
+        if line.trim_ascii().is_empty() {
+            return;
+        }
+        let v = match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(v) => v,
+            Err(_) => {
+                self.malformed = self.malformed.saturating_add(1);
+                return;
+            }
         };
-        if o.session.is_none() {
+        if self.parsed.session.is_none() {
             if let Some(s) = v.get("sessionID").and_then(|x| x.as_str()) {
-                o.session = Some(s.to_string());
+                self.parsed.session = Some(s.to_string());
             }
         }
         match v.get("type").and_then(|x| x.as_str()) {
@@ -1906,52 +2778,94 @@ fn parse_opencode_ndjson(stdout: &str) -> ParsedOut {
                         .to_string()
                 };
                 let (pid, mid, txt) = (get("id"), get("messageID"), get("text"));
-                if let Some(e) = texts
+                if let Some(e) = self
+                    .texts
                     .iter_mut()
                     .find(|(id, _, _)| !pid.is_empty() && *id == pid)
                 {
                     *e = (pid, mid, txt);
                 } else {
-                    texts.push((pid, mid, txt));
+                    self.texts.push((pid, mid, txt));
                 }
             }
-            Some("step_finish") => {
+            Some("step_finish") | Some("finish") => {
+                self.parsed.evidence.terminal_seen = true;
+                self.parsed.evidence.terminal_success.get_or_insert(true);
                 if let Some(part) = v.get("part") {
                     if let Some(tk) = part.get("tokens") {
-                        o.usage.input_tokens = num(tk.get("input"));
-                        o.usage.output_tokens = num(tk.get("output"));
+                        self.parsed.usage.input_tokens = num(tk.get("input"));
+                        self.parsed.usage.output_tokens = num(tk.get("output"));
                     }
                     if let Some(c) = part.get("cost").and_then(|x| x.as_f64()) {
-                        o.usage.add_reported_cost(c);
+                        self.parsed.usage.add_reported_cost(c);
                     }
                 }
             }
-            Some("error") => o.failed = true,
+            Some("error") => {
+                self.parsed.failed = true;
+                self.parsed.evidence.terminal_seen = true;
+                self.parsed.evidence.terminal_success = Some(false);
+            }
             _ => {}
         }
     }
-    let last_mid = texts.last().map(|(_, m, _)| m.clone()).unwrap_or_default();
-    o.text = texts
-        .iter()
-        .filter(|(_, m, _)| *m == last_mid)
-        .map(|(_, _, t)| t.as_str())
-        .collect::<Vec<_>>()
-        .join("")
-        .trim()
-        .to_string();
-    o
+
+    fn finish(mut self) -> ParsedOut {
+        let last_mid = self
+            .texts
+            .last()
+            .map(|(_, m, _)| m.clone())
+            .unwrap_or_default();
+        self.parsed.text = self
+            .texts
+            .iter()
+            .filter(|(_, m, _)| *m == last_mid)
+            .map(|(_, _, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+            .trim()
+            .to_string();
+        self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
+        let malformed = self.malformed;
+        finish_stream_evidence(&mut self.parsed, Self::TOOL, malformed, Self::SHAPE);
+        self.parsed
+    }
 }
 
-/// grok --output-format json: one pretty-printed object with .text/.sessionId.
+/// opencode --format json streamed as it arrives, instead of reparsed from
+/// the bounded raw capture after the process exits.
+type OpencodeStreamObserver = LineStreamObserver<OpencodeNdjsonAccumulator>;
+
+/// Non-streaming parser used by doctor and as a compatibility fallback; see
+/// `OpencodeNdjsonAccumulator` for the per-record semantics.
+fn parse_opencode_ndjson(stdout: &str) -> ParsedOut {
+    let mut acc = OpencodeNdjsonAccumulator::default();
+    for line in stdout.lines() {
+        acc.push_line(line.as_bytes());
+    }
+    acc.finish()
+}
+
+/// grok --output-format json: one pretty-printed object with .text/.sessionId,
+/// or an `{"type":"error", ...}` object. Either is a terminal record; anything
+/// else (including a truncated pretty-printed object) is not.
 fn parse_grok_json(stdout: &str) -> ParsedOut {
     let mut o = ParsedOut::default();
-    let t = stdout.trim();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
-        o.text = t.to_string();
-        return o;
+    let v = match single_envelope(stdout, "grok", &|v| {
+        v.get("type").and_then(|x| x.as_str()) == Some("error") || v.get("text").is_some()
+    }) {
+        Ok(v) => v,
+        Err(evidence) => {
+            o.failed = true;
+            o.evidence = evidence;
+            return o;
+        }
     };
+    o.evidence.protocol = ProtocolState::Valid;
+    o.evidence.terminal_seen = true;
     if v.get("type").and_then(|x| x.as_str()) == Some("error") {
         o.failed = true;
+        o.evidence.terminal_success = Some(false);
         o.text = v
             .get("message")
             .and_then(|x| x.as_str())
@@ -1959,12 +2873,14 @@ fn parse_grok_json(stdout: &str) -> ParsedOut {
             .to_string();
         return o;
     }
+    o.evidence.terminal_success = Some(true);
     o.text = v
         .get("text")
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
+    o.evidence.final_message_seen = !o.text.is_empty();
     o.session = v
         .get("sessionId")
         .and_then(|x| x.as_str())
@@ -1977,26 +2893,60 @@ fn parse_grok_json(stdout: &str) -> ParsedOut {
     o
 }
 
+/// The documented result record of an agy envelope, whether it arrived bare or
+/// wrapped by stream-json as `{"event":"result","result":{...}}`.
+fn agy_result_record(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    let obj = match v.get("event").and_then(|x| x.as_str()) {
+        Some("result") => v.get("result")?,
+        Some(_) => return None,
+        // Bare `--output-format json`: the object itself is the result record.
+        None => v,
+    };
+    // `status` is what makes this the terminal record rather than a progress
+    // object that merely happens to carry a `response` field.
+    obj.get("status").and_then(|x| x.as_str())?;
+    Some(obj)
+}
+
 /// agy --output-format json: {response, status, conversation_id, usage};
 /// stream-json wraps it as {"event":"result","result":{...}}.
+///
+/// This parser is the P0-01 blocker. Its old raw-stdout fallback combined with
+/// the execution layer's agy-only exit-code correction to turn `agy: unknown
+/// flag ...` + exit 1 into a successful step whose "answer" was the usage
+/// message. Nothing but a recognised terminal status may certify this run now.
 fn parse_agy_json(stdout: &str) -> ParsedOut {
     let mut o = ParsedOut::default();
-    let t = stdout.trim();
-    let Some(v) = serde_json::from_str::<serde_json::Value>(t)
-        .ok()
-        .or_else(|| {
-            t.lines()
-                .rev()
-                .find_map(|l| serde_json::from_str(l.trim()).ok())
-        })
-    else {
-        o.text = t.to_string();
-        return o;
+    let v = match single_envelope(stdout, "agy", &|v| agy_result_record(v).is_some()) {
+        Ok(v) => v,
+        Err(evidence) => {
+            o.failed = true;
+            o.evidence = evidence;
+            return o;
+        }
     };
-    let obj = if v.get("event").is_some() {
-        v.get("result").cloned().unwrap_or(v)
-    } else {
-        v
+    let obj = match agy_result_record(&v) {
+        Some(obj) => obj.clone(),
+        None => {
+            o.failed = true;
+            o.evidence = ProtocolEvidence {
+                protocol: ProtocolState::MissingTerminal,
+                diagnostic: Some(
+                    "agy printed no result record carrying a status field, so sfh cannot tell whether the turn finished".into(),
+                ),
+                ..Default::default()
+            };
+            return o;
+        }
+    };
+    let status = obj.get("status").and_then(|x| x.as_str()).unwrap_or("");
+    // An unrecognised status is not a success and not a documented failure - it
+    // is an envelope sfh does not understand, and guessing either way is how a
+    // broken invocation becomes a green step.
+    let terminal_success = match status.to_ascii_uppercase().as_str() {
+        "SUCCESS" | "OK" | "COMPLETED" | "DONE" => Some(true),
+        "ERROR" | "FAILED" | "FAILURE" | "CANCELLED" | "CANCELED" | "TIMEOUT" => Some(false),
+        _ => None,
     };
     o.text = obj
         .get("response")
@@ -2008,10 +2958,27 @@ fn parse_agy_json(stdout: &str) -> ParsedOut {
         .get("conversation_id")
         .and_then(|x| x.as_str())
         .map(String::from);
-    o.failed = obj.get("status").and_then(|x| x.as_str()) == Some("ERROR");
     if let Some(u) = obj.get("usage") {
         o.usage.input_tokens = num(u.get("input_tokens"));
         o.usage.output_tokens = num(u.get("output_tokens"));
+    }
+    match terminal_success {
+        Some(ok) => {
+            o.failed = !ok;
+            o.evidence.protocol = ProtocolState::Valid;
+            o.evidence.terminal_seen = true;
+            o.evidence.terminal_success = Some(ok);
+            o.evidence.final_message_seen = !o.text.is_empty();
+        }
+        None => {
+            o.failed = true;
+            // The envelope parsed, but sfh cannot read a verdict out of it, so
+            // its `response` is not an answer any downstream step may consume.
+            o.text.clear();
+            o.evidence = ProtocolEvidence::invalid(format!(
+                "agy reported the unrecognised terminal status '{status}'; sfh will not guess whether the turn succeeded"
+            ));
+        }
     }
     o
 }
@@ -2265,7 +3232,10 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         access: None,
         usage: preset::Usage::default(),
         cmd: String::new(),
+        harness_diagnostic: Some("worker thread died before producing a result".into()),
         persistence_error: None,
+        outcome: None,
+        protocol: ProtocolEvidence::invalid("worker thread died before producing a result"),
     }
 }
 
@@ -2441,6 +3411,190 @@ mod tests {
         assert_eq!(parse_opencode_ndjson(s).text, "partial full");
     }
 
+    // P0-03: opencode --format json can emit an NDJSON transcript well past the
+    // 32 MiB raw capture bound. These prove the streaming observer, not just
+    // the non-streaming `parse_opencode_ndjson` fallback, carries the session,
+    // the terminal record and its usage/cost across that bound intact - and
+    // that the two paths keep agreeing on everything else.
+
+    #[test]
+    fn opencode_ndjson_streaming_semantics_survive_more_than_raw_capture_limit() {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p0","messageID":"m0","text":"interim"}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy = format!("{{\"type\":\"step_start\",\"payload\":\"{payload}\"}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        observer.observe(
+            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p1","messageID":"m1","text":"VERDICT: PASS"}}
+"#,
+        );
+        let final_record = br#"{"type":"step_finish","sessionID":"stream-session","part":{"tokens":{"input":20,"output":3},"cost":0.5}}"#;
+        observer.observe(&final_record[..40]);
+        observer.observe(&final_record[40..]);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(parsed.text, "VERDICT: PASS");
+        assert_eq!(parsed.session.as_deref(), Some("stream-session"));
+        assert_eq!(parsed.usage.input_tokens, Some(20));
+        assert_eq!(parsed.usage.output_tokens, Some(3));
+        assert_eq!(parsed.usage.cost_usd, Some(0.5));
+        assert!(!parsed.failed);
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn opencode_ndjson_cost_before_and_after_the_truncation_point_sums_while_tokens_take_the_last()
+    {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":100,"output":10},"cost":0.1}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy = format!("{{\"type\":\"step_start\",\"payload\":\"{payload}\"}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":200,"output":20},"cost":0.25}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        // Cost accumulates across every step_finish (preset::Usage's
+        // add_reported_cost); tokens do not - they are overwritten by the
+        // latest step. Both are parse_opencode_ndjson's existing rule, not
+        // something the streaming path may change.
+        assert_eq!(parsed.usage.cost_usd, Some(0.35));
+        assert_eq!(parsed.usage.input_tokens, Some(200));
+        assert_eq!(parsed.usage.output_tokens, Some(20));
+    }
+
+    #[test]
+    fn opencode_ndjson_a_later_error_overrides_an_earlier_step_finish_verdict() {
+        // parse_opencode_ndjson's existing rule: step_finish/finish only sets
+        // the verdict if nothing has set it yet (get_or_insert), but error
+        // always overrides it outright. So a later in-band failure still
+        // invalidates an apparent completion, but a later step_finish cannot
+        // paper back over an error - the same asymmetry an internal retry that
+        // ultimately errors out relies on.
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":1,"output":1},"cost":0.01}}
+{"type":"error","sessionID":"s"}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert!(parsed.failed);
+        assert_eq!(parsed.evidence.terminal_success, Some(false));
+        assert!(parsed.evidence.terminal_seen);
+    }
+
+    #[test]
+    fn opencode_ndjson_single_record_over_the_per_record_ceiling_fails_closed() {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"before"}}
+"#,
+        );
+        // One line bigger than MAX_JSONL_LINE_BYTES, delivered in 64 KiB pieces
+        // the way spawn_reader's fixed read buffer actually would.
+        let giant = vec![b'y'; MAX_JSONL_LINE_BYTES + 1024];
+        for chunk in giant.chunks(65536) {
+            observer.observe(chunk);
+        }
+        observer.observe(b"\n");
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":1,"output":1}}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert!(parsed.failed);
+        assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid);
+        let diagnostic = diagnostic.expect("an oversized record must explain itself");
+        assert!(
+            diagnostic.contains("larger than 16 MiB"),
+            "got {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn opencode_ndjson_final_line_without_a_trailing_newline_is_still_a_complete_record() {
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(
+            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"answer"}}
+"#,
+        );
+        observer.observe(
+            br#"{"type":"step_finish","sessionID":"s","part":{"tokens":{"input":5,"output":1}}}"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert!(parsed.evidence.terminal_seen);
+        assert_eq!(parsed.evidence.terminal_success, Some(true));
+        assert_eq!(parsed.text, "answer");
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn opencode_ndjson_observer_and_non_streaming_parser_agree_on_small_input() {
+        let text = concat!(
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old"}}"#,
+            "\n",
+            "{not json",
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new "}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer"}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"tokens":{"input":171,"output":6},"cost":0.5}}"#,
+            "\n",
+        );
+
+        let direct = parse_opencode_ndjson(text);
+
+        let observer = OpencodeStreamObserver::default();
+        observer.observe(text.as_bytes());
+        let (streamed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, direct.evidence.diagnostic);
+        assert_eq!(streamed.text, direct.text);
+        assert_eq!(streamed.session, direct.session);
+        assert_eq!(streamed.usage.input_tokens, direct.usage.input_tokens);
+        assert_eq!(streamed.usage.output_tokens, direct.usage.output_tokens);
+        assert_eq!(streamed.usage.cost_usd, direct.usage.cost_usd);
+        assert_eq!(streamed.failed, direct.failed);
+        assert_eq!(streamed.evidence.protocol, direct.evidence.protocol);
+        assert_eq!(
+            streamed.evidence.malformed_records,
+            direct.evidence.malformed_records
+        );
+
+        // Concretely, not just "the two agree": the malformed line must have
+        // been counted and the protocol must fail closed, on both paths.
+        assert_eq!(direct.evidence.malformed_records, 1);
+        assert_eq!(direct.evidence.protocol, ProtocolState::Invalid);
+    }
+
     #[test]
     fn parses_grok_and_agy_envelopes() {
         let g = parse_grok_json(
@@ -2509,6 +3663,39 @@ mod tests {
     }
 
     #[test]
+    fn pi_streaming_semantics_survive_more_than_raw_capture_limit() {
+        let observer = PiStreamObserver::default();
+        observer.observe(
+            br#"{"type":"session","id":"stream-session","timestamp":"marker"}
+{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[],"usage":{"input":10,"output":2,"cost":{"total":0.25}}}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy =
+            format!("{{\"type\":\"message_update\",\"partial\":{{\"payload\":\"{payload}\"}}}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        let final_record = br#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"VERDICT: PASS"}],"usage":{"input":20,"output":3,"cost":{"total":0.5}}}}"#;
+        observer.observe(&final_record[..37]);
+        observer.observe(&final_record[37..]);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(parsed.text, "VERDICT: PASS");
+        assert_eq!(parsed.session.as_deref(), Some("stream-session"));
+        assert_eq!(parsed.session_marker.as_deref(), Some("marker"));
+        assert_eq!(parsed.usage.input_tokens, Some(30));
+        assert_eq!(parsed.usage.output_tokens, Some(5));
+        assert_eq!(parsed.usage.cost_usd, Some(0.75));
+        assert!(!parsed.failed);
+    }
+
+    #[test]
     fn pi_reports_in_band_failures_that_exit_zero() {
         let err = concat!(
             r#"{"type":"session","id":"s","timestamp":"t"}"#,
@@ -2535,15 +3722,149 @@ mod tests {
         assert_eq!(o.usage.output_tokens, Some(7));
         assert_eq!(o.usage.cost_usd, None, "cursor reports no cost");
         assert!(!o.failed);
+        assert!(o.evidence.certifies_success());
         // A model failure prints no envelope at all.
         assert!(parse_cursor_json("Error: something went wrong").failed);
-        assert!(
-            !parse_cursor_json("").failed,
-            "empty output is caught by allow_empty"
-        );
+        // Since v1.2 an empty stdout is a MISSING protocol, not an empty final
+        // message: `allow_empty` says a finished turn may answer with nothing,
+        // not that a turn that never reported finishing counts as one.
+        let empty = parse_cursor_json("");
+        assert!(empty.failed);
+        assert_eq!(empty.evidence.protocol, ProtocolState::MissingTerminal);
         // Leading noise (e.g. the worktree banner) must not hide the envelope.
         let noisy = format!("Using worktree: C:\\tmp\n{s}");
         assert_eq!(parse_cursor_json(&noisy).text, "hi there");
+        assert!(parse_cursor_json(&noisy).evidence.certifies_success());
+        // An arbitrary trailing JSON object is not a result envelope.
+        let not_a_result = r#"{"type":"progress","result":"looks like an answer"}"#;
+        assert!(parse_cursor_json(not_a_result).failed);
+        assert!(parse_cursor_json(not_a_result).text.is_empty());
+    }
+
+    /// P0-01. Each of these is a real way agy ends a run, and every one of them
+    /// used to be able to reach the execution layer's agy-only "non-empty text
+    /// and nothing said it failed, so call the non-zero exit a success"
+    /// correction. Only the last shape may certify anything.
+    #[test]
+    fn agy_only_certifies_success_from_a_recognised_terminal_record() {
+        let cases: [(&str, &str); 5] = [
+            (
+                "plain usage error on stdout",
+                "agy: unknown flag --output-format\nUsage: agy [options]",
+            ),
+            ("malformed JSON", r#"{"response":"looks fine","status":"SU"#),
+            (
+                "unknown status",
+                r#"{"response":"looks fine","status":"WEIRD"}"#,
+            ),
+            (
+                "no terminal record",
+                r#"{"event":"progress","result":{"response":"partial"}}"#,
+            ),
+            ("empty output", ""),
+        ];
+        for (what, stdout) in cases {
+            let o = parse_agy_json(stdout);
+            assert!(
+                !o.evidence.certifies_success(),
+                "{what} must never excuse a non-zero exit"
+            );
+            assert!(o.failed, "{what} must be an in-band failure");
+            assert!(
+                o.text.is_empty(),
+                "{what} must not hand raw stdout on as the answer (got {:?})",
+                o.text
+            );
+        }
+        // A documented terminal error is a failure that is nonetheless a
+        // COMPLETE protocol - sfh knows exactly what happened.
+        let err = parse_agy_json(r#"{"response":"nope","status":"ERROR"}"#);
+        assert!(err.failed);
+        assert_eq!(err.evidence.protocol, ProtocolState::Valid);
+        assert!(err.evidence.terminal_seen);
+        assert_eq!(err.evidence.terminal_success, Some(false));
+        // The one shape that may correct a non-zero exit.
+        let ok = parse_agy_json(
+            r#"{"response":"the answer","status":"SUCCESS","conversation_id":"a-1","usage":{"input_tokens":3,"output_tokens":4}}"#,
+        );
+        assert!(ok.evidence.certifies_success());
+        assert_eq!(ok.text, "the answer");
+        assert_eq!(ok.session.as_deref(), Some("a-1"));
+        assert_eq!(ok.usage.input_tokens, Some(3));
+        // stream-json wrapping reaches the same record.
+        let wrapped = parse_agy_json(
+            r#"{"event":"result","result":{"response":"the answer","status":"SUCCESS"}}"#,
+        );
+        assert!(wrapped.evidence.certifies_success());
+        assert_eq!(wrapped.text, "the answer");
+    }
+
+    /// P0-02. No preset parser may promote raw stdout to a final answer, and a
+    /// stream that stops before its terminal record is never a success.
+    #[test]
+    fn every_preset_parser_fails_closed_without_its_terminal_record() {
+        let noise = "I am not JSON at all, but I look like a helpful answer.";
+        let checks: Vec<(&str, ParsedOut)> = vec![
+            ("codex", parse_codex_jsonl(noise)),
+            ("claude", parse_claude_json(noise)),
+            ("opencode", parse_opencode_ndjson(noise)),
+            ("grok", parse_grok_json(noise)),
+            ("agy", parse_agy_json(noise)),
+            ("pi", parse_pi_jsonl(noise)),
+            ("cursor", parse_cursor_json(noise)),
+        ];
+        for (tool, o) in checks {
+            assert!(
+                !o.evidence.allows_success(),
+                "{tool} accepted raw text as a completed protocol"
+            );
+            assert!(
+                o.text.is_empty(),
+                "{tool} handed raw stdout on as the answer: {:?}",
+                o.text
+            );
+            assert!(
+                o.evidence.failure_reason(tool).is_some(),
+                "{tool} must explain why it failed"
+            );
+        }
+        // Well-formed records, terminal record missing: a different failure
+        // with the same fail-closed outcome.
+        let truncated_codex = concat!(
+            r#"{"type":"thread.started","thread_id":"t-1"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}"#,
+        );
+        let o = parse_codex_jsonl(truncated_codex);
+        assert_eq!(o.evidence.protocol, ProtocolState::MissingTerminal);
+        assert!(!o.evidence.allows_success());
+        // A malformed record inside an otherwise fine JSONL stream invalidates
+        // it: sfh cannot say what it missed.
+        let broken = concat!(
+            r#"{"type":"thread.started","thread_id":"t-1"}"#,
+            "\n",
+            "{oops",
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+        let o = parse_codex_jsonl(broken);
+        assert_eq!(o.evidence.protocol, ProtocolState::Invalid);
+        assert_eq!(o.evidence.malformed_records, 1);
+        assert!(!o.evidence.allows_success());
+        // claude: a JSON envelope that is not the documented result record.
+        let o = parse_claude_json(r#"{"type":"system","result":"not the answer"}"#);
+        assert_eq!(o.evidence.protocol, ProtocolState::MissingTerminal);
+        assert!(o.text.is_empty());
+        // opencode: text parts but no finish/error event.
+        let o = parse_opencode_ndjson(
+            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"hi"}}"#,
+        );
+        assert_eq!(o.evidence.protocol, ProtocolState::MissingTerminal);
+        assert!(!o.evidence.allows_success());
+        // pi: a session header and nothing else.
+        let o = parse_pi_jsonl(r#"{"type":"session","id":"s-1","timestamp":"2026-01-01"}"#);
+        assert_eq!(o.evidence.protocol, ProtocolState::MissingTerminal);
+        assert!(!o.evidence.allows_success());
     }
 
     #[test]
@@ -2576,6 +3897,182 @@ mod tests {
             codex_session_from_stderr("session id:\n019fa375-ae0f-7962-bcf6-8682ff388db6\n")
                 .is_none()
         );
+    }
+
+    // P0-03: codex --json can emit a JSONL transcript well past the 32 MiB raw
+    // capture bound. These prove the streaming observer, not just the
+    // non-streaming `parse_codex_jsonl` fallback, carries the session, the
+    // terminal record and its usage across that bound intact - and that the
+    // two paths keep agreeing on everything else.
+
+    #[test]
+    fn codex_jsonl_streaming_semantics_survive_more_than_raw_capture_limit() {
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}
+{"type":"item.completed","item":{"type":"agent_message","text":"interim"}}
+"#,
+        );
+
+        let payload = "x".repeat(65_000);
+        let noisy =
+            format!("{{\"type\":\"item.updated\",\"partial\":{{\"payload\":\"{payload}\"}}}}\n");
+        let mut emitted = 0usize;
+        while emitted <= 32 * 1024 * 1024 {
+            observer.observe(noisy.as_bytes());
+            emitted = emitted.saturating_add(noisy.len());
+        }
+
+        observer.observe(
+            br#"{"type":"item.completed","item":{"type":"agent_message","text":"VERDICT: PASS"}}
+"#,
+        );
+        let final_record =
+            br#"{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":3}}"#;
+        observer.observe(&final_record[..37]);
+        observer.observe(&final_record[37..]);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(parsed.text, "VERDICT: PASS");
+        assert_eq!(
+            parsed.session.as_deref(),
+            Some("019fa375-ae0f-7962-bcf6-8682ff388db6")
+        );
+        assert_eq!(parsed.usage.input_tokens, Some(20));
+        assert_eq!(parsed.usage.output_tokens, Some(3));
+        assert!(!parsed.failed);
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn codex_jsonl_more_than_one_terminal_record_keeps_the_last_ones_session_and_usage() {
+        // parse_codex_jsonl's existing rule for thread.started/turn.completed is
+        // a plain overwrite, not an accumulation: the pair re-emitted by an
+        // internal retry replaces the earlier attempt's session and usage
+        // entirely rather than being summed with it. The streaming observer
+        // must reproduce exactly that, not invent a merge rule of its own.
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"11111111-1111-1111-1111-111111111111"}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+{"type":"thread.started","thread_id":"22222222-2222-2222-2222-222222222222"}
+{"type":"turn.completed","usage":{"input_tokens":2,"output_tokens":2}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert_eq!(
+            parsed.session.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(parsed.usage.input_tokens, Some(2));
+        assert_eq!(parsed.usage.output_tokens, Some(2));
+        assert!(parsed.evidence.terminal_seen);
+        assert_eq!(parsed.evidence.terminal_success, Some(true));
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn codex_jsonl_single_record_over_the_per_record_ceiling_fails_closed() {
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}
+"#,
+        );
+        // One line bigger than MAX_JSONL_LINE_BYTES, delivered in 64 KiB pieces
+        // the way spawn_reader's fixed read buffer actually would.
+        let giant = vec![b'y'; MAX_JSONL_LINE_BYTES + 1024];
+        for chunk in giant.chunks(65536) {
+            observer.observe(chunk);
+        }
+        observer.observe(b"\n");
+        observer.observe(
+            br#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+"#,
+        );
+        let (parsed, diagnostic) = observer.finish();
+
+        assert!(parsed.failed);
+        assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid);
+        let diagnostic = diagnostic.expect("an oversized record must explain itself");
+        assert!(
+            diagnostic.contains("larger than 16 MiB"),
+            "got {diagnostic:?}"
+        );
+    }
+
+    #[test]
+    fn codex_jsonl_final_line_without_a_trailing_newline_is_still_a_complete_record() {
+        // The child can be killed the instant after it writes its terminal
+        // record's closing brace but before the newline that would normally
+        // follow it. That newline is a delimiter, not payload, so the record
+        // itself must still be read, not silently dropped on exit.
+        let observer = CodexStreamObserver::default();
+        observer.observe(
+            br#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}
+"#,
+        );
+        observer
+            .observe(br#"{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":1}}"#);
+        let (parsed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, None);
+        assert!(parsed.evidence.terminal_seen);
+        assert_eq!(parsed.evidence.terminal_success, Some(true));
+        assert_eq!(parsed.usage.input_tokens, Some(5));
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn codex_jsonl_observer_and_non_streaming_parser_agree_on_small_input() {
+        let text = concat!(
+            r#"{"type":"thread.started","thread_id":"019fa375-ae0f-7962-bcf6-8682ff388db6"}"#,
+            "\n",
+            "{not json",
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":20224,"output_tokens":12}}"#,
+            "\n",
+        );
+
+        let direct = parse_codex_jsonl(text);
+
+        let observer = CodexStreamObserver::default();
+        observer.observe(text.as_bytes());
+        let (streamed, diagnostic) = observer.finish();
+
+        assert_eq!(diagnostic, direct.evidence.diagnostic);
+        assert_eq!(streamed.text, direct.text);
+        assert_eq!(streamed.session, direct.session);
+        assert_eq!(streamed.usage.input_tokens, direct.usage.input_tokens);
+        assert_eq!(streamed.usage.output_tokens, direct.usage.output_tokens);
+        assert_eq!(streamed.usage.cost_usd, direct.usage.cost_usd);
+        assert_eq!(streamed.failed, direct.failed);
+        assert_eq!(streamed.evidence.protocol, direct.evidence.protocol);
+        assert_eq!(
+            streamed.evidence.terminal_seen,
+            direct.evidence.terminal_seen
+        );
+        assert_eq!(
+            streamed.evidence.terminal_success,
+            direct.evidence.terminal_success
+        );
+        assert_eq!(
+            streamed.evidence.malformed_records,
+            direct.evidence.malformed_records
+        );
+        assert_eq!(
+            streamed.evidence.final_message_seen,
+            direct.evidence.final_message_seen
+        );
+
+        // Concretely, not just "the two agree": the malformed line must have
+        // been counted and the protocol must fail closed, on both paths.
+        assert_eq!(direct.evidence.malformed_records, 1);
+        assert_eq!(direct.evidence.protocol, ProtocolState::Invalid);
     }
 
     #[test]
@@ -2724,6 +4221,7 @@ mod tests {
         needed: &'a HashSet<String>,
     ) -> PrepCtx<'a> {
         PrepCtx {
+            workspace: None,
             flow,
             vars,
             outputs,
@@ -3381,6 +4879,7 @@ mod tests {
         )
         .unwrap();
         let cx = PrepCtx {
+            workspace: None,
             flow: &f,
             vars: &vars,
             outputs: &outputs,

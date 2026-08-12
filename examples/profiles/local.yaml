@@ -1,0 +1,33 @@
+# A profile overlay: --profiles takes one of these.
+#
+#   sfh run examples/managed-loop.yaml --profiles examples/profiles/local.yaml
+#
+# This is NOT a flow. It is a file of machine-local decisions - which CLI, which
+# model, which binary - kept out of the flow so a shared flow stays portable and
+# its fingerprint does not change when somebody swaps their model.
+#
+# Rules worth knowing:
+#
+#   - Only the fields a profile mentions are replaced. `judge` below sets model
+#     and effort; whatever the flow's own `judge` profile said about tool,
+#     access or args stays as it was.
+#   - `args` is the exception to "merge": if an overlay lists args they REPLACE
+#     the profile's args entirely. Saying nothing about args keeps them.
+#   - `env` merges key by key. Removing a key is not possible in v1.2.
+#   - Repeated --profiles files layer left to right, so a team-shared file can
+#     be topped with a machine-local one.
+#   - A profile the flow does not define is CREATED, which is how a flow can say
+#     `use: judge` with no inline definition at all.
+#
+# Precedence, highest first:
+#
+#   step field > --profiles overlay > flow inline profile > ~/.sfh/profiles.yaml > defaults
+
+profiles:
+  judge:
+    model: your-reading-model
+    effort: high
+
+  actor:
+    model: your-writing-model
+    # bin: /opt/homebrew/bin/claude

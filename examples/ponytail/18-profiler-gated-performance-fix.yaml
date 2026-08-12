@@ -1,0 +1,101 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: no speculative optimization; proceed only when measured evidence names the bottleneck.
+api_version: 1
+name: ponytail-profiler-gated-performance
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  performance: {file: ./inputs/PERFORMANCE.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  performance_review: {file: ./prompts/performance-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 26
+  max_prompt_chars: 110000
+  max_context_chars: 85000
+
+steps:
+  - id: decide
+    use: analyst
+    effects: read
+    context: [task, performance, acceptance, project_rules, ponytail]
+    prompt: |
+      Inspect the profile/benchmark evidence and current code.
+      If no measured bottleneck justifies a change, explain why and end with:
+      DECISION: NO_CHANGE
+
+      If a specific bottleneck and stable benchmark justify a small change,
+      name the narrow implementation and end with:
+      DECISION: OPTIMIZE
+
+      If evidence is insufficient or contradictory, end with:
+      DECISION: UNCLEAR
+    route:
+      - {when_last_line_is: "DECISION: NO_CHANGE", goto: end}
+      - {when_last_line_is: "DECISION: OPTIMIZE", goto: implement}
+      - {goto: stuck}
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, performance, acceptance, project_rules, ponytail]
+    prompt: |
+      Implement only the measured optimization below.
+      Prefer algorithmic simplification, standard-library primitives, and removal
+      of repeated work before introducing caches, pools, schedulers, or dependencies.
+
+      Decision:
+      {{steps.decide.output | truncate:16000}}
+
+  - id: test
+    effects: workspace
+    cmd: ["cargo", "test", "--release", "--locked"]
+    timeout_sec: 2400
+    on_error: goto:fix
+
+  - id: benchmark
+    effects: workspace
+    cmd: ["cargo", "bench", "--no-run"]
+    timeout_sec: 2400
+    on_error: goto:fix
+
+  - id: review
+    use: reviewer
+    effects: read
+    context: [task, performance, acceptance, project_rules, performance_review]
+    prompt: |
+      Review the current implementation and available before/after evidence.
+      Reject speculative machinery or benchmarks that do not measure the stated workload.
+      End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: fix}
+      - {goto: stuck}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, performance, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 2
+    on_max_visits: goto:stuck
+    prompt: |
+      Resolve only the measured performance or correctness blocker.
+      Delete speculative optimization rather than defending it.
+    route:
+      - {goto: test}
