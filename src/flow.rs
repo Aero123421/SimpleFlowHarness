@@ -470,7 +470,8 @@ impl WorkspaceConfig {
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSource {
-    /// A path, relative to the flow file unless absolute.
+    /// A literal path, relative to the flow file unless absolute. Templates
+    /// are not expanded in this field.
     pub file: Option<String>,
     /// Literal text written in the flow.
     pub inline: Option<String>,
@@ -1331,7 +1332,7 @@ impl Flow {
         }
         if declared == WorkspaceMode::Auto && !writers.is_empty() {
             warnings.push(format!(
-                "workspace.mode: auto resolved to one managed git worktree because {} may write",
+                "workspace.mode: auto resolved to one managed git worktree because {} may write. Declare workspace.mode: git-worktree explicitly to accept this resolution.",
                 writers.join(", ")
             ));
         }
@@ -1535,7 +1536,7 @@ impl Flow {
                 && matches!(effects, Effects::External | Effects::Unknown)
             {
                 out.push(format!(
-                    "step '{name}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. Set replay.unfinished: stuck (or fail) if that is not safe.",
+                    "step '{name}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. If the step is read-only, declare effects: read instead. Otherwise set replay.unfinished: stuck (or fail) if rerunning is not safe.",
                     effects.as_str()
                 ));
             }
@@ -2598,6 +2599,34 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
         if let Some(tool) = flow.step_tool(s) {
             warnings.push(format!(
                 "step '{name}' declares outcomes: but runs preset tool '{tool}' rather than cmd: - outcomes: reads the process's raw exit code, and a bare AI CLI exits 0 whether its verdict was PASS or REVISE, so it cannot tell them apart here and a when_label_is/when_outcome_is rule against it can pass validate and then never fire. Only a gate command or a wrapper that inspects the answer and picks its own exit status can make outcomes: mean something on this step."
+            ));
+        }
+    }
+
+    // The runtime defines context_file for every step for compatibility, but
+    // it is empty unless the step actually names context. Catch the common
+    // authoring mistake without treating a deliberate empty value as a format
+    // error. template::check_keys skips raw blocks and accepts whitespace and
+    // filters exactly as the renderer does.
+    for (name, step) in flow.all_steps() {
+        if !step.context.is_empty() {
+            continue;
+        }
+        let mut references_context_file = false;
+        for (_, text) in template_fields(flow, step) {
+            let _ = crate::template::check_keys(&text, |key| {
+                if key == "context_file" {
+                    references_context_file = true;
+                }
+                Ok(())
+            });
+            if references_context_file {
+                break;
+            }
+        }
+        if references_context_file {
+            warnings.push(format!(
+                "step '{name}' references {{{{context_file}}}} but its context: list is empty, so it renders as an empty string. Add a context name to context: or remove the reference."
             ));
         }
     }
@@ -4904,11 +4933,37 @@ steps:
         // Only the child is flagged: the group's OWN policy is the safe
         // `stuck` it inherits from defaults.replay, and must not also appear.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("step 'fan.send'"), "{warnings:?}");
-        assert!(warnings[0].contains("effects: external"), "{warnings:?}");
-        assert!(
-            warnings[0].contains("replay.unfinished: rerun"),
-            "{warnings:?}"
+        assert_eq!(
+            warnings[0],
+            "step 'fan.send' declares effects: external but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. If the step is read-only, declare effects: read instead. Otherwise set replay.unfinished: stuck (or fail) if rerunning is not safe."
+        );
+    }
+
+    #[test]
+    fn workspace_auto_warning_names_the_explicit_strict_clean_choice() {
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nworkspace: {mode: auto}\nsteps:\n  - id: edit\n    cmd: [\"editor\"]\n    effects: workspace\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        assert_eq!(
+            flow.workspace_plan().unwrap().warnings,
+            vec!["workspace.mode: auto resolved to one managed git worktree because edit may write. Declare workspace.mode: git-worktree explicitly to accept this resolution."]
+        );
+    }
+
+    #[test]
+    fn strict_warns_when_context_file_would_render_empty() {
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: consume\n    tool: codex\n    access: read\n    prompt: 'Read {{ context_file | trim }}'\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        assert_eq!(
+            strict_warnings(&flow),
+            vec!["step 'consume' references {{context_file}} but its context: list is empty, so it renders as an empty string. Add a context name to context: or remove the reference."]
         );
     }
 

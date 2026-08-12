@@ -780,7 +780,7 @@
       "properties": {
         "file": {
           "type": "string",
-          "description": "A path, relative to the flow file unless absolute. Read no-follow and contained to the flow directory and the resolved workspace unless allow_external is set."
+          "description": "A literal path, relative to the flow file unless absolute; templates are not expanded. Read no-follow and contained to the flow directory and the resolved workspace unless allow_external is set."
         },
         "inline": {
           "type": "string",

@@ -1097,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn every_guide_yaml_example_validates_and_dry_runs() {
+    fn every_guide_yaml_example_strictly_validates_and_dry_runs() {
         for (index, tail) in GUIDE.split("```yaml").skip(1).enumerate() {
             let yaml = tail
                 .split("```")
@@ -1107,7 +1107,8 @@ mod tests {
             let path =
                 std::env::temp_dir().join(format!("sfh-guide-{}-{index}.yaml", std::process::id()));
             std::fs::write(&path, yaml).expect("write guide example");
-            let validate_result = crate::engine::validate(&path, &[]);
+            let validate_result =
+                crate::engine::validate_with_options(&path, &[], true, false, &[]);
             let runs_dir =
                 std::env::temp_dir().join(format!("sfh-guide-{}-{index}-runs", std::process::id()));
             let run_result = crate::engine::run(crate::engine::RunOpts {
@@ -1141,6 +1142,28 @@ mod tests {
                 index + 1
             );
         }
+    }
+
+    #[test]
+    fn readme_quick_start_strictly_validates() {
+        let quick_start = include_str!("../README.md")
+            .split("## Quick Start")
+            .nth(1)
+            .expect("README has a Quick Start section");
+        let yaml = quick_start
+            .split("```yaml")
+            .nth(1)
+            .and_then(|tail| tail.split("```").next())
+            .expect("Quick Start has a closed YAML example")
+            .trim();
+        let path = std::env::temp_dir().join(format!(
+            "sfh-readme-quick-start-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, yaml).expect("write README Quick Start example");
+        let result = crate::engine::validate_with_options(&path, &[], true, false, &[]);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(result, 0, "README Quick Start example is not strict-clean");
     }
 
     #[test]

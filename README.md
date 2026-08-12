@@ -67,14 +67,18 @@ name: test_and_repair
 defaults:
   max_visits: 3
   wall_clock_sec: 1800
+workspace:
+  mode: git-worktree
 
 steps:
   - id: test
     cmd: ["cargo", "test"]
+    effects: workspace
     on_error: goto:fix
 
   - id: ship
     cmd: ["sfh", "--version"]
+    effects: read
     route: [{goto: end}]
 
   - id: fix
@@ -246,7 +250,7 @@ steps:
 
 The assembled bundle is saved as `<tag>.context.txt` with a manifest in `<tag>.context.json` recording each source's origin, hash and size. The durable log records the hash, never the content. `{{context}}` and `{{context_file}}` are available in both delivery modes.
 
-Context files are read no-follow and must resolve inside the flow directory or the workspace; a symlink pointing out of them is refused. `allow_external: true` on a source is the only way out, and using it is recorded as an unsafe override. A bundle over `defaults.max_context_chars` fails **before anything is spawned** — sfh never summarizes or drops sources to make it fit. What to leave out is your decision, expressed with a template filter, a `max_chars`, or an upstream `compact:`.
+Context `file:` paths are literal (templates are not expanded), read no-follow, and must resolve inside the flow directory or the workspace; a symlink pointing out of them is refused. `allow_external: true` on a source is the only way out, and using it is recorded as an unsafe override. A bundle over `defaults.max_context_chars` fails **before anything is spawned** — sfh never summarizes or drops sources to make it fit. What to leave out is your decision, expressed with a template filter, a `max_chars`, or an upstream `compact:`.
 
 ### Required CLI versions
 

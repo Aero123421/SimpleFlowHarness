@@ -57,7 +57,7 @@ For detailed routing choices, activate `sfh-deterministic-gates`.
 ## Choose workspace and context explicitly
 
 - Read-only flow: `workspace.mode: current` is often enough.
-- Any writer: prefer `workspace.mode: auto` or `git-worktree` so one run owns one worktree.
+- Any writer: use explicit `workspace.mode: git-worktree` for a strict-clean flow where one run owns one worktree; use `auto` only when its resolution warning is intentional.
 - Do not run parallel writers in one workspace unless the flow explicitly accepts the race.
 - Use named context for task contracts, acceptance criteria, review rules, and bounded handoffs.
 - Give each role only the context it needs. Avoid copying the entire conversation.
@@ -83,10 +83,10 @@ Activate `sfh-failure-recovery` when any of these matter.
 1. Inspect `sfh guide`, `sfh --help`, and the installed flow schema.
 2. Draft the state graph in plain text.
 3. Write the smallest YAML that expresses it.
-4. Run `scripts/lint_sfh_flow.py FLOW` for design warnings.
+4. Resolve the installed skill directory, then run `<skill-dir>/scripts/lint_sfh_flow.py FLOW` for design warnings.
 5. Run `sfh validate FLOW --strict`.
 6. Run `sfh preflight FLOW --json`.
-7. Run `sfh plan FLOW --json --save` and inspect commands, context, workspace, warnings, and maximum work.
+7. Run `sfh plan FLOW --json --save --state-dir <dir>` and inspect commands, context, workspace, warnings, and maximum work.
 8. Correct the flow before any paid or external step runs.
 
 ## Output requirements
