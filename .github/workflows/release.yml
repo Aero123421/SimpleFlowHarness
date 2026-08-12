@@ -10,6 +10,8 @@ permissions:
 jobs:
   verify:
     uses: ./.github/workflows/ci.yml
+    with:
+      force_full: true
 
   release-contract:
     runs-on: ubuntu-latest
