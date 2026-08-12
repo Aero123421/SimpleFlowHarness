@@ -263,6 +263,29 @@ defaults:
 
 実runは、run directoryの作成やflow stepの開始より前に、解決済みbinaryの隔離された`--version`を照合します。不一致または読めないversionは`SFH_CAPABILITY_UNAVAILABLE`です。`plan`はspawnゼロを保ち、宣言と`observed: null`だけを報告します。`preflight`は宣言と実測を並べます。任意の`bin:` overrideを単独preflightで測るには、任意programの実行を明示的に許可する`--probe-binaries`が必要です。
 
+### protocolを使った復旧
+
+structured adapterのdriftは引き続きfail-closedですが、保存された証拠を明示的なsalvage stepへrouteし、同じ仕事を買い直さずに済ませられます。失敗した出力はwarning banner付きの`{{steps.<id>.outputs}}`とraw `.out.txt` artifactに残ります。
+
+```yaml
+- id: analyze
+  tool: codex
+  access: read
+  on_error: continue             # 失敗leafは通常route:より先に停止する
+  prompt: "問題を分析する。"
+  route:
+    - {when_protocol_is: missing_terminal, goto: salvage}
+    - {when_protocol_is: invalid, goto: salvage}
+    - {when_protocol_is: valid, goto: end}
+    - {goto: fail}
+- id: salvage
+  tool: claude
+  access: read
+  prompt: "有用な事実を復旧する: {{steps.analyze.outputs}}"
+```
+
+`when_protocol_is`は`plain`、`valid`、`missing_terminal`、`invalid`を取り、他のpredicateとは通常どおりANDで合成されます。leaf step専用で、fan-out groupには単一のprotocol stateがありません。stateは`step_end`に記録されるため、resumeはtoolを再実行せず同じ判断を再生します。
+
 ### replay policy
 
 step が開始されたのに終了を記録しなかった場合、resume が何をすべきか。sfh が「もう実行されたのか」を本当に知り得ない唯一のケースです。
@@ -403,7 +426,7 @@ sfh wait <run-dir> --json               # 完了までブロックし、結果�
 
 失敗には `schema_version` が変わらない限り意味が固定された code が付きます（現在は `1`）。message は改善され得るので、code で分岐してください。
 
-`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`
+`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`
 
 **run directory は必ず明示してください。** path を省略したコマンドは最新の run を選び、`"implicit_target": true` を返します。agent が望む挙動であることは稀です。
 

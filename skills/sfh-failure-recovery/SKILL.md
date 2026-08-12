@@ -2,10 +2,10 @@
 name: sfh-failure-recovery
 description: >
   Design failure handling and recovery for SimpleFlowHarness flows. Use when choosing retry, retry_on, fallback, on_error, replay.unfinished, resume, force-resume, adopt-workspace, carry-budget-from, budget landing, timeout, stuck, or idempotency behavior; especially for external APIs, deployments, migrations, CI, and long-running AI work.
-compatibility: Written for sfh v1.5 recovery, workspace checkpoint, budget, and machine-interface behavior.
+compatibility: Written for sfh v1.6 recovery, workspace checkpoint, budget, and machine-interface behavior.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.5.x"
+  target-sfh: "1.6.x"
 ---
 
 # Classify the failure before choosing the mechanism
@@ -46,6 +46,29 @@ retry_on: never
 ```
 
 Only add retry when the operation has an enforced idempotency key or a deterministic probe can prove whether it happened. Tool or MCP annotations are hints, not proof.
+
+## Salvage protocol drift
+
+A malformed or incomplete structured response fails closed, but its raw output is preserved in the step artifact and exposed with a warning banner through `{{steps.<id>.outputs}}`. To recover useful work without treating that response as success, explicitly allow failed control to reach the route and send only protocol failures to a separate interpreter:
+
+```yaml
+- id: analyze
+  tool: codex
+  access: read
+  on_error: continue
+  prompt: "Analyze the task."
+  route:
+    - {when_protocol_is: missing_terminal, goto: salvage}
+    - {when_protocol_is: invalid, goto: salvage}
+    - {when_protocol_is: valid, goto: next}
+    - {goto: fail}
+- id: salvage
+  tool: claude
+  access: read
+  prompt: "Recover only supported facts from: {{steps.analyze.outputs}}"
+```
+
+Do not route every failure to salvage: transport failure, timeout, an explicit terminal failure, and adapter drift are different facts. `when_protocol_is` is recorded durably, so resume replays this decision without buying the failed step again.
 
 ## Budgets
 

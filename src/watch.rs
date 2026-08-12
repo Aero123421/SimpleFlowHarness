@@ -32,6 +32,7 @@ pub struct Snapshot {
     pub emit_file: Option<String>,
     pub emit_step: Option<String>,
     pub error: Option<String>,
+    pub error_code: Option<crate::machine::ErrorCode>,
     pub flow: String,
     pub started: String,
     /// The idle clocks (F2). All three are absent from a status.json written by
@@ -225,6 +226,7 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
         emit_file: opt("emit_file"),
         emit_step: opt("emit_step"),
         error: opt("error"),
+        error_code: opt("error_code").and_then(|code| crate::machine::ErrorCode::parse(&code)),
         flow: s("flow"),
         started: s("started_utc"),
         step_started: opt("step_started_utc"),
@@ -351,6 +353,18 @@ fn fail(as_json: bool, command: &str, code: crate::machine::ErrorCode, msg: &str
     2
 }
 
+fn snapshot_error_code(snap: &Snapshot) -> crate::machine::ErrorCode {
+    snap.error_code.unwrap_or(match snap.state {
+        "stuck" => crate::machine::ErrorCode::Stuck,
+        "dead" | "stopped" => crate::machine::ErrorCode::Interrupted,
+        _ => snap
+            .error
+            .as_deref()
+            .map(crate::engine::run_failure_code)
+            .unwrap_or(crate::machine::ErrorCode::FlowInvalid),
+    })
+}
+
 pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     let dir = match resolve(target, root) {
         Ok(d) => d,
@@ -366,11 +380,26 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     // used to print as success and exit 0; it is now refused (rev_break #10).
     if snap.terminal() {
         if let Err(e) = nonce_consistent(&dir, &snap) {
-            eprintln!(
-                "sfh: refusing to report {} as '{}': {e}",
+            let message = format!(
+                "refusing to report {} as '{}': {e}",
                 dir.display(),
                 snap.state
             );
+            if as_json {
+                crate::machine::emit(&crate::machine::error_envelope(
+                    "status",
+                    crate::machine::ErrorCode::PersistenceFailure,
+                    &message,
+                    1,
+                    serde_json::json!({
+                        "state": snap.state,
+                        "run_dir": dir.display().to_string(),
+                        "terminal": true,
+                    }),
+                ));
+            } else {
+                eprintln!("sfh: {message}");
+            }
             return 1;
         }
     }
@@ -379,6 +408,13 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         // here and still means what it did. The common envelope header and
         // `implicit_target` are new keys beside them, so a reader written
         // against 1.1 keeps working unchanged.
+        let failure_code = snapshot_error_code(&snap);
+        let failure_message = snap
+            .error
+            .as_deref()
+            .or(snap.reason.as_deref())
+            .unwrap_or("the run did not finish")
+            .to_string();
         let body = serde_json::json!({
                 "state": snap.state,
                 "reason": snap.reason,
@@ -399,7 +435,6 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 "exit_code": snap.exit_code,
                 "emit_step": snap.emit_step,
                 "emit_file": snap.emit_file,
-                "error": snap.error,
                 "terminal": snap.terminal(),
                 "run_id": snap.dir.file_name().map(|n| n.to_string_lossy().into_owned()),
                 // A caller that omitted the path got the NEWEST run, which may
@@ -407,12 +442,18 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 // notice it is about to report on somebody else's run.
                 "implicit_target": target.is_none(),
         });
-        crate::machine::emit(&crate::machine::envelope(
-            "status",
-            snap.state == "done",
-            snap.exit(),
-            body,
-        ));
+        let envelope = match snap.state {
+            "done" => crate::machine::envelope("status", true, snap.exit(), body),
+            "running" => crate::machine::envelope("status", false, snap.exit(), body),
+            _ => crate::machine::error_envelope(
+                "status",
+                failure_code,
+                &failure_message,
+                snap.exit(),
+                body,
+            ),
+        };
+        crate::machine::emit(&envelope);
         return snap.exit();
     }
 
@@ -613,6 +654,10 @@ pub fn stop(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     m.insert("state".into(), serde_json::json!("stopped"));
     m.insert("exit_code".into(), serde_json::json!(1));
     m.insert("error".into(), serde_json::json!("cancelled by sfh stop"));
+    m.insert(
+        "error_code".into(),
+        serde_json::json!(crate::machine::ErrorCode::Interrupted.as_str()),
+    );
     let encoded = serde_json::to_string_pretty(&v).unwrap_or_default();
     if let Err(e) = contain::write_private_atomic(&sp, encoded) {
         return answer(
@@ -969,7 +1014,7 @@ pub fn wait(
                 } else {
                     crate::machine::emit(&crate::machine::error_envelope(
                         "wait",
-                        crate::machine::ErrorCode::FlowInvalid,
+                        snapshot_error_code(&snap),
                         snap.error.as_deref().unwrap_or("the run did not finish"),
                         code,
                         body,

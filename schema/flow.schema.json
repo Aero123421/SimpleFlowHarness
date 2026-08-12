@@ -401,6 +401,15 @@
         "when_outcome_is": {
           "$ref": "#/definitions/outcomeResult",
           "description": "Equality against the outcome class sfh recorded for this step. Added in v1.4.0."
+        },
+        "when_protocol_is": {
+          "enum": [
+            "plain",
+            "valid",
+            "missing_terminal",
+            "invalid"
+          ],
+          "description": "Equality against sfh's recorded structured-protocol state for this leaf. cmd: steps are plain; preset tool steps are valid, missing_terminal, or invalid."
         }
       }
     },

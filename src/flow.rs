@@ -921,6 +921,10 @@ pub struct Route {
     /// retryable | fail. `skip_serializing_if` for the reason above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when_outcome_is: Option<OutcomeResult>,
+    /// Equality against sfh's mechanical structured-protocol evidence for this
+    /// leaf. `skip_serializing_if` preserves old effective fingerprints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_protocol_is: Option<crate::protocol::ProtocolState>,
     /// Count the members of THIS step's fan-out that reported a given verdict.
     /// Only on a `parallel:`/`foreach:` step, and only alone in its rule (see
     /// validate). See `WhenMembers`.
@@ -941,6 +945,7 @@ impl Route {
             && self.when_stderr_matches.is_none()
             && self.when_label_is.is_none()
             && self.when_outcome_is.is_none()
+            && self.when_protocol_is.is_none()
             && self.when_members.is_none()
     }
 }
@@ -2200,10 +2205,12 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             // reading the group would simply never match. Members are judged
             // with when_members.
             if (s.is_group() || s.is_foreach())
-                && (r.when_label_is.is_some() || r.when_outcome_is.is_some())
+                && (r.when_label_is.is_some()
+                    || r.when_outcome_is.is_some()
+                    || r.when_protocol_is.is_some())
             {
                 return Err(format!(
-                    "step '{}' route[{i}]: when_label_is/when_outcome_is read this step's OWN outcome, and a parallel:/foreach: step has none - it records the group composite. Judge the members with when_members, or put the rule on a single step",
+                    "step '{}' route[{i}]: when_label_is/when_outcome_is/when_protocol_is read this step's OWN result, and a parallel:/foreach: step has none - it records the group composite. Judge the members with when_members, or put the rule on a single step",
                     s.id
                 ));
             }
@@ -2226,6 +2233,25 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                         "step '{}' route[{i}]: when_outcome_is '{}' can never match - no outcomes: entry on this step declares that result",
                         s.id,
                         want.as_str()
+                    ));
+                }
+            }
+            if let Some(want) = r.when_protocol_is {
+                let impossible = if s.cmd.is_some() {
+                    want != crate::protocol::ProtocolState::Plain
+                } else {
+                    want == crate::protocol::ProtocolState::Plain
+                };
+                if impossible {
+                    return Err(format!(
+                        "step '{}' route[{i}]: when_protocol_is '{}' can never match this {} step",
+                        s.id,
+                        want.as_str(),
+                        if s.cmd.is_some() {
+                            "cmd:"
+                        } else {
+                            "preset tool"
+                        }
                     ));
                 }
             }
@@ -2391,6 +2417,7 @@ fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
         ("when_stderr_matches", r.when_stderr_matches.is_some()),
         ("when_label_is", r.when_label_is.is_some()),
         ("when_outcome_is", r.when_outcome_is.is_some()),
+        ("when_protocol_is", r.when_protocol_is.is_some()),
     ] {
         if present {
             return Err(format!(
@@ -4220,6 +4247,29 @@ mod tests {
         assert!(error.contains("statically resolved bin"), "{error}");
     }
 
+    #[test]
+    fn protocol_routes_are_valid_only_for_a_leaf_state_the_step_can_produce() {
+        let ai: Flow = yaml::from_str(
+            "steps:\n  - id: judge\n    tool: codex\n    access: read\n    on_error: continue\n    prompt: x\n    route:\n      - {when_protocol_is: invalid, goto: end}\n      - {goto: fail}\n",
+        )
+        .unwrap();
+        validate(&ai, false).unwrap();
+
+        let impossible_cmd: Flow = yaml::from_str(
+            "steps:\n  - id: gate\n    cmd: [echo, x]\n    route:\n      - {when_protocol_is: invalid, goto: end}\n      - {goto: fail}\n",
+        )
+        .unwrap();
+        let error = validate(&impossible_cmd, false).unwrap_err();
+        assert!(error.contains("can never match this cmd:"), "{error}");
+
+        let group: Flow = yaml::from_str(
+            "steps:\n  - id: group\n    parallel:\n      - {id: a, cmd: [echo, a]}\n    route:\n      - {when_protocol_is: plain, goto: end}\n      - {goto: fail}\n",
+        )
+        .unwrap();
+        let error = validate(&group, false).unwrap_err();
+        assert!(error.contains("OWN result"), "{error}");
+    }
+
     /// Upgrading sfh must not, by itself, make every existing run dir
     /// unresumable.
     ///
@@ -4254,6 +4304,7 @@ mod tests {
             "\"outcomes\"",
             "\"when_label_is\"",
             "\"when_outcome_is\"",
+            "\"when_protocol_is\"",
         ] {
             assert!(
                 !json.contains(key),

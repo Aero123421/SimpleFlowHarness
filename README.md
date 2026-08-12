@@ -261,6 +261,29 @@ defaults:
 
 A real run checks the resolved binary's isolated `--version` before creating the run directory or starting any flow step. A mismatch or unusable version fails with `SFH_CAPABILITY_UNAVAILABLE`. `plan` remains spawn-free and reports the declaration with `observed: null`; `preflight` shows declaration versus measurement. A custom `bin:` is only measured by standalone preflight with `--probe-binaries`, because preflight has not otherwise been authorized to execute an arbitrary override.
 
+### Protocol-aware recovery
+
+Structured adapter drift remains fail-closed, but a flow can route the preserved evidence to an explicit salvage step rather than buying the same work again. Failed output stays available through `{{steps.<id>.outputs}}` with a warning banner and as the raw `.out.txt` artifact.
+
+```yaml
+- id: analyze
+  tool: codex
+  access: read
+  on_error: continue             # failed leaves normally stop before route:
+  prompt: "Analyze the issue."
+  route:
+    - {when_protocol_is: missing_terminal, goto: salvage}
+    - {when_protocol_is: invalid, goto: salvage}
+    - {when_protocol_is: valid, goto: end}
+    - {goto: fail}
+- id: salvage
+  tool: claude
+  access: read
+  prompt: "Recover the useful facts from: {{steps.analyze.outputs}}"
+```
+
+`when_protocol_is` accepts `plain`, `valid`, `missing_terminal`, or `invalid` and composes with other predicates using the usual AND rule. It applies to leaf steps only; fan-out groups have no single protocol state. The state is recorded in `step_end`, so resume replays the same decision without re-running the tool.
+
 ### Replay policy
 
 What a resume should do with a step that started and never recorded an end — the one case where sfh genuinely cannot know whether the work already happened.
@@ -418,7 +441,7 @@ sfh wait <run-dir> --json               # blocks, then the result
 
 Failures carry a code whose meaning is fixed for as long as `schema_version` does not change (currently `1`) — branch on the code, not on the message, which is allowed to improve:
 
-`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`.
+`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`.
 
 **Always pass the run directory explicitly.** A command given no path selects the newest run and says so with `"implicit_target": true`, which is rarely what an agent wants.
 

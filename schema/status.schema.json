@@ -121,10 +121,24 @@
       ]
     },
     "error": {
-      "type": [
-        "string",
-        "null"
+      "description": "A prose string in status.json; an error object or null in the status --json envelope.",
+      "oneOf": [
+        {"type": "string"},
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": {"type": "string", "pattern": "^SFH_[A-Z0-9_]+$"},
+            "message": {"type": "string"}
+          }
+        }
       ]
+    },
+    "error_code": {
+      "type": ["string", "null"],
+      "pattern": "^SFH_[A-Z0-9_]+$",
+      "description": "Stable classification recorded beside the prose error in status.json. Added in v1.6.0."
     },
     "unfinished_step": {
       "oneOf": [

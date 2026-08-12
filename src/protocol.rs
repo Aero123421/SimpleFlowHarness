@@ -14,7 +14,8 @@
 //! well-formed - never whether the model's answer was any good.
 
 /// Whether the structured stream held together end to end.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProtocolState {
     /// Not a structured protocol at all: a custom `cmd:` step, whose stdout is
     /// the contract the flow author chose. Unchanged from every prior release.
@@ -36,6 +37,16 @@ impl ProtocolState {
             ProtocolState::Valid => "valid",
             ProtocolState::MissingTerminal => "missing_terminal",
             ProtocolState::Invalid => "invalid",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "plain" => Some(Self::Plain),
+            "valid" => Some(Self::Valid),
+            "missing_terminal" => Some(Self::MissingTerminal),
+            "invalid" => Some(Self::Invalid),
+            _ => None,
         }
     }
 }

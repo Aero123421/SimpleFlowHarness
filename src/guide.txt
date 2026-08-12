@@ -85,8 +85,8 @@ sfh run       flow.yaml --json --detach   # returns {run_dir, next_actions:[{arg
 sfh wait <run-dir> --json        # blocks, then {ok, state, result, result_file}
 sfh status <run-dir> --json      # add --json to stop/workspaces too
 ```
-Pass the run dir explicitly. Omitting it selects the NEWEST run and sets `implicit_target: true`.
-Failures carry a stable `error.code` (SFH_PROTOCOL_INVALID, SFH_WORKSPACE_DRIFT, ...); branch on it, not on the message.
+Pass the run dir explicitly; omission selects the NEWEST. Branch on stable `error.code`, not messages.
+PROTOCOL SALVAGE: set `on_error: continue`, then `{when_protocol_is: invalid, goto: salvage}`; failed output remains in `steps.X.outputs`.
 WORKSPACE AND CONTEXT — opt-in; omit both and every step runs in the caller's cwd as before:
 ```yaml
 api_version: 1

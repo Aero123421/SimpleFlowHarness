@@ -142,6 +142,10 @@ pub struct Report {
     pub sfh_version: &'static str,
     pub flow_path: Option<String>,
     pub flow_name: Option<String>,
+    /// `None` for the flowless adapter survey, otherwise whether the flow
+    /// loaded and passed static validation. This keeps a machine caller from
+    /// confusing a broken flow with a valid flow whose local tools are absent.
+    pub flow_valid: Option<bool>,
     /// Whether `--probe-binaries` was given, so a JSON consumer can tell "no
     /// bin: overrides existed" apart from "overrides existed but this run
     /// was not allowed to execute them" without re-deriving it by scanning
@@ -165,11 +169,20 @@ impl Report {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
+        let failure_kind = if self.ok() {
+            None
+        } else if self.flow_valid == Some(false) {
+            Some("flow_invalid")
+        } else {
+            Some("capability_unavailable")
+        };
         json!({
             "sfh_version": self.sfh_version,
             "flow": self.flow_path,
             "flow_name": self.flow_name,
+            "flow_valid": self.flow_valid,
             "ok": self.ok(),
+            "failure_kind": failure_kind,
             "probe_binaries": self.probe_binaries,
             "tools": self.tools.iter().map(ToolReport::to_json).collect::<Vec<_>>(),
             "commands": self.commands.iter().map(CommandReport::to_json).collect::<Vec<_>>(),
@@ -572,6 +585,7 @@ pub fn all_adapters(probe_dir: Option<&Path>, probe_binaries: bool) -> Report {
         sfh_version: env!("CARGO_PKG_VERSION"),
         flow_path: None,
         flow_name: None,
+        flow_valid: None,
         probe_binaries,
         tools,
         commands: Vec::new(),
@@ -601,6 +615,7 @@ pub fn for_flow(
                 sfh_version: env!("CARGO_PKG_VERSION"),
                 flow_path: Some(path.display().to_string()),
                 flow_name: None,
+                flow_valid: Some(false),
                 probe_binaries,
                 tools: Vec::new(),
                 commands: Vec::new(),
@@ -681,6 +696,7 @@ pub fn for_flow(
         sfh_version: env!("CARGO_PKG_VERSION"),
         flow_path: Some(path.display().to_string()),
         flow_name: flow.name.clone(),
+        flow_valid: Some(true),
         probe_binaries,
         tools,
         commands,
@@ -873,9 +889,6 @@ pub fn run(
                 report.to_json(),
             ));
         } else {
-            // Everything preflight can block on is "this machine cannot provide
-            // what the flow asks for": a missing binary, a CLI whose flags have
-            // moved, an access level the tool has no headless equivalent for.
             let first = report
                 .blockers
                 .first()
@@ -887,10 +900,22 @@ pub fn run(
                         .flat_map(|t| t.blockers.first().cloned())
                         .next()
                 })
+                .or_else(|| {
+                    report
+                        .commands
+                        .iter()
+                        .flat_map(|c| c.blockers.first().cloned())
+                        .next()
+                })
                 .unwrap_or_else(|| "preflight found blockers".to_string());
+            let error_code = if report.flow_valid == Some(false) {
+                crate::machine::ErrorCode::FlowInvalid
+            } else {
+                crate::machine::ErrorCode::CapabilityUnavailable
+            };
             crate::machine::emit(&crate::machine::error_envelope(
                 "preflight",
-                crate::machine::ErrorCode::CapabilityUnavailable,
+                error_code,
                 &first,
                 code,
                 report.to_json(),
@@ -1097,6 +1122,7 @@ mod tests {
             sfh_version: "test",
             flow_path: None,
             flow_name: None,
+            flow_valid: None,
             probe_binaries: false,
             tools: Vec::new(),
             commands: vec![probe_command(
@@ -1112,6 +1138,26 @@ mod tests {
             "a cmd: step that cannot start must fail preflight like any other"
         );
         assert!(r.to_json()["commands"][0]["program"].is_string());
+        assert_eq!(r.to_json()["failure_kind"], "capability_unavailable");
+    }
+
+    #[test]
+    fn a_static_flow_error_is_distinct_from_a_missing_capability() {
+        let r = Report {
+            sfh_version: "test",
+            flow_path: Some("broken.yaml".to_string()),
+            flow_name: None,
+            flow_valid: Some(false),
+            probe_binaries: false,
+            tools: Vec::new(),
+            commands: Vec::new(),
+            blockers: vec!["flow is invalid".to_string()],
+            warnings: Vec::new(),
+            flow_facts: None,
+        };
+        let json = r.to_json();
+        assert_eq!(json["flow_valid"], false);
+        assert_eq!(json["failure_kind"], "flow_invalid");
     }
 
     #[test]

@@ -842,6 +842,9 @@ struct PendingRoute {
     /// before the snapshot existed - the router tells those two apart from the
     /// flow, and refuses the second rather than guessing (see `Members`).
     members: Option<Vec<MemberVerdict>>,
+    /// Durable protocol evidence for a leaf. None for fan-out composites and
+    /// logs written before protocol_state was recorded.
+    protocol: Option<protocol::ProtocolState>,
     /// The step/aggregate result is durable, but compact/notes post-processing
     /// has not yet reached its own durable end marker. Resume must finish that
     /// stage before evaluating this route.
@@ -1580,6 +1583,10 @@ fn load_resume_for_flow(
                             errored: !ok,
                             from_plain: false,
                             members: None,
+                            protocol: v
+                                .get("protocol_state")
+                                .and_then(|value| value.as_str())
+                                .and_then(protocol::ProtocolState::parse),
                             postprocess: postprocess_pending,
                             compact_done: false,
                             notes_done: false,
@@ -1600,6 +1607,7 @@ fn load_resume_for_flow(
                             errored: !ok,
                             from_plain: true,
                             members,
+                            protocol: None,
                             postprocess: postprocess_pending,
                             compact_done: false,
                             notes_done: false,
@@ -2111,6 +2119,7 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
             emit_step: None,
             emit_file: None,
             error: None,
+            error_code: None,
             unfinished_step: None,
             nonce: nonce.to_string(),
             pid_start: child_start,
@@ -2403,6 +2412,9 @@ struct Status {
     emit_step: Option<String>,
     emit_file: Option<String>,
     error: Option<String>,
+    /// Stable machine classification corresponding to `error`. Additive: the
+    /// prose remains for humans and older readers.
+    error_code: Option<String>,
     unfinished_step: Option<UnfinishedStep>,
     /// Random token proving this status.json was written by the sfh that owns
     /// the run dir. `sfh stop` refuses to kill without a matching nonce file.
@@ -2452,6 +2464,7 @@ fn status_json(s: &Status) -> Result<String, String> {
         "emit_step": s.emit_step,
         "emit_file": s.emit_file,
         "error": s.error,
+        "error_code": s.error_code,
         "unfinished_step": unfinished_step,
         "nonce": s.nonce,
         "pid_start": s.pid_start,
@@ -2465,7 +2478,13 @@ fn status_json(s: &Status) -> Result<String, String> {
 /// Used by the replay policy, which refuses before the run's status thread even
 /// exists. The previous document's fields are preserved so `runs show`, `wait`
 /// and `status` still see the run's history; only the outcome is replaced.
-fn mark_terminal_status(dir: &Path, state: &str, exit: i32, error: &str) -> Result<(), String> {
+fn mark_terminal_status(
+    dir: &Path,
+    state: &str,
+    exit: i32,
+    code: machine::ErrorCode,
+    error: &str,
+) -> Result<(), String> {
     let path = dir.join("status.json");
     let mut v: serde_json::Value = contain::read_contained_opt(dir, "status.json")?
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -2476,6 +2495,7 @@ fn mark_terminal_status(dir: &Path, state: &str, exit: i32, error: &str) -> Resu
     map.insert("state".into(), json!(state));
     map.insert("exit_code".into(), json!(exit));
     map.insert("error".into(), json!(error));
+    map.insert("error_code".into(), json!(code.as_str()));
     map.insert("heartbeat_utc".into(), json!(utc_stamp()));
     let text =
         serde_json::to_string_pretty(&v).map_err(|e| format!("cannot serialize status: {e}"))?;
@@ -3073,7 +3093,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                "replay_refused": policy.as_str(), "step": u.step,
                                "elapsed_sec": resumed.elapsed_sec}),
                     )?;
-                    mark_terminal_status(&dir, word, code, &why)?;
+                    mark_terminal_status(
+                        &dir,
+                        word,
+                        code,
+                        machine::ErrorCode::ReplayRefused,
+                        &why,
+                    )?;
                     if opts.as_json {
                         machine::emit(&machine::error_envelope(
                             "run",
@@ -3712,6 +3738,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         emit_step: None,
         emit_file: None,
         error: None,
+        error_code: None,
         unfinished_step: resumed.unfinished_step.clone(),
         nonce: nonce.clone(),
         pid_start,
@@ -3835,7 +3862,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             })?;
             let step = &flow.steps[completed_idx];
             let replay_route = if pending.errored {
-                match apply_on_error(&mut log, step, &index_of, &run_dir)? {
+                match apply_on_error(
+                    &mut log,
+                    step,
+                    &index_of,
+                    &run_dir,
+                    protocol_failure_code(pending.protocol),
+                )? {
                     ErrorDisposition::Continue => true,
                     ErrorDisposition::Goto(next) => {
                         cur = next;
@@ -3923,7 +3956,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 } else {
                     Members::NotAGroup
                 };
-                let target = evaluate_route(step, &pending.route_text, &ctx, &run_dir, members)?;
+                let target = evaluate_route(
+                    step,
+                    &pending.route_text,
+                    &ctx,
+                    &run_dir,
+                    members,
+                    pending.protocol,
+                )?;
                 match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                     None => {
                         log_position(
@@ -4330,11 +4370,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // ---- execute the step (leaf / parallel / foreach) ----
             // route_text: what route conditions match against - always the
             // pre-compact text, without sfh's "--- id ---" aggregate headers.
-            let (mut chain_output, route_text, errored, members): (
+            let (mut chain_output, route_text, errored, members, protocol_state): (
                 String,
                 String,
                 bool,
                 Option<Vec<MemberVerdict>>,
+                Option<protocol::ProtocolState>,
             ) = if let Some(pending) = &resumed_postprocess {
                 let restored = outputs.get(&step.id).ok_or_else(|| {
                     format!(
@@ -4347,6 +4388,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     pending.route_text.clone(),
                     pending.errored,
                     pending.members.clone(),
+                    pending.protocol,
                 )
             } else if let Some(children) = &step.parallel {
                 // Members the crashed attempt already finished: their step_end
@@ -4683,7 +4725,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
-                (agg, plain, hard_fail, Some(verdicts))
+                (agg, plain, hard_fail, Some(verdicts), None)
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
                 let pf = run_dir.join(format!("{gtag}.from.txt"));
@@ -5012,7 +5054,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
-                (agg, plain, hard_fail, Some(verdicts))
+                (agg, plain, hard_fail, Some(verdicts), None)
             } else {
                 let mut next_fallback_index = 0usize;
                 let mut done = if let Some(unfinished) = &resumed_fallback {
@@ -5170,7 +5212,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let rt = d.chain_output.clone();
                 // A leaf has no members, which is not the same as having none
                 // recorded - see `Members`.
-                (d.chain_output.clone(), rt, !d.ok(), None)
+                (
+                    d.chain_output.clone(),
+                    rt,
+                    !d.ok(),
+                    None,
+                    Some(d.protocol.protocol),
+                )
             };
             if let Some(e) = persistence_error.lock().ok().and_then(|mut e| e.take()) {
                 return Err(e);
@@ -5373,7 +5421,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
             // ---- error handling ----
             if errored {
-                match apply_on_error(&mut log, step, &index_of, &run_dir)? {
+                match apply_on_error(
+                    &mut log,
+                    step,
+                    &index_of,
+                    &run_dir,
+                    protocol_failure_code(protocol_state),
+                )? {
                     ErrorDisposition::Continue => {}
                     ErrorDisposition::Goto(next) => {
                         cur = next;
@@ -5408,6 +5462,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         Some(m) => Members::Known(m),
                         None => Members::NotAGroup,
                     },
+                    protocol_state,
                 )?
             };
             match target.as_ref().map(|h| (h.goto.as_str(), h)) {
@@ -5466,6 +5521,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .and_then(|id| chain_files.get(id))
             .map(|p| p.display().to_string());
         g.error = err.map(String::from);
+        g.error_code = match state {
+            "stuck" => Some(machine::ErrorCode::Stuck.as_str().to_string()),
+            "failed" => err
+                .map(run_failure_code)
+                .map(|code| code.as_str().to_string()),
+            "stopped" | "dead" => Some(machine::ErrorCode::Interrupted.as_str().to_string()),
+            _ => None,
+        };
         write_status(&status_path, &g)
     };
     // The output a caller gets when the run did NOT succeed. Computed once,
@@ -5674,7 +5737,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     exit_code: 4,
                     run_dir: &run_dir,
                     flow: &opts.flow_path,
-                    error: Some((machine::ErrorCode::ReplayRefused, msg.as_str())),
+                    error: Some((machine::ErrorCode::Stuck, msg.as_str())),
                     result: partial_pick
                         .as_deref()
                         .and_then(|id| outputs.get(id))
@@ -5761,8 +5824,11 @@ struct RunEnvelope<'a> {
 /// mapping keys off the markers sfh itself writes. Anything unrecognised stays
 /// a plain flow failure rather than being forced into a code that would tell a
 /// caller something specific and wrong.
-fn run_failure_code(msg: &str) -> machine::ErrorCode {
+pub(crate) fn run_failure_code(msg: &str) -> machine::ErrorCode {
     for code in [
+        machine::ErrorCode::ProtocolInvalid,
+        machine::ErrorCode::TerminalMissing,
+        machine::ErrorCode::SessionUnverified,
         machine::ErrorCode::ExecutionClosureChanged,
         machine::ErrorCode::WorkspaceMissing,
         machine::ErrorCode::WorkspaceDrift,
@@ -5772,6 +5838,8 @@ fn run_failure_code(msg: &str) -> machine::ErrorCode {
         machine::ErrorCode::ReplayRefused,
         machine::ErrorCode::PersistenceFailure,
         machine::ErrorCode::CapabilityUnavailable,
+        machine::ErrorCode::Stuck,
+        machine::ErrorCode::Interrupted,
     ] {
         if msg.contains(code.as_str()) {
             return code;
@@ -6828,6 +6896,9 @@ fn dry_run(
             if let Some(c) = &r.when_outcome_is {
                 cond.push(format!("outcome is {}", c.as_str()));
             }
+            if let Some(c) = r.when_protocol_is {
+                cond.push(format!("protocol is {}", c.as_str()));
+            }
             if let Some(m) = &r.when_members {
                 let quantifier = match (m.all, m.at_least) {
                     (Some(true), _) => "all".to_string(),
@@ -7628,6 +7699,7 @@ struct RouteHit {
     /// keys while they are None, so no other caller has to know about them.
     votes: Option<u32>,
     voters: Option<Vec<String>>,
+    protocol: Option<protocol::ProtocolState>,
 }
 
 /// How much of a step's stderr `when_stderr_matches` will read. A step is free
@@ -7664,6 +7736,7 @@ fn evaluate_route(
     ctx: &template::Ctx<'_>,
     run_dir: &Path,
     members: Members<'_>,
+    protocol_state: Option<protocol::ProtocolState>,
 ) -> Result<Option<RouteHit>, String> {
     let last = leaf::last_line(route_text).to_string();
     // Read at most once per routing decision, and only when a rule asks.
@@ -7741,6 +7814,11 @@ fn evaluate_route(
             }
         }
         if matched {
+            if let Some(want) = r.when_protocol_is {
+                matched = protocol_state == Some(want);
+            }
+        }
+        if matched {
             if let Some(t) = &r.when_stderr_matches {
                 let t = template::render(t, ctx)?;
                 let rx = regex::Regex::new(&t)
@@ -7769,6 +7847,7 @@ fn evaluate_route(
                 line: route_line_of(r, route_text, &last),
                 votes: tally.as_ref().map(|(n, _)| *n),
                 voters: tally.map(|(_, v)| v),
+                protocol: r.when_protocol_is.and(protocol_state),
             }));
         }
     }
@@ -7798,6 +7877,9 @@ fn log_position(
         if let Some(v) = &h.voters {
             o.insert("voters".into(), json!(v));
         }
+        if let Some(state) = h.protocol {
+            o.insert("protocol_state".into(), json!(state.as_str()));
+        }
     }
     log_event(f, ev)
 }
@@ -7807,6 +7889,7 @@ fn apply_on_error(
     step: &flow::Step,
     index_of: &HashMap<String, usize>,
     run_dir: &Path,
+    failure_code: Option<machine::ErrorCode>,
 ) -> Result<ErrorDisposition, String> {
     match step.on_error.as_deref().unwrap_or("fail") {
         "continue" => Ok(ErrorDisposition::Continue),
@@ -7834,11 +7917,23 @@ fn apply_on_error(
                 Ok(ErrorDisposition::Goto(next))
             }
         },
-        _ => Err(format!(
-            "step '{}' failed - see {}",
-            step.id,
-            run_dir.display()
-        )),
+        _ => Err(match failure_code {
+            Some(code) => format!(
+                "{}: step '{}' failed - see {}",
+                code.as_str(),
+                step.id,
+                run_dir.display()
+            ),
+            None => format!("step '{}' failed - see {}", step.id, run_dir.display()),
+        }),
+    }
+}
+
+fn protocol_failure_code(state: Option<protocol::ProtocolState>) -> Option<machine::ErrorCode> {
+    match state {
+        Some(protocol::ProtocolState::MissingTerminal) => Some(machine::ErrorCode::TerminalMissing),
+        Some(protocol::ProtocolState::Invalid) => Some(machine::ErrorCode::ProtocolInvalid),
+        _ => None,
     }
 }
 
@@ -8575,6 +8670,7 @@ mod tests {
             when_exit: None,
             when_label_is: None,
             when_outcome_is: None,
+            when_protocol_is: None,
             when_stderr_matches: None,
             when_members: None,
             goto: "end".to_string(),
@@ -8670,6 +8766,7 @@ mod tests {
                 &ctx,
                 Path::new("."),
                 Members::NotAGroup,
+                Some(protocol::ProtocolState::Plain),
             )
             .unwrap()
             .expect("some rule always matches here");
@@ -8691,6 +8788,7 @@ mod tests {
             &ctx,
             Path::new("."),
             Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
         )
         .unwrap()
         .unwrap();
@@ -8719,10 +8817,48 @@ mod tests {
             &ctx,
             Path::new("."),
             Members::NotAGroup,
+            None,
         )
         .unwrap()
         .unwrap();
         assert_eq!(hit.goto, "other");
+    }
+
+    #[test]
+    fn when_protocol_is_uses_recorded_evidence_and_fails_closed_without_it() {
+        let rules = "      - {when_protocol_is: invalid, goto: salvage}\n      - {goto: fail}\n";
+        let (flow, outputs, ids) = route_probe(rules, probe_output(1, ""));
+        let vars = BTreeMap::new();
+        let ctx = template::Ctx {
+            vars: &vars,
+            outputs: &outputs,
+            step_ids: &ids,
+            builtins: BTreeMap::new(),
+        };
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "broken adapter output",
+            &ctx,
+            Path::new("."),
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Invalid),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hit.goto, "salvage");
+        assert_eq!(hit.protocol, Some(protocol::ProtocolState::Invalid));
+
+        let missing = evaluate_route(
+            &flow.steps[0],
+            "broken adapter output",
+            &ctx,
+            Path::new("."),
+            Members::NotAGroup,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(missing.goto, "fail");
     }
 
     #[test]
@@ -8742,15 +8878,29 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            &dir,
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.goto, "guard_fired");
 
         std::fs::remove_file(&err).unwrap();
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            &dir,
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.goto, "broken", "a missing stderr file must not match");
 
         // A step that never recorded a stderr file at all (a fan-out group)
@@ -8762,9 +8912,16 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            &dir,
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.goto, "broken");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8858,7 +9015,7 @@ mod tests {
         std::fs::write(dir.join("probe.err.txt"), "permission denied\n").unwrap();
         std::fs::write(
             dir.join("log.jsonl"),
-            "{\"event\":\"step_end\",\"step\":\"probe\",\"visit\":1,\"exit\":3,\"timed_out\":false,\"interrupted\":false,\"chain_file\":\"probe.chain.txt\",\"out_file\":\"probe.out.txt\"}\n",
+            "{\"event\":\"step_end\",\"step\":\"probe\",\"visit\":1,\"exit\":3,\"timed_out\":false,\"interrupted\":false,\"protocol_state\":\"invalid\",\"chain_file\":\"probe.chain.txt\",\"out_file\":\"probe.out.txt\"}\n",
         )
         .unwrap();
 
@@ -8875,6 +9032,7 @@ mod tests {
         assert!(pending.errored);
         assert_eq!(pending.step, "probe");
         assert_eq!(pending.route_text, "guard refused");
+        assert_eq!(pending.protocol, Some(protocol::ProtocolState::Invalid));
         assert_eq!(resumed.outputs["probe"].exit, 3);
         assert!(
             resumed.outputs["probe"].output.contains("did not complete"),

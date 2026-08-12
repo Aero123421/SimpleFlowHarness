@@ -1,6 +1,6 @@
 # Machine API reference
 
-This describes sfh 1.4.0's `--json` surface as it actually behaves today:
+This describes sfh 1.6.0's `--json` surface as it actually behaves today:
 which commands answer with the shared envelope, what the envelope contains,
 the error-code vocabulary, the stability guarantee a caller can rely on, and
 where the surface is currently inconsistent. It documents behavior, not a
@@ -63,6 +63,19 @@ Command-specific fields (e.g. `run`'s `run_dir`, `run_id`, `result`,
 command; see each command's `--help` or the worked example in the main
 README's "Driving sfh from a program" section for a concrete instance.
 
+Terminal `run`, `status`, and `wait` answers preserve one classification: a
+protocol failure is `SFH_PROTOCOL_INVALID` or `SFH_TERMINAL_MISSING` in all
+three commands, and a human-decision terminal is `SFH_STUCK`. The on-disk
+`status.json` keeps its historical prose `error` string and records the same
+classification additively as `error_code`; `status --json` converts those to
+the envelope's required `{"code", "message"}` object.
+
+`preflight --json` also separates flow validity from machine readiness. Its
+body carries `flow_valid` (`true`, `false`, or `null` for a flowless survey)
+and `failure_kind` (`flow_invalid`, `capability_unavailable`, or `null`). A
+static flow error uses `SFH_FLOW_INVALID`; a valid flow blocked by a missing or
+unverifiable program uses `SFH_CAPABILITY_UNAVAILABLE`.
+
 ## Error-code vocabulary
 
 `error.code` is always one of the following (`src/machine.rs::ErrorCode`).
@@ -85,6 +98,8 @@ allowed to be reworded at any time.
 | `SFH_REPLAY_REFUSED` | A replay policy refused to re-run an unfinished effect. |
 | `SFH_PERSISTENCE_FAILURE` | A required durable artifact could not be written. |
 | `SFH_CAPABILITY_UNAVAILABLE` | A capability the flow requires is unavailable or unverifiable, including a failed `require_version` check. |
+| `SFH_STUCK` | The flow deliberately stopped for a human decision, including a `goto: stuck` reached through `max_visits`. |
+| `SFH_INTERRUPTED` | The run was stopped or its recorded owning process disappeared. |
 
 ## Stability guarantee
 
