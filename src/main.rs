@@ -17,7 +17,7 @@ mod template;
 mod watch;
 mod workspace;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const EXAMPLE: &str = include_str!("../examples/research.yaml");
 const GUIDE: &str = include_str!("guide.txt");
@@ -646,7 +646,8 @@ enum Watch {
 }
 
 fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
-    let mut runs_dir = PathBuf::from(".sfh").join("runs");
+    let mut runs_dir: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
     let mut target: Option<PathBuf> = None;
     let mut as_json = false;
     let mut quiet = false;
@@ -656,9 +657,12 @@ fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
     let mut i = 0;
     while i < rest.len() {
         let r: Result<(), String> = match rest[i].as_str() {
-            "--runs-dir" => need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v)),
-            "--state-dir" => need(rest, &mut i, "--state-dir")
-                .map(|v| runs_dir = state::StateRoot::resolve(Some(Path::new(v)), None).runs_dir()),
+            "--runs-dir" => {
+                need(rest, &mut i, "--runs-dir").map(|v| runs_dir = Some(PathBuf::from(v)))
+            }
+            "--state-dir" => {
+                need(rest, &mut i, "--state-dir").map(|v| state_dir = Some(PathBuf::from(v)))
+            }
             "--json" => {
                 as_json = true;
                 Ok(())
@@ -694,6 +698,7 @@ fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
     if as_json && quiet {
         return usage_err("--json and --quiet are mutually exclusive (JSON mode already keeps stdout to the envelope alone)");
     }
+    let runs_dir = state::StateRoot::resolve(state_dir.as_deref(), runs_dir.as_deref()).runs_dir();
     match mode {
         Watch::Wait => watch::wait(
             target.as_deref(),
@@ -923,6 +928,55 @@ fn cmd_runs(rest: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{cmd_config, cmd_init, cmd_plan, cmd_runs, cmd_watch, Watch, GUIDE};
+
+    fn terminal_run(root: &std::path::Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let start = crate::execute::pid_start_time(pid);
+        crate::contain::write_nonce(&dir, pid, start, "watch-order").unwrap();
+        std::fs::write(
+            dir.join("status.json"),
+            format!(
+                r#"{{"state":"done","pid":{pid},"pid_start":{},"nonce":"watch-order"}}"#,
+                start
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string())
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn watch_runs_dir_overrides_state_dir_in_either_flag_order() {
+        let base = std::env::temp_dir().join(format!(
+            "sfh-watch-flag-order-{}-{}",
+            std::process::id(),
+            crate::contain::random_nonce()
+        ));
+        let runs = base.join("runs");
+        let state = base.join("state");
+        terminal_run(&runs, "only-run");
+        std::fs::create_dir_all(state.join("runs")).unwrap();
+
+        for args in [
+            vec![
+                "--runs-dir".into(),
+                runs.display().to_string(),
+                "--state-dir".into(),
+                state.display().to_string(),
+            ],
+            vec![
+                "--state-dir".into(),
+                state.display().to_string(),
+                "--runs-dir".into(),
+                runs.display().to_string(),
+            ],
+        ] {
+            assert_eq!(cmd_watch(&args, Watch::Status), 0);
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn guide_fits_one_screen() {

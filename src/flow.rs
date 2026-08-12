@@ -1887,6 +1887,15 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         }
     }
     let top_ids = flow.top_ids();
+    let mut steps_by_id: HashMap<&str, &Step> = HashMap::new();
+    for step in &flow.steps {
+        steps_by_id.insert(step.id.as_str(), step);
+        if let Some(children) = &step.parallel {
+            for child in children {
+                steps_by_id.insert(child.id.as_str(), child);
+            }
+        }
+    }
     let check_goto = |ctx: &str, g: &str| -> Result<(), String> {
         if TERMINALS.contains(&g) || top_ids.contains(g) {
             Ok(())
@@ -2070,8 +2079,9 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         if cf == &s.id {
             return Err(format!("step '{}': {what} cannot reference itself", s.id));
         }
-        let target = flow
-            .find_step(cf)
+        let target = steps_by_id
+            .get(cf.as_str())
+            .copied()
             .ok_or_else(|| format!("step '{}': {what} target '{cf}' is not a step id", s.id))?;
         if target.is_group() {
             return Err(format!(
@@ -2575,6 +2585,131 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
     warnings
 }
 
+struct Dominance {
+    reachable: Vec<bool>,
+    enter: Vec<usize>,
+    leave: Vec<usize>,
+}
+
+impl Dominance {
+    fn contains(&self, node: usize) -> bool {
+        self.reachable.get(node).copied().unwrap_or(false)
+    }
+
+    fn dominates(&self, dominator: usize, node: usize) -> bool {
+        self.contains(node)
+            && self.contains(dominator)
+            && self.enter[dominator] <= self.enter[node]
+            && self.leave[node] <= self.leave[dominator]
+    }
+}
+
+/// Build immediate dominators with the Cooper-Harvey-Kennedy algorithm, then
+/// number the resulting tree so every dominance query is O(1). The old
+/// validator cloned the whole reachable-node set into every node and
+/// repeatedly intersected those sets: even a straight 20k-step flow needed
+/// quadratic memory. This representation is linear in the graph size.
+fn dominance_tree(edges: &[HashSet<usize>], entry: usize) -> Dominance {
+    let node_count = edges.len();
+    let mut visited = vec![false; node_count];
+    let mut postorder = Vec::with_capacity(node_count);
+    let mut stack = vec![(entry, false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if expanded {
+            postorder.push(node);
+            continue;
+        }
+        if visited[node] {
+            continue;
+        }
+        visited[node] = true;
+        stack.push((node, true));
+        for &next in &edges[node] {
+            if !visited[next] {
+                stack.push((next, false));
+            }
+        }
+    }
+    postorder.reverse();
+    let mut order = vec![usize::MAX; node_count];
+    for (position, &node) in postorder.iter().enumerate() {
+        order[node] = position;
+    }
+
+    let mut predecessors: Vec<Vec<usize>> = (0..node_count).map(|_| Vec::new()).collect();
+    for (from, nexts) in edges.iter().enumerate() {
+        for &to in nexts {
+            predecessors[to].push(from);
+        }
+    }
+    let mut idom = vec![None; node_count];
+    idom[entry] = Some(entry);
+    let intersect = |mut left: usize, mut right: usize, idom: &[Option<usize>]| {
+        while left != right {
+            while order[left] > order[right] {
+                left = idom[left].expect("processed dominator");
+            }
+            while order[right] > order[left] {
+                right = idom[right].expect("processed dominator");
+            }
+        }
+        left
+    };
+    loop {
+        let mut changed = false;
+        for &node in postorder.iter().skip(1) {
+            let mut known = predecessors[node]
+                .iter()
+                .copied()
+                .filter(|predecessor| idom[*predecessor].is_some());
+            let Some(mut next) = known.next() else {
+                continue;
+            };
+            for predecessor in known {
+                next = intersect(predecessor, next, &idom);
+            }
+            if idom[node] != Some(next) {
+                idom[node] = Some(next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut children: Vec<Vec<usize>> = (0..node_count).map(|_| Vec::new()).collect();
+    for (node, parent) in idom.iter().enumerate() {
+        if node != entry {
+            if let Some(parent) = parent {
+                children[*parent].push(node);
+            }
+        }
+    }
+    let mut enter = vec![usize::MAX; node_count];
+    let mut leave = vec![usize::MAX; node_count];
+    let mut clock = 0usize;
+    let mut tree_stack = vec![(entry, false)];
+    while let Some((node, leaving)) = tree_stack.pop() {
+        if leaving {
+            leave[node] = clock;
+            clock += 1;
+            continue;
+        }
+        enter[node] = clock;
+        clock += 1;
+        tree_stack.push((node, true));
+        for &child in children[node].iter().rev() {
+            tree_stack.push((child, false));
+        }
+    }
+    Dominance {
+        reachable: visited,
+        enter,
+        leave,
+    }
+}
+
 /// Prove that every session source is guaranteed to have executed before its
 /// consumer. Existence checks alone accept forward references and branch joins
 /// that can reach a consumer without ever creating the requested session.
@@ -2634,57 +2769,7 @@ fn validate_session_dominance(flow: &Flow) -> Result<(), String> {
         }
     }
 
-    let mut reachable = HashSet::from([entry]);
-    let mut stack = vec![entry];
-    while let Some(node) = stack.pop() {
-        for &next in &edges[node] {
-            if reachable.insert(next) {
-                stack.push(next);
-            }
-        }
-    }
-    let universe = reachable.clone();
-    let mut dom: Vec<HashSet<usize>> = (0..=n)
-        .map(|node| {
-            if node == entry {
-                HashSet::from([entry])
-            } else if reachable.contains(&node) {
-                universe.clone()
-            } else {
-                HashSet::new()
-            }
-        })
-        .collect();
-    let mut predecessors: Vec<Vec<usize>> = (0..=n).map(|_| Vec::new()).collect();
-    for (from, nexts) in edges.iter().enumerate() {
-        for &to in nexts {
-            predecessors[to].push(from);
-        }
-    }
-    loop {
-        let mut changed = false;
-        for node in 0..n {
-            if !reachable.contains(&node) {
-                continue;
-            }
-            let mut incoming = predecessors[node]
-                .iter()
-                .filter(|p| reachable.contains(p))
-                .map(|p| dom[*p].clone());
-            let mut next = incoming.next().unwrap_or_default();
-            for other in incoming {
-                next.retain(|candidate| other.contains(candidate));
-            }
-            next.insert(node);
-            if next != dom[node] {
-                dom[node] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let dominance = dominance_tree(&edges, entry);
 
     let source_can_fail_open = |step: &Step| {
         matches!(step.on_error.as_deref(), Some("continue"))
@@ -2703,7 +2788,9 @@ fn validate_session_dominance(flow: &Flow) -> Result<(), String> {
             let Some(&target_owner) = owner.get(target) else {
                 continue; // existence is reported by the earlier validation.
             };
-            if reachable.contains(&consumer_owner) && !dom[consumer_owner].contains(&target_owner) {
+            if dominance.contains(consumer_owner)
+                && !dominance.dominates(target_owner, consumer_owner)
+            {
                 return Err(format!(
                     "step '{}': {kind} target '{target}' is not guaranteed to run before this step on every control-flow path",
                     consumer.id
@@ -2794,8 +2881,8 @@ fn validate_session_dominance(flow: &Flow) -> Result<(), String> {
                             consumer.id, dependency.id
                         ));
                 }
-                if reachable.contains(&consumer_owner)
-                    && !dom[consumer_owner].contains(&target_owner)
+                if dominance.contains(consumer_owner)
+                    && !dominance.dominates(target_owner, consumer_owner)
                 {
                     return Err(format!(
                             "step '{}': {label} references steps.{} but that step does not dominate this consumer on every control-flow path; mark the reference `| optional`/`| default:...` or fix the routing",
@@ -3443,6 +3530,35 @@ mod tests {
     fn parse(y: &str) -> Result<(), String> {
         let f: Flow = yaml::from_str(y).map_err(|e| e.to_string())?;
         validate(&f, false)
+    }
+
+    fn straight_flow(step_count: usize) -> String {
+        let mut yaml = String::from("api_version: 1\nname: scale\nsteps:\n");
+        for index in 0..step_count {
+            yaml.push_str(&format!(
+                "  - id: s{index}\n    cmd: [echo, ok]\n    effects: read\n"
+            ));
+        }
+        yaml
+    }
+
+    #[test]
+    fn validation_scales_near_linearly_for_large_straight_flows() {
+        // Warm parser/allocation paths before measuring the ratio. The wide
+        // allowance is for shared CI hosts; it still rejects the former
+        // dominator-set implementation, where 4x the steps took about 16x the
+        // time and quadratic memory.
+        parse(&straight_flow(200)).unwrap();
+        let start = std::time::Instant::now();
+        parse(&straight_flow(2_000)).unwrap();
+        let small = start.elapsed();
+        let start = std::time::Instant::now();
+        parse(&straight_flow(8_000)).unwrap();
+        let large = start.elapsed();
+        assert!(
+            large <= small.saturating_mul(8) + std::time::Duration::from_millis(500),
+            "validation grew too quickly: 2k={small:?}, 8k={large:?}"
+        );
     }
 
     #[test]

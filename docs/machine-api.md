@@ -80,6 +80,7 @@ allowed to be reworded at any time.
 | `SFH_WORKSPACE_MISSING` | A managed workspace that should exist does not. |
 | `SFH_WORKSPACE_DRIFT` | A managed workspace changed underneath a resume. |
 | `SFH_WORKSPACE_BUSY` | Another live run holds this workspace. |
+| `SFH_RUN_BUSY` | Another live process owns this run directory. |
 | `SFH_WORKSPACE_UNOWNED` | A path sfh was asked to manage is not one it created. |
 | `SFH_REPLAY_REFUSED` | A replay policy refused to re-run an unfinished effect. |
 | `SFH_PERSISTENCE_FAILURE` | A required durable artifact could not be written. |

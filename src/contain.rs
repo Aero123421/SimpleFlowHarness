@@ -1,5 +1,93 @@
 use std::path::{Path, PathBuf};
 
+/// An exclusive, process-lifetime claim on one run directory.
+///
+/// The file remains as an ordinary private artifact after the process exits,
+/// but the OS lock is released automatically. That makes a crashed owner
+/// reclaimable without deleting a lock path and avoids a check-then-act race
+/// between two simultaneous resumes.
+pub struct RunLease {
+    _file: std::fs::File,
+}
+
+#[derive(Debug)]
+pub enum RunLeaseError {
+    Busy,
+    Io(std::io::Error),
+}
+
+/// Try to claim `dir` without following a planted final-component symlink.
+/// The returned handle must stay alive for the whole run attempt.
+pub fn try_run_lease(dir: &Path) -> Result<RunLease, RunLeaseError> {
+    let path = dir.join("sfh-run.lock");
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(RunLeaseError::Io)?;
+        let mut permissions = file.metadata().map_err(RunLeaseError::Io)?.permissions();
+        if permissions.mode() & 0o777 != 0o600 {
+            permissions.set_mode(0o600);
+            file.set_permissions(permissions)
+                .map_err(RunLeaseError::Io)?;
+        }
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.kind() == std::io::ErrorKind::WouldBlock {
+                Err(RunLeaseError::Busy)
+            } else {
+                Err(RunLeaseError::Io(error))
+            };
+        }
+        Ok(RunLease { _file: file })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .map_err(|error| {
+                if matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
+                    RunLeaseError::Busy
+                } else {
+                    RunLeaseError::Io(error)
+                }
+            })?;
+        Ok(RunLease { _file: file })
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    RunLeaseError::Busy
+                } else {
+                    RunLeaseError::Io(error)
+                }
+            })?;
+        Ok(RunLease { _file: file })
+    }
+}
+
 /// Reject absolute paths and `..` traversal components without resolving.
 /// Use this for paths that will be joined and stored, not read immediately.
 pub fn validate_relative(candidate: &str) -> Result<(), String> {
@@ -800,6 +888,27 @@ pub fn mkdir_private(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create exactly the final directory component, failing atomically if a
+/// concurrent process already created it. Missing parents are made private
+/// first; the final `create_dir` is the ownership boundary.
+pub fn mkdir_private_new(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        mkdir_private(parent)?;
+    }
+    std::fs::create_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
 /// Restrict a file that was created through a raw handle (tee streams and the
 /// detached run's stdio redirections). No-op outside Unix; see above.
 pub fn restrict_file(f: &std::fs::File) {
@@ -842,6 +951,18 @@ fn fill_random(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_lease_is_exclusive_and_released_on_drop() {
+        let dir = std::env::temp_dir().join(format!("sfh-run-lease-{}", random_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = try_run_lease(&dir).unwrap();
+        assert!(matches!(try_run_lease(&dir), Err(RunLeaseError::Busy)));
+        drop(first);
+        let second = try_run_lease(&dir).unwrap();
+        drop(second);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn private_atomic_write_replaces_an_existing_file() {

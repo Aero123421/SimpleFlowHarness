@@ -49,6 +49,8 @@ pub enum ErrorCode {
     WorkspaceDrift,
     /// Another live run holds this workspace.
     WorkspaceBusy,
+    /// Another live process owns this run directory.
+    RunBusy,
     /// A path sfh was asked to manage is not one it created.
     WorkspaceUnowned,
     /// A replay policy refused to re-run an unfinished effect.
@@ -71,6 +73,7 @@ impl ErrorCode {
             ErrorCode::WorkspaceMissing => "SFH_WORKSPACE_MISSING",
             ErrorCode::WorkspaceDrift => "SFH_WORKSPACE_DRIFT",
             ErrorCode::WorkspaceBusy => "SFH_WORKSPACE_BUSY",
+            ErrorCode::RunBusy => "SFH_RUN_BUSY",
             ErrorCode::WorkspaceUnowned => "SFH_WORKSPACE_UNOWNED",
             ErrorCode::ReplayRefused => "SFH_REPLAY_REFUSED",
             ErrorCode::PersistenceFailure => "SFH_PERSISTENCE_FAILURE",
@@ -191,6 +194,7 @@ mod tests {
             WorkspaceMissing,
             WorkspaceDrift,
             WorkspaceBusy,
+            RunBusy,
             WorkspaceUnowned,
             ReplayRefused,
             PersistenceFailure,
@@ -218,6 +222,7 @@ mod tests {
             "SFH_WORKSPACE_MISSING",
             "SFH_WORKSPACE_DRIFT",
             "SFH_WORKSPACE_BUSY",
+            "SFH_RUN_BUSY",
             "SFH_WORKSPACE_UNOWNED",
             "SFH_REPLAY_REFUSED",
             "SFH_PERSISTENCE_FAILURE",

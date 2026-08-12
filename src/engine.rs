@@ -2629,6 +2629,118 @@ fn carry_source_is_final(dir: &Path) -> Result<(), String> {
     ))
 }
 
+fn inherited_run_handoff_matches(
+    dir: &Path,
+    inherited_nonce: Option<&str>,
+) -> Result<bool, String> {
+    let Some(expected) = inherited_nonce else {
+        return Ok(false);
+    };
+    let Some(raw) = contain::read_contained_opt(dir, "sfh-nonce")? else {
+        return Ok(false);
+    };
+    let contain::Nonce::Bound { pid, start, nonce } = contain::parse_nonce(raw.trim())? else {
+        return Ok(false);
+    };
+    if pid != std::process::id() || nonce != expected {
+        return Ok(false);
+    }
+    Ok(start
+        .map(|recorded| execute::pid_start_time(pid) == Some(recorded))
+        .unwrap_or(true))
+}
+
+fn acquire_run_lease(
+    dir: &Path,
+    is_resume: bool,
+    inherited_nonce: Option<&str>,
+) -> Result<contain::RunLease, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let lease = loop {
+        match contain::try_run_lease(dir) {
+            Ok(lease) => break lease,
+            Err(contain::RunLeaseError::Busy)
+                if inherited_nonce.is_some() && Instant::now() < deadline =>
+            {
+                // A detached child starts while its parent still owns the
+                // lease. The parent publishes the child's nonce before
+                // returning and releasing its handle, so this bounded wait is
+                // the handoff rather than a second ownership path.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(contain::RunLeaseError::Busy) => {
+                return Err(format!(
+                    "{}: another process owns this run directory ({})",
+                    machine::ErrorCode::RunBusy.as_str(),
+                    dir.display()
+                ))
+            }
+            Err(contain::RunLeaseError::Io(error)) => {
+                return Err(format!(
+                    "cannot claim run directory {}: {error}",
+                    dir.display()
+                ))
+            }
+        }
+    };
+
+    if inherited_run_handoff_matches(dir, inherited_nonce)? {
+        return Ok(lease);
+    }
+    if inherited_nonce.is_some() {
+        return Err(format!(
+            "{}: detached run ownership for {} could not be verified",
+            machine::ErrorCode::RunBusy.as_str(),
+            dir.display()
+        ));
+    }
+
+    if is_resume {
+        match watch::owner_verifiably_dead(dir)? {
+            Some(false) => {
+                return Err(format!(
+                    "{}: the recorded owner of {} is still alive; wait for it or stop it before resuming",
+                    machine::ErrorCode::RunBusy.as_str(),
+                    dir.display()
+                ))
+            }
+            Some(true) => return Ok(lease),
+            None => {}
+        }
+        // Pre-nonce runs have no owner record to inspect. Their status still
+        // gives a fail-closed fallback: a matching live pid is enough to
+        // refuse, never enough to prove that an unrelated process is safe to
+        // take over.
+        if let Ok(snapshot) = watch::read(dir) {
+            let same_live_process = execute::pid_alive(snapshot.pid)
+                && snapshot
+                    .pid_start
+                    .map(|recorded| execute::pid_start_time(snapshot.pid) == Some(recorded))
+                    .unwrap_or(true);
+            if same_live_process {
+                return Err(format!(
+                    "{}: the recorded owner of {} may still be alive; wait for it or stop it before resuming",
+                    machine::ErrorCode::RunBusy.as_str(),
+                    dir.display()
+                ));
+            }
+        }
+        return Ok(lease);
+    }
+
+    let has_existing_artifact = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot inspect run directory {}: {error}", dir.display()))?
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() != "sfh-run.lock");
+    if has_existing_artifact {
+        return Err(format!(
+            "--run-dir {} is not empty; choose a new or empty path, or use --resume for an existing run",
+            dir.display()
+        ));
+    }
+    Ok(lease)
+}
+
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // `--runs-dir` keeps meaning exactly what it always meant, and with neither
     // flag the runs root is still `.sfh/runs`: every flow, script and CI job
@@ -2784,6 +2896,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut resumed = ResumeState::default();
     let run_dir: PathBuf;
     let mut is_resume = false;
+    let inherited_nonce = std::env::var("SFH_NONCE")
+        .ok()
+        .filter(|nonce| !nonce.trim().is_empty());
+    let _run_lease: Option<contain::RunLease>;
     if opts.dry_run {
         run_dir = std::env::temp_dir().join(format!("sfh-plan-{}", leaf::gen_uuid()));
         contain::mkdir_private(&run_dir).map_err(|e| {
@@ -2792,10 +2908,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 run_dir.display()
             )
         })?;
+        _run_lease = None;
     } else if let Some(dir) = resume_dir {
         // The resumed dir was protected when it was first created; nothing
         // here writes to the runs root, so its state is not this run's
         // concern (and the root may be absent or read-only by design).
+        _run_lease = Some(acquire_run_lease(&dir, true, inherited_nonce.as_deref())?);
         resumed = load_resume_for_flow(&dir, Some(&flow))?;
         // Cross-check the recorded session access against the flow (which the
         // fingerprint check above verified is unchanged, unless --force-resume
@@ -2930,18 +3048,30 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         contain::mkdir_private(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = d;
+        _run_lease = Some(acquire_run_lease(
+            &run_dir,
+            false,
+            inherited_nonce.as_deref(),
+        )?);
     } else {
         protect_runs_root(&runs_root)?;
         let base = format!("{}-{}", utc_stamp(), name);
         let mut d = runs_root.join(&base);
         let mut n = 1;
-        while d.exists() {
-            n += 1;
-            d = runs_root.join(format!("{base}-{n}"));
+        loop {
+            match contain::mkdir_private_new(&d) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    n += 1;
+                    d = runs_root.join(format!("{base}-{n}"));
+                }
+                Err(error) => {
+                    return Err(format!("cannot create run dir {}: {error}", d.display()))
+                }
+            }
         }
-        contain::mkdir_private(&d)
-            .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = abs(&d);
+        _run_lease = Some(acquire_run_lease(&run_dir, false, None)?);
     }
     // ---- inherit an earlier run's spend into this fresh one ----
     // Resolved AFTER the run dir exists, because the ancestor has to be told
@@ -5567,6 +5697,7 @@ fn run_failure_code(msg: &str) -> machine::ErrorCode {
         machine::ErrorCode::WorkspaceDrift,
         machine::ErrorCode::WorkspaceUnowned,
         machine::ErrorCode::WorkspaceBusy,
+        machine::ErrorCode::RunBusy,
         machine::ErrorCode::ReplayRefused,
         machine::ErrorCode::PersistenceFailure,
     ] {
