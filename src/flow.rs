@@ -1796,6 +1796,32 @@ impl Flow {
         }
         out
     }
+
+    /// A USD ceiling can only judge values an adapter actually reports. cmd:
+    /// steps and tokens-only adapters contribute zero dollars, which is not the
+    /// same fact as spending nothing.
+    pub fn max_cost_coverage_warning(&self) -> Option<String> {
+        self.defaults.max_cost_usd?;
+        let tools = self.resolved_tools();
+        if tools.iter().any(|tool| {
+            crate::preset::adapter_info(&tool.tool)
+                .is_some_and(|info| info.cost_coverage == crate::preset::Coverage::Cost)
+        }) {
+            return None;
+        }
+        let names: BTreeSet<&str> = tools.iter().map(|tool| tool.tool.as_str()).collect();
+        let detail = if names.is_empty() {
+            "this flow has no cost-reporting preset launches".to_string()
+        } else {
+            format!(
+                "every resolved preset is tokens-only ({})",
+                names.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        };
+        Some(format!(
+            "defaults.max_cost_usd is declared, but {detail}; cmd: steps report no provider cost either. The USD ceiling cannot bound this flow's spend. Add defaults.wall_clock_sec as an enforceable backstop or include a cost-reporting adapter"
+        ))
+    }
 }
 
 impl Step {
@@ -2496,6 +2522,10 @@ pub fn runtime_warnings(flow: &Flow) -> Vec<String> {
         .map(|(index, step)| (step.id.as_str(), index))
         .collect();
     let mut warnings = Vec::new();
+
+    if let Some(warning) = flow.max_cost_coverage_warning() {
+        warnings.push(warning);
+    }
 
     for source in &flow.steps {
         let mut targets: Vec<usize> = source
@@ -4574,6 +4604,43 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("step 'met'"), "{warnings:?}");
         assert!(warnings[0].contains("step 'unmet'"), "{warnings:?}");
+    }
+
+    #[test]
+    fn cost_ceiling_warns_only_when_no_resolved_tool_reports_usd() {
+        let load = |source: &str| {
+            let flow: Flow = yaml::from_str(source).unwrap();
+            validate(&flow, false).unwrap();
+            flow
+        };
+        let tokens_only = load(
+            "defaults:\n  max_cost_usd: 5\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n",
+        );
+        let warnings = runtime_warnings(&tokens_only);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("cannot bound this flow's spend")),
+            "{warnings:?}"
+        );
+
+        let mixed = load(
+            "defaults:\n  max_cost_usd: 5\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n  - id: b\n    tool: claude\n    access: read\n    prompt: x\n",
+        );
+        assert!(
+            runtime_warnings(&mixed)
+                .iter()
+                .all(|warning| !warning.contains("cannot bound this flow's spend")),
+            "one cost-reporting adapter makes the ceiling observable"
+        );
+
+        let no_ceiling =
+            load("steps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n");
+        assert!(runtime_warnings(&no_ceiling).is_empty());
+
+        let command_only =
+            load("defaults:\n  max_cost_usd: 5\nsteps:\n  - id: a\n    cmd: [echo, x]\n");
+        assert!(command_only.max_cost_coverage_warning().is_some());
     }
 
     #[test]

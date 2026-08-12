@@ -358,6 +358,8 @@ sfh run corrected-flow.yaml --carry-budget-from .sfh/runs/20260808-021925-loop
 | 報告済み cost | `max_cost_usd` |
 | active run 時間 | `wall_clock_sec` |
 
+`max_cost_usd`が制御できるのはadapterが報告したcostだけです。Claude、OpenCode、Grok、PiはUSDを報告しますが、Codex、Agy、Cursorはtokenのみ、`cmd:`はprovider costを報告しません。USD上限を宣言したflowにcostを計上できる解決済みadapterが1つもなければ、`validate`と`preflight`が警告します。その場合は実際に強制できるbackstopとして`wall_clock_sec`を併用してください。
+
 **counter だけです。** step output、session、routing 位置、workspace はすべて置いていきます。それらを作った flow は、これから走る flow ではないからです。`--resume` と `--carry-budget-from` は別の診断に対する別の答えなので、同時指定は usage error です。
 
 **合成します**: 引き継いだ run からさらに引き継いでも、最初の run の支出は残ります。2回目の修正で1回目の試行が黙って消えるのは、この機能が人手から取り上げようとしているまさにその算術です。

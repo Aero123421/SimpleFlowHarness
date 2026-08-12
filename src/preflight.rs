@@ -461,12 +461,6 @@ fn probe(
                 preset::Enforcement::Sandboxed | preset::Enforcement::Enforced => {}
             }
         }
-        if i.cost_coverage != preset::Coverage::Cost {
-            warnings.push(format!(
-                "{tool} reports {} rather than a cost, so defaults.max_cost_usd cannot bound what this step spends",
-                i.cost_coverage.as_str()
-            ));
-        }
     }
     blockers.extend(version_requirement_blockers(
         program,
@@ -626,6 +620,9 @@ pub fn for_flow(
         }
     };
     let resolved = flow.resolved_tools();
+    if let Some(warning) = flow.max_cost_coverage_warning() {
+        warnings.push(warning);
+    }
     // Group the access levels a flow asks of each (tool, bin) pair, so one
     // probe covers every step that shares a binary.
     let mut by_program: std::collections::BTreeMap<

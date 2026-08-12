@@ -356,6 +356,8 @@ This starts a **new** run holding the earlier one's spend:
 | reported cost | `max_cost_usd` |
 | active run time | `wall_clock_sec` |
 
+`max_cost_usd` can enforce only cost an adapter reports. Claude, OpenCode, Grok, and Pi report USD; Codex, Agy, and Cursor report tokens only, while `cmd:` reports no provider cost. `validate` and `preflight` warn when a flow declares the USD ceiling but none of its resolved adapters can contribute to it. Add `wall_clock_sec` as the enforceable backstop for those flows.
+
 **Counters only.** Step outputs, sessions, the routing position and the workspace are all left behind, because the flow that produced them is not the flow about to run. `--resume` and `--carry-budget-from` are different answers to different diagnoses, so asking for both is a usage error.
 
 It **composes**: carrying from a run that itself carried keeps the original run's spend too. A second correction silently forgetting the first attempt is exactly the arithmetic this exists to take out of human hands.
