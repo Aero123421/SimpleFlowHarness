@@ -47,7 +47,7 @@ jobs:
           python3 -c 'import json,sys; print(json.dumps({"version": sys.argv[1], "tag": sys.argv[2], "commit": sys.argv[3], "archive_sha256": sys.argv[4], "generated_utc": sys.argv[5]}, indent=2))' "$version" "$GITHUB_REF_NAME" "$commit" "$archive_sha256" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > provenance/provenance.json
           cat provenance/provenance.json
       - name: Stage release provenance
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-provenance
           path: provenance/*
@@ -116,7 +116,7 @@ jobs:
           Expand-Archive ${{ matrix.asset }} -DestinationPath verify -Force
           ./verify/sfh.exe --version
       - name: Stage release asset
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -131,7 +131,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download binary checksums
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
           path: binary-assets
@@ -156,7 +156,7 @@ jobs:
             done
           )
       - name: Stage installers and package-manager metadata
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-distribution-metadata
           path: release-assets/*
@@ -170,13 +170,13 @@ jobs:
       contents: write
     steps:
       - name: Download complete release set
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
       - name: Publish release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: dist/*
           fail_on_unmatched_files: true
