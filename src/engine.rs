@@ -946,6 +946,10 @@ struct ResumeState {
     /// with the restored cost still over the threshold and land a second time,
     /// which turns "one wrap-up chain per run" into "one per crash".
     budget_landed: bool,
+    /// A retry backoff reached the wall-clock landing threshold after its last
+    /// attempt was durably recorded. Kept until budget_landing appears so a
+    /// crash in that narrow gap resumes the landing instead of on_error.
+    retry_budget_trigger: Option<String>,
     /// Fan-out members that already finished in a crashed attempt, keyed by
     /// (parent step id, visit). A resume that re-runs a parallel/foreach group
     /// SKIPS these instead of executing them a second time: re-running spent
@@ -1313,6 +1317,12 @@ fn load_resume_for_flow(
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
                     st.total = st.total.saturating_add(1);
+                    if v.get("retry_budget_exhausted")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                    {
+                        st.retry_budget_trigger = Some("wall_clock".into());
+                    }
                 }
                 // A run dir is untrusted on --resume: a NEGATIVE cost_usd in an
                 // edited log would subtract from the running total and let a
@@ -1748,7 +1758,10 @@ fn load_resume_for_flow(
             // One landing per run, across resumes too. Only the fact is
             // restored, not the trigger or the numbers: what matters on the way
             // back in is that the wrap-up chain has already been paid for once.
-            "budget_landing" => st.budget_landed = true,
+            "budget_landing" => {
+                st.budget_landed = true;
+                st.retry_budget_trigger = None;
+            }
             // The workspace baseline this run last committed to. Later entries
             // replace earlier ones - the newest durable checkpoint is the one a
             // resume compares against - and an adoption is a checkpoint too.
@@ -3810,11 +3823,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut cost_usd: f64 = resumed.cost_usd;
     let mut last_executed = resumed.last_executed;
     let mut last_success = resumed.last_success;
+    let mut forced_budget_trigger = resumed.retry_budget_trigger.clone();
     let mut resume_postprocess = resumed
         .pending_route
         .clone()
         .filter(|pending| pending.postprocess);
-    let pending_route = resumed.pending_route.filter(|pending| !pending.postprocess);
+    let pending_route = if forced_budget_trigger.is_some() {
+        None
+    } else {
+        resumed.pending_route.filter(|pending| !pending.postprocess)
+    };
     let completed_members = resumed.completed_members;
     let member_fallbacks = resumed.member_fallbacks;
     let foreach_inputs = resumed.foreach_inputs;
@@ -3929,6 +3947,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // recorded route - so there is no child to time.
                     run_clock: None,
                     wall_deadline: None,
+                    retry_landing_deadline: None,
                     // The restored spend is real; the clock is this attempt's, the
                     // same one wall_clock_sec is judged on.
                     budget: leaf::BudgetVars::new(
@@ -4032,6 +4051,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             if execute::interrupted() {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
             }
+            if forced_budget_trigger.is_some() && (budget_plan.is_none() || budget_landed) {
+                return Err(
+                    "resume: a retry was durably pre-empted for budget landing, but the current flow cannot perform that landing"
+                        .into(),
+                );
+            }
             // F5: land before the cliff, once per run. Checked BEFORE the two
             // ceiling checks below, but that head start is worth exactly the
             // reserve and no more: the landing jumps and `continue`s, which
@@ -4046,7 +4071,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             if let (Some(plan), false) = (&budget_plan, budget_landed) {
                 let elapsed_sec =
                     elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs());
-                if let Some(trigger) = plan.trigger(Instant::now(), cost_usd) {
+                let trigger = forced_budget_trigger
+                    .take()
+                    .or_else(|| plan.trigger(Instant::now(), cost_usd).map(str::to_string));
+                if let Some(trigger) = trigger {
                     budget_landed = true;
                     // The step the landing PRE-EMPTED: it has not run and will
                     // not, unless a resume comes back for it. Recorded as the
@@ -4292,6 +4320,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         tainted_vars: &tainted_vars,
                         run_clock: Some(&run_clock),
                         wall_deadline,
+                        retry_landing_deadline: if budget_landed {
+                            None
+                        } else {
+                            budget_plan.as_ref().and_then(|plan| plan.wall_at)
+                        },
                         // Read at expansion time, so every step (and every
                         // retry, fallback and compaction inside it) renders
                         // {{budget.*}} from the totals as they stand now.
@@ -4314,7 +4347,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // finished, and a fallback is the expensive, rare path.
             macro_rules! fan_fallback {
                 ($done:expr, $mstep:expr, $label:expr, $mtag:expr, $fbs:expr, $start:expr, $extra:expr) => {{
-                    if !$done.ok() && !$done.interrupted && !$fbs.is_empty() {
+                    if !$done.ok()
+                        && !$done.interrupted
+                        && !$done.retry_budget_exhausted
+                        && !$fbs.is_empty()
+                    {
                         for (fallback_index, fb) in
                             $fbs.iter().enumerate().skip($start)
                         {
@@ -4393,12 +4430,20 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // ---- execute the step (leaf / parallel / foreach) ----
             // route_text: what route conditions match against - always the
             // pre-compact text, without sfh's "--- id ---" aggregate headers.
-            let (mut chain_output, route_text, errored, members, protocol_state): (
+            let (
+                mut chain_output,
+                route_text,
+                errored,
+                members,
+                protocol_state,
+                retry_budget_exhausted,
+            ): (
                 String,
                 String,
                 bool,
                 Option<Vec<MemberVerdict>>,
                 Option<protocol::ProtocolState>,
+                bool,
             ) = if let Some(pending) = &resumed_postprocess {
                 let restored = outputs.get(&step.id).ok_or_else(|| {
                     format!(
@@ -4412,6 +4457,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     pending.errored,
                     pending.members.clone(),
                     pending.protocol,
+                    false,
                 )
             } else if let Some(children) = &step.parallel {
                 // Members the crashed attempt already finished: their step_end
@@ -4565,14 +4611,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         let child_index = *fresh_idx.get(pos).ok_or_else(|| {
                             "internal error: fan-out child index out of range".to_string()
                         })?;
-                        let next_fallback = if !done.ok() && !done.interrupted {
-                            children[child_index]
-                                .fallback
-                                .get(fallback_starts[pos])
-                                .map(String::as_str)
-                        } else {
-                            None
-                        };
+                        let next_fallback =
+                            if !done.ok() && !done.interrupted && !done.retry_budget_exhausted {
+                                children[child_index]
+                                    .fallback
+                                    .get(fallback_starts[pos])
+                                    .map(String::as_str)
+                            } else {
+                                None
+                            };
                         accumulate_cost(&mut cost_usd, done.usage.reported_cost());
                         let durable = match &done.persistence_error {
                             Some(e) => log_persistence_failure(
@@ -4748,7 +4795,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
-                (agg, plain, hard_fail, Some(verdicts), None)
+                (
+                    agg,
+                    plain,
+                    hard_fail,
+                    Some(verdicts),
+                    None,
+                    dones.iter().any(|done| done.retry_budget_exhausted),
+                )
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
                 let pf = run_dir.join(format!("{gtag}.from.txt"));
@@ -4920,11 +4974,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         let label = fresh_labels.get(pos).ok_or_else(|| {
                             "internal error: foreach completion index out of range".to_string()
                         })?;
-                        let next_fallback = if !done.ok() && !done.interrupted {
-                            step.fallback.get(fallback_starts[pos]).map(String::as_str)
-                        } else {
-                            None
-                        };
+                        let next_fallback =
+                            if !done.ok() && !done.interrupted && !done.retry_budget_exhausted {
+                                step.fallback.get(fallback_starts[pos]).map(String::as_str)
+                            } else {
+                                None
+                            };
                         accumulate_cost(&mut cost_usd, done.usage.reported_cost());
                         let durable = match &done.persistence_error {
                             Some(e) => log_persistence_failure(
@@ -5077,7 +5132,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
-                (agg, plain, hard_fail, Some(verdicts), None)
+                (
+                    agg,
+                    plain,
+                    hard_fail,
+                    Some(verdicts),
+                    None,
+                    dones.iter().any(|done| done.retry_budget_exhausted),
+                )
             } else {
                 let mut next_fallback_index = 0usize;
                 let mut done = if let Some(unfinished) = &resumed_fallback {
@@ -5130,7 +5192,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     return Err(format!("step '{}': {e}", step.id));
                 }
                 // fallback: retry the step with a different profile (tool/model).
-                if !done.ok() && !done.interrupted && !step.fallback.is_empty() {
+                if !done.ok()
+                    && !done.interrupted
+                    && !done.retry_budget_exhausted
+                    && !step.fallback.is_empty()
+                {
                     for fb in step.fallback.iter().skip(next_fallback_index) {
                         log_step_end_with_next(
                             &mut log,
@@ -5241,6 +5307,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     !d.ok(),
                     None,
                     Some(d.protocol.protocol),
+                    d.retry_budget_exhausted,
                 )
             };
             if let Some(e) = persistence_error.lock().ok().and_then(|mut e| e.take()) {
@@ -5253,6 +5320,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // interrupt check gets another chance to run.
             if execute::interrupted() {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
+            }
+            // A failed attempt is durable above, but its next retry was
+            // pre-empted when backoff entered the wall-clock reserve. Budget
+            // landing outranks fallback/on_error and is evaluated at the loop
+            // head, using the same one-shot event/position path as any other
+            // landing. The step remains current so the position records what
+            // work the landing pre-empted.
+            if retry_budget_exhausted {
+                forced_budget_trigger = Some("wall_clock".into());
+                continue;
             }
             // A run-level deadline is stronger than a leaf's on_error policy.
             // Each leaf timeout is capped to this instant, so report the
@@ -6459,6 +6536,7 @@ fn prepare_compact(
         cwd: run.workspace.map(PathBuf::from),
         timeout: timeout_sec.map(Duration::from_secs),
         wall_deadline: *wall_deadline,
+        retry_landing_deadline: None,
         preassigned_session: None,
         expect_session: None,
         expect_marker: None,
@@ -6794,6 +6872,7 @@ fn dry_run(
         // A dry run renders and prints; it spawns nothing to time.
         run_clock: None,
         wall_deadline: None,
+        retry_landing_deadline: None,
         // Nothing has been spent and no time has passed, so {{budget.*}} shows
         // the whole declared budget - which is what a prompt reviewer wants to
         // see, and it exercises the `unlimited` spelling for undeclared axes.
@@ -7020,6 +7099,7 @@ fn dry_run_json(
         tainted_vars,
         run_clock: None,
         wall_deadline: None,
+        retry_landing_deadline: None,
         budget: leaf::BudgetVars::new(&flow.defaults, 0.0, 0),
         workspace: None,
         quiet: true,
@@ -7027,8 +7107,10 @@ fn dry_run_json(
     };
     let mut steps = Vec::new();
     for s in &flow.steps {
+        let retry = leaf::retry_cfg(flow, s);
         let mut invocations = Vec::new();
         let mut push = |label: String, p: &leaf::Prepared| {
+            let invocation_retry = p.retry;
             invocations.push(json!({
                 "label": label,
                 "cmd": p.inv.describe(),
@@ -7037,6 +7119,13 @@ fn dry_run_json(
                 "protocol": protocol::expected_kind(&p.parse),
                 "cwd": p.cwd.as_ref().map(|c| c.display().to_string()),
                 "context_hash": p.context_hash,
+                "retry": {
+                    "mode": invocation_retry.mode_name(),
+                    "max_retries": invocation_retry.max,
+                    "max_attempts": invocation_retry.max_attempts(),
+                    "backoff_sec": invocation_retry.backoff_sec,
+                    "counts_toward_max_total_steps": false,
+                },
             }));
         };
         match (&s.parallel, &s.foreach) {
@@ -7076,6 +7165,13 @@ fn dry_run_json(
             "replay_unfinished": s.replay_policy(flow).as_str(),
             "context": s.context,
             "context_delivery": s.context_delivery().as_str(),
+            "retry": {
+                "mode": retry.mode_name(),
+                "max_retries": retry.max,
+                "max_attempts": retry.max_attempts(),
+                "backoff_sec": retry.backoff_sec,
+                "counts_toward_max_total_steps": false,
+            },
             "invocations": invocations,
             "route": s.route.iter().map(|r| json!({"goto": r.goto})).collect::<Vec<_>>(),
         }));
@@ -8017,6 +8113,7 @@ fn log_step_end_with_next(
             // an ordinary completed leaf.
             "interrupted": d.interrupted || execute::interrupted(),
             "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
+            "retry_budget_exhausted": d.retry_budget_exhausted,
             "idle_ms": d.idle_ms,
             "output_chars": d.chain_output.chars().count(),
             "output_hash": fingerprint(&d.chain_output),
@@ -9121,6 +9218,41 @@ mod tests {
         assert_eq!(state.last_success.as_deref(), Some("work"));
         assert_eq!(state.total, 2);
         assert_eq!(state.cost_usd, 0.35);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_preserves_retry_budget_landing_until_its_event_is_durable() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-resume-retry-budget-{}",
+            contain::random_nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let checkpoint = concat!(
+            "{\"event\":\"step_end\",\"step\":\"work\",\"visit\":1,",
+            "\"exit\":7,\"timed_out\":false,\"interrupted\":false,",
+            "\"retry_budget_exhausted\":true}\n"
+        );
+        std::fs::write(dir.join("log.jsonl"), checkpoint).unwrap();
+
+        let state = load_resume(&dir).expect("retry landing checkpoint must load");
+        assert_eq!(state.start.as_deref(), Some("work"));
+        assert_eq!(state.retry_budget_trigger.as_deref(), Some("wall_clock"));
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log.jsonl"))
+            .unwrap();
+        writeln!(
+            log,
+            "{{\"event\":\"budget_landing\",\"trigger\":\"wall_clock\",\"goto\":\"wrap\"}}"
+        )
+        .unwrap();
+        drop(log);
+
+        let state = load_resume(&dir).expect("durable landing must load");
+        assert!(state.budget_landed);
+        assert!(state.retry_budget_trigger.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

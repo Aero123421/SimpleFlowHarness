@@ -153,6 +153,8 @@ these four incorrectly.
 - **`sfh runs show --json`** — the same per-run fields as above flattened
   into the top level (no nested `summary` key) alongside `flow`,
   `sfh_version`, `tools`, `budget_landed`, `steps` — with no wrapper at all.
+  Each `steps[]` entry includes `attempts`, the total process attempts across
+  its leaf events; a legacy `step_end` without that field counts as one.
 - **`sfh runs why --json`** — `{"run_dir", "state", "current_step", "error",
   "harness_diagnostic", "protocol_failure", "explanation", "last_event",
   "last_position", "unfinished_leaves", "unfinished_fanouts",

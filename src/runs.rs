@@ -86,6 +86,7 @@ struct StepAccumulator {
     dur_ms: u64,
     output_chars: u64,
     cost_usd: f64,
+    attempts: u64,
 }
 
 impl StepAccumulator {
@@ -106,6 +107,11 @@ impl StepAccumulator {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         self.cost_usd += event.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+        if event.get("event").and_then(Value::as_str) == Some("step_end") {
+            self.attempts = self
+                .attempts
+                .saturating_add(event.get("attempts").and_then(Value::as_u64).unwrap_or(1));
+        }
 
         let Some(hash) = event.get("output_hash").and_then(Value::as_str) else {
             self.last_hash = None;
@@ -133,6 +139,9 @@ struct StepSummary {
     dur_ms: u64,
     output_chars: u64,
     cost_usd: f64,
+    /// Total process attempts across this step's visits and fallbacks. Retries
+    /// are attempts inside one leaf run and do not consume max_total_steps.
+    attempts: u64,
 }
 
 impl StepSummary {
@@ -147,6 +156,7 @@ impl StepSummary {
             dur_ms: a.dur_ms,
             output_chars: a.output_chars,
             cost_usd: a.cost_usd,
+            attempts: a.attempts,
         }
     }
 
@@ -587,12 +597,12 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
     }
     println!();
     println!(
-        "{:<26} {:>4} {:>4} {:>6} {:>5} {:>6} {:>8} {:>9} {:>10}",
-        "STEP", "EXIT", "OK", "FAILED", "VISIT", "REPEAT", "SECS", "CHARS", "COST_USD"
+        "{:<26} {:>4} {:>4} {:>6} {:>5} {:>6} {:>8} {:>8} {:>9} {:>10}",
+        "STEP", "EXIT", "OK", "FAILED", "VISIT", "REPEAT", "ATTEMPTS", "SECS", "CHARS", "COST_USD"
     );
     for step in &run.steps {
         println!(
-            "{:<26} {:>4} {:>4} {:>6} {:>5} {:>6} {:>8.1} {:>9} {:>10.4}",
+            "{:<26} {:>4} {:>4} {:>6} {:>5} {:>6} {:>8} {:>8.1} {:>9} {:>10.4}",
             step.step,
             step.exit
                 .map(|x| x.to_string())
@@ -601,6 +611,7 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
             step.failed,
             step.visit,
             step.repeat,
+            step.attempts,
             step.dur_ms as f64 / 1000.0,
             step.output_chars,
             step.cost_usd,
@@ -1421,6 +1432,16 @@ mod tests {
         assert_eq!(step.repeat, 1);
         assert_eq!(step.ok, 3);
         assert_eq!(step.failed, 1);
+    }
+
+    #[test]
+    fn process_attempts_sum_across_leaf_events_and_legacy_events_count_as_one() {
+        let mut step = StepAccumulator::default();
+        step.record(&serde_json::json!({"event": "step_end", "attempts": 3}));
+        step.record(&serde_json::json!({"event": "step_end"}));
+        step.record(&serde_json::json!({"event": "aggregate_end", "attempts": 99}));
+
+        assert_eq!(step.attempts, 4);
     }
 
     // ---- P1-08: a run's cost fields must be individually correct, and a

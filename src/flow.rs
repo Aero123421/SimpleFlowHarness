@@ -1669,6 +1669,7 @@ impl Flow {
                 .min(leaves_per_visit),
             "bounded_by_max_total_steps": self.defaults.max_total_steps,
             "foreach_unbounded": unbounded,
+            "retry_attempts_count_toward_max_total_steps": false,
         })
     }
 
