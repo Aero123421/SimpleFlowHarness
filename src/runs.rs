@@ -559,6 +559,23 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
             );
         }
     }
+    let snapshot = match crate::watch::read(dir) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return bare_json_error(as_json, dir, &error),
+    };
+    if snapshot.terminal() {
+        if let Err(error) = crate::watch::terminal_consistent(dir, &snapshot) {
+            return bare_json_error(
+                as_json,
+                dir,
+                &format!(
+                    "refusing to report {} as '{}': {error}",
+                    dir.display(),
+                    snapshot.state
+                ),
+            );
+        }
+    }
     let run = details(dir);
     if as_json {
         println!(

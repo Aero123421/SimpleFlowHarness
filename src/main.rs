@@ -1041,6 +1041,11 @@ mod tests {
         let start = crate::execute::pid_start_time(pid);
         crate::contain::write_nonce(&dir, pid, start, "watch-order").unwrap();
         std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
             dir.join("status.json"),
             format!(
                 r#"{{"state":"done","pid":{pid},"pid_start":{},"nonce":"watch-order"}}"#,

@@ -375,11 +375,9 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         Err(e) => return fail(as_json, "status", crate::machine::ErrorCode::Usage, &e),
     };
     // A terminal state an untrusted run dir asserts about itself is not reported
-    // as fact: the same nonce authentication `sfh wait` and `sfh stop` run must
-    // back it. A forged status.json that says "done" without a matching nonce
-    // used to print as success and exit 0; it is now refused (rev_break #10).
+    // as fact until both the run identity and its durable final log agree.
     if snap.terminal() {
-        if let Err(e) = nonce_consistent(&dir, &snap) {
+        if let Err(e) = terminal_consistent(&dir, &snap) {
             let message = format!(
                 "refusing to report {} as '{}': {e}",
                 dir.display(),
@@ -780,6 +778,58 @@ pub(crate) fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String
     }
 }
 
+/// Authenticate a terminal snapshot and, for engine-produced terminal states,
+/// require the durable log's final event to make the same claim. `stopped` is
+/// written by `sfh stop` after the process is killed and `dead` is derived from
+/// a stale `running` status, so neither has a corresponding `run_end` event.
+pub(crate) fn terminal_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
+    nonce_consistent(dir, snap)?;
+    let expected = match snap.state {
+        "done" => "ok",
+        "failed" => "failed",
+        "stuck" => "stuck",
+        "dead" | "stopped" => return Ok(()),
+        _ => return Ok(()),
+    };
+
+    let log = contain::read_contained_opt(dir, "log.jsonl")?
+        .ok_or_else(|| "terminal status has no durable log.jsonl".to_string())?;
+    let mut final_line = None;
+    for (line_no, line) in log.lines().enumerate() {
+        if !line.trim().is_empty() {
+            final_line = Some((line_no, line));
+        }
+    }
+    let (line_no, line) =
+        final_line.ok_or_else(|| "terminal status has an empty durable log.jsonl".to_string())?;
+    let event: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+        format!(
+            "terminal status disagrees with log.jsonl: final line {} is invalid JSON: {error}",
+            line_no + 1
+        )
+    })?;
+    if event.get("event").and_then(|value| value.as_str()) != Some("run_end") {
+        return Err(format!(
+            "terminal status disagrees with log.jsonl: final event is '{}', not 'run_end'",
+            event
+                .get("event")
+                .and_then(|value| value.as_str())
+                .unwrap_or("(missing)")
+        ));
+    }
+    let actual = event
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("(missing)");
+    if actual != expected {
+        return Err(format!(
+            "terminal status disagrees with log.jsonl: status.json says '{}' but the final run_end says '{}'",
+            snap.state, actual
+        ));
+    }
+    Ok(())
+}
+
 /// Whether the process that most recently owned this run dir is verifiably
 /// gone, read directly from sfh-nonce rather than status.json. The two are
 /// consulted for different reasons: status.json is cheap and, when it can be
@@ -973,7 +1023,7 @@ pub fn wait(
                 // content is read: a run dir an attacker can write must not
                 // become a file-read primitive just because the caller asked
                 // for a machine answer.
-                if let Err(e) = nonce_consistent(&dir, &snap) {
+                if let Err(e) = terminal_consistent(&dir, &snap) {
                     return fail(
                         as_json,
                         "wait",
@@ -1032,7 +1082,7 @@ pub fn wait(
             // The same applies to dead/stopped, which report content too.
             //
             // Before the match, so no arm can be added later that forgets.
-            if let Err(e) = nonce_consistent(&dir, &snap) {
+            if let Err(e) = terminal_consistent(&dir, &snap) {
                 eprintln!(
                     "sfh: refusing to report {} as '{}': {e}",
                     dir.display(),
@@ -1155,6 +1205,75 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sfh-watch-{tag}-{}", contain::random_nonce()));
         contain::mkdir_private(&dir).unwrap();
         dir
+    }
+
+    fn terminal_snapshot(tag: &str, state: &str, log: &str) -> (PathBuf, Snapshot) {
+        let dir = temp_dir(tag);
+        let pid = std::process::id();
+        let pid_start = execute::pid_start_time(pid);
+        contain::write_nonce(&dir, pid, pid_start, "terminal-test").unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({
+                "state": state,
+                "pid": pid,
+                "pid_start": pid_start,
+                "nonce": "terminal-test",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("log.jsonl"), log).unwrap();
+        let snapshot = read(&dir).unwrap();
+        (dir, snapshot)
+    }
+
+    #[test]
+    fn terminal_status_requires_a_matching_final_run_end() {
+        for (state, log_status) in [("done", "ok"), ("failed", "failed"), ("stuck", "stuck")] {
+            let log = format!("{{\"event\":\"run_end\",\"status\":\"{log_status}\"}}\n");
+            let (dir, snapshot) = terminal_snapshot(state, state, &log);
+            assert!(terminal_consistent(&dir, &snapshot).is_ok());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn terminal_status_refuses_an_unfinished_or_contradictory_log() {
+        let cases = [
+            (
+                "unfinished",
+                "{\"event\":\"step_start\",\"step\":\"work\"}\n",
+                "final event",
+            ),
+            (
+                "contradictory",
+                "{\"event\":\"run_end\",\"status\":\"failed\"}\n",
+                "final run_end says 'failed'",
+            ),
+            (
+                "resumed-after-end",
+                "{\"event\":\"run_end\",\"status\":\"ok\"}\n{\"event\":\"step_start\",\"step\":\"again\"}\n",
+                "final event",
+            ),
+        ];
+        for (tag, log, expected) in cases {
+            let (dir, snapshot) = terminal_snapshot(tag, "done", log);
+            let error = terminal_consistent(&dir, &snapshot).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn stopped_status_does_not_require_an_engine_run_end() {
+        let (dir, snapshot) = terminal_snapshot(
+            "stopped",
+            "stopped",
+            "{\"event\":\"step_start\",\"step\":\"work\"}\n",
+        );
+        assert!(terminal_consistent(&dir, &snapshot).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
