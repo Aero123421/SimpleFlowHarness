@@ -54,6 +54,7 @@ steps:
     on_max_visits: goto:handoff
     cmd: ["git", "diff", "--check"]
     on_error: goto:fix
+    route: [{goto: review}]
 
   - id: review
     use: reviewer

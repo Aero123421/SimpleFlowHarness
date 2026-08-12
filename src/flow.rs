@@ -2645,20 +2645,55 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
         .map(|(i, s)| (s.id.as_str(), i))
         .collect();
     let mut edges: Vec<HashSet<usize>> = (0..n).map(|_| HashSet::new()).collect();
+    let mut reaches_declared_terminal = vec![false; n];
     for (i, step) in flow.steps.iter().enumerate() {
         for route in &step.route {
             if let Some(&to) = index.get(route.goto.as_str()) {
                 edges[i].insert(to);
+            } else if matches!(route.goto.as_str(), "end" | "fail") {
+                reaches_declared_terminal[i] = true;
             }
         }
-        if !step.route.iter().any(Route::is_catch_all) && i + 1 < n {
-            edges[i].insert(i + 1);
+        let falls_through = !step.route.iter().any(Route::is_catch_all);
+        if falls_through {
+            if i + 1 < n {
+                let next = &flow.steps[i + 1];
+                edges[i].insert(i + 1);
+                let next_is_ai = flow.step_tool(next).is_some()
+                    || next.parallel.as_ref().is_some_and(|children| {
+                        children.iter().any(|child| flow.step_tool(child).is_some())
+                    });
+                let next_may_write = next.effects(flow).is_potential_writer();
+                if next_is_ai || next_may_write {
+                    let kind = match (next_is_ai, next_may_write) {
+                        (true, true) => "AI/potential-writer",
+                        (true, false) => "AI",
+                        (false, true) => "potential-writer",
+                        (false, false) => unreachable!(),
+                    };
+                    warnings.push(format!(
+                        "step '{}' can fall through on success into {kind} step '{}' because it has no catch-all route. Add an explicit route: [{{goto: {}}}] to confirm the transition, or route to a terminal.",
+                        step.id, next.id, next.id
+                    ));
+                }
+            } else {
+                // Running off the end of the step list is the historical
+                // implicit-success terminal and counts as a real completion.
+                reaches_declared_terminal[i] = true;
+            }
         }
         for action in [step.on_error.as_deref(), step.on_max_visits.as_deref()] {
             if let Some(target) = action.and_then(|a| a.strip_prefix("goto:")) {
                 if let Some(&to) = index.get(target) {
                     edges[i].insert(to);
+                } else if matches!(target, "end" | "fail") {
+                    reaches_declared_terminal[i] = true;
                 }
+            } else if action == Some("fail") {
+                // Only an explicit declaration counts. The implicit error and
+                // max-visits defaults eventually stop any loop, but they do
+                // not make a flow's intended control path complete.
+                reaches_declared_terminal[i] = true;
             }
         }
         if step.on_error.as_deref() == Some("continue") && i + 1 < n {
@@ -2694,6 +2729,40 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
                 "step '{}' is unreachable from the flow entry, routes, error actions and on_budget",
                 step.id
             ));
+        }
+    }
+    if n > 0 {
+        let mut predecessors: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
+        for (from, destinations) in edges.iter().enumerate() {
+            for &to in destinations {
+                predecessors[to].push(from);
+            }
+        }
+        let mut can_reach_terminal = reaches_declared_terminal.clone();
+        let mut terminal_stack: Vec<usize> = reaches_declared_terminal
+            .iter()
+            .enumerate()
+            .filter_map(|(i, reaches)| reaches.then_some(i))
+            .collect();
+        while let Some(node) = terminal_stack.pop() {
+            for &before in &predecessors[node] {
+                if !can_reach_terminal[before] {
+                    can_reach_terminal[before] = true;
+                    terminal_stack.push(before);
+                }
+            }
+        }
+        let budget_can_reach_terminal = flow.defaults.budget_goto().is_some_and(|target| {
+            matches!(target, "end" | "fail")
+                || index
+                    .get(target)
+                    .is_some_and(|&node| can_reach_terminal[node])
+        });
+        if !can_reach_terminal[0] && !budget_can_reach_terminal {
+            warnings.push(
+                "the flow entry cannot reach end or fail through declared control flow; every normal path loops or ends at stuck. Add an explicit route to end/fail if the flow should terminate without human intervention."
+                    .into(),
+            );
         }
     }
     warnings.sort();
@@ -4913,6 +4982,69 @@ steps:
         let warnings = strict_warnings(&flow).join("\n");
         assert!(warnings.contains("api_version is omitted"), "{warnings}");
         assert!(warnings.contains("no catch-all"), "{warnings}");
+    }
+
+    #[test]
+    fn strict_warns_when_no_declared_path_can_complete_or_fail() {
+        for yaml in [
+            "api_version: 1\nsteps:\n  - id: spin\n    cmd: [\"echo\", \"again\"]\n    effects: read\n    route: [{goto: spin}]\n",
+            "api_version: 1\nsteps:\n  - id: handoff\n    cmd: [\"echo\", \"human\"]\n    effects: read\n    route: [{goto: stuck}]\n",
+        ] {
+            let flow: Flow = yaml::from_str(yaml).unwrap();
+            validate(&flow, false).unwrap();
+            assert!(
+                strict_warnings(&flow).iter().any(|warning| warning
+                    == "the flow entry cannot reach end or fail through declared control flow; every normal path loops or ends at stuck. Add an explicit route to end/fail if the flow should terminate without human intervention."),
+                "{:?}",
+                strict_warnings(&flow)
+            );
+        }
+
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: decide\n    cmd: [\"echo\", \"done\"]\n    effects: read\n    route:\n      - {when_last_line_is: done, goto: end}\n      - {goto: stuck}\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+        assert!(
+            strict_warnings(&flow).is_empty(),
+            "{:?}",
+            strict_warnings(&flow)
+        );
+
+        let budget_landing: Flow = yaml::from_str(
+            "api_version: 1\ndefaults:\n  wall_clock_sec: 10\n  on_budget: goto:finish\n  budget_reserve: {wall_clock_sec: 1}\nsteps:\n  - id: spin\n    cmd: [\"echo\", \"again\"]\n    effects: read\n    route: [{goto: spin}]\n  - id: finish\n    cmd: [\"echo\", \"done\"]\n    effects: read\n    route: [{goto: end}]\n",
+        )
+        .unwrap();
+        validate(&budget_landing, false).unwrap();
+        assert!(
+            strict_warnings(&budget_landing).is_empty(),
+            "{:?}",
+            strict_warnings(&budget_landing)
+        );
+    }
+
+    #[test]
+    fn strict_requires_an_explicit_success_transition_into_ai_or_writer_work() {
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: inspect\n    cmd: [\"echo\", \"ok\"]\n    effects: read\n  - id: change\n    tool: codex\n    access: write\n    prompt: fix\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+        assert_eq!(
+            strict_warnings(&flow),
+            vec!["step 'inspect' can fall through on success into AI/potential-writer step 'change' because it has no catch-all route. Add an explicit route: [{goto: change}] to confirm the transition, or route to a terminal."]
+        );
+
+        let explicit: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: inspect\n    cmd: [\"echo\", \"ok\"]\n    effects: read\n    route: [{goto: change}]\n  - id: change\n    tool: codex\n    access: write\n    prompt: fix\n",
+        )
+        .unwrap();
+        validate(&explicit, false).unwrap();
+        assert!(
+            strict_warnings(&explicit).is_empty(),
+            "{:?}",
+            strict_warnings(&explicit)
+        );
     }
 
     #[test]
