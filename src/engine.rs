@@ -3142,6 +3142,29 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         )?);
     } else {
         protect_runs_root(&runs_root)?;
+        match state_root.run_retention() {
+            Ok(Some(policy)) => {
+                let report = crate::runs::apply_retention(&runs_root, policy);
+                if !report.removed.is_empty() && !opts.quiet {
+                    let noun = if report.removed.len() == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    };
+                    eprintln!(
+                        "sfh: retention removed {} old run {noun}",
+                        report.removed.len(),
+                    );
+                }
+                for warning in report.warnings {
+                    eprintln!("sfh: warning: retention: {warning}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("sfh: warning: retention disabled: {error}");
+            }
+        }
         let base = format!("{}-{}", utc_stamp(), name);
         let mut d = runs_root.join(&base);
         let mut n = 1;

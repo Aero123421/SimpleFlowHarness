@@ -14,6 +14,21 @@
 
 use std::path::{Path, PathBuf};
 
+pub const RETENTION_CONFIG: &str = "retention.yaml";
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunRetention {
+    pub older_than_days: u64,
+    pub keep: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetentionConfig {
+    runs: RunRetention,
+}
+
 /// The resolved locations a run may write to.
 #[derive(Clone, Debug)]
 pub struct StateRoot {
@@ -52,6 +67,34 @@ impl StateRoot {
 
     pub fn explicit(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// Optional host policy, deliberately outside the flow. A flow author must
+    /// not get to decide how long the operator keeps prompts and evidence.
+    pub fn run_retention(&self) -> Result<Option<RunRetention>, String> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let path = root.join(RETENTION_CONFIG);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!("cannot read {}: {error}", path.display()));
+            }
+        };
+        let config: RetentionConfig = serde_yaml_ng::from_str(&text)
+            .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+        if config.runs.older_than_days == 0 {
+            return Err(format!(
+                "{}: runs.older_than_days must be at least 1",
+                path.display()
+            ));
+        }
+        if config.runs.keep == 0 {
+            return Err(format!("{}: runs.keep must be at least 1", path.display()));
+        }
+        Ok(Some(config.runs))
     }
 
     /// Where run artifacts go. `--runs-dir` first, then `<state>/runs`, then
@@ -184,5 +227,40 @@ mod tests {
                 "the error must say how to fix it: {e}"
             ),
         }
+    }
+
+    #[test]
+    fn retention_is_opt_in_and_rejects_dangerous_zeroes() {
+        let base = std::env::temp_dir().join(format!(
+            "sfh-retention-config-{}",
+            crate::contain::random_nonce()
+        ));
+        crate::contain::mkdir_private(&base).unwrap();
+        let state = StateRoot {
+            root: Some(base.clone()),
+            runs_override: None,
+        };
+        assert_eq!(state.run_retention().unwrap(), None);
+
+        std::fs::write(
+            base.join(RETENTION_CONFIG),
+            "runs:\n  older_than_days: 30\n  keep: 5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            state.run_retention().unwrap(),
+            Some(RunRetention {
+                older_than_days: 30,
+                keep: 5,
+            })
+        );
+
+        std::fs::write(
+            base.join(RETENTION_CONFIG),
+            "runs:\n  older_than_days: 0\n  keep: 0\n",
+        )
+        .unwrap();
+        assert!(state.run_retention().unwrap_err().contains("at least 1"));
+        let _ = std::fs::remove_dir_all(base);
     }
 }

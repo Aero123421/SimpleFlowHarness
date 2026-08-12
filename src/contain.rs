@@ -94,6 +94,39 @@ pub fn try_run_lease(dir: &Path) -> Result<RunLease, RunLeaseError> {
     }
 }
 
+/// The same exclusive claim as `try_run_lease`, but on Windows the handle
+/// permits deletion. A normal live-run lease uses share_mode(0), so this open
+/// still fails while a run owns the directory; once acquired, another normal
+/// lease cannot open the file for read/write, while retention may remove it.
+pub fn try_run_lease_for_delete(dir: &Path) -> Result<RunLease, RunLeaseError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+
+        let path = dir.join(RUN_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .map_err(|error| {
+                if matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
+                    RunLeaseError::Busy
+                } else {
+                    RunLeaseError::Io(error)
+                }
+            })?;
+        Ok(RunLease { _file: file })
+    }
+    #[cfg(not(windows))]
+    {
+        try_run_lease(dir)
+    }
+}
+
 /// Reject absolute paths and `..` traversal components without resolving.
 /// Use this for paths that will be joined and stored, not read immediately.
 pub fn validate_relative(candidate: &str) -> Result<(), String> {
@@ -964,8 +997,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let first = try_run_lease(&dir).unwrap();
         assert!(matches!(try_run_lease(&dir), Err(RunLeaseError::Busy)));
+        assert!(matches!(
+            try_run_lease_for_delete(&dir),
+            Err(RunLeaseError::Busy)
+        ));
         drop(first);
-        let second = try_run_lease(&dir).unwrap();
+        let second = try_run_lease_for_delete(&dir).unwrap();
+        assert!(matches!(try_run_lease(&dir), Err(RunLeaseError::Busy)));
         drop(second);
         let _ = std::fs::remove_dir_all(dir);
     }

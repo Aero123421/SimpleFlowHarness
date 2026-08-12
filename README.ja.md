@@ -411,6 +411,16 @@ sfh run flow.yaml --state-dir ~/.local/state/sfh     # または SFH_STATE_DIR
 
 `runs` / `workspaces` / `plans` / `doctor` を1つのディレクトリ配下に置きます。`--runs-dir` は従来どおり run artifacts だけを移し、どちらも指定しなければ run は今までどおり `.sfh/runs` に落ちます。state root のない managed workspace は platform の user-state ディレクトリ（`$XDG_STATE_HOME/sfh`、`$HOME/.local/state/sfh`、`%LOCALAPPDATA%\sfh`）へ fallback し、それも決められない場合はリポジトリ内へ書く代わりに error になります。
 
+run retentionはhost側のopt-in設定です。`<state-dir>/retention.yaml`へ次を置くと、fresh run開始時に解決済みruns directory（`--runs-dir`が引き続き優先）へ機会的に適用します。
+
+```yaml
+runs:
+  older_than_days: 30
+  keep: 5
+```
+
+両値とも1以上が必須です。新しい`keep`件の外側で期限を超え、terminal status、所有processの死亡、run lock取得、managed worktree削除済みをすべて確認できたrunだけを削除します。live run、livenessを証明できないlegacy run、壊れた証拠、残存managed worktreeは保持します。不正なpolicyはwarning付きでretentionを無効にし、新しいrun自体は止めません。
+
 ---
 
 ## プログラムから sfh を動かす
@@ -491,6 +501,7 @@ sfh はどの adapter についても **minimum version を固定していませ
 - [Flow JSON スキーマ](schema/flow.schema.json)
 - [耐久ログイベント JSON スキーマ](schema/log-event.schema.json)
 - [ステータススナップショット JSON スキーマ](schema/status.schema.json)
+- [state retention JSON スキーマ](schema/retention.schema.json)
 - [Machine API リファレンス](docs/machine-api.md): 各`--json` commandのenvelopeまたはbare JSONの形、error codeの語彙、stabilityの保証範囲。
 
 ---

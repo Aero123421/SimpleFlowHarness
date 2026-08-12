@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Aero123421/SimpleFlowHarness/blob/main/schema/retention.schema.json",
+  "title": "SimpleFlowHarness state retention policy",
+  "description": "Host-owned policy read from <state-dir>/retention.yaml. The absence of this file disables automatic retention.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["runs"],
+  "properties": {
+    "runs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["older_than_days", "keep"],
+      "properties": {
+        "older_than_days": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Only run directories older than this many days are candidates."
+        },
+        "keep": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Always keep at least this many newest run directories."
+        }
+      }
+    }
+  }
+}

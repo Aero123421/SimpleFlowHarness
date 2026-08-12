@@ -806,6 +806,143 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     0
 }
 
+#[derive(Default, Debug)]
+pub struct RetentionReport {
+    pub removed: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+}
+
+fn terminal_for_retention(dir: &Path) -> Result<bool, String> {
+    let Some(text) = contain::read_contained_opt(dir, "status.json")? else {
+        return Ok(false);
+    };
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("cannot parse {}/status.json: {error}", dir.display()))?;
+    Ok(matches!(
+        value.get("state").and_then(Value::as_str),
+        Some("done" | "failed" | "stuck" | "stopped" | "dead")
+    ))
+}
+
+fn identity_verified_for_retention(dir: &Path) -> Result<bool, String> {
+    let snapshot = crate::watch::read(dir)?;
+    crate::watch::nonce_consistent(dir, &snapshot)?;
+    Ok(true)
+}
+
+/// A retained managed worktree needs its run manifest as the durable link back
+/// to source, branch, and ownership. Absence is safe; ambiguity is not.
+fn managed_workspace_is_gone(dir: &Path) -> Result<bool, String> {
+    let Some(text) = contain::read_contained_opt(dir, crate::workspace::MANIFEST)? else {
+        return Ok(true);
+    };
+    let value: Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "cannot parse {}/{}: {error}",
+            dir.display(),
+            crate::workspace::MANIFEST
+        )
+    })?;
+    let workspace = crate::workspace::Workspace::from_manifest(&value).ok_or_else(|| {
+        format!(
+            "cannot verify managed workspace in {}/{}",
+            dir.display(),
+            crate::workspace::MANIFEST
+        )
+    })?;
+    if workspace.mode != crate::flow::WorkspaceMode::GitWorktree {
+        return Ok(true);
+    }
+    match workspace.path.symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "cannot inspect managed workspace {}: {error}",
+            workspace.path.display()
+        )),
+    }
+}
+
+/// Opportunistically prune old run evidence under a host-owned policy.
+/// Every uncertain fact keeps the directory; cleanup must never be the event
+/// that decides whether a run or its managed worktree was still live.
+pub fn apply_retention(root: &Path, policy: crate::state::RunRetention) -> RetentionReport {
+    let mut report = RetentionReport::default();
+    let dirs = run_dirs(root);
+    if dirs.len() <= policy.keep {
+        return report;
+    }
+    let canon_root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            report.warnings.push(format!(
+                "cannot resolve runs root {}: {error}",
+                root.display()
+            ));
+            return report;
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let cutoff = std::time::Duration::from_secs(policy.older_than_days.saturating_mul(86_400));
+
+    for dir in dirs.iter().take(dirs.len() - policy.keep) {
+        let old_enough = std::fs::metadata(dir)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > cutoff);
+        if !old_enough {
+            continue;
+        }
+        if !matches!(terminal_for_retention(dir), Ok(true))
+            || !matches!(identity_verified_for_retention(dir), Ok(true))
+            || !matches!(crate::watch::owner_verifiably_dead(dir), Ok(Some(true)))
+            || !matches!(managed_workspace_is_gone(dir), Ok(true))
+        {
+            continue;
+        }
+
+        // The lease closes the check/delete race with resume or an explicitly
+        // targeted second run. Re-check all mutable facts after claiming it.
+        let lease = match contain::try_run_lease_for_delete(dir) {
+            Ok(lease) => lease,
+            Err(contain::RunLeaseError::Busy) => continue,
+            Err(contain::RunLeaseError::Io(error)) => {
+                report.warnings.push(format!(
+                    "cannot lock retention candidate {}: {error}",
+                    dir.display()
+                ));
+                continue;
+            }
+        };
+        let still_safe = dir
+            .symlink_metadata()
+            .map(|metadata| metadata.file_type().is_dir())
+            .unwrap_or(false)
+            && dir
+                .canonicalize()
+                .map(|resolved| resolved.starts_with(&canon_root))
+                .unwrap_or(false)
+            && matches!(terminal_for_retention(dir), Ok(true))
+            && matches!(identity_verified_for_retention(dir), Ok(true))
+            && matches!(crate::watch::owner_verifiably_dead(dir), Ok(Some(true)))
+            && matches!(managed_workspace_is_gone(dir), Ok(true));
+        if !still_safe {
+            drop(lease);
+            continue;
+        }
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => report.removed.push(dir.clone()),
+            Err(error) => report.warnings.push(format!(
+                "cannot remove retained run {}: {error}",
+                dir.display()
+            )),
+        }
+        drop(lease);
+    }
+    report
+}
+
 /// Delete run dirs older than `days`, always keeping the newest `keep`.
 pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
     let dirs = run_dirs(root);
@@ -1171,6 +1308,88 @@ pub fn workspaces_remove(dir: &Path, discard: bool, as_json: bool) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retention_run(root: &Path, name: &str, owner_start: Option<u64>) -> PathBuf {
+        let dir = root.join(name);
+        contain::mkdir_private(&dir).unwrap();
+        std::fs::write(dir.join("log.jsonl"), "{\"event\":\"run_end\"}\n").unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({
+                "state": "done",
+                "pid": std::process::id(),
+                "pid_start": owner_start,
+                "nonce": "retention-test",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        contain::write_nonce(&dir, std::process::id(), owner_start, "retention-test").unwrap();
+        dir
+    }
+
+    #[test]
+    fn automatic_retention_never_removes_a_live_run_or_a_remaining_worktree() {
+        let root =
+            std::env::temp_dir().join(format!("sfh-retention-runs-{}", contain::random_nonce()));
+        contain::mkdir_private(&root).unwrap();
+
+        let removable = retention_run(&root, "001-removable", Some(1));
+        let live = retention_run(
+            &root,
+            "002-live",
+            crate::execute::pid_start_time(std::process::id()),
+        );
+        let with_workspace = retention_run(&root, "003-workspace", Some(1));
+        let workspace_path = root.join("managed-worktree");
+        contain::mkdir_private(&workspace_path).unwrap();
+        let workspace = crate::workspace::Workspace {
+            id: "primary".into(),
+            mode: crate::flow::WorkspaceMode::GitWorktree,
+            source_root: root.clone(),
+            path: workspace_path.clone(),
+            base_ref: Some("main".into()),
+            base_commit: Some("abc".into()),
+            branch: Some("sfh/test".into()),
+            created_by_sfh: true,
+            ownership_nonce: Some("workspace-test".into()),
+            cleanup: crate::flow::WorkspaceCleanup::Keep,
+        };
+        contain::write_private_atomic(
+            &with_workspace.join(crate::workspace::MANIFEST),
+            workspace.to_json(None).to_string(),
+        )
+        .unwrap();
+        let newest = retention_run(&root, "004-newest", Some(1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let report = apply_retention(
+            &root,
+            crate::state::RunRetention {
+                older_than_days: 0,
+                keep: 1,
+            },
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(
+            !removable.exists(),
+            "a proven-dead terminal run is eligible"
+        );
+        assert!(
+            live.exists(),
+            "a live owner must always win over status.json"
+        );
+        assert!(
+            with_workspace.exists(),
+            "the manifest for an existing managed worktree must be kept"
+        );
+        assert!(
+            workspace_path.exists(),
+            "retention never deletes the worktree"
+        );
+        assert!(newest.exists(), "the newest keep entries are unconditional");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn consecutive_hashes_count_repeats_after_the_first() {

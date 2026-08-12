@@ -409,6 +409,16 @@ sfh run flow.yaml --state-dir ~/.local/state/sfh     # or SFH_STATE_DIR
 
 Puts `runs`, `workspaces`, `plans` and `doctor` under one directory. `--runs-dir` still moves run artifacts and only those, and with neither flag runs still land in `.sfh/runs`. A managed workspace with no state root falls back to the platform user-state directory (`$XDG_STATE_HOME/sfh`, `$HOME/.local/state/sfh`, `%LOCALAPPDATA%\sfh`) and errors rather than writing inside your repository if none can be determined.
 
+Automatic run retention is opt-in and host-owned. Put this in `<state-dir>/retention.yaml`; a fresh run opportunistically applies it to the resolved runs directory (`--runs-dir` still wins):
+
+```yaml
+runs:
+  older_than_days: 30
+  keep: 5
+```
+
+Both values must be at least 1. sfh removes only candidates outside the newest `keep` set whose age exceeds the limit, status is terminal, recorded owner is provably dead, run lock can be acquired, and managed worktree is already gone. A live run, legacy run whose liveness cannot be proved, malformed evidence, or remaining managed worktree is kept. Invalid policy disables retention with a warning; it never blocks the new run.
+
 ---
 
 ## Driving sfh from a program
@@ -506,6 +516,7 @@ Public JSON Schemas:
 - [Flow JSON Schema](schema/flow.schema.json)
 - [Durable Log Event JSON Schema](schema/log-event.schema.json)
 - [Status Snapshot JSON Schema](schema/status.schema.json)
+- [State Retention JSON Schema](schema/retention.schema.json)
 - [Machine API Reference](docs/machine-api.md): every `--json` command's envelope or bare-JSON shape, the error-code vocabulary, and the stability guarantee.
 
 ---

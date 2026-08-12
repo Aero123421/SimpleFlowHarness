@@ -700,7 +700,7 @@ pub fn stop(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
 /// symlink). A bare status.json is trivial to forge, an EMPTY log.jsonl next
 /// to it is just as trivial (rev_break #10), and a linked one would point the
 /// check at a file outside the run dir (rev_break #6) - none are enough (R-3).
-fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
+pub(crate) fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
     // Contained, no-follow read: a symlink planted at the fixed name used to be
     // followed to an attacker-chosen file whose contents then authenticated the
     // run (rev_break #6). Missing reads as None; a containment violation or an
