@@ -1,6 +1,6 @@
 # Validation
 
-Checked against the `sfh` binary built from this repository at v1.5.1.
+Checked against the `sfh` binary built from this repository at v1.6.0.
 
 ## Structure
 

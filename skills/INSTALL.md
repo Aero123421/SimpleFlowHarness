@@ -27,7 +27,7 @@ A project skill is repository content and can contain instructions or scripts. D
 
 ## sfh runtime boundary
 
-Agent Skills guide the AI that authors the flow. Current sfh v1.5 does not parse a `skills:` flow key.
+Agent Skills guide the AI that authors the flow. Current sfh v1.6 does not parse a `skills:` flow key.
 
 When a runtime AI step must receive stable operating rules, use:
 

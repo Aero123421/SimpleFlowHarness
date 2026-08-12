@@ -67,14 +67,18 @@ name: test_and_repair
 defaults:
   max_visits: 3
   wall_clock_sec: 1800
+workspace:
+  mode: git-worktree
 
 steps:
   - id: test
     cmd: ["cargo", "test"]
+    effects: workspace
     on_error: goto:fix
 
   - id: ship
     cmd: ["sfh", "--version"]
+    effects: read
     route: [{goto: end}]
 
   - id: fix
@@ -246,7 +250,43 @@ steps:
 
 The assembled bundle is saved as `<tag>.context.txt` with a manifest in `<tag>.context.json` recording each source's origin, hash and size. The durable log records the hash, never the content. `{{context}}` and `{{context_file}}` are available in both delivery modes.
 
-Context files are read no-follow and must resolve inside the flow directory or the workspace; a symlink pointing out of them is refused. `allow_external: true` on a source is the only way out, and using it is recorded as an unsafe override. A bundle over `defaults.max_context_chars` fails **before anything is spawned** — sfh never summarizes or drops sources to make it fit. What to leave out is your decision, expressed with a template filter, a `max_chars`, or an upstream `compact:`.
+Context `file:` paths are literal (templates are not expanded), read no-follow, and must resolve inside the flow directory or the workspace; a symlink pointing out of them is refused. `allow_external: true` on a source is the only way out, and using it is recorded as an unsafe override. A bundle over `defaults.max_context_chars` fails **before anything is spawned** — sfh never summarizes or drops sources to make it fit. What to leave out is your decision, expressed with a template filter, a `max_chars`, or an upstream `compact:`.
+
+### Required CLI versions
+
+Pin the adapter range a flow was verified against at `defaults`, profile, or step level. Step settings win over profile settings, which win over defaults; fallback profiles resolve independently.
+
+```yaml
+defaults:
+  tool: codex
+  access: read
+  require_version: ">=0.70.0, <1.0.0"  # exact versions such as 0.75.0 also work
+```
+
+A real run checks the resolved binary's isolated `--version` before creating the run directory or starting any flow step. A mismatch or unusable version fails with `SFH_CAPABILITY_UNAVAILABLE`. `plan` remains spawn-free and reports the declaration with `observed: null`; `preflight` shows declaration versus measurement. A custom `bin:` is only measured by standalone preflight with `--probe-binaries`, because preflight has not otherwise been authorized to execute an arbitrary override.
+
+### Protocol-aware recovery
+
+Structured adapter drift remains fail-closed, but a flow can route the preserved evidence to an explicit salvage step rather than buying the same work again. Failed output stays available through `{{steps.<id>.outputs}}` with a warning banner and as the raw `.out.txt` artifact.
+
+```yaml
+- id: analyze
+  tool: codex
+  access: read
+  on_error: continue             # failed leaves normally stop before route:
+  prompt: "Analyze the issue."
+  route:
+    - {when_protocol_is: missing_terminal, goto: salvage}
+    - {when_protocol_is: invalid, goto: salvage}
+    - {when_protocol_is: valid, goto: end}
+    - {goto: fail}
+- id: salvage
+  tool: claude
+  access: read
+  prompt: "Recover the useful facts from: {{steps.analyze.outputs}}"
+```
+
+`when_protocol_is` accepts `plain`, `valid`, `missing_terminal`, or `invalid` and composes with other predicates using the usual AND rule. It applies to leaf steps only; fan-out groups have no single protocol state. The state is recorded in `step_end`, so resume replays the same decision without re-running the tool.
 
 ### Replay policy
 
@@ -320,6 +360,10 @@ This starts a **new** run holding the earlier one's spend:
 | reported cost | `max_cost_usd` |
 | active run time | `wall_clock_sec` |
 
+`max_total_steps` counts logical leaf runs, not process attempts inside a leaf's `retry`. `sfh plan --json` reports both `max_retries` and `max_attempts`; `sfh runs show` reports the attempts actually made. During retry backoff, a wall-clock `budget_reserve` threshold pre-empts the next attempt and takes `on_budget`; an attempt already running is allowed to finish and remains subject to the hard `wall_clock_sec` deadline.
+
+`max_cost_usd` can enforce only cost an adapter reports. Claude, OpenCode, Grok, and Pi report USD; Codex, Agy, and Cursor report tokens only, while `cmd:` reports no provider cost. `validate` and `preflight` warn when a flow declares the USD ceiling but none of its resolved adapters can contribute to it. Add `wall_clock_sec` as the enforceable backstop for those flows.
+
 **Counters only.** Step outputs, sessions, the routing position and the workspace are all left behind, because the flow that produced them is not the flow about to run. `--resume` and `--carry-budget-from` are different answers to different diagnoses, so asking for both is a usage error.
 
 It **composes**: carrying from a run that itself carried keeps the original run's spend too. A second correction silently forgetting the first attempt is exactly the arithmetic this exists to take out of human hands.
@@ -373,11 +417,23 @@ sfh run flow.yaml --state-dir ~/.local/state/sfh     # or SFH_STATE_DIR
 
 Puts `runs`, `workspaces`, `plans` and `doctor` under one directory. `--runs-dir` still moves run artifacts and only those, and with neither flag runs still land in `.sfh/runs`. A managed workspace with no state root falls back to the platform user-state directory (`$XDG_STATE_HOME/sfh`, `$HOME/.local/state/sfh`, `%LOCALAPPDATA%\sfh`) and errors rather than writing inside your repository if none can be determined.
 
+Automatic run retention is opt-in and host-owned. Put this in `<state-dir>/retention.yaml`; a fresh run opportunistically applies it to the resolved runs directory (`--runs-dir` still wins):
+
+```yaml
+runs:
+  older_than_days: 30
+  keep: 5
+```
+
+Both values must be at least 1. sfh removes only candidates outside the newest `keep` set whose age exceeds the limit, status is terminal, recorded owner is provably dead, run lock can be acquired, and managed worktree is already gone. A live run, legacy run whose liveness cannot be proved, malformed evidence, or remaining managed worktree is kept. Invalid policy disables retention with a warning; it never blocks the new run.
+
 ---
 
 ## Driving sfh from a program
 
 `--json` on `run`, `plan`, `wait`, `stop`, `status`, `preflight` and `workspaces` makes stdout an envelope and nothing else — progress and warnings go to stderr, and a configuration error is still an envelope rather than prose. `validate --json` and `runs list|show|why --json` predate the envelope and still print their own bare JSON: no `schema_version`, no `command`, no `exit_code`, no stable error code. Check the response for `schema_version` before relying on the header fields below — its absence means you are looking at one of those four. See [docs/machine-api.md](docs/machine-api.md) for the full contract, every header field, and the exact shape the bare-JSON holdouts answer with instead.
+
+That guarantee includes argument errors: `sfh run --json`, or any other envelope command with bad arguments, returns `SFH_USAGE` on stdout. The four legacy bare-JSON commands likewise return `{"ok":false,"error":"..."}` rather than empty stdout.
 
 ```bash
 sfh preflight flow.yaml --json          # free: no model calls
@@ -405,7 +461,7 @@ sfh wait <run-dir> --json               # blocks, then the result
 
 Failures carry a code whose meaning is fixed for as long as `schema_version` does not change (currently `1`) — branch on the code, not on the message, which is allowed to improve:
 
-`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`.
+`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`.
 
 **Always pass the run directory explicitly.** A command given no path selects the newest run and says so with `"implicit_target": true`, which is rarely what an agent wants.
 
@@ -468,6 +524,7 @@ Public JSON Schemas:
 - [Flow JSON Schema](schema/flow.schema.json)
 - [Durable Log Event JSON Schema](schema/log-event.schema.json)
 - [Status Snapshot JSON Schema](schema/status.schema.json)
+- [State Retention JSON Schema](schema/retention.schema.json)
 - [Machine API Reference](docs/machine-api.md): every `--json` command's envelope or bare-JSON shape, the error-code vocabulary, and the stability guarantee.
 
 ---

@@ -1,6 +1,6 @@
 # Validation report
 
-Checked against the `sfh` binary built from this repository at v1.5.1.
+Checked against the `sfh` binary built from this repository at v1.6.0.
 
 The pack originally shipped as a standalone zip whose validation report could
 only claim YAML/schema checks: the environment that generated it had no `sfh`

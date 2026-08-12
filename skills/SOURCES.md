@@ -5,11 +5,11 @@ This pack is an independent set of Agent Skills for designing SimpleFlowHarness 
 ## SimpleFlowHarness
 
 - Repository: https://github.com/Aero123421/SimpleFlowHarness
-- Target release: https://github.com/Aero123421/SimpleFlowHarness/tree/v1.5.0
-- Flow schema: https://github.com/Aero123421/SimpleFlowHarness/blob/v1.5.0/schema/flow.schema.json
+- Target release: https://github.com/Aero123421/SimpleFlowHarness/tree/v1.6.0
+- Flow schema: https://github.com/Aero123421/SimpleFlowHarness/blob/v1.6.0/schema/flow.schema.json
 - Built-in guide: `sfh guide`
 
-The skills are written against sfh v1.5 concepts: routes, bounded visits, retry/fallback, replay, outcomes and labels, parallel/foreach, managed workspace, named context, execution closure, budgets, detach/status/wait/stop, preflight, doctor, plan, and machine JSON.
+The skills are written against sfh v1.6 concepts: routes, bounded visits, retry/fallback, replay, outcomes and labels, parallel/foreach, managed workspace, named context, execution closure, budgets, detach/status/wait/stop, preflight, doctor, plan, and machine JSON.
 
 ## Agent Skills
 

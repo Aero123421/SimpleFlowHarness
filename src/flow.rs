@@ -49,6 +49,9 @@ pub struct Flow {
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     pub tool: Option<String>,
+    /// Exact or comma-separated comparator range checked before a run starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: Option<String>,
@@ -467,7 +470,8 @@ impl WorkspaceConfig {
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSource {
-    /// A path, relative to the flow file unless absolute.
+    /// A literal path, relative to the flow file unless absolute. Templates
+    /// are not expanded in this field.
     pub file: Option<String>,
     /// Literal text written in the flow.
     pub inline: Option<String>,
@@ -629,6 +633,8 @@ impl Defaults {
 pub struct Profile {
     pub tool: Option<String>,
     pub bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: Option<String>,
@@ -661,6 +667,9 @@ pub struct Step {
     pub tool: Option<String>,
     /// Executable path override for the preset tool (e.g. a specific codex.exe).
     pub bin: Option<String>,
+    /// Exact or comma-separated comparator range checked before a run starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_version: Option<String>,
     pub model: Option<String>,
     /// Reasoning effort. codex: model_reasoning_effort, claude: --effort,
     /// opencode: --variant, grok: --reasoning-effort, agy: --effort,
@@ -706,7 +715,7 @@ pub struct Step {
     pub on_error: Option<String>,
     /// fail (default) | continue | goto:<id> - when max_visits is exhausted.
     pub on_max_visits: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_routes")]
     pub route: Vec<Route>,
     /// Run these child steps concurrently; the step's output is the aggregation.
     pub parallel: Option<Vec<Step>>,
@@ -766,6 +775,36 @@ pub struct Step {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub env_remove: Vec<String>,
+}
+
+fn deserialize_routes<'de, D>(deserializer: D) -> Result<Vec<Route>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct RoutesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for RoutesVisitor {
+        type Value = Vec<Route>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(
+                "a sequence of route mappings; use `route: [{goto: <step>}]` or `route:\n  - {goto: <step>}`",
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut routes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(route) = seq.next_element()? {
+                routes.push(route);
+            }
+            Ok(routes)
+        }
+    }
+
+    deserializer.deserialize_seq(RoutesVisitor)
 }
 
 impl Step {
@@ -913,6 +952,10 @@ pub struct Route {
     /// retryable | fail. `skip_serializing_if` for the reason above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when_outcome_is: Option<OutcomeResult>,
+    /// Equality against sfh's mechanical structured-protocol evidence for this
+    /// leaf. `skip_serializing_if` preserves old effective fingerprints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_protocol_is: Option<crate::protocol::ProtocolState>,
     /// Count the members of THIS step's fan-out that reported a given verdict.
     /// Only on a `parallel:`/`foreach:` step, and only alone in its rule (see
     /// validate). See `WhenMembers`.
@@ -933,6 +976,7 @@ impl Route {
             && self.when_stderr_matches.is_none()
             && self.when_label_is.is_none()
             && self.when_outcome_is.is_none()
+            && self.when_protocol_is.is_none()
             && self.when_members.is_none()
     }
 }
@@ -989,6 +1033,7 @@ pub const DEFAULT_MAX_VISITS: u32 = 5;
 pub struct ResolvedTool {
     pub tool: String,
     pub bin: Option<String>,
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// The access level this launch asks for. Part of the identity because the
@@ -1013,6 +1058,7 @@ pub fn load(path: &Path) -> Result<Flow, String> {
 pub struct ProfileOverlay {
     pub tool: Option<String>,
     pub bin: Option<String>,
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: Option<String>,
@@ -1030,7 +1076,16 @@ impl ProfileOverlay {
         macro_rules! scalar {
             ($($f:ident),*) => { $( if let Some(v) = &self.$f { p.$f = Some(v.clone()); } )* };
         }
-        scalar!(tool, bin, model, effort, access, agent, cwd);
+        scalar!(
+            tool,
+            bin,
+            require_version,
+            model,
+            effort,
+            access,
+            agent,
+            cwd
+        );
         if let Some(v) = self.timeout_sec {
             p.timeout_sec = Some(v);
         }
@@ -1307,7 +1362,7 @@ impl Flow {
         }
         if declared == WorkspaceMode::Auto && !writers.is_empty() {
             warnings.push(format!(
-                "workspace.mode: auto resolved to one managed git worktree because {} may write",
+                "workspace.mode: auto resolved to one managed git worktree because {} may write. Declare workspace.mode: git-worktree explicitly to accept this resolution.",
                 writers.join(", ")
             ));
         }
@@ -1511,7 +1566,7 @@ impl Flow {
                 && matches!(effects, Effects::External | Effects::Unknown)
             {
                 out.push(format!(
-                    "step '{name}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. Set replay.unfinished: stuck (or fail) if that is not safe.",
+                    "step '{name}' declares effects: {} but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. If the step is read-only, declare effects: read instead. Otherwise set replay.unfinished: stuck (or fail) if rerunning is not safe.",
                     effects.as_str()
                 ));
             }
@@ -1644,6 +1699,7 @@ impl Flow {
                 .min(leaves_per_visit),
             "bounded_by_max_total_steps": self.defaults.max_total_steps,
             "foreach_unbounded": unbounded,
+            "retry_attempts_count_toward_max_total_steps": false,
         })
     }
 
@@ -1716,6 +1772,7 @@ impl Flow {
                         out.insert(ResolvedTool {
                             tool,
                             bin: e.bin,
+                            require_version: e.require_version,
                             model: e.model,
                             effort: e.effort,
                             access: vec![e.access.as_str().to_string()],
@@ -1728,6 +1785,7 @@ impl Flow {
                             out.insert(ResolvedTool {
                                 tool,
                                 bin: e.bin,
+                                require_version: e.require_version,
                                 model: e.model,
                                 effort: e.effort,
                                 access: vec![e.access.as_str().to_string()],
@@ -1743,6 +1801,7 @@ impl Flow {
                 if let Some(tool) = c.tool.clone().or_else(|| prof.and_then(|p| p.tool.clone())) {
                     out.insert(ResolvedTool {
                         bin: c.bin.clone().or_else(|| prof.and_then(|p| p.bin.clone())),
+                        require_version: prof.and_then(|p| p.require_version.clone()),
                         model: c
                             .model
                             .clone()
@@ -1768,6 +1827,32 @@ impl Flow {
             }
         }
         out
+    }
+
+    /// A USD ceiling can only judge values an adapter actually reports. cmd:
+    /// steps and tokens-only adapters contribute zero dollars, which is not the
+    /// same fact as spending nothing.
+    pub fn max_cost_coverage_warning(&self) -> Option<String> {
+        self.defaults.max_cost_usd?;
+        let tools = self.resolved_tools();
+        if tools.iter().any(|tool| {
+            crate::preset::adapter_info(&tool.tool)
+                .is_some_and(|info| info.cost_coverage == crate::preset::Coverage::Cost)
+        }) {
+            return None;
+        }
+        let names: BTreeSet<&str> = tools.iter().map(|tool| tool.tool.as_str()).collect();
+        let detail = if names.is_empty() {
+            "this flow has no cost-reporting preset launches".to_string()
+        } else {
+            format!(
+                "every resolved preset is tokens-only ({})",
+                names.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        };
+        Some(format!(
+            "defaults.max_cost_usd is declared, but {detail}; cmd: steps report no provider cost either. The USD ceiling cannot bound this flow's spend. Add defaults.wall_clock_sec as an enforceable backstop or include a cost-reporting adapter"
+        ))
     }
 }
 
@@ -1887,6 +1972,15 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         }
     }
     let top_ids = flow.top_ids();
+    let mut steps_by_id: HashMap<&str, &Step> = HashMap::new();
+    for step in &flow.steps {
+        steps_by_id.insert(step.id.as_str(), step);
+        if let Some(children) = &step.parallel {
+            for child in children {
+                steps_by_id.insert(child.id.as_str(), child);
+            }
+        }
+    }
     let check_goto = |ctx: &str, g: &str| -> Result<(), String> {
         if TERMINALS.contains(&g) || top_ids.contains(g) {
             Ok(())
@@ -1916,6 +2010,10 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 return Err(format!("profile '{name}': access must be read/write/full"));
             }
         }
+        if let Some(requirement) = &p.require_version {
+            crate::version::validate_requirement(requirement)
+                .map_err(|error| format!("profile '{name}'.require_version: {error}"))?;
+        }
         positive_u64(&format!("profile '{name}'.timeout_sec"), p.timeout_sec)?;
     }
     if let Some(t) = &flow.defaults.tool {
@@ -1932,6 +2030,10 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                 "defaults.access must be read/write/full, got '{a}'"
             ));
         }
+    }
+    if let Some(requirement) = &flow.defaults.require_version {
+        crate::version::validate_requirement(requirement)
+            .map_err(|error| format!("defaults.require_version: {error}"))?;
     }
     positive_u64("defaults.timeout_sec", flow.defaults.timeout_sec)?;
     positive_u32("defaults.max_visits", flow.defaults.max_visits)?;
@@ -2070,8 +2172,9 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
         if cf == &s.id {
             return Err(format!("step '{}': {what} cannot reference itself", s.id));
         }
-        let target = flow
-            .find_step(cf)
+        let target = steps_by_id
+            .get(cf.as_str())
+            .copied()
             .ok_or_else(|| format!("step '{}': {what} target '{cf}' is not a step id", s.id))?;
         if target.is_group() {
             return Err(format!(
@@ -2160,10 +2263,12 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
             // reading the group would simply never match. Members are judged
             // with when_members.
             if (s.is_group() || s.is_foreach())
-                && (r.when_label_is.is_some() || r.when_outcome_is.is_some())
+                && (r.when_label_is.is_some()
+                    || r.when_outcome_is.is_some()
+                    || r.when_protocol_is.is_some())
             {
                 return Err(format!(
-                    "step '{}' route[{i}]: when_label_is/when_outcome_is read this step's OWN outcome, and a parallel:/foreach: step has none - it records the group composite. Judge the members with when_members, or put the rule on a single step",
+                    "step '{}' route[{i}]: when_label_is/when_outcome_is/when_protocol_is read this step's OWN result, and a parallel:/foreach: step has none - it records the group composite. Judge the members with when_members, or put the rule on a single step",
                     s.id
                 ));
             }
@@ -2186,6 +2291,25 @@ fn validate(flow: &Flow, legacy: bool) -> Result<(), String> {
                         "step '{}' route[{i}]: when_outcome_is '{}' can never match - no outcomes: entry on this step declares that result",
                         s.id,
                         want.as_str()
+                    ));
+                }
+            }
+            if let Some(want) = r.when_protocol_is {
+                let impossible = if s.cmd.is_some() {
+                    want != crate::protocol::ProtocolState::Plain
+                } else {
+                    want == crate::protocol::ProtocolState::Plain
+                };
+                if impossible {
+                    return Err(format!(
+                        "step '{}' route[{i}]: when_protocol_is '{}' can never match this {} step",
+                        s.id,
+                        want.as_str(),
+                        if s.cmd.is_some() {
+                            "cmd:"
+                        } else {
+                            "preset tool"
+                        }
                     ));
                 }
             }
@@ -2351,6 +2475,7 @@ fn check_when_members(s: &Step, i: usize, r: &Route) -> Result<(), String> {
         ("when_stderr_matches", r.when_stderr_matches.is_some()),
         ("when_label_is", r.when_label_is.is_some()),
         ("when_outcome_is", r.when_outcome_is.is_some()),
+        ("when_protocol_is", r.when_protocol_is.is_some()),
     ] {
         if present {
             return Err(format!(
@@ -2430,6 +2555,10 @@ pub fn runtime_warnings(flow: &Flow) -> Vec<String> {
         .collect();
     let mut warnings = Vec::new();
 
+    if let Some(warning) = flow.max_cost_coverage_warning() {
+        warnings.push(warning);
+    }
+
     for source in &flow.steps {
         let mut targets: Vec<usize> = source
             .route
@@ -2505,6 +2634,34 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
         }
     }
 
+    // The runtime defines context_file for every step for compatibility, but
+    // it is empty unless the step actually names context. Catch the common
+    // authoring mistake without treating a deliberate empty value as a format
+    // error. template::check_keys skips raw blocks and accepts whitespace and
+    // filters exactly as the renderer does.
+    for (name, step) in flow.all_steps() {
+        if !step.context.is_empty() {
+            continue;
+        }
+        let mut references_context_file = false;
+        for (_, text) in template_fields(flow, step) {
+            let _ = crate::template::check_keys(&text, |key| {
+                if key == "context_file" {
+                    references_context_file = true;
+                }
+                Ok(())
+            });
+            if references_context_file {
+                break;
+            }
+        }
+        if references_context_file {
+            warnings.push(format!(
+                "step '{name}' references {{{{context_file}}}} but its context: list is empty, so it renders as an empty string. Add a context name to context: or remove the reference."
+            ));
+        }
+    }
+
     // Everything from here reasons about the CONTROL-FLOW GRAPH between
     // steps - route:/on_error:/on_max_visits: goto chains - which is a
     // top-level-only concept for the same reason runtime_warnings above is:
@@ -2519,20 +2676,55 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
         .map(|(i, s)| (s.id.as_str(), i))
         .collect();
     let mut edges: Vec<HashSet<usize>> = (0..n).map(|_| HashSet::new()).collect();
+    let mut reaches_declared_terminal = vec![false; n];
     for (i, step) in flow.steps.iter().enumerate() {
         for route in &step.route {
             if let Some(&to) = index.get(route.goto.as_str()) {
                 edges[i].insert(to);
+            } else if matches!(route.goto.as_str(), "end" | "fail") {
+                reaches_declared_terminal[i] = true;
             }
         }
-        if !step.route.iter().any(Route::is_catch_all) && i + 1 < n {
-            edges[i].insert(i + 1);
+        let falls_through = !step.route.iter().any(Route::is_catch_all);
+        if falls_through {
+            if i + 1 < n {
+                let next = &flow.steps[i + 1];
+                edges[i].insert(i + 1);
+                let next_is_ai = flow.step_tool(next).is_some()
+                    || next.parallel.as_ref().is_some_and(|children| {
+                        children.iter().any(|child| flow.step_tool(child).is_some())
+                    });
+                let next_may_write = next.effects(flow).is_potential_writer();
+                if next_is_ai || next_may_write {
+                    let kind = match (next_is_ai, next_may_write) {
+                        (true, true) => "AI/potential-writer",
+                        (true, false) => "AI",
+                        (false, true) => "potential-writer",
+                        (false, false) => unreachable!(),
+                    };
+                    warnings.push(format!(
+                        "step '{}' can fall through on success into {kind} step '{}' because it has no catch-all route. Add an explicit route: [{{goto: {}}}] to confirm the transition, or route to a terminal.",
+                        step.id, next.id, next.id
+                    ));
+                }
+            } else {
+                // Running off the end of the step list is the historical
+                // implicit-success terminal and counts as a real completion.
+                reaches_declared_terminal[i] = true;
+            }
         }
         for action in [step.on_error.as_deref(), step.on_max_visits.as_deref()] {
             if let Some(target) = action.and_then(|a| a.strip_prefix("goto:")) {
                 if let Some(&to) = index.get(target) {
                     edges[i].insert(to);
+                } else if matches!(target, "end" | "fail") {
+                    reaches_declared_terminal[i] = true;
                 }
+            } else if action == Some("fail") {
+                // Only an explicit declaration counts. The implicit error and
+                // max-visits defaults eventually stop any loop, but they do
+                // not make a flow's intended control path complete.
+                reaches_declared_terminal[i] = true;
             }
         }
         if step.on_error.as_deref() == Some("continue") && i + 1 < n {
@@ -2570,9 +2762,168 @@ pub fn strict_warnings(flow: &Flow) -> Vec<String> {
             ));
         }
     }
+    if n > 0 {
+        let mut predecessors: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
+        for (from, destinations) in edges.iter().enumerate() {
+            for &to in destinations {
+                predecessors[to].push(from);
+            }
+        }
+        let mut can_reach_terminal = reaches_declared_terminal.clone();
+        let mut terminal_stack: Vec<usize> = reaches_declared_terminal
+            .iter()
+            .enumerate()
+            .filter_map(|(i, reaches)| reaches.then_some(i))
+            .collect();
+        while let Some(node) = terminal_stack.pop() {
+            for &before in &predecessors[node] {
+                if !can_reach_terminal[before] {
+                    can_reach_terminal[before] = true;
+                    terminal_stack.push(before);
+                }
+            }
+        }
+        let budget_can_reach_terminal = flow.defaults.budget_goto().is_some_and(|target| {
+            matches!(target, "end" | "fail")
+                || index
+                    .get(target)
+                    .is_some_and(|&node| can_reach_terminal[node])
+        });
+        if !can_reach_terminal[0] && !budget_can_reach_terminal {
+            warnings.push(
+                "the flow entry cannot reach end or fail through declared control flow; every normal path loops or ends at stuck. Add an explicit route to end/fail if the flow should terminate without human intervention."
+                    .into(),
+            );
+        }
+    }
     warnings.sort();
     warnings.dedup();
     warnings
+}
+
+struct Dominance {
+    reachable: Vec<bool>,
+    enter: Vec<usize>,
+    leave: Vec<usize>,
+}
+
+impl Dominance {
+    fn contains(&self, node: usize) -> bool {
+        self.reachable.get(node).copied().unwrap_or(false)
+    }
+
+    fn dominates(&self, dominator: usize, node: usize) -> bool {
+        self.contains(node)
+            && self.contains(dominator)
+            && self.enter[dominator] <= self.enter[node]
+            && self.leave[node] <= self.leave[dominator]
+    }
+}
+
+/// Build immediate dominators with the Cooper-Harvey-Kennedy algorithm, then
+/// number the resulting tree so every dominance query is O(1). The old
+/// validator cloned the whole reachable-node set into every node and
+/// repeatedly intersected those sets: even a straight 20k-step flow needed
+/// quadratic memory. This representation is linear in the graph size.
+fn dominance_tree(edges: &[HashSet<usize>], entry: usize) -> Dominance {
+    let node_count = edges.len();
+    let mut visited = vec![false; node_count];
+    let mut postorder = Vec::with_capacity(node_count);
+    let mut stack = vec![(entry, false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if expanded {
+            postorder.push(node);
+            continue;
+        }
+        if visited[node] {
+            continue;
+        }
+        visited[node] = true;
+        stack.push((node, true));
+        for &next in &edges[node] {
+            if !visited[next] {
+                stack.push((next, false));
+            }
+        }
+    }
+    postorder.reverse();
+    let mut order = vec![usize::MAX; node_count];
+    for (position, &node) in postorder.iter().enumerate() {
+        order[node] = position;
+    }
+
+    let mut predecessors: Vec<Vec<usize>> = (0..node_count).map(|_| Vec::new()).collect();
+    for (from, nexts) in edges.iter().enumerate() {
+        for &to in nexts {
+            predecessors[to].push(from);
+        }
+    }
+    let mut idom = vec![None; node_count];
+    idom[entry] = Some(entry);
+    let intersect = |mut left: usize, mut right: usize, idom: &[Option<usize>]| {
+        while left != right {
+            while order[left] > order[right] {
+                left = idom[left].expect("processed dominator");
+            }
+            while order[right] > order[left] {
+                right = idom[right].expect("processed dominator");
+            }
+        }
+        left
+    };
+    loop {
+        let mut changed = false;
+        for &node in postorder.iter().skip(1) {
+            let mut known = predecessors[node]
+                .iter()
+                .copied()
+                .filter(|predecessor| idom[*predecessor].is_some());
+            let Some(mut next) = known.next() else {
+                continue;
+            };
+            for predecessor in known {
+                next = intersect(predecessor, next, &idom);
+            }
+            if idom[node] != Some(next) {
+                idom[node] = Some(next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut children: Vec<Vec<usize>> = (0..node_count).map(|_| Vec::new()).collect();
+    for (node, parent) in idom.iter().enumerate() {
+        if node != entry {
+            if let Some(parent) = parent {
+                children[*parent].push(node);
+            }
+        }
+    }
+    let mut enter = vec![usize::MAX; node_count];
+    let mut leave = vec![usize::MAX; node_count];
+    let mut clock = 0usize;
+    let mut tree_stack = vec![(entry, false)];
+    while let Some((node, leaving)) = tree_stack.pop() {
+        if leaving {
+            leave[node] = clock;
+            clock += 1;
+            continue;
+        }
+        enter[node] = clock;
+        clock += 1;
+        tree_stack.push((node, true));
+        for &child in children[node].iter().rev() {
+            tree_stack.push((child, false));
+        }
+    }
+    Dominance {
+        reachable: visited,
+        enter,
+        leave,
+    }
 }
 
 /// Prove that every session source is guaranteed to have executed before its
@@ -2634,57 +2985,7 @@ fn validate_session_dominance(flow: &Flow) -> Result<(), String> {
         }
     }
 
-    let mut reachable = HashSet::from([entry]);
-    let mut stack = vec![entry];
-    while let Some(node) = stack.pop() {
-        for &next in &edges[node] {
-            if reachable.insert(next) {
-                stack.push(next);
-            }
-        }
-    }
-    let universe = reachable.clone();
-    let mut dom: Vec<HashSet<usize>> = (0..=n)
-        .map(|node| {
-            if node == entry {
-                HashSet::from([entry])
-            } else if reachable.contains(&node) {
-                universe.clone()
-            } else {
-                HashSet::new()
-            }
-        })
-        .collect();
-    let mut predecessors: Vec<Vec<usize>> = (0..=n).map(|_| Vec::new()).collect();
-    for (from, nexts) in edges.iter().enumerate() {
-        for &to in nexts {
-            predecessors[to].push(from);
-        }
-    }
-    loop {
-        let mut changed = false;
-        for node in 0..n {
-            if !reachable.contains(&node) {
-                continue;
-            }
-            let mut incoming = predecessors[node]
-                .iter()
-                .filter(|p| reachable.contains(p))
-                .map(|p| dom[*p].clone());
-            let mut next = incoming.next().unwrap_or_default();
-            for other in incoming {
-                next.retain(|candidate| other.contains(candidate));
-            }
-            next.insert(node);
-            if next != dom[node] {
-                dom[node] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let dominance = dominance_tree(&edges, entry);
 
     let source_can_fail_open = |step: &Step| {
         matches!(step.on_error.as_deref(), Some("continue"))
@@ -2703,7 +3004,9 @@ fn validate_session_dominance(flow: &Flow) -> Result<(), String> {
             let Some(&target_owner) = owner.get(target) else {
                 continue; // existence is reported by the earlier validation.
             };
-            if reachable.contains(&consumer_owner) && !dom[consumer_owner].contains(&target_owner) {
+            if dominance.contains(consumer_owner)
+                && !dominance.dominates(target_owner, consumer_owner)
+            {
                 return Err(format!(
                     "step '{}': {kind} target '{target}' is not guaranteed to run before this step on every control-flow path",
                     consumer.id
@@ -2794,8 +3097,8 @@ fn validate_session_dominance(flow: &Flow) -> Result<(), String> {
                             consumer.id, dependency.id
                         ));
                 }
-                if reachable.contains(&consumer_owner)
-                    && !dom[consumer_owner].contains(&target_owner)
+                if dominance.contains(consumer_owner)
+                    && !dominance.dominates(target_owner, consumer_owner)
                 {
                     return Err(format!(
                             "step '{}': {label} references steps.{} but that step does not dominate this consumer on every control-flow path; mark the reference `| optional`/`| default:...` or fix the routing",
@@ -2944,6 +3247,32 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
         &format!("step '{sid}'.max_prompt_chars"),
         s.max_prompt_chars,
     )?;
+    if let Some(requirement) = &s.require_version {
+        crate::version::validate_requirement(requirement)
+            .map_err(|error| format!("step '{sid}'.require_version: {error}"))?;
+        if s.cmd.is_some() {
+            return Err(format!(
+                "step '{sid}': require_version applies to preset tool steps, not cmd:"
+            ));
+        }
+    }
+    if s.cmd.is_none() {
+        for profile_override in
+            std::iter::once(None).chain(s.fallback.iter().map(|profile| Some(profile.as_str())))
+        {
+            let effective = crate::leaf::effective_with(flow, s, profile_override)?;
+            if effective.require_version.is_some()
+                && effective
+                    .bin
+                    .as_deref()
+                    .is_some_and(|bin| bin.contains("{{"))
+            {
+                return Err(format!(
+                    "step '{sid}': require_version needs a statically resolved bin; a templated bin cannot be verified before the run starts"
+                ));
+            }
+        }
+    }
     if is_child {
         if !s.route.is_empty() {
             return Err(format!(
@@ -2976,6 +3305,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             || s.agent.is_some()
             || s.compact.is_some()
             || s.bin.is_some()
+            || s.require_version.is_some()
             || s.effort.is_some()
             || s.access.is_some()
             || s.allow_access_override.is_some()
@@ -3330,6 +3660,18 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
                 return Err(format!("step '{sid}': compact resolves unknown tool '{t}'"));
             }
         }
+        let compact_profile = c.use_.as_ref().and_then(|u| flow.profiles.get(u));
+        let compact_requirement =
+            compact_profile.and_then(|profile| profile.require_version.as_ref());
+        let compact_bin = c
+            .bin
+            .as_ref()
+            .or_else(|| compact_profile.and_then(|profile| profile.bin.as_ref()));
+        if compact_requirement.is_some() && compact_bin.is_some_and(|bin| bin.contains("{{")) {
+            return Err(format!(
+                "step '{sid}': compact require_version needs a statically resolved bin; a templated bin cannot be verified before the run starts"
+            ));
+        }
     }
     group_common(s)
 }
@@ -3443,6 +3785,44 @@ mod tests {
     fn parse(y: &str) -> Result<(), String> {
         let f: Flow = yaml::from_str(y).map_err(|e| e.to_string())?;
         validate(&f, false)
+    }
+
+    fn straight_flow(step_count: usize) -> String {
+        let mut yaml = String::from("api_version: 1\nname: scale\nsteps:\n");
+        for index in 0..step_count {
+            yaml.push_str(&format!(
+                "  - id: s{index}\n    cmd: [echo, ok]\n    effects: read\n"
+            ));
+        }
+        yaml
+    }
+
+    #[test]
+    fn validation_scales_near_linearly_for_large_straight_flows() {
+        // Warm parser/allocation paths before measuring the ratio. The wide
+        // allowance is for shared CI hosts; it still rejects the former
+        // dominator-set implementation, where 4x the steps took about 16x the
+        // time and quadratic memory.
+        parse(&straight_flow(200)).unwrap();
+        let start = std::time::Instant::now();
+        parse(&straight_flow(2_000)).unwrap();
+        let small = start.elapsed();
+        let start = std::time::Instant::now();
+        parse(&straight_flow(8_000)).unwrap();
+        let large = start.elapsed();
+        assert!(
+            large <= small.saturating_mul(8) + std::time::Duration::from_millis(500),
+            "validation grew too quickly: 2k={small:?}, 8k={large:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_route_error_shows_the_required_yaml_mapping_shape() {
+        let error =
+            parse("api_version: 1\nsteps:\n  - id: a\n    cmd: [echo, ok]\n    route: goto:fix\n")
+                .unwrap_err();
+        assert!(error.contains("a sequence of route mappings"), "{error}");
+        assert!(error.contains("route: [{goto: <step>}]"), "{error}");
     }
 
     #[test]
@@ -3960,6 +4340,7 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "claude".to_string(),
             bin: Some("/opt/claude".into()),
+            require_version: None,
             model: Some("m1".into()),
             effort: Some("high".into()),
             access: vec!["write".into()],
@@ -3967,6 +4348,7 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "grok".to_string(),
             bin: Some("/opt/grok".into()),
+            require_version: None,
             model: None,
             effort: None,
             access: vec!["write".into()],
@@ -3974,6 +4356,7 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "codex".to_string(),
             bin: None,
+            require_version: None,
             model: None,
             effort: None,
             access: vec!["read".into()],
@@ -3982,12 +4365,77 @@ mod tests {
         assert!(r.contains(&ResolvedTool {
             tool: "opencode".to_string(),
             bin: Some("/opt/oc".into()),
+            require_version: None,
             model: None,
             effort: None,
             // A compact summarizer only ever reads the text it was handed.
             access: vec!["read".into()],
         }));
         assert_eq!(r.len(), 4, "{r:?}");
+    }
+
+    #[test]
+    fn required_version_resolves_step_then_profile_then_defaults_and_fallback_independently() {
+        let f: Flow = yaml::from_str(
+            "defaults: {tool: codex, access: read, require_version: '>=1.0'}\nprofiles:\n  primary: {tool: claude, require_version: '>=2.0'}\n  fallback: {tool: grok, require_version: '>=3.0'}\nsteps:\n  - id: inherited\n    use: primary\n    fallback: [fallback]\n    prompt: x\n  - id: overridden\n    require_version: '4.0.0'\n    prompt: y\n",
+        )
+        .unwrap();
+        validate(&f, false).unwrap();
+        let requirements: BTreeSet<_> = f
+            .resolved_tools()
+            .into_iter()
+            .filter_map(|tool| tool.require_version)
+            .collect();
+        assert_eq!(
+            requirements,
+            [">=2.0", ">=3.0", "4.0.0"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn malformed_required_version_is_rejected_during_static_validation() {
+        let f: Flow = yaml::from_str(
+            "defaults: {tool: codex, access: read, require_version: '>=1'}\nsteps:\n  - id: a\n    prompt: x\n",
+        )
+        .unwrap();
+        let error = validate(&f, false).unwrap_err();
+        assert!(error.contains("defaults.require_version"), "{error}");
+    }
+
+    #[test]
+    fn required_version_refuses_a_binary_that_is_only_known_after_rendering() {
+        let f: Flow = yaml::from_str(
+            "vars: {launcher: codex}\ndefaults: {tool: codex, access: read, require_version: '>=1.0'}\nsteps:\n  - id: a\n    bin: '{{vars.launcher}}'\n    prompt: x\n",
+        )
+        .unwrap();
+        let error = validate(&f, false).unwrap_err();
+        assert!(error.contains("statically resolved bin"), "{error}");
+    }
+
+    #[test]
+    fn protocol_routes_are_valid_only_for_a_leaf_state_the_step_can_produce() {
+        let ai: Flow = yaml::from_str(
+            "steps:\n  - id: judge\n    tool: codex\n    access: read\n    on_error: continue\n    prompt: x\n    route:\n      - {when_protocol_is: invalid, goto: end}\n      - {goto: fail}\n",
+        )
+        .unwrap();
+        validate(&ai, false).unwrap();
+
+        let impossible_cmd: Flow = yaml::from_str(
+            "steps:\n  - id: gate\n    cmd: [echo, x]\n    route:\n      - {when_protocol_is: invalid, goto: end}\n      - {goto: fail}\n",
+        )
+        .unwrap();
+        let error = validate(&impossible_cmd, false).unwrap_err();
+        assert!(error.contains("can never match this cmd:"), "{error}");
+
+        let group: Flow = yaml::from_str(
+            "steps:\n  - id: group\n    parallel:\n      - {id: a, cmd: [echo, a]}\n    route:\n      - {when_protocol_is: plain, goto: end}\n      - {goto: fail}\n",
+        )
+        .unwrap();
+        let error = validate(&group, false).unwrap_err();
+        assert!(error.contains("OWN result"), "{error}");
     }
 
     /// Upgrading sfh must not, by itself, make every existing run dir
@@ -4024,6 +4472,7 @@ mod tests {
             "\"outcomes\"",
             "\"when_label_is\"",
             "\"when_outcome_is\"",
+            "\"when_protocol_is\"",
         ] {
             assert!(
                 !json.contains(key),
@@ -4296,6 +4745,43 @@ mod tests {
     }
 
     #[test]
+    fn cost_ceiling_warns_only_when_no_resolved_tool_reports_usd() {
+        let load = |source: &str| {
+            let flow: Flow = yaml::from_str(source).unwrap();
+            validate(&flow, false).unwrap();
+            flow
+        };
+        let tokens_only = load(
+            "defaults:\n  max_cost_usd: 5\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n",
+        );
+        let warnings = runtime_warnings(&tokens_only);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("cannot bound this flow's spend")),
+            "{warnings:?}"
+        );
+
+        let mixed = load(
+            "defaults:\n  max_cost_usd: 5\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n  - id: b\n    tool: claude\n    access: read\n    prompt: x\n",
+        );
+        assert!(
+            runtime_warnings(&mixed)
+                .iter()
+                .all(|warning| !warning.contains("cannot bound this flow's spend")),
+            "one cost-reporting adapter makes the ceiling observable"
+        );
+
+        let no_ceiling =
+            load("steps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n");
+        assert!(runtime_warnings(&no_ceiling).is_empty());
+
+        let command_only =
+            load("defaults:\n  max_cost_usd: 5\nsteps:\n  - id: a\n    cmd: [echo, x]\n");
+        assert!(command_only.max_cost_coverage_warning().is_some());
+    }
+
+    #[test]
     fn validate_name_allows_unicode_spaces_and_dots() {
         assert!(validate_name("研究 2026.07").is_ok());
         assert!(validate_name("my flow v2.1").is_ok());
@@ -4539,6 +5025,69 @@ steps:
     }
 
     #[test]
+    fn strict_warns_when_no_declared_path_can_complete_or_fail() {
+        for yaml in [
+            "api_version: 1\nsteps:\n  - id: spin\n    cmd: [\"echo\", \"again\"]\n    effects: read\n    route: [{goto: spin}]\n",
+            "api_version: 1\nsteps:\n  - id: handoff\n    cmd: [\"echo\", \"human\"]\n    effects: read\n    route: [{goto: stuck}]\n",
+        ] {
+            let flow: Flow = yaml::from_str(yaml).unwrap();
+            validate(&flow, false).unwrap();
+            assert!(
+                strict_warnings(&flow).iter().any(|warning| warning
+                    == "the flow entry cannot reach end or fail through declared control flow; every normal path loops or ends at stuck. Add an explicit route to end/fail if the flow should terminate without human intervention."),
+                "{:?}",
+                strict_warnings(&flow)
+            );
+        }
+
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: decide\n    cmd: [\"echo\", \"done\"]\n    effects: read\n    route:\n      - {when_last_line_is: done, goto: end}\n      - {goto: stuck}\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+        assert!(
+            strict_warnings(&flow).is_empty(),
+            "{:?}",
+            strict_warnings(&flow)
+        );
+
+        let budget_landing: Flow = yaml::from_str(
+            "api_version: 1\ndefaults:\n  wall_clock_sec: 10\n  on_budget: goto:finish\n  budget_reserve: {wall_clock_sec: 1}\nsteps:\n  - id: spin\n    cmd: [\"echo\", \"again\"]\n    effects: read\n    route: [{goto: spin}]\n  - id: finish\n    cmd: [\"echo\", \"done\"]\n    effects: read\n    route: [{goto: end}]\n",
+        )
+        .unwrap();
+        validate(&budget_landing, false).unwrap();
+        assert!(
+            strict_warnings(&budget_landing).is_empty(),
+            "{:?}",
+            strict_warnings(&budget_landing)
+        );
+    }
+
+    #[test]
+    fn strict_requires_an_explicit_success_transition_into_ai_or_writer_work() {
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: inspect\n    cmd: [\"echo\", \"ok\"]\n    effects: read\n  - id: change\n    tool: codex\n    access: write\n    prompt: fix\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+        assert_eq!(
+            strict_warnings(&flow),
+            vec!["step 'inspect' can fall through on success into AI/potential-writer step 'change' because it has no catch-all route. Add an explicit route: [{goto: change}] to confirm the transition, or route to a terminal."]
+        );
+
+        let explicit: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: inspect\n    cmd: [\"echo\", \"ok\"]\n    effects: read\n    route: [{goto: change}]\n  - id: change\n    tool: codex\n    access: write\n    prompt: fix\n",
+        )
+        .unwrap();
+        validate(&explicit, false).unwrap();
+        assert!(
+            strict_warnings(&explicit).is_empty(),
+            "{:?}",
+            strict_warnings(&explicit)
+        );
+    }
+
+    #[test]
     fn replay_warnings_reaches_a_parallel_childs_own_rerun_policy() {
         // The engine looks up an unfinished CHILD by id at resume time and
         // applies THAT CHILD's own replay: policy, never its parent's - so a
@@ -4556,11 +5105,37 @@ steps:
         // Only the child is flagged: the group's OWN policy is the safe
         // `stuck` it inherits from defaults.replay, and must not also appear.
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("step 'fan.send'"), "{warnings:?}");
-        assert!(warnings[0].contains("effects: external"), "{warnings:?}");
-        assert!(
-            warnings[0].contains("replay.unfinished: rerun"),
-            "{warnings:?}"
+        assert_eq!(
+            warnings[0],
+            "step 'fan.send' declares effects: external but keeps replay.unfinished: rerun, so a resume after a crash mid-step will run it again without knowing whether its effects already happened. If the step is read-only, declare effects: read instead. Otherwise set replay.unfinished: stuck (or fail) if rerunning is not safe."
+        );
+    }
+
+    #[test]
+    fn workspace_auto_warning_names_the_explicit_strict_clean_choice() {
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nworkspace: {mode: auto}\nsteps:\n  - id: edit\n    cmd: [\"editor\"]\n    effects: workspace\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        assert_eq!(
+            flow.workspace_plan().unwrap().warnings,
+            vec!["workspace.mode: auto resolved to one managed git worktree because edit may write. Declare workspace.mode: git-worktree explicitly to accept this resolution."]
+        );
+    }
+
+    #[test]
+    fn strict_warns_when_context_file_would_render_empty() {
+        let flow: Flow = yaml::from_str(
+            "api_version: 1\nsteps:\n  - id: consume\n    tool: codex\n    access: read\n    prompt: 'Read {{ context_file | trim }}'\n",
+        )
+        .unwrap();
+        validate(&flow, false).unwrap();
+
+        assert_eq!(
+            strict_warnings(&flow),
+            vec!["step 'consume' references {{context_file}} but its context: list is empty, so it renders as an empty string. Add a context name to context: or remove the reference."]
         );
     }
 

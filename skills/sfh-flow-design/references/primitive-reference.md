@@ -1,4 +1,4 @@
-# sfh v1.5 primitive reference for authors
+# sfh v1.6 primitive reference for authors
 
 Use the installed schema as final authority. This file is a design map, not a replacement for `sfh guide`.
 
@@ -60,7 +60,7 @@ Text predicates are available but weaker for contracts:
 - `git-worktree`
 - `auto`
 
-A managed run owns at most one worktree in v1.5. Parallel writers share that worktree and are refused unless explicitly allowed.
+A managed run owns at most one worktree in v1.6. Parallel writers share that worktree and are refused unless explicitly allowed.
 
 ## Context
 

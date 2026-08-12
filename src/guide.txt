@@ -2,11 +2,10 @@ DETERMINISTIC GATE — use process exit status for facts, then send diagnostics 
 ```yaml
 api_version: 1
 steps:
-  - id: build
-    cmd: ["cargo", "test"]     # direct spawn; no shell
-    on_error: goto:fix
+  - {id: build, cmd: ["cargo", "test"], effects: workspace, on_error: "goto:fix"} # direct spawn
   - id: ship
-    cmd: ["sfh", "--version"]
+    cmd: ["sfh", "--version"]  # effects is what the process touches, not its purpose
+    effects: read
     route: [{goto: end}]       # always terminate a branch
   - id: fix
     tool: codex
@@ -14,9 +13,7 @@ steps:
     prompt: "{{steps.build.stderr_file}}: read this file and fix the failure"
     route: [{goto: build}]
 ```
-This is the only form with exactly the same behavior on Windows, macOS, and Linux.
-Use `sh -c` only to join multiple commands; on Windows it requires Git Bash.
-For long command input, pass the rendered prompt as `{{prompt_file}}` instead of shell quoting it.
+Portable: pin AI CLIs with `require_version: ">=1.2, <2.0"`; use `sh -c` only to join commands (Windows needs Git Bash), and pass long input as `{{prompt_file}}`.
 AI GOAL VERDICT — require exactly one final-line token and fail closed:
 ```yaml
 api_version: 1
@@ -30,9 +27,9 @@ steps:
       - {when_last_line_is: UNMET, goto: unmet}
       - {when_last_line_is: UNCLEAR, goto: unclear}
       - {goto: unclear}
-  - {id: achieved, cmd: ["sfh", "--version"], route: [{goto: end}]}
-  - {id: unmet, cmd: ["sfh", "--version"], route: [{goto: fail}]}
-  - {id: unclear, cmd: ["sfh", "--version"], route: [{goto: fail}]}
+  - {id: achieved, cmd: ["sfh", "--version"], effects: read, route: [{goto: end}]}
+  - {id: unmet, cmd: ["sfh", "--version"], effects: read, route: [{goto: fail}]}
+  - {id: unclear, cmd: ["sfh", "--version"], effects: read, route: [{goto: fail}]}
 ```
 BOUNDED REWORK WITH DEGRADATION:
 ```yaml
@@ -44,6 +41,7 @@ steps:
     max_visits: 3
     on_max_visits: goto:degraded
     prompt: "Revise using: {{steps.review.output | optional}}"
+    route: [{goto: review}]
   - id: review
     tool: codex
     access: read
@@ -51,7 +49,7 @@ steps:
     route:
       - {when_last_line_is: PASS, goto: end}
       - {goto: revise}
-  - {id: degraded, cmd: ["sfh", "--version"]}
+  - {id: degraded, cmd: ["sfh", "--version"], effects: read}
 ```
 Limits are checked on entry, so the node entered first in a loop reaches its limit first.
 PARALLEL MEMBERS / ONE BRANCH PER ITEM — when_members counts verdicts, never text:
@@ -69,12 +67,13 @@ steps:
   - id: per_target
     foreach: {from: "{{vars.targets}}", split: lines}
     cmd: ["sfh", "{{item}}"]
+    effects: read
 ```
 HUMAN ANSWER — the command waits; timeout_sec is the deadline:
 ```yaml
 api_version: 1
 steps:
-  - {id: approval, cmd: ["approval-cli", "wait", "--question", "Ship this build?"], timeout_sec: 3600}
+  - {id: approval, cmd: ["approval-cli", "wait", "--question", "Ship this build?"], effects: read, timeout_sec: 3600}
 ```
 DETACH AND COLLECT: `sfh run flow.yaml --detach` → `sfh status` → `sfh wait` / `sfh stop`
 DRIVING SFH FROM A PROGRAM — add --json; stdout is then the envelope and nothing else:
@@ -85,13 +84,15 @@ sfh run       flow.yaml --json --detach   # returns {run_dir, next_actions:[{arg
 sfh wait <run-dir> --json        # blocks, then {ok, state, result, result_file}
 sfh status <run-dir> --json      # add --json to stop/workspaces too
 ```
-Pass the run dir explicitly. Omitting it selects the NEWEST run and sets `implicit_target: true`.
-Failures carry a stable `error.code` (SFH_PROTOCOL_INVALID, SFH_WORKSPACE_DRIFT, ...); branch on it, not on the message.
+Pass the run dir explicitly; omission selects the NEWEST. Branch on stable `error.code`, not messages.
+YAML route entries are mappings: `{goto: fix}` needs a space; `on_error: goto:fix` is the intentional scalar spelling.
+`max_total_steps` excludes retry attempts (`plan`/`runs show` expose them); Codex/Agy/Cursor/cmd report no USD, so pair cost limits with wall time.
+PROTOCOL SALVAGE: set `on_error: continue`, then `{when_protocol_is: invalid, goto: salvage}`; failed output remains in `steps.X.outputs`.
 WORKSPACE AND CONTEXT — opt-in; omit both and every step runs in the caller's cwd as before:
 ```yaml
 api_version: 1
-workspace: {mode: auto}        # any step that may write → ONE git worktree for the whole run
-contexts:                      # also {file: ./TASK.md} or {template: "{{steps.x.output}}"}
+workspace: {mode: git-worktree} # one explicit worktree for the whole writer run
+contexts:                       # file paths are literal; dynamic content uses template:
   rules: {inline: "be brief"}  # named, ordered, hashed; recorded in <tag>.context.json
 steps:
   - id: edit
@@ -103,8 +104,7 @@ steps:
     cmd: ["sh", "-c", "true"]
 ```
 `--state-dir` keeps workspaces out of the repository; `--profiles f.yaml` swaps tools without editing the flow.
-A resume is refused if the flow, an overlay, a context file or a tool version moved (--force-resume), or if the
-workspace changed with no unfinished step to explain it (--adopt-workspace). They are different questions.
+A resume refuses changed flow/overlay/context/tool version (`--force-resume`) separately from unexplained workspace drift (`--adopt-workspace`).
 If you had to FIX the flow, resume is not the tool: `--carry-budget-from <run-dir>` starts a new run holding the
 old one's spend (steps, per-step visits, cost, time), so a corrected retry does not silently reset its budget.
 Details: README. If unsure: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.

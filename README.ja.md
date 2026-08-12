@@ -250,6 +250,42 @@ steps:
 
 context file は no-follow で読まれ、flow directory または workspace の内側に解決される必要があります。外を指す symlink は拒否されます。唯一の逃げ道は source ごとの `allow_external: true` で、使った事実は unsafe override として記録されます。`defaults.max_context_chars` を超える bundle は **何も起動する前に** 失敗します。sfh は要約もしませんし、収まるように source を落とすこともしません。何を落とすかは利用者の判断であり、template filter、`max_chars`、上流の `compact:` で表明してください。
 
+### 必須CLIバージョン
+
+flowを検証したadapterの範囲を、`defaults`、profile、stepのいずれかに宣言できます。stepがprofileより、profileがdefaultsより優先され、fallback profileは独立に解決されます。
+
+```yaml
+defaults:
+  tool: codex
+  access: read
+  require_version: ">=0.70.0, <1.0.0"  # 0.75.0 のような完全一致も可
+```
+
+実runは、run directoryの作成やflow stepの開始より前に、解決済みbinaryの隔離された`--version`を照合します。不一致または読めないversionは`SFH_CAPABILITY_UNAVAILABLE`です。`plan`はspawnゼロを保ち、宣言と`observed: null`だけを報告します。`preflight`は宣言と実測を並べます。任意の`bin:` overrideを単独preflightで測るには、任意programの実行を明示的に許可する`--probe-binaries`が必要です。
+
+### protocolを使った復旧
+
+structured adapterのdriftは引き続きfail-closedですが、保存された証拠を明示的なsalvage stepへrouteし、同じ仕事を買い直さずに済ませられます。失敗した出力はwarning banner付きの`{{steps.<id>.outputs}}`とraw `.out.txt` artifactに残ります。
+
+```yaml
+- id: analyze
+  tool: codex
+  access: read
+  on_error: continue             # 失敗leafは通常route:より先に停止する
+  prompt: "問題を分析する。"
+  route:
+    - {when_protocol_is: missing_terminal, goto: salvage}
+    - {when_protocol_is: invalid, goto: salvage}
+    - {when_protocol_is: valid, goto: end}
+    - {goto: fail}
+- id: salvage
+  tool: claude
+  access: read
+  prompt: "有用な事実を復旧する: {{steps.analyze.outputs}}"
+```
+
+`when_protocol_is`は`plain`、`valid`、`missing_terminal`、`invalid`を取り、他のpredicateとは通常どおりANDで合成されます。leaf step専用で、fan-out groupには単一のprotocol stateがありません。stateは`step_end`に記録されるため、resumeはtoolを再実行せず同じ判断を再生します。
+
 ### replay policy
 
 step が開始されたのに終了を記録しなかった場合、resume が何をすべきか。sfh が「もう実行されたのか」を本当に知り得ない唯一のケースです。
@@ -322,6 +358,8 @@ sfh run corrected-flow.yaml --carry-budget-from .sfh/runs/20260808-021925-loop
 | 報告済み cost | `max_cost_usd` |
 | active run 時間 | `wall_clock_sec` |
 
+`max_cost_usd`が制御できるのはadapterが報告したcostだけです。Claude、OpenCode、Grok、PiはUSDを報告しますが、Codex、Agy、Cursorはtokenのみ、`cmd:`はprovider costを報告しません。USD上限を宣言したflowにcostを計上できる解決済みadapterが1つもなければ、`validate`と`preflight`が警告します。その場合は実際に強制できるbackstopとして`wall_clock_sec`を併用してください。
+
 **counter だけです。** step output、session、routing 位置、workspace はすべて置いていきます。それらを作った flow は、これから走る flow ではないからです。`--resume` と `--carry-budget-from` は別の診断に対する別の答えなので、同時指定は usage error です。
 
 **合成します**: 引き継いだ run からさらに引き継いでも、最初の run の支出は残ります。2回目の修正で1回目の試行が黙って消えるのは、この機能が人手から取り上げようとしているまさにその算術です。
@@ -375,11 +413,23 @@ sfh run flow.yaml --state-dir ~/.local/state/sfh     # または SFH_STATE_DIR
 
 `runs` / `workspaces` / `plans` / `doctor` を1つのディレクトリ配下に置きます。`--runs-dir` は従来どおり run artifacts だけを移し、どちらも指定しなければ run は今までどおり `.sfh/runs` に落ちます。state root のない managed workspace は platform の user-state ディレクトリ（`$XDG_STATE_HOME/sfh`、`$HOME/.local/state/sfh`、`%LOCALAPPDATA%\sfh`）へ fallback し、それも決められない場合はリポジトリ内へ書く代わりに error になります。
 
+run retentionはhost側のopt-in設定です。`<state-dir>/retention.yaml`へ次を置くと、fresh run開始時に解決済みruns directory（`--runs-dir`が引き続き優先）へ機会的に適用します。
+
+```yaml
+runs:
+  older_than_days: 30
+  keep: 5
+```
+
+両値とも1以上が必須です。新しい`keep`件の外側で期限を超え、terminal status、所有processの死亡、run lock取得、managed worktree削除済みをすべて確認できたrunだけを削除します。live run、livenessを証明できないlegacy run、壊れた証拠、残存managed worktreeは保持します。不正なpolicyはwarning付きでretentionを無効にし、新しいrun自体は止めません。
+
 ---
 
 ## プログラムから sfh を動かす
 
 `run` / `plan` / `wait` / `stop` / `status` / `preflight` / `workspaces` で `--json` を付けると、stdout は envelope だけになります。進捗と warning は stderr へ回り、設定エラーであっても prose ではなく envelope が返ります。`validate --json` と `runs list|show|why --json` はenvelopeより前からあるcommandで、今も独自のbare JSONを返します — `schema_version` も `command` も `exit_code` も安定した error code もありません。以下のheader fieldに頼る前に、応答に `schema_version` があるか確認してください。無ければこの4つのどれかです。全fieldの契約とbare JSON側の正確な形は [docs/machine-api.md](docs/machine-api.md) を参照してください。
+
+この保証は引数エラーにも適用されます。`sfh run --json`などenvelope対象commandの不正な引数はstdoutへ`SFH_USAGE`を返します。4つの旧bare JSON commandも、stdoutを空にせず`{"ok":false,"error":"..."}`を返します。
 
 ```bash
 sfh preflight flow.yaml --json          # 無料: model 呼び出しなし
@@ -390,7 +440,7 @@ sfh wait <run-dir> --json               # 完了までブロックし、結果�
 
 失敗には `schema_version` が変わらない限り意味が固定された code が付きます（現在は `1`）。message は改善され得るので、code で分岐してください。
 
-`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`
+`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`
 
 **run directory は必ず明示してください。** path を省略したコマンドは最新の run を選び、`"implicit_target": true` を返します。agent が望む挙動であることは稀です。
 
@@ -453,6 +503,7 @@ sfh はどの adapter についても **minimum version を固定していませ
 - [Flow JSON スキーマ](schema/flow.schema.json)
 - [耐久ログイベント JSON スキーマ](schema/log-event.schema.json)
 - [ステータススナップショット JSON スキーマ](schema/status.schema.json)
+- [state retention JSON スキーマ](schema/retention.schema.json)
 - [Machine API リファレンス](docs/machine-api.md): 各`--json` commandのenvelopeまたはbare JSONの形、error codeの語彙、stabilityの保証範囲。
 
 ---

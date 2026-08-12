@@ -1,8 +1,8 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
 api_version: 1
 name: failure-to-regression-eval
 
-workspace: {mode: auto, cleanup: keep}
+workspace: {mode: git-worktree, cleanup: keep}
 
 contexts:
   incident: {file: ./INCIDENT.md}
@@ -60,6 +60,7 @@ steps:
     effects: read
     cmd: ["python", "-m", "pytest", "-q"]
     on_error: goto:fix
+    route: [{goto: review}]
 
   - id: review
     use: reviewer

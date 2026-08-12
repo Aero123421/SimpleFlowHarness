@@ -32,6 +32,7 @@ pub struct Snapshot {
     pub emit_file: Option<String>,
     pub emit_step: Option<String>,
     pub error: Option<String>,
+    pub error_code: Option<crate::machine::ErrorCode>,
     pub flow: String,
     pub started: String,
     /// The idle clocks (F2). All three are absent from a status.json written by
@@ -225,6 +226,7 @@ fn read_once(dir: &Path) -> Result<Snapshot, String> {
         emit_file: opt("emit_file"),
         emit_step: opt("emit_step"),
         error: opt("error"),
+        error_code: opt("error_code").and_then(|code| crate::machine::ErrorCode::parse(&code)),
         flow: s("flow"),
         started: s("started_utc"),
         step_started: opt("step_started_utc"),
@@ -351,6 +353,18 @@ fn fail(as_json: bool, command: &str, code: crate::machine::ErrorCode, msg: &str
     2
 }
 
+fn snapshot_error_code(snap: &Snapshot) -> crate::machine::ErrorCode {
+    snap.error_code.unwrap_or(match snap.state {
+        "stuck" => crate::machine::ErrorCode::Stuck,
+        "dead" | "stopped" => crate::machine::ErrorCode::Interrupted,
+        _ => snap
+            .error
+            .as_deref()
+            .map(crate::engine::run_failure_code)
+            .unwrap_or(crate::machine::ErrorCode::FlowInvalid),
+    })
+}
+
 pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     let dir = match resolve(target, root) {
         Ok(d) => d,
@@ -361,16 +375,29 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         Err(e) => return fail(as_json, "status", crate::machine::ErrorCode::Usage, &e),
     };
     // A terminal state an untrusted run dir asserts about itself is not reported
-    // as fact: the same nonce authentication `sfh wait` and `sfh stop` run must
-    // back it. A forged status.json that says "done" without a matching nonce
-    // used to print as success and exit 0; it is now refused (rev_break #10).
+    // as fact until both the run identity and its durable final log agree.
     if snap.terminal() {
-        if let Err(e) = nonce_consistent(&dir, &snap) {
-            eprintln!(
-                "sfh: refusing to report {} as '{}': {e}",
+        if let Err(e) = terminal_consistent(&dir, &snap) {
+            let message = format!(
+                "refusing to report {} as '{}': {e}",
                 dir.display(),
                 snap.state
             );
+            if as_json {
+                crate::machine::emit(&crate::machine::error_envelope(
+                    "status",
+                    crate::machine::ErrorCode::PersistenceFailure,
+                    &message,
+                    1,
+                    serde_json::json!({
+                        "state": snap.state,
+                        "run_dir": dir.display().to_string(),
+                        "terminal": true,
+                    }),
+                ));
+            } else {
+                eprintln!("sfh: {message}");
+            }
             return 1;
         }
     }
@@ -379,6 +406,13 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
         // here and still means what it did. The common envelope header and
         // `implicit_target` are new keys beside them, so a reader written
         // against 1.1 keeps working unchanged.
+        let failure_code = snapshot_error_code(&snap);
+        let failure_message = snap
+            .error
+            .as_deref()
+            .or(snap.reason.as_deref())
+            .unwrap_or("the run did not finish")
+            .to_string();
         let body = serde_json::json!({
                 "state": snap.state,
                 "reason": snap.reason,
@@ -399,7 +433,6 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 "exit_code": snap.exit_code,
                 "emit_step": snap.emit_step,
                 "emit_file": snap.emit_file,
-                "error": snap.error,
                 "terminal": snap.terminal(),
                 "run_id": snap.dir.file_name().map(|n| n.to_string_lossy().into_owned()),
                 // A caller that omitted the path got the NEWEST run, which may
@@ -407,12 +440,18 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
                 // notice it is about to report on somebody else's run.
                 "implicit_target": target.is_none(),
         });
-        crate::machine::emit(&crate::machine::envelope(
-            "status",
-            snap.state == "done",
-            snap.exit(),
-            body,
-        ));
+        let envelope = match snap.state {
+            "done" => crate::machine::envelope("status", true, snap.exit(), body),
+            "running" => crate::machine::envelope("status", false, snap.exit(), body),
+            _ => crate::machine::error_envelope(
+                "status",
+                failure_code,
+                &failure_message,
+                snap.exit(),
+                body,
+            ),
+        };
+        crate::machine::emit(&envelope);
         return snap.exit();
     }
 
@@ -613,6 +652,10 @@ pub fn stop(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
     m.insert("state".into(), serde_json::json!("stopped"));
     m.insert("exit_code".into(), serde_json::json!(1));
     m.insert("error".into(), serde_json::json!("cancelled by sfh stop"));
+    m.insert(
+        "error_code".into(),
+        serde_json::json!(crate::machine::ErrorCode::Interrupted.as_str()),
+    );
     let encoded = serde_json::to_string_pretty(&v).unwrap_or_default();
     if let Err(e) = contain::write_private_atomic(&sp, encoded) {
         return answer(
@@ -655,7 +698,7 @@ pub fn stop(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
 /// symlink). A bare status.json is trivial to forge, an EMPTY log.jsonl next
 /// to it is just as trivial (rev_break #10), and a linked one would point the
 /// check at a file outside the run dir (rev_break #6) - none are enough (R-3).
-fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
+pub(crate) fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
     // Contained, no-follow read: a symlink planted at the fixed name used to be
     // followed to an attacker-chosen file whose contents then authenticated the
     // run (rev_break #6). Missing reads as None; a containment violation or an
@@ -733,6 +776,58 @@ fn nonce_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
                 .to_string(),
         ),
     }
+}
+
+/// Authenticate a terminal snapshot and, for engine-produced terminal states,
+/// require the durable log's final event to make the same claim. `stopped` is
+/// written by `sfh stop` after the process is killed and `dead` is derived from
+/// a stale `running` status, so neither has a corresponding `run_end` event.
+pub(crate) fn terminal_consistent(dir: &Path, snap: &Snapshot) -> Result<(), String> {
+    nonce_consistent(dir, snap)?;
+    let expected = match snap.state {
+        "done" => "ok",
+        "failed" => "failed",
+        "stuck" => "stuck",
+        "dead" | "stopped" => return Ok(()),
+        _ => return Ok(()),
+    };
+
+    let log = contain::read_contained_opt(dir, "log.jsonl")?
+        .ok_or_else(|| "terminal status has no durable log.jsonl".to_string())?;
+    let mut final_line = None;
+    for (line_no, line) in log.lines().enumerate() {
+        if !line.trim().is_empty() {
+            final_line = Some((line_no, line));
+        }
+    }
+    let (line_no, line) =
+        final_line.ok_or_else(|| "terminal status has an empty durable log.jsonl".to_string())?;
+    let event: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+        format!(
+            "terminal status disagrees with log.jsonl: final line {} is invalid JSON: {error}",
+            line_no + 1
+        )
+    })?;
+    if event.get("event").and_then(|value| value.as_str()) != Some("run_end") {
+        return Err(format!(
+            "terminal status disagrees with log.jsonl: final event is '{}', not 'run_end'",
+            event
+                .get("event")
+                .and_then(|value| value.as_str())
+                .unwrap_or("(missing)")
+        ));
+    }
+    let actual = event
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("(missing)");
+    if actual != expected {
+        return Err(format!(
+            "terminal status disagrees with log.jsonl: status.json says '{}' but the final run_end says '{}'",
+            snap.state, actual
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the process that most recently owned this run dir is verifiably
@@ -928,7 +1023,7 @@ pub fn wait(
                 // content is read: a run dir an attacker can write must not
                 // become a file-read primitive just because the caller asked
                 // for a machine answer.
-                if let Err(e) = nonce_consistent(&dir, &snap) {
+                if let Err(e) = terminal_consistent(&dir, &snap) {
                     return fail(
                         as_json,
                         "wait",
@@ -969,7 +1064,7 @@ pub fn wait(
                 } else {
                     crate::machine::emit(&crate::machine::error_envelope(
                         "wait",
-                        crate::machine::ErrorCode::FlowInvalid,
+                        snapshot_error_code(&snap),
                         snap.error.as_deref().unwrap_or("the run did not finish"),
                         code,
                         body,
@@ -987,7 +1082,7 @@ pub fn wait(
             // The same applies to dead/stopped, which report content too.
             //
             // Before the match, so no arm can be added later that forgets.
-            if let Err(e) = nonce_consistent(&dir, &snap) {
+            if let Err(e) = terminal_consistent(&dir, &snap) {
                 eprintln!(
                     "sfh: refusing to report {} as '{}': {e}",
                     dir.display(),
@@ -1110,6 +1205,75 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sfh-watch-{tag}-{}", contain::random_nonce()));
         contain::mkdir_private(&dir).unwrap();
         dir
+    }
+
+    fn terminal_snapshot(tag: &str, state: &str, log: &str) -> (PathBuf, Snapshot) {
+        let dir = temp_dir(tag);
+        let pid = std::process::id();
+        let pid_start = execute::pid_start_time(pid);
+        contain::write_nonce(&dir, pid, pid_start, "terminal-test").unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({
+                "state": state,
+                "pid": pid,
+                "pid_start": pid_start,
+                "nonce": "terminal-test",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("log.jsonl"), log).unwrap();
+        let snapshot = read(&dir).unwrap();
+        (dir, snapshot)
+    }
+
+    #[test]
+    fn terminal_status_requires_a_matching_final_run_end() {
+        for (state, log_status) in [("done", "ok"), ("failed", "failed"), ("stuck", "stuck")] {
+            let log = format!("{{\"event\":\"run_end\",\"status\":\"{log_status}\"}}\n");
+            let (dir, snapshot) = terminal_snapshot(state, state, &log);
+            assert!(terminal_consistent(&dir, &snapshot).is_ok());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn terminal_status_refuses_an_unfinished_or_contradictory_log() {
+        let cases = [
+            (
+                "unfinished",
+                "{\"event\":\"step_start\",\"step\":\"work\"}\n",
+                "final event",
+            ),
+            (
+                "contradictory",
+                "{\"event\":\"run_end\",\"status\":\"failed\"}\n",
+                "final run_end says 'failed'",
+            ),
+            (
+                "resumed-after-end",
+                "{\"event\":\"run_end\",\"status\":\"ok\"}\n{\"event\":\"step_start\",\"step\":\"again\"}\n",
+                "final event",
+            ),
+        ];
+        for (tag, log, expected) in cases {
+            let (dir, snapshot) = terminal_snapshot(tag, "done", log);
+            let error = terminal_consistent(&dir, &snapshot).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn stopped_status_does_not_require_an_engine_run_end() {
+        let (dir, snapshot) = terminal_snapshot(
+            "stopped",
+            "stopped",
+            "{\"event\":\"step_start\",\"step\":\"work\"}\n",
+        );
+        assert!(terminal_consistent(&dir, &snapshot).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

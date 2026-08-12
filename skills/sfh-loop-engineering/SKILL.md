@@ -2,10 +2,10 @@
 name: sfh-loop-engineering
 description: >
   Design stable, bounded SimpleFlowHarness loops: review/fix cycles, planner-builder-evaluator systems, long-running chunked work, multi-agent councils, and iterative improvement. Use when a route revisits a step, an AI must improve work over several laps, a run may last hours, or an existing sfh loop oscillates, repeats work, loses context, or never converges.
-compatibility: Written for sfh v1.5 loop, route, fan-out, budget, context, and resume semantics.
+compatibility: Written for sfh v1.6 loop, route, fan-out, budget, context, and resume semantics.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.5.x"
+  target-sfh: "1.6.x"
 ---
 
 # Engineer loops that make progress or stop honestly

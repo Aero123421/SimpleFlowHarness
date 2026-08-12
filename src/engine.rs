@@ -1,6 +1,6 @@
 use crate::{
-    closure, contain, context, execute, flow, leaf, machine, preset, protocol, sha256, state,
-    template, watch, workspace,
+    closure, contain, context, execute, flow, leaf, machine, preflight, preset, protocol, sha256,
+    state, template, watch, workspace,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -842,6 +842,9 @@ struct PendingRoute {
     /// before the snapshot existed - the router tells those two apart from the
     /// flow, and refuses the second rather than guessing (see `Members`).
     members: Option<Vec<MemberVerdict>>,
+    /// Durable protocol evidence for a leaf. None for fan-out composites and
+    /// logs written before protocol_state was recorded.
+    protocol: Option<protocol::ProtocolState>,
     /// The step/aggregate result is durable, but compact/notes post-processing
     /// has not yet reached its own durable end marker. Resume must finish that
     /// stage before evaluating this route.
@@ -943,6 +946,10 @@ struct ResumeState {
     /// with the restored cost still over the threshold and land a second time,
     /// which turns "one wrap-up chain per run" into "one per crash".
     budget_landed: bool,
+    /// A retry backoff reached the wall-clock landing threshold after its last
+    /// attempt was durably recorded. Kept until budget_landing appears so a
+    /// crash in that narrow gap resumes the landing instead of on_error.
+    retry_budget_trigger: Option<String>,
     /// Fan-out members that already finished in a crashed attempt, keyed by
     /// (parent step id, visit). A resume that re-runs a parallel/foreach group
     /// SKIPS these instead of executing them a second time: re-running spent
@@ -1310,6 +1317,12 @@ fn load_resume_for_flow(
             "step_end" | "aggregate_end" => {
                 if ev == "step_end" {
                     st.total = st.total.saturating_add(1);
+                    if v.get("retry_budget_exhausted")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                    {
+                        st.retry_budget_trigger = Some("wall_clock".into());
+                    }
                 }
                 // A run dir is untrusted on --resume: a NEGATIVE cost_usd in an
                 // edited log would subtract from the running total and let a
@@ -1580,6 +1593,10 @@ fn load_resume_for_flow(
                             errored: !ok,
                             from_plain: false,
                             members: None,
+                            protocol: v
+                                .get("protocol_state")
+                                .and_then(|value| value.as_str())
+                                .and_then(protocol::ProtocolState::parse),
                             postprocess: postprocess_pending,
                             compact_done: false,
                             notes_done: false,
@@ -1600,6 +1617,7 @@ fn load_resume_for_flow(
                             errored: !ok,
                             from_plain: true,
                             members,
+                            protocol: None,
                             postprocess: postprocess_pending,
                             compact_done: false,
                             notes_done: false,
@@ -1740,7 +1758,10 @@ fn load_resume_for_flow(
             // One landing per run, across resumes too. Only the fact is
             // restored, not the trigger or the numbers: what matters on the way
             // back in is that the wrap-up chain has already been paid for once.
-            "budget_landing" => st.budget_landed = true,
+            "budget_landing" => {
+                st.budget_landed = true;
+                st.retry_budget_trigger = None;
+            }
             // The workspace baseline this run last committed to. Later entries
             // replace earlier ones - the newest durable checkpoint is the one a
             // resume compares against - and an adoption is a checkpoint too.
@@ -2111,6 +2132,7 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
             emit_step: None,
             emit_file: None,
             error: None,
+            error_code: None,
             unfinished_step: None,
             nonce: nonce.to_string(),
             pid_start: child_start,
@@ -2403,6 +2425,9 @@ struct Status {
     emit_step: Option<String>,
     emit_file: Option<String>,
     error: Option<String>,
+    /// Stable machine classification corresponding to `error`. Additive: the
+    /// prose remains for humans and older readers.
+    error_code: Option<String>,
     unfinished_step: Option<UnfinishedStep>,
     /// Random token proving this status.json was written by the sfh that owns
     /// the run dir. `sfh stop` refuses to kill without a matching nonce file.
@@ -2452,6 +2477,7 @@ fn status_json(s: &Status) -> Result<String, String> {
         "emit_step": s.emit_step,
         "emit_file": s.emit_file,
         "error": s.error,
+        "error_code": s.error_code,
         "unfinished_step": unfinished_step,
         "nonce": s.nonce,
         "pid_start": s.pid_start,
@@ -2465,7 +2491,13 @@ fn status_json(s: &Status) -> Result<String, String> {
 /// Used by the replay policy, which refuses before the run's status thread even
 /// exists. The previous document's fields are preserved so `runs show`, `wait`
 /// and `status` still see the run's history; only the outcome is replaced.
-fn mark_terminal_status(dir: &Path, state: &str, exit: i32, error: &str) -> Result<(), String> {
+fn mark_terminal_status(
+    dir: &Path,
+    state: &str,
+    exit: i32,
+    code: machine::ErrorCode,
+    error: &str,
+) -> Result<(), String> {
     let path = dir.join("status.json");
     let mut v: serde_json::Value = contain::read_contained_opt(dir, "status.json")?
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -2476,6 +2508,7 @@ fn mark_terminal_status(dir: &Path, state: &str, exit: i32, error: &str) -> Resu
     map.insert("state".into(), json!(state));
     map.insert("exit_code".into(), json!(exit));
     map.insert("error".into(), json!(error));
+    map.insert("error_code".into(), json!(code.as_str()));
     map.insert("heartbeat_utc".into(), json!(utc_stamp()));
     let text =
         serde_json::to_string_pretty(&v).map_err(|e| format!("cannot serialize status: {e}"))?;
@@ -2629,6 +2662,166 @@ fn carry_source_is_final(dir: &Path) -> Result<(), String> {
     ))
 }
 
+fn inherited_run_handoff_matches(
+    dir: &Path,
+    inherited_nonce: Option<&str>,
+) -> Result<bool, String> {
+    let Some(expected) = inherited_nonce else {
+        return Ok(false);
+    };
+    let Some(raw) = contain::read_contained_opt(dir, "sfh-nonce")? else {
+        return Ok(false);
+    };
+    let contain::Nonce::Bound { pid, start, nonce } = contain::parse_nonce(raw.trim())? else {
+        return Ok(false);
+    };
+    if pid != std::process::id() || nonce != expected {
+        return Ok(false);
+    }
+    Ok(start
+        .map(|recorded| execute::pid_start_time(pid) == Some(recorded))
+        .unwrap_or(true))
+}
+
+fn acquire_run_lease(
+    dir: &Path,
+    is_resume: bool,
+    inherited_nonce: Option<&str>,
+) -> Result<contain::RunLease, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let lease = loop {
+        match contain::try_run_lease(dir) {
+            Ok(lease) => break lease,
+            Err(contain::RunLeaseError::Busy)
+                if inherited_nonce.is_some() && Instant::now() < deadline =>
+            {
+                // A detached child starts while its parent still owns the
+                // lease. The parent publishes the child's nonce before
+                // returning and releasing its handle, so this bounded wait is
+                // the handoff rather than a second ownership path.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(contain::RunLeaseError::Busy) => {
+                return Err(format!(
+                    "{}: another process owns this run directory ({})",
+                    machine::ErrorCode::RunBusy.as_str(),
+                    dir.display()
+                ))
+            }
+            Err(contain::RunLeaseError::Io(error)) => {
+                return Err(format!(
+                    "cannot claim run directory {}: {error}",
+                    dir.display()
+                ))
+            }
+        }
+    };
+
+    if inherited_run_handoff_matches(dir, inherited_nonce)? {
+        return Ok(lease);
+    }
+    if inherited_nonce.is_some() {
+        return Err(format!(
+            "{}: detached run ownership for {} could not be verified",
+            machine::ErrorCode::RunBusy.as_str(),
+            dir.display()
+        ));
+    }
+
+    if is_resume {
+        match watch::owner_verifiably_dead(dir)? {
+            Some(false) => {
+                return Err(format!(
+                    "{}: the recorded owner of {} is still alive; wait for it or stop it before resuming",
+                    machine::ErrorCode::RunBusy.as_str(),
+                    dir.display()
+                ))
+            }
+            Some(true) => return Ok(lease),
+            None => {}
+        }
+        // Pre-nonce runs have no owner record to inspect. Their status still
+        // gives a fail-closed fallback: a matching live pid is enough to
+        // refuse, never enough to prove that an unrelated process is safe to
+        // take over.
+        if let Ok(snapshot) = watch::read(dir) {
+            let same_live_process = execute::pid_alive(snapshot.pid)
+                && snapshot
+                    .pid_start
+                    .map(|recorded| execute::pid_start_time(snapshot.pid) == Some(recorded))
+                    .unwrap_or(true);
+            if same_live_process {
+                return Err(format!(
+                    "{}: the recorded owner of {} may still be alive; wait for it or stop it before resuming",
+                    machine::ErrorCode::RunBusy.as_str(),
+                    dir.display()
+                ));
+            }
+        }
+        return Ok(lease);
+    }
+
+    let has_existing_artifact = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot inspect run directory {}: {error}", dir.display()))?
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() != std::ffi::OsStr::new(contain::RUN_LOCK));
+    if has_existing_artifact {
+        return Err(format!(
+            "--run-dir {} is not empty; choose a new or empty path, or use --resume for an existing run",
+            dir.display()
+        ));
+    }
+    Ok(lease)
+}
+
+fn verify_required_versions(flow: &flow::Flow) -> Result<(), String> {
+    let mut requirements: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for resolved in flow.resolved_tools() {
+        let Some(requirement) = resolved.require_version else {
+            continue;
+        };
+        let program = resolved
+            .bin
+            .unwrap_or_else(|| preset::default_program(&resolved.tool));
+        requirements
+            .entry((resolved.tool, program))
+            .or_default()
+            .insert(requirement);
+    }
+    for ((tool, program), requirements) in requirements {
+        let version = preflight::probe_version_for_run(&tool, &program).map_err(|error| {
+            format!(
+                "{}: cannot verify {tool} ({program}) before starting: {error}",
+                machine::ErrorCode::CapabilityUnavailable.as_str()
+            )
+        })?;
+        let observed = version.ok_or_else(|| {
+            format!(
+                "{}: {tool} ({program}) produced no usable --version output, so its require_version declaration cannot be verified",
+                machine::ErrorCode::CapabilityUnavailable.as_str()
+            )
+        })?;
+        for requirement in requirements {
+            match crate::version::satisfies(&requirement, &observed) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "{}: {tool} ({program}) reports {observed:?}, which does not satisfy require_version: {requirement}",
+                        machine::ErrorCode::CapabilityUnavailable.as_str()
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "{}: {tool} ({program}) cannot be checked against require_version: {requirement}: {error}",
+                        machine::ErrorCode::CapabilityUnavailable.as_str()
+                    ))
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // `--runs-dir` keeps meaning exactly what it always meant, and with neither
     // flag the runs root is still `.sfh/runs`: every flow, script and CI job
@@ -2761,6 +2954,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         tainted_vars.remove(k); // an explicit --var is the user's own value
     }
     precheck(&flow, &vars, &tainted_vars)?;
+    // `plan` has a strict spawn-zero contract and only reports declarations.
+    // A real run is already authorized to launch these programs; check their
+    // inert --version path before creating/mutating a run dir or starting any
+    // model process. Detached parents repeat this in the child after handoff,
+    // closing the update race between approval and execution.
+    if !opts.dry_run && resume_dir.is_none() {
+        verify_required_versions(&flow)?;
+    }
 
     // Which steps must produce resumable sessions (continue_from targets).
     let mut needed_sessions: HashSet<String> = HashSet::new();
@@ -2784,6 +2985,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut resumed = ResumeState::default();
     let run_dir: PathBuf;
     let mut is_resume = false;
+    let inherited_nonce = std::env::var("SFH_NONCE")
+        .ok()
+        .filter(|nonce| !nonce.trim().is_empty());
+    let mut _run_lease: Option<contain::RunLease>;
     if opts.dry_run {
         run_dir = std::env::temp_dir().join(format!("sfh-plan-{}", leaf::gen_uuid()));
         contain::mkdir_private(&run_dir).map_err(|e| {
@@ -2792,10 +2997,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 run_dir.display()
             )
         })?;
+        _run_lease = None;
     } else if let Some(dir) = resume_dir {
         // The resumed dir was protected when it was first created; nothing
         // here writes to the runs root, so its state is not this run's
         // concern (and the root may be absent or read-only by design).
+        _run_lease = Some(acquire_run_lease(&dir, true, inherited_nonce.as_deref())?);
+        // Ownership comes first on resume: a duplicate resume must not get to
+        // execute even a declared binary's --version while the live owner is
+        // still working. This remains before log/status/workspace mutation and
+        // before any flow step.
+        verify_required_versions(&flow)?;
         resumed = load_resume_for_flow(&dir, Some(&flow))?;
         // Cross-check the recorded session access against the flow (which the
         // fingerprint check above verified is unchanged, unless --force-resume
@@ -2894,7 +3106,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                                "replay_refused": policy.as_str(), "step": u.step,
                                "elapsed_sec": resumed.elapsed_sec}),
                     )?;
-                    mark_terminal_status(&dir, word, code, &why)?;
+                    mark_terminal_status(
+                        &dir,
+                        word,
+                        code,
+                        machine::ErrorCode::ReplayRefused,
+                        &why,
+                    )?;
                     if opts.as_json {
                         machine::emit(&machine::error_envelope(
                             "run",
@@ -2930,18 +3148,53 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         contain::mkdir_private(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = d;
+        _run_lease = Some(acquire_run_lease(
+            &run_dir,
+            false,
+            inherited_nonce.as_deref(),
+        )?);
     } else {
         protect_runs_root(&runs_root)?;
+        match state_root.run_retention() {
+            Ok(Some(policy)) => {
+                let report = crate::runs::apply_retention(&runs_root, policy);
+                if !report.removed.is_empty() && !opts.quiet {
+                    let noun = if report.removed.len() == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    };
+                    eprintln!(
+                        "sfh: retention removed {} old run {noun}",
+                        report.removed.len(),
+                    );
+                }
+                for warning in report.warnings {
+                    eprintln!("sfh: warning: retention: {warning}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("sfh: warning: retention disabled: {error}");
+            }
+        }
         let base = format!("{}-{}", utc_stamp(), name);
         let mut d = runs_root.join(&base);
         let mut n = 1;
-        while d.exists() {
-            n += 1;
-            d = runs_root.join(format!("{base}-{n}"));
+        loop {
+            match contain::mkdir_private_new(&d) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    n += 1;
+                    d = runs_root.join(format!("{base}-{n}"));
+                }
+                Err(error) => {
+                    return Err(format!("cannot create run dir {}: {error}", d.display()))
+                }
+            }
         }
-        contain::mkdir_private(&d)
-            .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = abs(&d);
+        _run_lease = Some(acquire_run_lease(&run_dir, false, None)?);
     }
     // ---- inherit an earlier run's spend into this fresh one ----
     // Resolved AFTER the run dir exists, because the ancestor has to be told
@@ -3012,7 +3265,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // can never grow into deleting a real run. A resumed dir and a
             // --run-dir handed in by the detaching parent are not ours to
             // remove.
+            //
+            // The one thing the directory does hold by now is this attempt's
+            // own lease file, so the lease is dropped (releasing the OS lock,
+            // and on Windows closing the handle that would otherwise refuse
+            // the delete outright) and that one named file is removed first.
+            // Removing only the lock keeps the safety property intact: any
+            // OTHER entry still makes remove_dir fail and leaves the directory
+            // exactly where it is.
             if !is_resume && opts.run_dir.is_none() {
+                _run_lease = None;
+                let _ = std::fs::remove_file(run_dir.join(contain::RUN_LOCK));
                 let _ = std::fs::remove_dir(&run_dir);
             }
             return Err(e);
@@ -3511,6 +3774,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         emit_step: None,
         emit_file: None,
         error: None,
+        error_code: None,
         unfinished_step: resumed.unfinished_step.clone(),
         nonce: nonce.clone(),
         pid_start,
@@ -3559,11 +3823,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let mut cost_usd: f64 = resumed.cost_usd;
     let mut last_executed = resumed.last_executed;
     let mut last_success = resumed.last_success;
+    let mut forced_budget_trigger = resumed.retry_budget_trigger.clone();
     let mut resume_postprocess = resumed
         .pending_route
         .clone()
         .filter(|pending| pending.postprocess);
-    let pending_route = resumed.pending_route.filter(|pending| !pending.postprocess);
+    let pending_route = if forced_budget_trigger.is_some() {
+        None
+    } else {
+        resumed.pending_route.filter(|pending| !pending.postprocess)
+    };
     let completed_members = resumed.completed_members;
     let member_fallbacks = resumed.member_fallbacks;
     let foreach_inputs = resumed.foreach_inputs;
@@ -3634,7 +3903,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             })?;
             let step = &flow.steps[completed_idx];
             let replay_route = if pending.errored {
-                match apply_on_error(&mut log, step, &index_of, &run_dir)? {
+                match apply_on_error(
+                    &mut log,
+                    step,
+                    &index_of,
+                    &run_dir,
+                    protocol_failure_code(pending.protocol),
+                )? {
                     ErrorDisposition::Continue => true,
                     ErrorDisposition::Goto(next) => {
                         cur = next;
@@ -3672,6 +3947,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     // recorded route - so there is no child to time.
                     run_clock: None,
                     wall_deadline: None,
+                    retry_landing_deadline: None,
                     // The restored spend is real; the clock is this attempt's, the
                     // same one wall_clock_sec is judged on.
                     budget: leaf::BudgetVars::new(
@@ -3722,7 +3998,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 } else {
                     Members::NotAGroup
                 };
-                let target = evaluate_route(step, &pending.route_text, &ctx, &run_dir, members)?;
+                let target = evaluate_route(
+                    step,
+                    &pending.route_text,
+                    &ctx,
+                    &run_dir,
+                    members,
+                    pending.protocol,
+                )?;
                 match target.as_ref().map(|h| (h.goto.as_str(), h)) {
                     None => {
                         log_position(
@@ -3768,6 +4051,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             if execute::interrupted() {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
             }
+            if forced_budget_trigger.is_some() && (budget_plan.is_none() || budget_landed) {
+                return Err(
+                    "resume: a retry was durably pre-empted for budget landing, but the current flow cannot perform that landing"
+                        .into(),
+                );
+            }
             // F5: land before the cliff, once per run. Checked BEFORE the two
             // ceiling checks below, but that head start is worth exactly the
             // reserve and no more: the landing jumps and `continue`s, which
@@ -3782,7 +4071,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             if let (Some(plan), false) = (&budget_plan, budget_landed) {
                 let elapsed_sec =
                     elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs());
-                if let Some(trigger) = plan.trigger(Instant::now(), cost_usd) {
+                let trigger = forced_budget_trigger
+                    .take()
+                    .or_else(|| plan.trigger(Instant::now(), cost_usd).map(str::to_string));
+                if let Some(trigger) = trigger {
                     budget_landed = true;
                     // The step the landing PRE-EMPTED: it has not run and will
                     // not, unless a resume comes back for it. Recorded as the
@@ -4028,6 +4320,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         tainted_vars: &tainted_vars,
                         run_clock: Some(&run_clock),
                         wall_deadline,
+                        retry_landing_deadline: if budget_landed {
+                            None
+                        } else {
+                            budget_plan.as_ref().and_then(|plan| plan.wall_at)
+                        },
                         // Read at expansion time, so every step (and every
                         // retry, fallback and compaction inside it) renders
                         // {{budget.*}} from the totals as they stand now.
@@ -4050,7 +4347,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // finished, and a fallback is the expensive, rare path.
             macro_rules! fan_fallback {
                 ($done:expr, $mstep:expr, $label:expr, $mtag:expr, $fbs:expr, $start:expr, $extra:expr) => {{
-                    if !$done.ok() && !$done.interrupted && !$fbs.is_empty() {
+                    if !$done.ok()
+                        && !$done.interrupted
+                        && !$done.retry_budget_exhausted
+                        && !$fbs.is_empty()
+                    {
                         for (fallback_index, fb) in
                             $fbs.iter().enumerate().skip($start)
                         {
@@ -4129,11 +4430,20 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // ---- execute the step (leaf / parallel / foreach) ----
             // route_text: what route conditions match against - always the
             // pre-compact text, without sfh's "--- id ---" aggregate headers.
-            let (mut chain_output, route_text, errored, members): (
+            let (
+                mut chain_output,
+                route_text,
+                errored,
+                members,
+                protocol_state,
+                retry_budget_exhausted,
+            ): (
                 String,
                 String,
                 bool,
                 Option<Vec<MemberVerdict>>,
+                Option<protocol::ProtocolState>,
+                bool,
             ) = if let Some(pending) = &resumed_postprocess {
                 let restored = outputs.get(&step.id).ok_or_else(|| {
                     format!(
@@ -4146,6 +4456,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     pending.route_text.clone(),
                     pending.errored,
                     pending.members.clone(),
+                    pending.protocol,
+                    false,
                 )
             } else if let Some(children) = &step.parallel {
                 // Members the crashed attempt already finished: their step_end
@@ -4299,14 +4611,15 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         let child_index = *fresh_idx.get(pos).ok_or_else(|| {
                             "internal error: fan-out child index out of range".to_string()
                         })?;
-                        let next_fallback = if !done.ok() && !done.interrupted {
-                            children[child_index]
-                                .fallback
-                                .get(fallback_starts[pos])
-                                .map(String::as_str)
-                        } else {
-                            None
-                        };
+                        let next_fallback =
+                            if !done.ok() && !done.interrupted && !done.retry_budget_exhausted {
+                                children[child_index]
+                                    .fallback
+                                    .get(fallback_starts[pos])
+                                    .map(String::as_str)
+                            } else {
+                                None
+                            };
                         accumulate_cost(&mut cost_usd, done.usage.reported_cost());
                         let durable = match &done.persistence_error {
                             Some(e) => log_persistence_failure(
@@ -4482,7 +4795,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
-                (agg, plain, hard_fail, Some(verdicts))
+                (
+                    agg,
+                    plain,
+                    hard_fail,
+                    Some(verdicts),
+                    None,
+                    dones.iter().any(|done| done.retry_budget_exhausted),
+                )
             } else if let Some(fe) = &step.foreach {
                 let cx = mk_cx!(&outputs, &sessions);
                 let pf = run_dir.join(format!("{gtag}.from.txt"));
@@ -4654,11 +4974,12 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         let label = fresh_labels.get(pos).ok_or_else(|| {
                             "internal error: foreach completion index out of range".to_string()
                         })?;
-                        let next_fallback = if !done.ok() && !done.interrupted {
-                            step.fallback.get(fallback_starts[pos]).map(String::as_str)
-                        } else {
-                            None
-                        };
+                        let next_fallback =
+                            if !done.ok() && !done.interrupted && !done.retry_budget_exhausted {
+                                step.fallback.get(fallback_starts[pos]).map(String::as_str)
+                            } else {
+                                None
+                            };
                         accumulate_cost(&mut cost_usd, done.usage.reported_cost());
                         let durable = match &done.persistence_error {
                             Some(e) => log_persistence_failure(
@@ -4811,7 +5132,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
-                (agg, plain, hard_fail, Some(verdicts))
+                (
+                    agg,
+                    plain,
+                    hard_fail,
+                    Some(verdicts),
+                    None,
+                    dones.iter().any(|done| done.retry_budget_exhausted),
+                )
             } else {
                 let mut next_fallback_index = 0usize;
                 let mut done = if let Some(unfinished) = &resumed_fallback {
@@ -4864,7 +5192,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     return Err(format!("step '{}': {e}", step.id));
                 }
                 // fallback: retry the step with a different profile (tool/model).
-                if !done.ok() && !done.interrupted && !step.fallback.is_empty() {
+                if !done.ok()
+                    && !done.interrupted
+                    && !done.retry_budget_exhausted
+                    && !step.fallback.is_empty()
+                {
                     for fb in step.fallback.iter().skip(next_fallback_index) {
                         log_step_end_with_next(
                             &mut log,
@@ -4969,7 +5301,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let rt = d.chain_output.clone();
                 // A leaf has no members, which is not the same as having none
                 // recorded - see `Members`.
-                (d.chain_output.clone(), rt, !d.ok(), None)
+                (
+                    d.chain_output.clone(),
+                    rt,
+                    !d.ok(),
+                    None,
+                    Some(d.protocol.protocol),
+                    d.retry_budget_exhausted,
+                )
             };
             if let Some(e) = persistence_error.lock().ok().and_then(|mut e| e.take()) {
                 return Err(e);
@@ -4981,6 +5320,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // interrupt check gets another chance to run.
             if execute::interrupted() {
                 return Err("interrupted (Ctrl+C): child processes were terminated".into());
+            }
+            // A failed attempt is durable above, but its next retry was
+            // pre-empted when backoff entered the wall-clock reserve. Budget
+            // landing outranks fallback/on_error and is evaluated at the loop
+            // head, using the same one-shot event/position path as any other
+            // landing. The step remains current so the position records what
+            // work the landing pre-empted.
+            if retry_budget_exhausted {
+                forced_budget_trigger = Some("wall_clock".into());
+                continue;
             }
             // A run-level deadline is stronger than a leaf's on_error policy.
             // Each leaf timeout is capped to this instant, so report the
@@ -5172,7 +5521,13 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
 
             // ---- error handling ----
             if errored {
-                match apply_on_error(&mut log, step, &index_of, &run_dir)? {
+                match apply_on_error(
+                    &mut log,
+                    step,
+                    &index_of,
+                    &run_dir,
+                    protocol_failure_code(protocol_state),
+                )? {
                     ErrorDisposition::Continue => {}
                     ErrorDisposition::Goto(next) => {
                         cur = next;
@@ -5207,6 +5562,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         Some(m) => Members::Known(m),
                         None => Members::NotAGroup,
                     },
+                    protocol_state,
                 )?
             };
             match target.as_ref().map(|h| (h.goto.as_str(), h)) {
@@ -5265,6 +5621,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .and_then(|id| chain_files.get(id))
             .map(|p| p.display().to_string());
         g.error = err.map(String::from);
+        g.error_code = match state {
+            "stuck" => Some(machine::ErrorCode::Stuck.as_str().to_string()),
+            "failed" => err
+                .map(run_failure_code)
+                .map(|code| code.as_str().to_string()),
+            "stopped" | "dead" => Some(machine::ErrorCode::Interrupted.as_str().to_string()),
+            _ => None,
+        };
         write_status(&status_path, &g)
     };
     // The output a caller gets when the run did NOT succeed. Computed once,
@@ -5473,7 +5837,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     exit_code: 4,
                     run_dir: &run_dir,
                     flow: &opts.flow_path,
-                    error: Some((machine::ErrorCode::ReplayRefused, msg.as_str())),
+                    error: Some((machine::ErrorCode::Stuck, msg.as_str())),
                     result: partial_pick
                         .as_deref()
                         .and_then(|id| outputs.get(id))
@@ -5560,15 +5924,22 @@ struct RunEnvelope<'a> {
 /// mapping keys off the markers sfh itself writes. Anything unrecognised stays
 /// a plain flow failure rather than being forced into a code that would tell a
 /// caller something specific and wrong.
-fn run_failure_code(msg: &str) -> machine::ErrorCode {
+pub(crate) fn run_failure_code(msg: &str) -> machine::ErrorCode {
     for code in [
+        machine::ErrorCode::ProtocolInvalid,
+        machine::ErrorCode::TerminalMissing,
+        machine::ErrorCode::SessionUnverified,
         machine::ErrorCode::ExecutionClosureChanged,
         machine::ErrorCode::WorkspaceMissing,
         machine::ErrorCode::WorkspaceDrift,
         machine::ErrorCode::WorkspaceUnowned,
         machine::ErrorCode::WorkspaceBusy,
+        machine::ErrorCode::RunBusy,
         machine::ErrorCode::ReplayRefused,
         machine::ErrorCode::PersistenceFailure,
+        machine::ErrorCode::CapabilityUnavailable,
+        machine::ErrorCode::Stuck,
+        machine::ErrorCode::Interrupted,
     ] {
         if msg.contains(code.as_str()) {
             return code;
@@ -6165,6 +6536,7 @@ fn prepare_compact(
         cwd: run.workspace.map(PathBuf::from),
         timeout: timeout_sec.map(Duration::from_secs),
         wall_deadline: *wall_deadline,
+        retry_landing_deadline: None,
         preassigned_session: None,
         expect_session: None,
         expect_marker: None,
@@ -6450,6 +6822,22 @@ fn dry_run(
         "workspace: {}",
         serde_json::to_string(&extras.workspace.to_json()).unwrap_or_default()
     );
+    for tool in flow
+        .resolved_tools()
+        .into_iter()
+        .filter(|tool| tool.require_version.is_some())
+    {
+        let program = tool
+            .bin
+            .clone()
+            .unwrap_or_else(|| preset::default_program(&tool.tool));
+        println!(
+            "required version: {} ({}) {}",
+            tool.tool,
+            program,
+            tool.require_version.as_deref().unwrap_or_default()
+        );
+    }
     // The one goto that never appears in any step's route:, so a reader of the
     // flow cannot see it by following the steps. Print it where the jump is
     // declared - at the top, with the flow, not against any step.
@@ -6484,6 +6872,7 @@ fn dry_run(
         // A dry run renders and prints; it spawns nothing to time.
         run_clock: None,
         wall_deadline: None,
+        retry_landing_deadline: None,
         // Nothing has been spent and no time has passed, so {{budget.*}} shows
         // the whole declared budget - which is what a prompt reviewer wants to
         // see, and it exercises the `unlimited` spelling for undeclared axes.
@@ -6609,6 +6998,9 @@ fn dry_run(
             if let Some(c) = &r.when_outcome_is {
                 cond.push(format!("outcome is {}", c.as_str()));
             }
+            if let Some(c) = r.when_protocol_is {
+                cond.push(format!("protocol is {}", c.as_str()));
+            }
             if let Some(m) = &r.when_members {
                 let quantifier = match (m.all, m.at_least) {
                     (Some(true), _) => "all".to_string(),
@@ -6707,6 +7099,7 @@ fn dry_run_json(
         tainted_vars,
         run_clock: None,
         wall_deadline: None,
+        retry_landing_deadline: None,
         budget: leaf::BudgetVars::new(&flow.defaults, 0.0, 0),
         workspace: None,
         quiet: true,
@@ -6714,8 +7107,10 @@ fn dry_run_json(
     };
     let mut steps = Vec::new();
     for s in &flow.steps {
+        let retry = leaf::retry_cfg(flow, s);
         let mut invocations = Vec::new();
         let mut push = |label: String, p: &leaf::Prepared| {
+            let invocation_retry = p.retry;
             invocations.push(json!({
                 "label": label,
                 "cmd": p.inv.describe(),
@@ -6724,6 +7119,13 @@ fn dry_run_json(
                 "protocol": protocol::expected_kind(&p.parse),
                 "cwd": p.cwd.as_ref().map(|c| c.display().to_string()),
                 "context_hash": p.context_hash,
+                "retry": {
+                    "mode": invocation_retry.mode_name(),
+                    "max_retries": invocation_retry.max,
+                    "max_attempts": invocation_retry.max_attempts(),
+                    "backoff_sec": invocation_retry.backoff_sec,
+                    "counts_toward_max_total_steps": false,
+                },
             }));
         };
         match (&s.parallel, &s.foreach) {
@@ -6763,6 +7165,13 @@ fn dry_run_json(
             "replay_unfinished": s.replay_policy(flow).as_str(),
             "context": s.context,
             "context_delivery": s.context_delivery().as_str(),
+            "retry": {
+                "mode": retry.mode_name(),
+                "max_retries": retry.max,
+                "max_attempts": retry.max_attempts(),
+                "backoff_sec": retry.backoff_sec,
+                "counts_toward_max_total_steps": false,
+            },
             "invocations": invocations,
             "route": s.route.iter().map(|r| json!({"goto": r.goto})).collect::<Vec<_>>(),
         }));
@@ -6792,6 +7201,14 @@ fn dry_run_json(
         "replay": flow.replay_summary(),
         "unsafe_overrides": flow.unsafe_overrides(),
         "static_max_leaves": flow.static_max_leaves(),
+        "required_versions": flow.resolved_tools().into_iter().filter_map(|tool| {
+            tool.require_version.map(|requirement| json!({
+                "tool": tool.tool,
+                "bin": tool.bin.unwrap_or_else(|| preset::default_program(&tool.tool)),
+                "requirement": requirement,
+                "observed": null,
+            }))
+        }).collect::<Vec<_>>(),
         "vars": vars,
         "steps": steps,
         "warnings": warnings,
@@ -7401,6 +7818,7 @@ struct RouteHit {
     /// keys while they are None, so no other caller has to know about them.
     votes: Option<u32>,
     voters: Option<Vec<String>>,
+    protocol: Option<protocol::ProtocolState>,
 }
 
 /// How much of a step's stderr `when_stderr_matches` will read. A step is free
@@ -7437,6 +7855,7 @@ fn evaluate_route(
     ctx: &template::Ctx<'_>,
     run_dir: &Path,
     members: Members<'_>,
+    protocol_state: Option<protocol::ProtocolState>,
 ) -> Result<Option<RouteHit>, String> {
     let last = leaf::last_line(route_text).to_string();
     // Read at most once per routing decision, and only when a rule asks.
@@ -7514,6 +7933,11 @@ fn evaluate_route(
             }
         }
         if matched {
+            if let Some(want) = r.when_protocol_is {
+                matched = protocol_state == Some(want);
+            }
+        }
+        if matched {
             if let Some(t) = &r.when_stderr_matches {
                 let t = template::render(t, ctx)?;
                 let rx = regex::Regex::new(&t)
@@ -7542,6 +7966,7 @@ fn evaluate_route(
                 line: route_line_of(r, route_text, &last),
                 votes: tally.as_ref().map(|(n, _)| *n),
                 voters: tally.map(|(_, v)| v),
+                protocol: r.when_protocol_is.and(protocol_state),
             }));
         }
     }
@@ -7571,6 +7996,9 @@ fn log_position(
         if let Some(v) = &h.voters {
             o.insert("voters".into(), json!(v));
         }
+        if let Some(state) = h.protocol {
+            o.insert("protocol_state".into(), json!(state.as_str()));
+        }
     }
     log_event(f, ev)
 }
@@ -7580,6 +8008,7 @@ fn apply_on_error(
     step: &flow::Step,
     index_of: &HashMap<String, usize>,
     run_dir: &Path,
+    failure_code: Option<machine::ErrorCode>,
 ) -> Result<ErrorDisposition, String> {
     match step.on_error.as_deref().unwrap_or("fail") {
         "continue" => Ok(ErrorDisposition::Continue),
@@ -7607,11 +8036,23 @@ fn apply_on_error(
                 Ok(ErrorDisposition::Goto(next))
             }
         },
-        _ => Err(format!(
-            "step '{}' failed - see {}",
-            step.id,
-            run_dir.display()
-        )),
+        _ => Err(match failure_code {
+            Some(code) => format!(
+                "{}: step '{}' failed - see {}",
+                code.as_str(),
+                step.id,
+                run_dir.display()
+            ),
+            None => format!("step '{}' failed - see {}", step.id, run_dir.display()),
+        }),
+    }
+}
+
+fn protocol_failure_code(state: Option<protocol::ProtocolState>) -> Option<machine::ErrorCode> {
+    match state {
+        Some(protocol::ProtocolState::MissingTerminal) => Some(machine::ErrorCode::TerminalMissing),
+        Some(protocol::ProtocolState::Invalid) => Some(machine::ErrorCode::ProtocolInvalid),
+        _ => None,
     }
 }
 
@@ -7672,6 +8113,7 @@ fn log_step_end_with_next(
             // an ordinary completed leaf.
             "interrupted": d.interrupted || execute::interrupted(),
             "attempts": d.attempts, "dur_ms": d.dur_ms as u64,
+            "retry_budget_exhausted": d.retry_budget_exhausted,
             "idle_ms": d.idle_ms,
             "output_chars": d.chain_output.chars().count(),
             "output_hash": fingerprint(&d.chain_output),
@@ -8348,6 +8790,7 @@ mod tests {
             when_exit: None,
             when_label_is: None,
             when_outcome_is: None,
+            when_protocol_is: None,
             when_stderr_matches: None,
             when_members: None,
             goto: "end".to_string(),
@@ -8443,6 +8886,7 @@ mod tests {
                 &ctx,
                 Path::new("."),
                 Members::NotAGroup,
+                Some(protocol::ProtocolState::Plain),
             )
             .unwrap()
             .expect("some rule always matches here");
@@ -8464,6 +8908,7 @@ mod tests {
             &ctx,
             Path::new("."),
             Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
         )
         .unwrap()
         .unwrap();
@@ -8492,10 +8937,48 @@ mod tests {
             &ctx,
             Path::new("."),
             Members::NotAGroup,
+            None,
         )
         .unwrap()
         .unwrap();
         assert_eq!(hit.goto, "other");
+    }
+
+    #[test]
+    fn when_protocol_is_uses_recorded_evidence_and_fails_closed_without_it() {
+        let rules = "      - {when_protocol_is: invalid, goto: salvage}\n      - {goto: fail}\n";
+        let (flow, outputs, ids) = route_probe(rules, probe_output(1, ""));
+        let vars = BTreeMap::new();
+        let ctx = template::Ctx {
+            vars: &vars,
+            outputs: &outputs,
+            step_ids: &ids,
+            builtins: BTreeMap::new(),
+        };
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "broken adapter output",
+            &ctx,
+            Path::new("."),
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Invalid),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hit.goto, "salvage");
+        assert_eq!(hit.protocol, Some(protocol::ProtocolState::Invalid));
+
+        let missing = evaluate_route(
+            &flow.steps[0],
+            "broken adapter output",
+            &ctx,
+            Path::new("."),
+            Members::NotAGroup,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(missing.goto, "fail");
     }
 
     #[test]
@@ -8515,15 +8998,29 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            &dir,
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.goto, "guard_fired");
 
         std::fs::remove_file(&err).unwrap();
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            &dir,
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.goto, "broken", "a missing stderr file must not match");
 
         // A step that never recorded a stderr file at all (a fan-out group)
@@ -8535,9 +9032,16 @@ mod tests {
             step_ids: &ids,
             builtins: BTreeMap::new(),
         };
-        let hit = evaluate_route(&flow.steps[0], "PROBE-DONE", &ctx, &dir, Members::NotAGroup)
-            .unwrap()
-            .unwrap();
+        let hit = evaluate_route(
+            &flow.steps[0],
+            "PROBE-DONE",
+            &ctx,
+            &dir,
+            Members::NotAGroup,
+            Some(protocol::ProtocolState::Plain),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(hit.goto, "broken");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8631,7 +9135,7 @@ mod tests {
         std::fs::write(dir.join("probe.err.txt"), "permission denied\n").unwrap();
         std::fs::write(
             dir.join("log.jsonl"),
-            "{\"event\":\"step_end\",\"step\":\"probe\",\"visit\":1,\"exit\":3,\"timed_out\":false,\"interrupted\":false,\"chain_file\":\"probe.chain.txt\",\"out_file\":\"probe.out.txt\"}\n",
+            "{\"event\":\"step_end\",\"step\":\"probe\",\"visit\":1,\"exit\":3,\"timed_out\":false,\"interrupted\":false,\"protocol_state\":\"invalid\",\"chain_file\":\"probe.chain.txt\",\"out_file\":\"probe.out.txt\"}\n",
         )
         .unwrap();
 
@@ -8648,6 +9152,7 @@ mod tests {
         assert!(pending.errored);
         assert_eq!(pending.step, "probe");
         assert_eq!(pending.route_text, "guard refused");
+        assert_eq!(pending.protocol, Some(protocol::ProtocolState::Invalid));
         assert_eq!(resumed.outputs["probe"].exit, 3);
         assert!(
             resumed.outputs["probe"].output.contains("did not complete"),
@@ -8713,6 +9218,41 @@ mod tests {
         assert_eq!(state.last_success.as_deref(), Some("work"));
         assert_eq!(state.total, 2);
         assert_eq!(state.cost_usd, 0.35);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_preserves_retry_budget_landing_until_its_event_is_durable() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-resume-retry-budget-{}",
+            contain::random_nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let checkpoint = concat!(
+            "{\"event\":\"step_end\",\"step\":\"work\",\"visit\":1,",
+            "\"exit\":7,\"timed_out\":false,\"interrupted\":false,",
+            "\"retry_budget_exhausted\":true}\n"
+        );
+        std::fs::write(dir.join("log.jsonl"), checkpoint).unwrap();
+
+        let state = load_resume(&dir).expect("retry landing checkpoint must load");
+        assert_eq!(state.start.as_deref(), Some("work"));
+        assert_eq!(state.retry_budget_trigger.as_deref(), Some("wall_clock"));
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log.jsonl"))
+            .unwrap();
+        writeln!(
+            log,
+            "{{\"event\":\"budget_landing\",\"trigger\":\"wall_clock\",\"goto\":\"wrap\"}}"
+        )
+        .unwrap();
+        drop(log);
+
+        let state = load_resume(&dir).expect("durable landing must load");
+        assert!(state.budget_landed);
+        assert!(state.retry_budget_trigger.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

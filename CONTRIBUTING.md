@@ -3,6 +3,10 @@
 Thank you for helping improve sfh. Bug reports, portability findings,
 documentation fixes, and focused pull requests are welcome.
 
+Maintenance sessions driven by an AI agent should start from
+[AGENTS.md](AGENTS.md), which holds the repository map and the invariants this
+document assumes.
+
 ## Before opening a change
 
 For behavior changes, open an issue first when the public YAML format, durable

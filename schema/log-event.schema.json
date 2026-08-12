@@ -142,7 +142,7 @@
         "missing_terminal",
         "invalid"
       ],
-      "description": "step_end: whether the structured protocol held end to end. `valid` means the tool's documented terminal record arrived; `missing_terminal` that the stream stopped before it; `invalid` that the output was not the documented shape. Only `plain` and `valid` may accompany a successful step. Added in v1.2.0; absent from older logs."
+      "description": "step_end: whether the structured protocol held end to end. `valid` means the tool's documented terminal record arrived; `missing_terminal` that the stream stopped before it; `invalid` that the output was not the documented shape. Only `plain` and `valid` may accompany a successful step. position: the state a when_protocol_is rule matched. Added to step_end in v1.2.0 and position in v1.6.0; absent from older logs."
     },
     "terminal_seen": {
       "type": "boolean",

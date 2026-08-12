@@ -1,6 +1,6 @@
 # Machine API reference
 
-This describes sfh 1.4.0's `--json` surface as it actually behaves today:
+This describes sfh 1.6.0's `--json` surface as it actually behaves today:
 which commands answer with the shared envelope, what the envelope contains,
 the error-code vocabulary, the stability guarantee a caller can rely on, and
 where the surface is currently inconsistent. It documents behavior, not a
@@ -63,6 +63,19 @@ Command-specific fields (e.g. `run`'s `run_dir`, `run_id`, `result`,
 command; see each command's `--help` or the worked example in the main
 README's "Driving sfh from a program" section for a concrete instance.
 
+Terminal `run`, `status`, and `wait` answers preserve one classification: a
+protocol failure is `SFH_PROTOCOL_INVALID` or `SFH_TERMINAL_MISSING` in all
+three commands, and a human-decision terminal is `SFH_STUCK`. The on-disk
+`status.json` keeps its historical prose `error` string and records the same
+classification additively as `error_code`; `status --json` converts those to
+the envelope's required `{"code", "message"}` object.
+
+`preflight --json` also separates flow validity from machine readiness. Its
+body carries `flow_valid` (`true`, `false`, or `null` for a flowless survey)
+and `failure_kind` (`flow_invalid`, `capability_unavailable`, or `null`). A
+static flow error uses `SFH_FLOW_INVALID`; a valid flow blocked by a missing or
+unverifiable program uses `SFH_CAPABILITY_UNAVAILABLE`.
+
 ## Error-code vocabulary
 
 `error.code` is always one of the following (`src/machine.rs::ErrorCode`).
@@ -80,10 +93,13 @@ allowed to be reworded at any time.
 | `SFH_WORKSPACE_MISSING` | A managed workspace that should exist does not. |
 | `SFH_WORKSPACE_DRIFT` | A managed workspace changed underneath a resume. |
 | `SFH_WORKSPACE_BUSY` | Another live run holds this workspace. |
+| `SFH_RUN_BUSY` | Another live process owns this run directory. |
 | `SFH_WORKSPACE_UNOWNED` | A path sfh was asked to manage is not one it created. |
 | `SFH_REPLAY_REFUSED` | A replay policy refused to re-run an unfinished effect. |
 | `SFH_PERSISTENCE_FAILURE` | A required durable artifact could not be written. |
-| `SFH_CAPABILITY_UNAVAILABLE` | A capability the flow requires is not available here. |
+| `SFH_CAPABILITY_UNAVAILABLE` | A capability the flow requires is unavailable or unverifiable, including a failed `require_version` check. |
+| `SFH_STUCK` | The flow deliberately stopped for a human decision, including a `goto: stuck` reached through `max_visits`. |
+| `SFH_INTERRUPTED` | The run was stopped or its recorded owning process disappeared. |
 
 ## Stability guarantee
 
@@ -137,12 +153,19 @@ these four incorrectly.
 - **`sfh runs show --json`** — the same per-run fields as above flattened
   into the top level (no nested `summary` key) alongside `flow`,
   `sfh_version`, `tools`, `budget_landed`, `steps` — with no wrapper at all.
+  Each `steps[]` entry includes `attempts`, the total process attempts across
+  its leaf events; a legacy `step_end` without that field counts as one.
 - **`sfh runs why --json`** — `{"run_dir", "state", "current_step", "error",
   "harness_diagnostic", "protocol_failure", "explanation", "last_event",
   "last_position", "unfinished_leaves", "unfinished_fanouts",
   "unfinished_fallbacks", "unfinished_postprocessing"}`. Note that `error`
   here is a bare string-or-`null` from the run's `status.json`, which looks
   superficially like the envelope's `error` field but is not shaped like it.
+
+These legacy commands still honor the basic stdout guarantee on early
+failures. Missing arguments, unknown flags, and a missing/unsafe run directory
+produce valid bare JSON with `"ok": false` and a prose `"error"` string;
+they never leave stdout empty when `--json` was requested.
 
 This is a real trap, not just a hypothetical one: a `run --json` envelope's
 own `next_actions` routinely suggests `sfh runs why <dir> --json` as the next
@@ -152,6 +175,6 @@ another envelope. Detect which kind of response you have by checking for
 
 **Intended direction, not yet scheduled:** unifying `validate` and `runs
 list|show|why` onto the envelope is the known fix for this gap. It has not
-happened as of 1.4.0 because it is a breaking change to four response shapes
+happened as of 1.6.0 because it is a breaking change to four response shapes
 at once, and it is out of scope for the fixes in this document — treat the
 shapes above as current fact, not as something about to change underfoot.

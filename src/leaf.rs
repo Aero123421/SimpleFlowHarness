@@ -61,6 +61,24 @@ impl Default for RetryCfg {
     }
 }
 
+impl RetryCfg {
+    pub fn max_attempts(self) -> u32 {
+        if self.mode == RetryMode::Never {
+            1
+        } else {
+            self.max.saturating_add(1)
+        }
+    }
+
+    pub fn mode_name(self) -> &'static str {
+        match self.mode {
+            RetryMode::Transient => "transient",
+            RetryMode::Any => "any",
+            RetryMode::Never => "never",
+        }
+    }
+}
+
 /// The session this step was resolved to continue or fork, as decided while
 /// preparing it. Recorded in step_start so a reader of log.jsonl can follow the
 /// session lineage without re-deriving it from the flow (which, after an edit
@@ -90,6 +108,10 @@ pub struct Prepared {
     /// Absolute run-level deadline. Unlike a relative step timeout this also
     /// expires while a leaf waits in a bounded fan-out queue.
     pub wall_deadline: Option<std::time::Instant>,
+    /// The wall-clock budget landing threshold. It does not interrupt a
+    /// running attempt, but it stops a backoff from launching another attempt
+    /// after the reserve window has begun.
+    pub retry_landing_deadline: Option<std::time::Instant>,
     pub preassigned_session: Option<String>,
     pub expect_session: Option<String>,
     /// On resume: the session marker the tool must report back (see SessionInfo).
@@ -143,6 +165,9 @@ pub struct LeafDone {
     /// Silence before the child exited or was killed (see ExecOutcome::idle_ms).
     pub idle_ms: u64,
     pub attempts: u32,
+    /// A retry was ready but its backoff reached the wall-clock budget landing
+    /// threshold. The engine must land before applying fallback/on_error.
+    pub retry_budget_exhausted: bool,
     pub chain_output: String,
     pub stderr_clean: String,
     pub out_file: PathBuf,
@@ -180,6 +205,7 @@ impl LeafDone {
 pub struct Effective {
     pub tool: Option<String>,
     pub bin: Option<String>,
+    pub require_version: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub access: preset::Access,
@@ -247,6 +273,17 @@ pub fn effective_with(
             prof.bin.clone().or_else(|| step.bin.clone())
         } else {
             step.bin.clone().or_else(|| prof.bin.clone())
+        },
+        require_version: if profile_override.is_some() {
+            prof.require_version
+                .clone()
+                .or_else(|| step.require_version.clone())
+                .or_else(|| d.require_version.clone())
+        } else {
+            step.require_version
+                .clone()
+                .or_else(|| prof.require_version.clone())
+                .or_else(|| d.require_version.clone())
         },
         model,
         effort: step
@@ -404,6 +441,9 @@ pub struct PrepCtx<'a> {
     pub run_clock: Option<&'a Arc<std::sync::atomic::AtomicU64>>,
     /// Hard run deadline applied to every prepared leaf.
     pub wall_deadline: Option<std::time::Instant>,
+    /// Earlier wall-clock threshold at which retry backoff yields to
+    /// `on_budget`. Unlike wall_deadline, it never kills an active attempt.
+    pub retry_landing_deadline: Option<std::time::Instant>,
     /// Spend and time as of now, exposed to templates as `{{budget.*}}`.
     pub budget: BudgetVars,
     /// The managed workspace this run's steps execute in, when the flow asked
@@ -1209,6 +1249,7 @@ pub fn prepare_leaf(
         cwd,
         timeout: timeout_sec.map(Duration::from_secs),
         wall_deadline: cx.wall_deadline,
+        retry_landing_deadline: cx.retry_landing_deadline,
         preassigned_session: preassigned,
         expect_session,
         expect_marker,
@@ -1825,29 +1866,52 @@ pub fn exec_leaf(prep: Prepared) -> LeafDone {
             return done;
         }
         let wait = cfg.backoff_sec.saturating_mul(1u64 << attempt.min(5));
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        let landing_preempts_retry = prep
+            .retry_landing_deadline
+            .is_some_and(|landing| landing <= retry_deadline);
         if !prep.quiet {
             let why = if done.timed_out {
                 format!("timed out after {}s of silence", done.idle_ms / 1000)
             } else {
                 format!("exit={}", done.exit_code)
             };
-            eprintln!(
-                "sfh: [{}] transient failure ({why}), retrying in {wait}s ({}/{})",
-                prep.tag,
-                attempt + 1,
-                cfg.max
-            );
+            if landing_preempts_retry {
+                eprintln!(
+                    "sfh: [{}] retryable failure ({why}); budget landing will pre-empt attempt {}",
+                    prep.tag,
+                    attempt + 2
+                );
+            } else {
+                eprintln!(
+                    "sfh: [{}] retryable failure ({why}), retrying in {wait}s ({}/{})",
+                    prep.tag,
+                    attempt + 1,
+                    cfg.max
+                );
+            }
         }
-        let retry_deadline = std::time::Instant::now() + Duration::from_secs(wait);
-        let deadline = prep
-            .wall_deadline
-            .map(|wall| wall.min(retry_deadline))
-            .unwrap_or(retry_deadline);
+        let deadline = [
+            Some(retry_deadline),
+            prep.wall_deadline,
+            prep.retry_landing_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(retry_deadline);
         while std::time::Instant::now() < deadline {
             if execute::interrupted() {
                 return done;
             }
             std::thread::sleep(Duration::from_millis(200));
+        }
+        if prep
+            .retry_landing_deadline
+            .is_some_and(|landing| std::time::Instant::now() >= landing)
+        {
+            done.retry_budget_exhausted = true;
+            return done;
         }
         attempt += 1;
     }
@@ -1972,6 +2036,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             dur_ms: 0,
             idle_ms: 0,
             attempts: 1,
+            retry_budget_exhausted: false,
             chain_output: String::new(),
             stderr_clean: why.clone(),
             out_file: p.out_file,
@@ -2022,6 +2087,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             dur_ms: 0,
             idle_ms: 0,
             attempts: 1,
+            retry_budget_exhausted: false,
             chain_output: String::new(),
             stderr_clean: why.into(),
             out_file: p.out_file,
@@ -2079,6 +2145,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 dur_ms: 0,
                 idle_ms: 0,
                 attempts: 1,
+                retry_budget_exhausted: false,
                 chain_output: String::new(),
                 stderr_clean: e.clone(),
                 out_file: p.out_file,
@@ -2212,7 +2279,13 @@ fn exec_once(p: Prepared) -> LeafDone {
         })
         .flatten();
     if let Some(why) = &protocol_failure {
-        stderr_clean.push_str(&format!("\nsfh: {why}\n"));
+        // Streaming observers surface their bounded diagnostic before parsed
+        // evidence is finalized. `failure_reason` can then return that exact
+        // same diagnosis; persist it once while retaining genuinely distinct
+        // parse and protocol failures.
+        if harness_diagnostic.as_deref() != Some(why.as_str()) {
+            stderr_clean.push_str(&format!("\nsfh: {why}\n"));
+        }
         harness_diagnostic.get_or_insert_with(|| why.clone());
         if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
             persistence_error.get_or_insert_with(|| {
@@ -2412,6 +2485,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         dur_ms: outcome.dur_ms,
         idle_ms: outcome.idle_ms,
         attempts: 1,
+        retry_budget_exhausted: false,
         chain_output,
         stderr_clean,
         out_file: p.out_file,
@@ -3222,6 +3296,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         dur_ms: 0,
         idle_ms: 0,
         attempts: 1,
+        retry_budget_exhausted: false,
         chain_output: String::new(),
         stderr_clean: "sfh: internal error: worker thread died before producing a result".into(),
         out_file: PathBuf::new(),
@@ -4198,6 +4273,38 @@ mod tests {
         .is_none());
     }
 
+    #[test]
+    fn retry_backoff_yields_before_crossing_the_budget_landing_threshold() {
+        let flow: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: retrying\n    cmd: [\"sfh-this-program-does-not-exist-f6\"]\n    retry: {max: 3, backoff_sec: 30}\n    retry_on: any\n",
+        )
+        .unwrap();
+        let dir = temp_run_dir();
+        let vars = BTreeMap::new();
+        let outputs = BTreeMap::new();
+        let step_ids = flow.step_ids();
+        let sessions = HashMap::new();
+        let needed = HashSet::new();
+        let mut prepared = prepare_leaf(
+            &ctx(&flow, &vars, &outputs, &step_ids, &dir, &sessions, &needed),
+            &flow.steps[0],
+            1,
+            "retrying",
+            &[],
+            None,
+        )
+        .unwrap();
+        prepared.retry_landing_deadline =
+            Some(std::time::Instant::now() + Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let done = exec_leaf(prepared);
+        assert!(done.retry_budget_exhausted);
+        assert_eq!(done.attempts, 1, "no second process may start in reserve");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn temp_run_dir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("sfh-leaf-test-{}", gen_uuid()));
         std::fs::create_dir_all(&d).unwrap();
@@ -4234,6 +4341,7 @@ mod tests {
             tainted_vars: no_tainted_vars(),
             run_clock: None,
             wall_deadline: None,
+            retry_landing_deadline: None,
             budget: BudgetVars::default(),
             quiet: true,
             verbose: false,
@@ -4892,6 +5000,7 @@ mod tests {
             tainted_vars: &tainted,
             run_clock: None,
             wall_deadline: None,
+            retry_landing_deadline: None,
             budget: BudgetVars::default(),
             quiet: true,
             verbose: false,

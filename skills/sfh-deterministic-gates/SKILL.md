@@ -2,10 +2,10 @@
 name: sfh-deterministic-gates
 description: >
   Design deterministic gates and routing in SimpleFlowHarness. Use when tests, builds, validators, CI conclusions, exact votes, exit codes, stderr patterns, outcomes, labels, or AI verdicts decide what happens next; when separating deterministic facts from nondeterministic model output; or when a flow retries, branches, or gets stuck for the wrong reason.
-compatibility: Uses sfh v1.5 outcomes, labels, route predicates, protocol evidence, and when_members semantics.
+compatibility: Uses sfh v1.6 outcomes, labels, route predicates, protocol evidence, and when_members semantics.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.5.x"
+  target-sfh: "1.6.x"
 ---
 
 # Put machine facts in machine gates

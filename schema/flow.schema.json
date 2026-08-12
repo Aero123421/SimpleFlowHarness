@@ -95,6 +95,11 @@
       ],
       "description": "read = no writes, write = workspace edits (never an auto-approved shell), full = auto-approve everything. Mandatory for AI steps (on the step, its profile, or defaults); there is no implicit default. cursor supports only read and full."
     },
+    "versionRequirement": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required CLI version: an exact major.minor[.patch] version or comma-separated comparisons such as >=1.2.0, <2.0.0. Prerelease and build suffixes are supported."
+    },
     "action": {
       "type": "string",
       "pattern": "^(fail|continue|goto:[A-Za-z0-9_-]+|goto:end|goto:fail|goto:stuck)$",
@@ -126,6 +131,9 @@
       "properties": {
         "tool": {
           "$ref": "#/definitions/tool"
+        },
+        "require_version": {
+          "$ref": "#/definitions/versionRequirement"
         },
         "model": {
           "type": "string"
@@ -277,6 +285,9 @@
           "type": "string",
           "description": "Executable path override."
         },
+        "require_version": {
+          "$ref": "#/definitions/versionRequirement"
+        },
         "model": {
           "type": "string"
         },
@@ -390,6 +401,15 @@
         "when_outcome_is": {
           "$ref": "#/definitions/outcomeResult",
           "description": "Equality against the outcome class sfh recorded for this step. Added in v1.4.0."
+        },
+        "when_protocol_is": {
+          "enum": [
+            "plain",
+            "valid",
+            "missing_terminal",
+            "invalid"
+          ],
+          "description": "Equality against sfh's recorded structured-protocol state for this leaf. cmd: steps are plain; preset tool steps are valid, missing_terminal, or invalid."
         }
       }
     },
@@ -481,6 +501,9 @@
         },
         "bin": {
           "type": "string"
+        },
+        "require_version": {
+          "$ref": "#/definitions/versionRequirement"
         },
         "model": {
           "type": "string"
@@ -757,7 +780,7 @@
       "properties": {
         "file": {
           "type": "string",
-          "description": "A path, relative to the flow file unless absolute. Read no-follow and contained to the flow directory and the resolved workspace unless allow_external is set."
+          "description": "A literal path, relative to the flow file unless absolute; templates are not expanded. Read no-follow and contained to the flow directory and the resolved workspace unless allow_external is set."
         },
         "inline": {
           "type": "string",

@@ -49,6 +49,8 @@ pub enum ErrorCode {
     WorkspaceDrift,
     /// Another live run holds this workspace.
     WorkspaceBusy,
+    /// Another live process owns this run directory.
+    RunBusy,
     /// A path sfh was asked to manage is not one it created.
     WorkspaceUnowned,
     /// A replay policy refused to re-run an unfinished effect.
@@ -57,6 +59,10 @@ pub enum ErrorCode {
     PersistenceFailure,
     /// A capability the flow requires is not available here.
     CapabilityUnavailable,
+    /// The flow deliberately stopped for a human decision.
+    Stuck,
+    /// The run was stopped or its owning process disappeared.
+    Interrupted,
 }
 
 impl ErrorCode {
@@ -71,11 +77,37 @@ impl ErrorCode {
             ErrorCode::WorkspaceMissing => "SFH_WORKSPACE_MISSING",
             ErrorCode::WorkspaceDrift => "SFH_WORKSPACE_DRIFT",
             ErrorCode::WorkspaceBusy => "SFH_WORKSPACE_BUSY",
+            ErrorCode::RunBusy => "SFH_RUN_BUSY",
             ErrorCode::WorkspaceUnowned => "SFH_WORKSPACE_UNOWNED",
             ErrorCode::ReplayRefused => "SFH_REPLAY_REFUSED",
             ErrorCode::PersistenceFailure => "SFH_PERSISTENCE_FAILURE",
             ErrorCode::CapabilityUnavailable => "SFH_CAPABILITY_UNAVAILABLE",
+            ErrorCode::Stuck => "SFH_STUCK",
+            ErrorCode::Interrupted => "SFH_INTERRUPTED",
         }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::Usage,
+            Self::FlowInvalid,
+            Self::ProtocolInvalid,
+            Self::TerminalMissing,
+            Self::SessionUnverified,
+            Self::ExecutionClosureChanged,
+            Self::WorkspaceMissing,
+            Self::WorkspaceDrift,
+            Self::WorkspaceBusy,
+            Self::RunBusy,
+            Self::WorkspaceUnowned,
+            Self::ReplayRefused,
+            Self::PersistenceFailure,
+            Self::CapabilityUnavailable,
+            Self::Stuck,
+            Self::Interrupted,
+        ]
+        .into_iter()
+        .find(|code| code.as_str() == value)
     }
 }
 
@@ -191,10 +223,13 @@ mod tests {
             WorkspaceMissing,
             WorkspaceDrift,
             WorkspaceBusy,
+            RunBusy,
             WorkspaceUnowned,
             ReplayRefused,
             PersistenceFailure,
             CapabilityUnavailable,
+            Stuck,
+            Interrupted,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
@@ -218,10 +253,13 @@ mod tests {
             "SFH_WORKSPACE_MISSING",
             "SFH_WORKSPACE_DRIFT",
             "SFH_WORKSPACE_BUSY",
+            "SFH_RUN_BUSY",
             "SFH_WORKSPACE_UNOWNED",
             "SFH_REPLAY_REFUSED",
             "SFH_PERSISTENCE_FAILURE",
             "SFH_CAPABILITY_UNAVAILABLE",
+            "SFH_STUCK",
+            "SFH_INTERRUPTED",
         ] {
             assert!(seen.contains(expected), "{expected} disappeared");
         }

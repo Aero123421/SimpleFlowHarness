@@ -2,10 +2,10 @@
 name: sfh-flow-review
 description: >
   Audit an existing SimpleFlowHarness YAML flow for correctness, stability, convergence, recovery, security boundaries, portability, context/workspace use, external-tool identity, CI monitoring, and AI usability. Use when reviewing an AI-authored flow, diagnosing a brittle loop, checking a flow before release, or producing prioritized fixes without running paid or mutating steps.
-compatibility: Review against the installed sfh version; bundled rubric targets v1.5.x.
+compatibility: Review against the installed sfh version; bundled rubric targets v1.6.x.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.5.x"
+  target-sfh: "1.6.x"
 ---
 
 # Review the flow as a program, not as prose

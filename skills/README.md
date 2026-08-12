@@ -90,7 +90,7 @@ sfh flowのheuristic lint:
 python3 skills/tools/lint_sfh_flow.py path/to/flow.yaml
 ```
 
-実際のsfh v1.5で:
+実際のsfh v1.6で:
 
 ```bash
 sfh validate flow.yaml --strict

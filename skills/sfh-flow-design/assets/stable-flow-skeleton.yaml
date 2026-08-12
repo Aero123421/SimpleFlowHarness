@@ -1,9 +1,9 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
 api_version: 1
 name: stable-change-loop
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: keep
 
 contexts:
@@ -54,6 +54,7 @@ steps:
     on_max_visits: goto:handoff
     cmd: ["git", "diff", "--check"]
     on_error: goto:fix
+    route: [{goto: review}]
 
   - id: review
     use: reviewer

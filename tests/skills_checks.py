@@ -26,7 +26,7 @@ CATALOG = SKILLS / "skill-catalog.json"
 REFERENCE_RE = re.compile(
     r"(?<![A-Za-z0-9_./-])((?:references|scripts|assets)/[A-Za-z0-9_.\-/]+)"
 )
-# The `# yaml-language-server: $schema=.../v1.5.0/schema/...` header every
+# The `# yaml-language-server: $schema=.../v1.6.0/schema/...` header every
 # example flow carries.
 SCHEMA_PIN_RE = re.compile(
     r"SimpleFlowHarness/v(\d+)\.(\d+)\.(\d+)/schema/flow\.schema\.json"
@@ -226,9 +226,10 @@ def _has_pyyaml() -> bool:
 
 
 @unittest.skipUnless(_has_pyyaml(), "the bundled linter needs PyYAML")
-class LoopBoundRule(unittest.TestCase):
-    """SFH042/SFH043 used to read the wrong node of the cycle.
+class LinterRules(unittest.TestCase):
+    """Regression checks for the high-value heuristic rules.
 
+    SFH042/SFH043 used to read the wrong node of the cycle.
     The rule checked whether the step a backward route points AT carries
     `max_visits`. A review/fix loop puts the bound on the fixer that jumps
     back - the step whose repeated failure is what you would give up on - so
@@ -261,6 +262,22 @@ class LoopBoundRule(unittest.TestCase):
         output = self.lint(BOUNDED_AT_THE_SOURCE)
         self.assertNotIn("SFH042", output)
         self.assertNotIn("SFH043", output)
+
+    def test_remote_reads_are_read_but_known_remote_mutations_are_external(self) -> None:
+        remote_read = """api_version: 1
+name: remote-read
+workspace: {mode: current}
+steps:
+  - {id: query, cmd: [web-search-cli, search, topic], effects: read}
+"""
+        remote_write = """api_version: 1
+name: remote-write
+workspace: {mode: current}
+steps:
+  - {id: create, cmd: [gh, issue, create, --title, test], effects: read}
+"""
+        self.assertNotIn("SFH033", self.lint(remote_read))
+        self.assertIn("SFH033", self.lint(remote_write))
 
     def test_the_bundled_flows_are_clean(self) -> None:
         # The pack's own README makes this linter step 6 of the standard
