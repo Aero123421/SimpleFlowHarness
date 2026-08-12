@@ -54,6 +54,14 @@ jobs:
           # --profiles overlay files, which are not flows and are not validated
           # as such.
           for f in examples/*.yaml; do ./target/release/sfh validate "$f"; done
+          # `validate` never opens a context file; `plan` does, and CONTRIBUTING
+          # already tells contributors to run both over every example. Only
+          # validate was gated, so examples/managed-loop.yaml shipped naming a
+          # context file that was not in the tree: it validated, and the very
+          # command the README points a new reader at (`sfh plan <example>`)
+          # failed on a clean checkout. Plan resolves in a temporary directory
+          # and starts no process.
+          for f in examples/*.yaml; do ./target/release/sfh plan "$f" > /dev/null; done
           # The overlay must still parse, and must still apply cleanly to the
           # flow that documents it.
           ./target/release/sfh validate examples/managed-loop.yaml --profiles examples/profiles/local.yaml
