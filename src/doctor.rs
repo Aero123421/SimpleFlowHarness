@@ -99,6 +99,20 @@ pub fn run(flow_path: Option<&Path>, timeout_sec: u64, work: &Path) -> i32 {
         eprintln!("sfh: cannot create {}: {e}", work.display());
         return 2;
     }
+    // Every path handed to an external CLI is absolute. The probe runs with the
+    // scratch directory as its cwd (so it cannot read the repository's own
+    // instruction files, and cannot write into the user's project), which means
+    // a relative artifact path - `--output-last-message`, `--prompt-file` -
+    // would resolve against the scratch dir instead of against sfh's cwd and
+    // land somewhere nobody looks, or nowhere at all.
+    let work = match work.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sfh: cannot resolve {}: {e}", work.display());
+            return 2;
+        }
+    };
+    let work = work.as_path();
     eprintln!(
         "sfh: probing {} tool(s) with a one-token prompt each; this makes real calls",
         targets.len()
@@ -133,7 +147,7 @@ pub fn run(flow_path: Option<&Path>, timeout_sec: u64, work: &Path) -> i32 {
         let outcome = if version.is_none() && !required {
             None
         } else {
-            Some(run_probe(built.expect("built"), timeout_sec))
+            Some(run_probe(built.expect("built"), timeout_sec, work))
         };
         let r = Report {
             tool,
@@ -270,7 +284,7 @@ fn build_probe(
     Ok((program, built))
 }
 
-fn run_probe(built: preset::Built, timeout_sec: u64) -> Result<Detail, String> {
+fn run_probe(built: preset::Built, timeout_sec: u64, work: &Path) -> Result<Detail, String> {
     let mut argv = built.argv;
     let stdin_payload = match built.delivery {
         preset::Delivery::Stdin => Some(PROBE.as_bytes().to_vec()),
@@ -283,7 +297,13 @@ fn run_probe(built: preset::Built, timeout_sec: u64) -> Result<Detail, String> {
     let out = execute::run_cmd(
         &execute::Invocation::Argv(argv),
         stdin_payload,
-        None,
+        // Probe from the scratch directory, not from wherever sfh was invoked.
+        // Every one of these CLIs reads project instruction files (CLAUDE.md,
+        // AGENTS.md, .cursor/, an opencode config) out of its working directory,
+        // so a doctor run in a repository was answering a question about that
+        // repository's configuration rather than about the adapter. It also
+        // means the probe cannot write into the user's project.
+        Some(work),
         Some(Duration::from_secs(timeout_sec)),
         &built.env_remove,
         &built.env_set,
@@ -330,6 +350,14 @@ fn run_probe(built: preset::Built, timeout_sec: u64) -> Result<Detail, String> {
 }
 
 /// Where doctor keeps its scratch prompt/last-message files.
-pub fn default_work_dir(runs_dir: &Path) -> PathBuf {
-    runs_dir.join(".doctor")
+/// Where `doctor` does its probing.
+///
+/// A state root, when one is given, keeps the scratch directory out of the
+/// user's project entirely; otherwise it stays where it has always been, under
+/// the runs root, so nothing about the default layout changes.
+pub fn default_work_dir(runs_dir: &Path, state: &crate::state::StateRoot) -> PathBuf {
+    match state.doctor_dir() {
+        Some(d) => d,
+        None => runs_dir.join(".doctor"),
+    }
 }

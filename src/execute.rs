@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -10,20 +11,70 @@ pub enum Invocation {
     /// Spawned directly, no shell. argv[0] is resolved against PATH
     /// (on Windows also tries .exe/.cmd/.bat so npm shims work).
     Argv(Vec<String>),
+    /// The same, except that some argv elements carry payload the durable log
+    /// must not hold. Adapters that deliver the prompt through argv (agy's
+    /// `-p <prompt>`) mark those indices when they build the command line; the
+    /// child still receives the real argv, but every rendering of it - verbose
+    /// progress, `step_start.cmd`, `step_end.cmd`, spawn errors - shows a
+    /// summary instead of the text (spec P0-04).
+    ///
+    /// The prompt is flow data: it can carry a pasted file, a previous step's
+    /// output, or anything a `--var` put there, and the run directory outlives
+    /// the run.
+    ArgvWithPayload {
+        argv: Vec<String>,
+        payload_at: Vec<usize>,
+    },
     /// Run through `cmd /C` (Windows) or `sh -c` (Unix).
     Shell(String),
 }
 
 impl Invocation {
-    pub fn describe(&self) -> String {
+    /// The argv actually handed to the OS, payload included. Not for logging.
+    pub fn argv(&self) -> Option<&[String]> {
         match self {
-            Invocation::Argv(a) => a
+            Invocation::Argv(a) => Some(a),
+            Invocation::ArgvWithPayload { argv, .. } => Some(argv),
+            Invocation::Shell(_) => None,
+        }
+    }
+
+    /// Mark argv elements as payload. A no-op for a shell invocation, whose
+    /// text is the command itself and is never a prompt delivery channel.
+    pub fn redact_argv(self, payload_at: Vec<usize>) -> Invocation {
+        if payload_at.is_empty() {
+            return self;
+        }
+        match self {
+            Invocation::Argv(argv) | Invocation::ArgvWithPayload { argv, .. } => {
+                Invocation::ArgvWithPayload { argv, payload_at }
+            }
+            shell => shell,
+        }
+    }
+
+    /// How this command is written down anywhere a human or a durable artifact
+    /// can see it. Binary path, flags, model, cwd and every other diagnostic
+    /// argument survive; a marked payload becomes its length and digest, which
+    /// is enough to prove two runs used the same prompt without storing it.
+    pub fn describe(&self) -> String {
+        let quote = |s: &String| {
+            if s.contains(' ') || s.is_empty() {
+                format!("\"{s}\"")
+            } else {
+                s.clone()
+            }
+        };
+        match self {
+            Invocation::Argv(a) => a.iter().map(quote).collect::<Vec<_>>().join(" "),
+            Invocation::ArgvWithPayload { argv, payload_at } => argv
                 .iter()
-                .map(|s| {
-                    if s.contains(' ') || s.is_empty() {
-                        format!("\"{s}\"")
+                .enumerate()
+                .map(|(i, s)| {
+                    if payload_at.contains(&i) {
+                        redacted_payload(s)
                     } else {
-                        s.clone()
+                        quote(s)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -31,6 +82,15 @@ impl Invocation {
             Invocation::Shell(s) => format!("$ {s}"),
         }
     }
+}
+
+/// What replaces a payload argument in every log line.
+pub fn redacted_payload(value: &str) -> String {
+    format!(
+        "<prompt chars={} sha256={}>",
+        value.chars().count(),
+        crate::sha256::hex(value.as_bytes())
+    )
 }
 
 pub struct ExecOutcome {
@@ -54,10 +114,21 @@ pub struct ExecOutcome {
 /// Where a child's output goes besides the capture buffer, and which run-level
 /// clock its arrival touches. Bundled so `run_cmd` keeps one "observation"
 /// parameter instead of growing one per watcher.
+/// Receives every stdout byte before the bounded diagnostic capture drops any
+/// of it. Structured presets use this to extract their final answer and usage
+/// incrementally instead of treating a raw transcript size limit as a semantic
+/// limit. Implementations must stay bounded: this callback runs on the pipe
+/// reader thread and sees untrusted tool output.
+pub trait OutputObserver: Send + Sync {
+    fn observe(&self, chunk: &[u8]);
+}
+
 #[derive(Default, Clone)]
 pub struct Observe {
     /// Mirror stdout to this file as it arrives.
     pub tee: Option<std::path::PathBuf>,
+    /// Optional bounded semantic observer for structured stdout.
+    pub stdout_observer: Option<Arc<dyn OutputObserver>>,
     /// Run-level activity clock in unix-epoch seconds, shared by every child of
     /// the run so `status.json` can report when ANY of them last said anything.
     /// 0 means nothing has been read yet.
@@ -693,11 +764,69 @@ pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    if unsafe { libc::kill(pid as i32, 0) } == 0 {
-        return true;
-    }
-    // EPERM: it exists, it just is not ours to signal.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let signalable = if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        true
+    } else {
+        // EPERM: it exists, it just is not ours to signal.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    // A zombie answers kill(pid, 0) exactly as a live process does - the pid is
+    // still in the table, holding an exit status nobody has collected - but it
+    // is not running, and where PID 1 does not reap orphans it never will be.
+    // That host is not exotic: it is every container started without an init,
+    // which is precisely where a `--detach` run lives. Counting a zombie as
+    // alive made a SIGKILLed run read `running` until its heartbeat went stale,
+    // told `sfh stop` to verify ownership of a process whose /proc/<pid>/exe a
+    // zombie no longer has (so the stop was refused), and left
+    // `--carry-budget-from` refusing permanently (see `carry_source_is_final`).
+    signalable && !pid_is_zombie(pid)
+}
+
+/// Whether this pid names a process that has already exited and is only waiting
+/// for its parent to collect the status (state `Z`).
+///
+/// Linux: the state character is field 3 of /proc/<pid>/stat - the first token
+/// after the parenthesized `comm`, which may itself contain spaces and
+/// parentheses, so it is split off at the LAST ')' exactly as `pid_start_time`
+/// does with the same string.
+///
+/// Anything it cannot read answers `false`: "not provably a zombie". Liveness
+/// is only ever narrowed here by positive evidence, never widened by the
+/// absence of it, which keeps every caller's fail-closed reading intact.
+#[cfg(target_os = "linux")]
+fn pid_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some("Z")
+}
+
+/// Every other Unix, macOS included: "cannot tell", which reads as
+/// not-a-zombie and so leaves liveness exactly as it was before this check
+/// existed.
+///
+/// Not a stub for want of trying. macOS cannot answer through `proc_pidinfo`
+/// at all - both BSD-info flavors reach the process through `proc_find`, which
+/// skips a `SZOMB` entry by design, so every flavor reports "no such process"
+/// for precisely the case being asked about. The call that does see zombies is
+/// the `KERN_PROC_PID` sysctl, and libc exposes neither `kinfo_proc` nor
+/// `extern_proc` on Apple targets: reading `p_stat` would mean hand-computing
+/// its offset inside a large layout-sensitive struct, and getting that wrong
+/// fails in the dangerous direction - a live process misread as dead lets
+/// `sfh stop` skip a real one and lets a carry run against a run still
+/// spending.
+///
+/// The trade is worth taking because the condition is not durable here. This
+/// bug needs a PID 1 that does not reap orphans; macOS's is launchd, which
+/// always does, so a detached run's zombie is collected in the moment rather
+/// than outliving the run. On Linux - where a container's PID 1 is routinely
+/// not an init at all - it is durable, and that is where the check is
+/// implemented.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_is_zombie(_pid: u32) -> bool {
+    false
 }
 
 /// The start time of a process, as an opaque u64 that is unique per pid on one
@@ -857,8 +986,8 @@ pub fn run_cmd(
     if interrupted() {
         return Err("interrupted before start".into());
     }
-    let mut cmd = match inv {
-        Invocation::Argv(argv) => {
+    let mut cmd = match inv.argv() {
+        Some(argv) => {
             if argv.is_empty() {
                 return Err("empty command".into());
             }
@@ -866,7 +995,10 @@ pub fn run_cmd(
             c.args(&argv[1..]);
             c
         }
-        Invocation::Shell(line) => shell_command(line),
+        None => match inv {
+            Invocation::Shell(line) => shell_command(line),
+            _ => unreachable!("only Shell has no argv"),
+        },
     };
     if let Some(d) = cwd {
         cmd.current_dir(d);
@@ -932,14 +1064,17 @@ pub fn run_cmd(
         run_clock: obs.run_clock.clone(),
     };
     let tee_enabled = Arc::new(AtomicBool::new(true));
+    let stdout_semantically_observed = obs.stdout_observer.is_some();
     let rx_out = spawn_reader(
         child.stdout.take().expect("stdout piped"),
         obs.tee,
+        obs.stdout_observer,
         Arc::clone(&tee_enabled),
         activity.clone(),
     );
     let rx_err = spawn_reader(
         child.stderr.take().expect("stderr piped"),
+        None,
         None,
         Arc::clone(&tee_enabled),
         activity.clone(),
@@ -1012,10 +1147,24 @@ pub fn run_cmd(
     };
     let (stdout, out_trunc) = recv(&rx_out);
     let (mut stderr, err_trunc) = recv(&rx_err);
-    if out_trunc || err_trunc {
+    if out_trunc {
+        let semantic = if stdout_semantically_observed {
+            "; the structured semantic observer processed the complete stream"
+        } else {
+            ""
+        };
         stderr.extend_from_slice(
             format!(
-                "\n[sfh: captured output truncated at {} MB]\n",
+                "\n[sfh: raw stdout middle omitted at {} MB capture limit{semantic}]\n",
+                MAX_CAPTURE / 1024 / 1024
+            )
+            .as_bytes(),
+        );
+    }
+    if err_trunc {
+        stderr.extend_from_slice(
+            format!(
+                "\n[sfh: raw stderr middle omitted at {} MB capture limit]\n",
                 MAX_CAPTURE / 1024 / 1024
             )
             .as_bytes(),
@@ -1053,9 +1202,74 @@ fn idle_at(death_elapsed_ms: u64, last_activity_ms: u64) -> u64 {
     death_elapsed_ms.saturating_sub(last_activity_ms.min(death_elapsed_ms))
 }
 
-/// Per-stream capture cap; the reader keeps draining past it (discarding) so
-/// the child never blocks on a full pipe.
+/// Per-stream diagnostic capture cap. The reader always drains and semantic
+/// observers still receive the complete stream. Oversized raw output retains
+/// both its beginning and end: headers/session identity tend to be at the
+/// beginning, while final answers and terminal errors are at the end.
 const MAX_CAPTURE: usize = 32 * 1024 * 1024;
+const CAPTURE_HEAD: usize = MAX_CAPTURE / 2;
+const CAPTURE_TAIL: usize = MAX_CAPTURE - CAPTURE_HEAD;
+const CAPTURE_GAP: &[u8] = b"\n[sfh: raw output middle omitted after 32 MB capture limit]\n";
+
+struct BoundedCapture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: usize,
+}
+
+impl BoundedCapture {
+    fn new() -> Self {
+        Self {
+            head: Vec::with_capacity(CAPTURE_HEAD),
+            tail: VecDeque::with_capacity(CAPTURE_TAIL),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, mut chunk: &[u8]) {
+        self.total = self.total.saturating_add(chunk.len());
+        if self.head.len() < CAPTURE_HEAD {
+            let take = chunk.len().min(CAPTURE_HEAD - self.head.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        if chunk.is_empty() {
+            return;
+        }
+        if chunk.len() >= CAPTURE_TAIL {
+            self.tail.clear();
+            self.tail.extend(
+                chunk[chunk.len().saturating_sub(CAPTURE_TAIL)..]
+                    .iter()
+                    .copied(),
+            );
+            return;
+        }
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(CAPTURE_TAIL);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+        }
+        self.tail.extend(chunk.iter().copied());
+    }
+
+    fn finish(self) -> (Vec<u8>, bool) {
+        let truncated = self.total > MAX_CAPTURE;
+        if !truncated {
+            let mut all = self.head;
+            all.extend(self.tail);
+            return (all, false);
+        }
+        let mut all = Vec::with_capacity(MAX_CAPTURE + CAPTURE_GAP.len());
+        all.extend(self.head);
+        all.extend_from_slice(CAPTURE_GAP);
+        all.extend(self.tail);
+        (all, true)
+    }
+}
 
 /// `tee`: mirror each chunk to this file as it arrives. Without it nothing is
 /// observable until the child exits, so a 30-minute step is indistinguishable
@@ -1064,6 +1278,7 @@ const MAX_CAPTURE: usize = 32 * 1024 * 1024;
 fn spawn_reader<R: Read + Send + 'static>(
     mut r: R,
     tee: Option<std::path::PathBuf>,
+    observer: Option<Arc<dyn OutputObserver>>,
     tee_enabled: Arc<AtomicBool>,
     activity: Activity,
 ) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
@@ -1082,46 +1297,124 @@ fn spawn_reader<R: Read + Send + 'static>(
             drop(f);
             Some(p)
         });
-        let mut buf = Vec::new();
+        let mut capture = BoundedCapture::new();
+        let mut tee_written = 0usize;
         let mut tmp = [0u8; 65536];
-        let mut truncated = false;
         loop {
             match r.read(&mut tmp) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    // Before the capture cap is consulted: a tool that has run
-                    // past 32 MB is noisy, not hung, and dropping the bytes
-                    // must not make it look silent.
+                    // Before the raw capture cap is consulted: a noisy tool is
+                    // still active, and a structured observer must see every
+                    // byte so its final answer/accounting cannot be truncated.
                     activity.touch();
-                    if buf.len() < MAX_CAPTURE {
-                        let take = n.min(MAX_CAPTURE - buf.len());
-                        if tee_enabled.load(Ordering::SeqCst) {
-                            if let Some(path) = &tee {
-                                // Same cap as the in-memory capture, so a runaway
-                                // tool cannot fill the disk through this path.
-                                // Open only for the duration of one chunk. On
-                                // Windows a reader blocked on an inherited pipe
-                                // must never hold the destination open across
-                                // the later atomic canonical replacement.
-                                if let Ok(mut f) = crate::contain::append_private(path) {
-                                    let _ = f.write_all(&tmp[..take]);
-                                    let _ = f.flush();
-                                }
+                    if let Some(observer) = &observer {
+                        observer.observe(&tmp[..n]);
+                    }
+                    if tee_written < MAX_CAPTURE && tee_enabled.load(Ordering::SeqCst) {
+                        let take = n.min(MAX_CAPTURE - tee_written);
+                        if let Some(path) = &tee {
+                            // The live tee is prefix-only and bounded. It is an
+                            // in-progress view; the canonical head+tail snapshot
+                            // atomically replaces it after the child exits.
+                            if let Ok(mut f) = crate::contain::append_private(path) {
+                                let _ = f.write_all(&tmp[..take]);
+                                let _ = f.flush();
                             }
                         }
-                        buf.extend_from_slice(&tmp[..take]);
-                        if take < n {
-                            truncated = true;
-                        }
-                    } else {
-                        truncated = true;
+                        tee_written += take;
                     }
+                    capture.push(&tmp[..n]);
                 }
             }
         }
-        let _ = tx.send((buf, truncated));
+        let _ = tx.send(capture.finish());
     });
     rx
+}
+
+/// Where a program name resolves on this machine, or `None` when it does not.
+///
+/// Deliberately does NOT spawn anything: preflight has to be able to say "that
+/// binary is not installed" without running a stranger's executable to find
+/// out. A name that already carries a path separator or an extension is taken
+/// as a path and only checked for existence.
+pub fn which(name: &str) -> Option<String> {
+    let direct = Path::new(name);
+    if name.contains('/') || name.contains('\\') {
+        return direct.is_file().then(|| name.to_string());
+    }
+    // The extension list has to be the one `resolve_program` uses at spawn
+    // time, or preflight reports a path the run would not actually launch.
+    //
+    // On Windows that is a two-case rule, and collapsing it either way is
+    // wrong. A BARE name is completed with the npm shim extensions and never
+    // launched extension-less, so `bash` must not report a file called `bash`.
+    // A name that ALREADY carries an extension is handed to the OS verbatim,
+    // so `pwsh.exe` and `claude.cmd` are looked up as written - appending to
+    // them would find nothing and preflight would block a program that runs.
+    let exts: &[&str] = if cfg!(windows) {
+        if Path::new(name).extension().is_some() {
+            &[""]
+        } else {
+            &[".exe", ".cmd", ".bat"]
+        }
+    } else {
+        &[""]
+    };
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        for ext in exts {
+            let cand = dir.join(format!("{name}{ext}"));
+            if is_executable_file(&cand) {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// A PATH candidate the OS would actually exec. On Unix `execvp` skips a file
+/// without the exec bit and keeps searching, so reporting the first readable
+/// match would name a file the run never runs.
+fn is_executable_file(p: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// True when a resolved path is the Windows WSL launcher rather than a shell
+/// that can run in this OS.
+///
+/// `%SystemRoot%\System32` sits near the front of PATH on every Windows box and
+/// ships `bash.exe`/`wsl.exe`, which start a Linux distribution. Git for Windows
+/// does not put its own `bash.exe` on PATH. So a flow that says `bash` on
+/// Windows gets WSL, where the repository's Windows paths are meaningless and a
+/// worktree's `.git` gitfile points somewhere that does not exist - the commands
+/// fail in seconds, for a reason that has nothing to do with the code under
+/// test, and the failure text flows on to whatever reads that step's output.
+///
+/// Takes the resolved path as text so the rule is testable on every platform.
+pub fn is_wsl_launcher(resolved_path: &str) -> bool {
+    let lower = resolved_path.to_ascii_lowercase().replace('/', "\\");
+    // sysnative and syswow64 are the same directory seen through the 32/64-bit
+    // redirector, so all three spellings have to count.
+    ["\\system32\\", "\\sysnative\\", "\\syswow64\\"]
+        .iter()
+        .any(|dir| lower.contains(dir))
+        && (lower.ends_with("\\bash.exe") || lower.ends_with("\\wsl.exe"))
 }
 
 /// Capture `<program> --version` (no AI call) for the run's provenance record.
@@ -1219,6 +1512,16 @@ fn kill_tree(child: &mut Child) {
 }
 
 /// Classify a failure as transient (worth retrying) from the tool's own output.
+///
+/// Every needle below names a way a PROVIDER can fail: a rate limit, a 5xx, a
+/// dropped socket, a serving-side abort. That is what `retry_on: transient`
+/// exists for, and matching it against an AI CLI's own report is sound.
+///
+/// It is not sound against arbitrary program output, which is why the caller
+/// decides what counts as the tool's report (see `leaf`): a `cmd:` step's
+/// STDOUT is its RESULT - the test list, the diff, the JSON - and a test named
+/// `tcp_502_returns_error` failing deterministically is not a rate limit. sfh
+/// used to re-run the whole verification suite for exactly that reason.
 pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
     const NEEDLES: [&str; 22] = [
         "429",
@@ -1256,6 +1559,127 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process that has exited but has not been reaped still answers
+    /// `kill(pid, 0)`, so `pid_alive` used to call it alive. Where PID 1 does
+    /// not reap orphans - every container started without an init, which is
+    /// where a `--detach` run lives - that answer never changed, and it is the
+    /// answer `sfh status`, `sfh stop` and `--carry-budget-from` are all built
+    /// on.
+    ///
+    /// Reaped here at the end rather than left behind: a test that leaks a
+    /// zombie into a suite which itself runs under a non-reaping init is the
+    /// bug it is testing for.
+    ///
+    /// Linux only, because that is where `pid_is_zombie` can answer. macOS
+    /// reaches every process through `proc_find`, which skips a `SZOMB` entry
+    /// by design, so no `proc_pidinfo` flavor can see the state this asserts
+    /// on - see `pid_is_zombie` for why reading it the one way that works is
+    /// not worth the ABI assumption, and why the condition is not durable
+    /// under launchd anyway.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_is_not_alive_even_though_it_still_answers_signal_zero() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a child that exits at once");
+        let pid = child.id();
+        // Wait for the exit WITHOUT reaping, so the pid is a zombie held open
+        // by this process still owing it a wait().
+        for _ in 0..200 {
+            if pid_is_zombie(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            pid_is_zombie(pid),
+            "the child should be an unreaped zombie by now"
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "a zombie must still answer signal 0 - that is what made this a bug"
+        );
+        assert!(
+            !pid_alive(pid),
+            "a zombie is not running, so pid_alive must not say it is"
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn the_windows_wsl_launcher_is_recognised_wherever_it_is_spelled() {
+        // The exact path a bare `bash` resolves to on a stock Windows box.
+        for p in [
+            r"C:\Windows\System32\bash.exe",
+            r"c:\windows\system32\BASH.EXE",
+            r"C:/Windows/System32/bash.exe",
+            r"C:\Windows\Sysnative\wsl.exe",
+            r"C:\Windows\SysWOW64\bash.exe",
+        ] {
+            assert!(is_wsl_launcher(p), "{p} should be recognised as WSL");
+        }
+        // Real shells that can run in this OS, and unrelated System32 binaries,
+        // must not be caught: a false positive here blocks a working flow.
+        for p in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\msys64\usr\bin\bash.exe",
+            r"C:\Windows\System32\cmd.exe",
+            r"C:\Windows\System32\where.exe",
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/opt/system32-tools/bin/bash",
+        ] {
+            assert!(!is_wsl_launcher(p), "{p} must not be treated as WSL");
+        }
+    }
+
+    // PATH is process-global and these tests run in parallel, so the candidate
+    // predicate is exercised directly rather than by pointing `which` at a
+    // temporary directory - a test that reaches for `set_var("PATH", ...)`
+    // corrupts whatever else is resolving a program at that moment.
+    #[test]
+    #[cfg(windows)]
+    fn a_program_name_that_already_carries_an_extension_is_looked_up_as_written() {
+        // `Command::new` hands such a name to the OS verbatim, so appending
+        // .exe/.cmd/.bat to it would find nothing and preflight would block a
+        // program that runs perfectly well. cmd.exe is always in System32,
+        // which is always on PATH.
+        assert!(
+            which("cmd.exe").is_some(),
+            "a name with an extension must resolve as written"
+        );
+        assert!(which("cmd").is_some(), "and a bare name still completes");
+    }
+
+    #[test]
+    fn a_path_candidate_the_os_would_not_exec_is_not_a_program() {
+        let dir = std::env::temp_dir().join(format!("sfh-which-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("sfh-which-probe");
+        std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Readable but not executable: execvp skips it and keeps searching,
+            // so reporting it would name a file the run never runs.
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!is_executable_file(&p));
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(is_executable_file(&p));
+        // A directory with a program's name is not a program.
+        let d = dir.join("sfh-which-dir");
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!is_executable_file(&d));
+        assert!(!is_executable_file(&dir.join("nothing-here")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_blocked_pipe_reader_does_not_hold_the_canonical_output_open() {
@@ -1295,6 +1719,7 @@ mod tests {
         let captured = spawn_reader(
             reader,
             Some(output.clone()),
+            None,
             Arc::clone(&tee_enabled),
             Activity {
                 start: Instant::now(),
@@ -1320,6 +1745,63 @@ mod tests {
         );
         assert_eq!(std::fs::read(&output).unwrap(), b"canonical");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_capture_keeps_head_and_tail_while_observer_sees_every_byte() {
+        #[derive(Default)]
+        struct CountObserver {
+            seen: std::sync::Mutex<(usize, VecDeque<u8>)>,
+        }
+        impl OutputObserver for CountObserver {
+            fn observe(&self, chunk: &[u8]) {
+                let mut seen = self.seen.lock().unwrap();
+                seen.0 = seen.0.saturating_add(chunk.len());
+                for byte in chunk {
+                    if seen.1.len() == 16 {
+                        seen.1.pop_front();
+                    }
+                    seen.1.push_back(*byte);
+                }
+            }
+        }
+
+        let mut source = vec![b'x'; MAX_CAPTURE + 1024];
+        source[..5].copy_from_slice(b"BEGIN");
+        let end = source.len();
+        source[end - 5..].copy_from_slice(b"FINAL");
+        let expected_len = source.len();
+        let observer = Arc::new(CountObserver::default());
+        let tee_enabled = Arc::new(AtomicBool::new(false));
+        let captured = spawn_reader(
+            std::io::Cursor::new(source),
+            None,
+            Some(Arc::clone(&observer) as Arc<dyn OutputObserver>),
+            tee_enabled,
+            Activity {
+                start: Instant::now(),
+                last_ms: Arc::new(AtomicU64::new(0)),
+                run_clock: None,
+            },
+        )
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+
+        assert!(captured.1);
+        assert!(captured.0.starts_with(b"BEGIN"));
+        assert!(captured.0.ends_with(b"FINAL"));
+        assert!(captured
+            .0
+            .windows(CAPTURE_GAP.len())
+            .any(|window| window == CAPTURE_GAP));
+        let seen = observer.seen.lock().unwrap();
+        assert_eq!(seen.0, expected_len);
+        assert!(seen
+            .1
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .ends_with(b"FINAL"));
     }
 
     #[test]
@@ -1379,6 +1861,54 @@ mod tests {
         let a = Invocation::Argv(vec!["tool".into(), "--flag".into(), "two words".into()]);
         assert_eq!(a.describe(), "tool --flag \"two words\"");
         assert_eq!(Invocation::Shell("echo hi".into()).describe(), "$ echo hi");
+    }
+
+    /// P0-04. The prompt an argv-delivery adapter carries is flow data - a
+    /// pasted file, an upstream step's output, whatever a --var held - and
+    /// every description of the command line ends up in a durable artifact.
+    /// The diagnostics that make a command line worth logging (binary, flags,
+    /// model, access) have to survive; the payload must not.
+    #[test]
+    fn an_argv_prompt_never_reaches_a_command_description() {
+        let secret = "line one\nSSH_KEY=hunter2\nplease review the diff";
+        let inv = Invocation::Argv(vec![
+            "agy".into(),
+            "--model".into(),
+            "big-model".into(),
+            "--mode".into(),
+            "plan".into(),
+            "-p".into(),
+            secret.into(),
+        ])
+        .redact_argv(vec![6]);
+        let described = inv.describe();
+        assert!(
+            !described.contains("hunter2") && !described.contains("please review"),
+            "the prompt leaked into {described}"
+        );
+        for keep in ["agy", "--model", "big-model", "--mode", "plan", "-p"] {
+            assert!(described.contains(keep), "{keep} must stay in {described}");
+        }
+        assert!(
+            described.contains(&format!("chars={}", secret.chars().count())),
+            "the summary reports the prompt size: {described}"
+        );
+        assert!(
+            described.contains(&crate::sha256::hex(secret.as_bytes())),
+            "the summary pins the exact prompt by digest: {described}"
+        );
+        // The child still gets the real thing.
+        assert_eq!(
+            inv.argv().and_then(|a| a.last()).map(String::as_str),
+            Some(secret)
+        );
+        // Nothing marked, nothing changed.
+        assert_eq!(
+            Invocation::Argv(vec!["tool".into(), "x".into()])
+                .redact_argv(vec![])
+                .describe(),
+            "tool x"
+        );
     }
 
     #[test]

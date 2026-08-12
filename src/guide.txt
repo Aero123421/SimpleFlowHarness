@@ -77,4 +77,34 @@ steps:
   - {id: approval, cmd: ["approval-cli", "wait", "--question", "Ship this build?"], timeout_sec: 3600}
 ```
 DETACH AND COLLECT: `sfh run flow.yaml --detach` → `sfh status` → `sfh wait` / `sfh stop`
+DRIVING SFH FROM A PROGRAM — add --json; stdout is then the envelope and nothing else:
+```text
+sfh preflight flow.yaml --json   # free: binaries (incl. every cmd: program), flags, protocols, gaps.
+sfh plan      flow.yaml --json   # what would run, with prompts redacted. Starts nothing.
+sfh run       flow.yaml --json --detach   # returns {run_dir, next_actions:[{argv:[...]}]}
+sfh wait <run-dir> --json        # blocks, then {ok, state, result, result_file}
+sfh status <run-dir> --json      # add --json to stop/workspaces too
+```
+Pass the run dir explicitly. Omitting it selects the NEWEST run and sets `implicit_target: true`.
+Failures carry a stable `error.code` (SFH_PROTOCOL_INVALID, SFH_WORKSPACE_DRIFT, ...); branch on it, not on the message.
+WORKSPACE AND CONTEXT — opt-in; omit both and every step runs in the caller's cwd as before:
+```yaml
+api_version: 1
+workspace: {mode: auto}        # any step that may write → ONE git worktree for the whole run
+contexts:                      # also {file: ./TASK.md} or {template: "{{steps.x.output}}"}
+  rules: {inline: "be brief"}  # named, ordered, hashed; recorded in <tag>.context.json
+steps:
+  - id: edit
+    effects: workspace         # read | workspace | external | unknown (cmd: defaults to unknown)
+    context: [rules]
+    replay: {unfinished: stuck}   # a crashed external effect: stuck/fail launch nothing
+    exit_conflict: trust_protocol # ONLY for a CLI that exits non-zero after a certified-good turn
+    outcomes: {2: {result: continue, label: more_to_do}}  # exit code -> meaning; route with when_label_is
+    cmd: ["sh", "-c", "true"]
+```
+`--state-dir` keeps workspaces out of the repository; `--profiles f.yaml` swaps tools without editing the flow.
+A resume is refused if the flow, an overlay, a context file or a tool version moved (--force-resume), or if the
+workspace changed with no unfinished step to explain it (--adopt-workspace). They are different questions.
+If you had to FIX the flow, resume is not the tool: `--carry-budget-from <run-dir>` starts a new run holding the
+old one's spend (steps, per-step visits, cost, time), so a corrected retry does not silently reset its budget.
 Details: README. If unsure: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.

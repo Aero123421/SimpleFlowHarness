@@ -50,7 +50,46 @@ jobs:
           ./target/release/sfh --version
           ./target/release/sfh run examples/smoke.yaml -q
           ./target/release/sfh run examples/smoke-parallel.yaml -q
+          # Top-level example YAML files are flows. examples/profiles/ holds
+          # --profiles overlay files, which are not flows and are not validated
+          # as such.
           for f in examples/*.yaml; do ./target/release/sfh validate "$f"; done
+          # `validate` never opens a context file; `plan` does, and CONTRIBUTING
+          # already tells contributors to run both over every example. Only
+          # validate was gated, so examples/managed-loop.yaml shipped naming a
+          # context file that was not in the tree: it validated, and the very
+          # command the README points a new reader at (`sfh plan <example>`)
+          # failed on a clean checkout. Plan resolves in a temporary directory
+          # and starts no process.
+          for f in examples/*.yaml; do ./target/release/sfh plan "$f" > /dev/null; done
+          # The overlay must still parse, and must still apply cleanly to the
+          # flow that documents it.
+          ./target/release/sfh validate examples/managed-loop.yaml --profiles examples/profiles/local.yaml
+          ./target/release/sfh preflight --json > /dev/null
+      - name: Bundled flow packs (no AI calls)
+        shell: bash
+        run: |
+          set -e
+          # The examples/*.yaml glob above is deliberately top level, so these
+          # would otherwise ship unvalidated. Both packs arrived with a real
+          # defect that only the binary could see - a `goto:fix` that YAML read
+          # as a key name, and two profile overlays missing their `profiles:`
+          # wrapper, which made the pack's own documented --profiles command
+          # fail on the first try.
+          for f in examples/ponytail/[0-9][0-9]-*.yaml skills/sfh-*/assets/*.yaml; do
+            ./target/release/sfh validate "$f"
+          done
+          # profiles.*.example.yaml are overlays, not flows. Every flow is
+          # validated against every overlay the pack ships, because "the
+          # overlay parses" and "the overlay applies to this flow" are
+          # different claims and the README makes the second one.
+          for overlay in examples/ponytail/profiles.*.example.yaml; do
+            for f in examples/ponytail/[0-9][0-9]-*.yaml; do
+              ./target/release/sfh validate "$f" --profiles "$overlay"
+            done
+          done
+      - name: Agent Skills structure and version claims
+        run: python3 tests/skills_checks.py
       - name: Engine behaviour (fake tools, no AI calls)
         shell: bash
         run: bash tests/engine_behaviour.sh ./target/release/sfh

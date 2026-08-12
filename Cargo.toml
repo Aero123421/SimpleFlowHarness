@@ -1,6 +1,6 @@
 [package]
 name = "sfh"
-version = "1.1.4"
+version = "1.5.1"
 edition = "2021"
 rust-version = "1.85"
 description = "SimpleFlowHarness - chain AI CLI agents (codex / claude / opencode / grok / agy / pi / cursor / any command) into staged flows"
@@ -8,7 +8,7 @@ license = "MIT"
 authors = ["Aero123421"]
 repository = "https://github.com/Aero123421/SimpleFlowHarness"
 homepage = "https://github.com/Aero123421/SimpleFlowHarness"
-readme = "README.en.md"
+readme = "README.md"
 keywords = ["ai", "cli", "workflow", "orchestration", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 

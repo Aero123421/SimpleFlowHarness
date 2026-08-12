@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+api_version: 1
+name: failure-to-regression-eval
+
+workspace: {mode: auto, cleanup: keep}
+
+contexts:
+  incident: {file: ./INCIDENT.md}
+  acceptance: {file: ./ACCEPTANCE.md}
+  latest_failure:
+    template: |
+      reproduce stdout={{steps.reproduce.output_file | optional}}
+      reproduce stderr={{steps.reproduce.stderr_file | optional}}
+      focused stdout={{steps.focused.output_file | optional}}
+      focused stderr={{steps.focused.stderr_file | optional}}
+
+profiles:
+  engineer: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+steps:
+  - id: write_eval
+    use: engineer
+    effects: workspace
+    context: [incident, acceptance]
+    prompt: |
+      Add the smallest deterministic regression test or fixture reproducing the
+      incident. Do not fix production code yet.
+
+  # Replace with the project-specific focused test command. It is expected to
+  # fail before the fix, so outcome 2 is a valid continue result.
+  - id: reproduce
+    effects: read
+    cmd: ["python", "-m", "pytest", "-q", "tests/regression_test.py"]
+    outcomes:
+      0: {result: fail, label: test_did_not_reproduce}
+      1: {result: continue, label: reproduced}
+    on_error: goto:handoff
+    route:
+      - {when_label_is: reproduced, goto: fix}
+      - {goto: stuck}
+
+  - id: fix
+    use: engineer
+    effects: workspace
+    context: [incident, acceptance, latest_failure]
+    max_visits: 3
+    on_max_visits: goto:handoff
+    prompt: |
+      Fix the shared root cause while keeping the regression test unchanged.
+    route:
+      - {goto: focused}
+
+  - id: focused
+    effects: read
+    cmd: ["python", "-m", "pytest", "-q", "tests/regression_test.py"]
+    on_error: goto:fix
+
+  - id: regression
+    effects: read
+    cmd: ["python", "-m", "pytest", "-q"]
+    on_error: goto:fix
+
+  - id: review
+    use: reviewer
+    effects: read
+    context: [incident, acceptance, latest_failure]
+    prompt: |
+      Verify the eval failed before the fix for the right reason, passes now,
+      and the patch addresses the root cause without fixture-specific cheating.
+      End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: fix}
+      - {goto: stuck}
+
+  - id: handoff
+    use: reviewer
+    effects: read
+    context: [incident, acceptance, latest_failure]
+    prompt: |
+      Produce a handoff explaining whether reproduction, the fix, or regression
+      proof is missing and give the next smallest action.
+    route:
+      - {goto: stuck}

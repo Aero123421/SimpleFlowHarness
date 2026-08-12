@@ -14,11 +14,65 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// SHA-256 initial hash values (FIPS 180-4 5.3.3).
+const INIT: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
+
+/// One 64-byte block, folded into `h`. Shared by the one-shot and incremental
+/// entry points so the two can never disagree about a digest.
+fn compress(h: &mut [u32; 8], chunk: &[u8]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([
+            chunk[4 * i],
+            chunk[4 * i + 1],
+            chunk[4 * i + 2],
+            chunk[4 * i + 3],
+        ]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+        (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(hh);
+}
+
 pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+    let mut h = INIT;
     let bit_len = (data.len() as u64).wrapping_mul(8);
     let mut msg = data.to_vec();
     msg.push(0x80);
@@ -27,53 +81,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
     for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                chunk[4 * i],
-                chunk[4 * i + 1],
-                chunk[4 * i + 2],
-                chunk[4 * i + 3],
-            ]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
-            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        compress(&mut h, chunk);
     }
     let mut out = [0u8; 32];
     for (i, word) in h.iter().enumerate() {
@@ -83,13 +91,81 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 pub fn hex(data: &[u8]) -> String {
+    to_hex(&sha256(data))
+}
+
+fn to_hex(digest: &[u8]) -> String {
     use std::fmt::Write as _;
-    let digest = sha256(data);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         write!(&mut out, "{byte:02x}").expect("writing to a String cannot fail");
     }
     out
+}
+
+/// Incremental SHA-256, for input too large to hold in memory.
+///
+/// A workspace fingerprint has to cover every untracked file, and some of those
+/// are build artifacts measured in gigabytes. Reading one into a `Vec` to hash
+/// it would make the fingerprint itself the thing that kills the run, and
+/// skipping large files would make "too big to check" indistinguishable from
+/// "unchanged" - which is exactly the confusion the fingerprint exists to
+/// prevent.
+///
+/// This buffers only up to one 64-byte block: whole blocks are folded in as
+/// they arrive, and the final padding is done over the small tail.
+#[derive(Default)]
+pub struct Hasher {
+    buf: Vec<u8>,
+    /// Blocks already folded into `state`, as bytes.
+    consumed: u64,
+    state: Option<[u32; 8]>,
+}
+
+impl Hasher {
+    pub fn new() -> Hasher {
+        Hasher::default()
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+        let whole = self.buf.len() / 64 * 64;
+        if whole == 0 {
+            return;
+        }
+        // Keep the tail: only complete blocks may be compressed, because the
+        // padding depends on the total length, which is not known yet.
+        let mut state = self.state.unwrap_or(INIT);
+        for chunk in self.buf[..whole].chunks_exact(64) {
+            compress(&mut state, chunk);
+        }
+        self.state = Some(state);
+        self.consumed += whole as u64;
+        self.buf.drain(..whole);
+    }
+
+    pub fn finish(mut self) -> [u8; 32] {
+        let total_bits = (self.consumed + self.buf.len() as u64).wrapping_mul(8);
+        let mut state = self.state.unwrap_or(INIT);
+        let mut tail = std::mem::take(&mut self.buf);
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&total_bits.to_be_bytes());
+        for chunk in tail.chunks_exact(64) {
+            compress(&mut state, chunk);
+        }
+        let mut out = [0u8; 32];
+        for (i, word) in state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn finish_hex(self) -> String {
+        to_hex(&self.finish())
+    }
 }
 
 #[cfg(test)]
@@ -133,5 +209,40 @@ mod tests {
         );
         assert_ne!(hex(&[b'x'; 55]), hex(&[b'x'; 56]));
         assert_eq!(hex(&[b'x'; 64]).len(), 64);
+    }
+
+    /// The incremental hasher must agree with the one-shot one for every chunk
+    /// boundary, including the ones that land inside a block and inside the
+    /// length padding. A workspace fingerprint is compared for equality across
+    /// runs, so a hasher that depended on how the reader happened to split its
+    /// buffers would report drift that never happened.
+    #[test]
+    fn streaming_matches_one_shot_at_every_boundary() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        for len in [0usize, 1, 55, 56, 63, 64, 65, 127, 128, 129, 1000] {
+            let slice = &data[..len];
+            let expect = hex(slice);
+            for step in [1usize, 7, 63, 64, 65, 512] {
+                let mut h = Hasher::new();
+                for chunk in slice.chunks(step) {
+                    h.update(chunk);
+                }
+                assert_eq!(
+                    h.finish_hex(),
+                    expect,
+                    "len {len} fed in {step}-byte chunks disagreed with the one-shot digest"
+                );
+            }
+        }
+        // The multi-block path, fed in one go and in awkward pieces.
+        let big = vec![b'a'; 1_000_000];
+        let mut h = Hasher::new();
+        for chunk in big.chunks(9973) {
+            h.update(chunk);
+        }
+        assert_eq!(
+            h.finish_hex(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 }

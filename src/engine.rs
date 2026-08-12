@@ -1,4 +1,7 @@
-use crate::{contain, execute, flow, leaf, preset, template};
+use crate::{
+    closure, contain, context, execute, flow, leaf, machine, preset, protocol, sha256, state,
+    template, watch, workspace,
+};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
@@ -30,20 +33,155 @@ pub struct RunOpts {
     /// Use exactly this run directory instead of a fresh timestamped one.
     /// Set by `--detach` when it hands the run off to the background copy.
     pub run_dir: Option<PathBuf>,
+    /// Root for state that is not a run artifact - above all a managed
+    /// workspace, which cannot live inside the repository it branches from.
+    pub state_dir: Option<PathBuf>,
+    /// Profile overlay files, applied in order (later wins).
+    pub profiles: Vec<PathBuf>,
+    /// Answer with a machine envelope on stdout instead of human progress.
+    pub as_json: bool,
+    /// `plan --save [dir]`: keep the rendered artifacts for review.
+    pub save_plan: Option<Option<PathBuf>>,
+    /// Accept the workspace's CURRENT contents as a new checkpoint on resume.
+    /// Deliberately separate from --force-resume: one says "the definition of
+    /// this run changed and I mean it", the other says "the working tree
+    /// changed and I mean it", and conflating them made a single flag waive
+    /// two unrelated guarantees.
+    pub adopt_workspace: bool,
+    /// Start a FRESH run that inherits an earlier run's spend: its visit
+    /// counts, total leaf runs, reported cost and active time.
+    ///
+    /// This is the case a resume cannot serve, by design. When a run stops and
+    /// the diagnosis is "the flow itself was wrong", fixing the flow is the
+    /// correct response - and it invalidates the effective-config fingerprint,
+    /// so `--resume` refuses, exactly as it should. What was left was a fresh
+    /// run whose counters all started at zero, so the budget already spent
+    /// simply vanished, and the only way to account for it was to edit the
+    /// ceilings in the flow by hand. Hand arithmetic is not accounting: it is
+    /// unverifiable, it is wrong the moment anyone loses count, and it leaves
+    /// no record that the second run was ever a continuation of the first.
+    pub carry_budget_from: Option<PathBuf>,
+}
+
+impl Default for RunOpts {
+    fn default() -> Self {
+        RunOpts {
+            flow_path: PathBuf::new(),
+            vars: Vec::new(),
+            emit: None,
+            runs_dir: None,
+            dry_run: false,
+            verbose: false,
+            quiet: false,
+            resume: None,
+            resume_latest: false,
+            force_resume: false,
+            no_partial_emit: false,
+            detach: false,
+            run_dir: None,
+            state_dir: None,
+            profiles: Vec::new(),
+            as_json: false,
+            save_plan: None,
+            adopt_workspace: false,
+            carry_budget_from: None,
+        }
+    }
+}
+
+/// What one run inherited from an earlier one, and from where.
+///
+/// Only spend is carried: counters, not results. Step outputs, sessions, the
+/// routing position and the workspace are all deliberately left behind, because
+/// the flow that produced them is not the flow about to run - that is the whole
+/// reason `--resume` refused and this exists.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CarriedBudget {
+    pub from: PathBuf,
+    /// Highest visit number reached per step id - the same shape `max_visits`
+    /// is enforced against, so a loop that had four laps left really has four
+    /// laps left. Only ids the NEW flow still defines are applied.
+    pub visits: BTreeMap<String, u32>,
+    /// Step ids the ancestor had visited that the corrected flow no longer
+    /// defines. Their laps cannot be enforced against anything, so they are
+    /// named rather than silently forgotten.
+    pub dropped: Vec<String>,
+    pub steps: u32,
+    pub cost_usd: f64,
+    pub elapsed_sec: u64,
+}
+
+impl CarriedBudget {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "from": self.from.display().to_string(),
+            "visits": self.visits,
+            "dropped_steps": self.dropped,
+            "steps": self.steps,
+            "cost_usd": self.cost_usd,
+            "elapsed_sec": self.elapsed_sec,
+        })
+    }
+
+    /// One line a human can check against the earlier run's own `runs why`.
+    fn summary(&self) -> String {
+        let laps = self
+            .visits
+            .iter()
+            .map(|(step, visit)| format!("{step}@{visit}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut s = format!(
+            "carried from {}: {} step run(s), ${:.4}, {}s active{}{}",
+            self.from.display(),
+            self.steps,
+            self.cost_usd,
+            self.elapsed_sec,
+            if laps.is_empty() { "" } else { ", visits " },
+            laps
+        );
+        if !self.dropped.is_empty() {
+            // Never silent: a dropped id means that step's laps are NOT being
+            // counted against anything in this run.
+            s.push_str(&format!(
+                " (not applied, no longer in the flow: {})",
+                self.dropped.join(", ")
+            ));
+        }
+        s
+    }
 }
 
 pub fn run(opts: RunOpts) -> i32 {
     match run_inner(&opts) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("sfh: {e}");
+            // A config or usage failure is exactly the case a machine caller
+            // cannot recover from by parsing prose, and exactly the case most
+            // likely to happen when something is wrong - so JSON mode answers
+            // with an envelope here too, never with a bare message.
+            if opts.as_json {
+                machine::emit(&machine::error_envelope(
+                    if opts.dry_run { "plan" } else { "run" },
+                    run_failure_code(&e),
+                    &e,
+                    2,
+                    json!({
+                        "state": "config_error",
+                        "terminal": true,
+                        "flow": abs(&opts.flow_path).display().to_string(),
+                    }),
+                ));
+            } else {
+                eprintln!("sfh: {e}");
+            }
             2
         }
     }
 }
 
 pub fn validate(path: &Path, var_overrides: &[(String, String)]) -> i32 {
-    validate_with_options(path, var_overrides, false, false)
+    validate_with_options(path, var_overrides, false, false, &[])
 }
 
 pub fn validate_with_options(
@@ -51,15 +189,28 @@ pub fn validate_with_options(
     var_overrides: &[(String, String)],
     strict: bool,
     as_json: bool,
+    profiles: &[PathBuf],
 ) -> i32 {
     let inner = || -> Result<(flow::Flow, Vec<String>), String> {
-        let flow = flow::load(path)?;
+        let flow = flow::load_with_overlays(path, profiles)?;
         let mut vars = flow.vars_string_map()?;
         for (k, v) in var_overrides {
             vars.insert(k.clone(), v.clone());
         }
         precheck(&flow, &vars, &HashSet::new())?;
-        let warnings = flow::strict_warnings(&flow);
+        let mut warnings = flow::strict_warnings(&flow);
+        // A workspace the flow cannot resolve is a static error, not a runtime
+        // surprise: two writers sharing one workspace is refused here, before
+        // anyone has paid for a step.
+        match flow.workspace_plan() {
+            Ok(plan) => warnings.extend(plan.warnings.iter().cloned()),
+            Err(e) => return Err(e),
+        }
+        flow.context_plan(path)?;
+        // Replay is a warning rather than an error: `rerun` has always been the
+        // behaviour, and a flow that never crashes never notices. `--strict` is
+        // where a user asks to be told about the choices they did not make.
+        warnings.extend(flow.replay_warnings());
         if strict && !warnings.is_empty() {
             return Err(format!(
                 "strict validation found {} issue(s):\n  - {}",
@@ -136,8 +287,10 @@ pub fn validate_with_options(
     }
 }
 
-pub fn show_config(path: &Path, show_secrets: bool) -> i32 {
-    match flow::load(path).and_then(|flow| flow.effective_config_json_pretty(show_secrets)) {
+pub fn show_config(path: &Path, show_secrets: bool, profiles: &[PathBuf]) -> i32 {
+    match flow::load_with_overlays(path, profiles)
+        .and_then(|flow| flow.effective_config_json_pretty(show_secrets))
+    {
         Ok(config) => {
             println!("{config}");
             0
@@ -337,6 +490,13 @@ fn precheck(
             "os",
             "prompt_file",
             "notes",
+            // v1.2's named context. The runtime defines both unconditionally
+            // (empty when the step named no context), and `context_delivery:
+            // file` is documented as "point the prompt at {{context_file}}" -
+            // which validate and run were both rejecting outright, because
+            // this list never learned about them.
+            "context",
+            "context_file",
             // The F5 budget snapshot. Listed here as well as in make_builtins
             // because this check is what decides whether `sfh validate`
             // accepts a key, and a validator that rejects what the runtime
@@ -439,6 +599,7 @@ fn precheck(
                 &r.when_last_line_is,
                 &r.when_last_line_matches,
                 &r.when_stderr_matches,
+                &r.when_label_is,
             ]
             .into_iter()
             .flatten()
@@ -772,6 +933,11 @@ struct ResumeState {
     last_executed: Option<String>,
     last_success: Option<String>,
     completed: bool,
+    /// The last durable workspace fingerprint this run recorded. A resume
+    /// compares the workspace against it to tell "nothing moved" from "something
+    /// outside this run edited it". Absent for a run with no managed workspace,
+    /// and for every run written before v1.2.
+    workspace_checkpoint: Option<String>,
     /// True once this run has already spent its one `on_budget` landing. The
     /// log is the only record of it: without this the resumed run would arrive
     /// with the restored cost still over the threshold and land a second time,
@@ -812,6 +978,22 @@ fn load_resume_for_flow(
     let log = contain::read_contained_opt(run_dir, "log.jsonl")?
         .ok_or_else(|| format!("cannot read {}/log.jsonl: file missing", run_dir.display()))?;
     let mut st = ResumeState::default();
+    // Active seconds this run INHERITED from an earlier one. Kept separate
+    // because the ordinary source of elapsed_sec is status.json, and that file
+    // is not durable the way the log is - a detached resume deletes it and
+    // seeds a zeroed replacement. Used as a FLOOR at the end of this function,
+    // never as an addend, so it can restore a lost figure without ever
+    // double-counting a present one.
+    let mut carried_elapsed: u64 = 0;
+    // The most durable elapsed-time source there is (see the restore
+    // precedence at the end of this function): a `run_end` event is logged
+    // exactly once, at the true end of an attempt, and never rewritten
+    // afterwards - unlike status.json, which a detached resume deletes and
+    // reseeds at zero. A log spanning several attempts (a stuck run,
+    // resumed, then failing) can carry more than one of these; the latest
+    // describes the most recent attempt, so it wins (plain assignment, not
+    // a max: an attempt's own total already includes everything before it).
+    let mut run_end_elapsed: Option<u64> = None;
     let mut last_step: Option<String> = None;
     let mut unfinished: BTreeMap<(String, u32), UnfinishedStep> = BTreeMap::new();
     // A completed leaf's chain may later be intentionally replaced by its
@@ -911,6 +1093,46 @@ fn load_resume_for_flow(
                         // old step hash can be checked.
                         pending_step_hashes.remove(&(step.clone(), visit));
                     }
+                }
+            }
+            // Spend this run inherited from an earlier one via
+            // --carry-budget-from. Folded in HERE, while reading the log in
+            // order, so it is the baseline the run's own step_end events then
+            // add to - and so it composes. Without this a second correction
+            // would silently forget the first run's spend, which is precisely
+            // the arithmetic the feature exists to stop anyone doing by hand.
+            // The event sits immediately after run_start, before any step ran,
+            // so the `.max(visit)` below can only ever raise these.
+            "budget_carried" => {
+                if let Some(n) = v.get("steps").and_then(|x| x.as_u64()) {
+                    st.total = st.total.saturating_add(n.min(u32::MAX as u64) as u32);
+                }
+                if let Some(c) = v.get("cost_usd").and_then(|x| x.as_f64()) {
+                    accumulate_cost(&mut st.cost_usd, c);
+                }
+                if let Some(visits) = v.get("visits").and_then(|x| x.as_object()) {
+                    for (step, visit) in visits {
+                        if let Some(n) = visit.as_u64() {
+                            let e = st.visits.entry(step.clone()).or_insert(0);
+                            *e = (*e).max(n.min(u32::MAX as u64) as u32);
+                        }
+                    }
+                }
+                // elapsed_sec is deliberately NOT ADDED: whichever of the
+                // three sources wins in the restore precedence at the end of
+                // this function (run_end, then meta.json, then status.json)
+                // records elapsed_before_attempt PLUS this attempt, so the
+                // carried seconds are normally already inside it, and adding
+                // them would double-count. Remembered as a floor instead,
+                // because "normally" is not "always": detach_run deletes a
+                // resumed run's status.json and seeds a zeroed replacement,
+                // so on `--resume <carried-run> --detach` the only surviving
+                // record of the inherited seconds may be this event. Steps,
+                // cost and visits are all durable in the log; wall clock has
+                // to be too, or three of the four carried ceilings hold and
+                // the fourth silently resets.
+                if let Some(secs) = v.get("elapsed_sec").and_then(|x| x.as_u64()) {
+                    carried_elapsed = carried_elapsed.max(secs);
                 }
             }
             // A completed compactor is its own durable post-processing stage.
@@ -1319,6 +1541,16 @@ fn load_resume_for_flow(
                         output_file: file,
                         exit,
                         stderr_file,
+                        outcome: v
+                            .get("outcome")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        label: v
+                            .get("outcome_label")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                     },
                 );
                 if !is_child {
@@ -1509,7 +1741,21 @@ fn load_resume_for_flow(
             // restored, not the trigger or the numbers: what matters on the way
             // back in is that the wrap-up chain has already been paid for once.
             "budget_landing" => st.budget_landed = true,
-            "run_end" => {}
+            // The workspace baseline this run last committed to. Later entries
+            // replace earlier ones - the newest durable checkpoint is the one a
+            // resume compares against - and an adoption is a checkpoint too.
+            "workspace_checkpoint" | "workspace_adopted" => {
+                if let Some(fp) = v
+                    .get("fingerprint")
+                    .or_else(|| v.get("to"))
+                    .and_then(|x| x.as_str())
+                {
+                    st.workspace_checkpoint = Some(fp.to_string());
+                }
+            }
+            "run_end" => {
+                run_end_elapsed = v.get("elapsed_sec").and_then(|x| x.as_u64());
+            }
             _ => {}
         }
     }
@@ -1571,14 +1817,46 @@ fn load_resume_for_flow(
             }
         }
     }
-    if let Some(text) = contain::read_contained_opt(run_dir, "status.json")? {
-        if let Ok(status) = serde_json::from_str::<serde_json::Value>(&text) {
-            st.elapsed_sec = status
-                .get("elapsed_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-        }
-    }
+    // ---- restore active time (P1-03) ----
+    // Three possible sources, consulted in this order - most durable first,
+    // and NEVER blended, because status.json's own elapsed already includes
+    // whatever came before it and adding a second source on top would
+    // double it:
+    //
+    // 1. `run_end_elapsed`, above: a run_end event, logged once at the true
+    //    end of an attempt and never rewritten. Most trusted because it is
+    //    both durable AND known-final.
+    // 2. meta.json's `elapsed_sec`: refreshed at that same final moment
+    //    (see the `meta_final` write in run_inner), so it normally agrees
+    //    with (1) exactly - it only falls behind when the attempt that
+    //    would have refreshed it was killed first, in which case it still
+    //    holds the value from the START of that attempt: a valid, if
+    //    stale, lower bound rather than the true total.
+    // 3. status.json's `elapsed_sec`: refreshed on every heartbeat, so the
+    //    freshest source for a run that crashed mid-attempt with neither of
+    //    the above - but the least durable of the three, because
+    //    detach_run deletes a resumed run's copy and seeds a zeroed
+    //    replacement before the child even starts (see the comment on
+    //    `carried_elapsed`, above, for the same durability gap encountered
+    //    one layer up).
+    //
+    // Whichever of the three answers, `carried_elapsed` is still applied as
+    // an unconditional FLOOR afterwards: what this run itself durably
+    // inherited via --carry-budget-from cannot be un-inherited by an
+    // earlier ancestor's record going quiet (see the `budget_carried`
+    // handling above for why that value is a floor and not an addend here
+    // too).
+    let meta_elapsed_sec = contain::read_contained_opt(run_dir, "meta.json")?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|meta| meta.get("elapsed_sec").and_then(|v| v.as_u64()));
+    let status_elapsed_sec = contain::read_contained_opt(run_dir, "status.json")?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|status| status.get("elapsed_sec").and_then(|v| v.as_u64()));
+    st.elapsed_sec = run_end_elapsed
+        .or(meta_elapsed_sec)
+        .or(status_elapsed_sec)
+        .unwrap_or(0)
+        .max(carried_elapsed);
     Ok(st)
 }
 
@@ -1726,6 +2004,27 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
         args.push("--runs-dir".into());
         args.push(d.display().to_string());
     }
+    // The background copy must resolve the same state root, the same overlays
+    // and the same workspace this validation pass just resolved; otherwise the
+    // detached run is a different run from the one that was checked.
+    if let Some(d) = &opts.state_dir {
+        args.push("--state-dir".into());
+        args.push(d.display().to_string());
+    }
+    for p in &opts.profiles {
+        args.push("--profiles".into());
+        args.push(p.display().to_string());
+    }
+    if opts.adopt_workspace {
+        args.push("--adopt-workspace".into());
+    }
+    // Absolute, like every other path here: the detached copy is started from
+    // a directory of the harness's choosing, and a relative ancestor would
+    // either miss or - worse - resolve to a different run.
+    if let Some(d) = &opts.carry_budget_from {
+        args.push("--carry-budget-from".into());
+        args.push(abs(d).display().to_string());
+    }
     if opts.no_partial_emit {
         args.push("--no-partial-emit".into());
     }
@@ -1819,6 +2118,28 @@ fn detach_run(opts: &RunOpts, run_dir: &Path, is_resume: bool, nonce: &str) -> R
     ) {
         let _ = execute::kill_pid_tree(d.pid);
         return Err(e);
+    }
+    if opts.as_json {
+        // A detached run has no result yet, so this envelope is explicitly
+        // NON-terminal and hands back the handle plus the command that blocks
+        // for the answer. `sfh status`/`wait`/`stop` all take the same run_dir,
+        // so a caller can prove it is talking about this run and not the newest.
+        machine::emit(&machine::envelope(
+            "run",
+            true,
+            0,
+            json!({
+                "state": "running",
+                "terminal": false,
+                "detached": true,
+                "pid": d.pid,
+                "run_id": run_dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+                "run_dir": run_dir.display().to_string(),
+                "flow": abs(&opts.flow_path).display().to_string(),
+                "next_actions": next_actions_for("running", run_dir, &opts.flow_path, None),
+            }),
+        ));
+        return Ok(0);
     }
     // stdout gets the run dir and nothing else, so a caller can capture it.
     println!("{}", run_dir.display());
@@ -2138,6 +2459,30 @@ fn status_json(s: &Status) -> Result<String, String> {
     serde_json::to_string_pretty(&v).map_err(|e| format!("cannot serialize status: {e}"))
 }
 
+/// Stamp a terminal state onto an existing run's status.json without going
+/// through the live `Status` machinery.
+///
+/// Used by the replay policy, which refuses before the run's status thread even
+/// exists. The previous document's fields are preserved so `runs show`, `wait`
+/// and `status` still see the run's history; only the outcome is replaced.
+fn mark_terminal_status(dir: &Path, state: &str, exit: i32, error: &str) -> Result<(), String> {
+    let path = dir.join("status.json");
+    let mut v: serde_json::Value = contain::read_contained_opt(dir, "status.json")?
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| json!({"schema_version": 1}));
+    let Some(map) = v.as_object_mut() else {
+        return Err(format!("{}: status.json is not an object", dir.display()));
+    };
+    map.insert("state".into(), json!(state));
+    map.insert("exit_code".into(), json!(exit));
+    map.insert("error".into(), json!(error));
+    map.insert("heartbeat_utc".into(), json!(utc_stamp()));
+    let text =
+        serde_json::to_string_pretty(&v).map_err(|e| format!("cannot serialize status: {e}"))?;
+    contain::write_private_atomic(&path, &text)
+        .map_err(|e| format!("cannot persist status {}: {e}", path.display()))
+}
+
 fn write_status(path: &Path, s: &Status) -> Result<(), String> {
     let text = status_json(s)?;
     // Write-then-rename: `sfh status` and `sfh wait` poll this file every few
@@ -2178,11 +2523,118 @@ fn seed_status(path: &Path, s: &Status) -> Result<(), String> {
     }
 }
 
+/// Proof, read straight from the log, that an attempt reached a genuine
+/// stop. Returns `(saw_run_end, log_recovers_a_terminal_landing)`:
+///
+/// - `saw_run_end`: a durable `run_end` event exists anywhere in the log.
+///   It is the very last thing `run` ever logs for an attempt, written
+///   exactly once, only at a true stop, so its presence alone proves
+///   finality - see `carry_source_is_final`, the only caller that treats it
+///   that way.
+/// - `log_recovers_a_terminal_landing`: the log's own LAST recorded routing
+///   decision already lands on "end", "fail" or "stuck" - the only three
+///   positions a live run does not step away from - or it logged a
+///   `persistence_failure`, which ends the attempt immediately for the same
+///   reason. This is weaker than `saw_run_end` on its own (the process that
+///   reached it could in principle still be alive), so callers pair it with
+///   independent proof the owning process is gone.
+fn log_terminal_evidence(dir: &Path) -> Result<(bool, bool), String> {
+    let mut run_end = false;
+    let mut last_position_terminal = false;
+    let mut persistence_failure = false;
+    if let Some(text) = contain::read_contained_opt(dir, "log.jsonl")? {
+        for line in text.lines() {
+            // Same fail-safe skip load_resume_for_flow uses: a torn last line
+            // from a kill mid-write is evidence of nothing and must not be
+            // misread as proof of anything (fail-SAFE, not fail-open - see
+            // the matching comment there).
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            match v.get("event").and_then(|x| x.as_str()).unwrap_or("") {
+                "run_end" => run_end = true,
+                "persistence_failure" => persistence_failure = true,
+                "position" => {
+                    let next = v.get("next").and_then(|x| x.as_str()).unwrap_or("");
+                    last_position_terminal = matches!(next, "end" | "fail" | "stuck");
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((run_end, last_position_terminal || persistence_failure))
+}
+
+/// Whether `dir` is a run `--carry-budget-from` may trust as a source: the
+/// finality check, factored out of the carry closure in `run_inner` so it
+/// can also back the `carryable` field `next_actions_for` reports for a run
+/// that just ended (see there) - both questions are "can this run's numbers
+/// be trusted as final", asked at different times.
+///
+/// When status.json can be read, its resolved state decides this exactly as
+/// it always has: refuse a run that is "running", or "wedged" (dead-looking
+/// on disk while the SAME process that started it is still alive - see
+/// execute::pid_start_time). pid_alive alone is not enough here because pid
+/// reuse makes it advisory: a run SIGKILLed with `state: running` still on
+/// disk would read as alive forever the moment the OS handed its pid to
+/// something unrelated, and `sfh stop` would refuse to clear it, leaving no
+/// way to carry at all. The recorded start time is what tells the original
+/// process from a stranger wearing its pid (rev_break #8). Anything else
+/// status.json resolves to - done, failed, stuck, a confirmed dead, a
+/// deliberate stop - is trusted, same as before.
+///
+/// When status.json cannot be read at all - missing, corrupt, or caught
+/// mid-rewrite - that USED TO say nothing either way and carry anyway
+/// (P1-02: fail-open in exactly the case that matters, a source run still
+/// appending to its log). Proof now has to come from the log and the
+/// process table instead: a durable `run_end` settles it outright; short of
+/// that, the owning process must be independently confirmed gone (via the
+/// run dir's own sfh-nonce, since status.json is exactly what is
+/// unavailable here) AND the log's own last word must already be a
+/// terminal landing. Absent both, the carry is refused rather than
+/// assumed.
+fn carry_source_is_final(dir: &Path) -> Result<(), String> {
+    if let Ok(snap) = watch::read(dir) {
+        // `pid_alive` first, and not merely because a gone process has no start
+        // time to compare: a ZOMBIE keeps its /proc entry, so the recorded start
+        // time still matches long after the process is dead, and "wedged" stayed
+        // true forever on any host that does not reap orphans. The carry was
+        // then refused with a message naming `sfh wait` and `sfh stop` - neither
+        // of which can clear a zombie - so the only documented route out of a
+        // SIGKILLed run was closed. Liveness is the question being asked here;
+        // the start time only tells the original owner from a stranger wearing
+        // its pid (rev_break #8), and is worth asking about a live pid alone.
+        let wedged = snap.state == "dead"
+            && snap.pid_start.is_some()
+            && execute::pid_alive(snap.pid)
+            && execute::pid_start_time(snap.pid) == snap.pid_start;
+        if snap.state == "running" || wedged {
+            return Err(format!(
+                "that run is still going, so its spend is not final yet. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
+                dir.display(), dir.display()
+            ));
+        }
+        return Ok(());
+    }
+    let (run_end, log_terminal) = log_terminal_evidence(dir)?;
+    if run_end {
+        return Ok(());
+    }
+    if log_terminal && matches!(watch::owner_verifiably_dead(dir)?, Some(true)) {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot confirm that run has finished - its status.json is missing or unreadable, and its log does not yet prove it reached a terminal state. Wait for it (`sfh wait {}`), or stop it (`sfh stop {}`), then carry.",
+        dir.display(), dir.display()
+    ))
+}
+
 fn run_inner(opts: &RunOpts) -> Result<i32, String> {
-    let runs_root = opts
-        .runs_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(".sfh").join("runs"));
+    // `--runs-dir` keeps meaning exactly what it always meant, and with neither
+    // flag the runs root is still `.sfh/runs`: every flow, script and CI job
+    // that predates v1.2 lands in the same place.
+    let state_root = state::StateRoot::resolve(opts.state_dir.as_deref(), opts.runs_dir.as_deref());
+    let runs_root = state_root.runs_dir();
 
     // Resolve the resume target BEFORE loading the flow. The era recorded in
     // meta.json decides whether the lenient loader (which restores pre-1.0
@@ -2219,10 +2671,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         .and_then(|m| m.get("sfh_version").and_then(|x| x.as_str()))
         .map(|v| v.starts_with("0."))
         .unwrap_or(false);
-    let flow = match flow::load(&opts.flow_path) {
+    let flow = match flow::load_with_overlays(&opts.flow_path, &opts.profiles) {
         Ok(f) => f,
         Err(e) => {
-            if resume_dir.is_some() && legacy_era {
+            if resume_dir.is_some() && legacy_era && opts.profiles.is_empty() {
                 flow::load_lenient(&opts.flow_path).map_err(|_| e)?
             } else {
                 return Err(e);
@@ -2386,16 +2838,87 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             ));
         }
         if let Some(u) = &resumed.unfinished_step {
-            if let Some(profile) = &u.profile {
-                eprintln!(
-                    "sfh: step '{}' selected fallback '{}' in visit {} but never recorded its end.\n     resuming that fallback directly: {}",
-                    u.step, profile, u.visit, u.cmd
-                );
-            } else {
-                eprintln!(
-                    "sfh: step '{}' started {} and never recorded an end.\n     resuming will run it again: {}",
-                    u.step, u.started, u.cmd
-                );
+            // The replay decision. A step that started and never recorded an
+            // end may have already done whatever it does out in the world, and
+            // sfh cannot look and find out. Re-running is right for a pure
+            // computation and wrong for a deploy, so the flow says which - and
+            // the refusals happen HERE, before anything is launched.
+            let policy = flow
+                .find_step(&u.step)
+                .map(|s| s.replay_policy(&flow))
+                .unwrap_or_default();
+            let effects = flow
+                .find_step(&u.step)
+                .map(|s| s.effects(&flow).as_str())
+                .unwrap_or("unknown");
+            match policy {
+                flow::ReplayPolicy::Rerun => {
+                    if let Some(profile) = &u.profile {
+                        eprintln!(
+                            "sfh: step '{}' selected fallback '{}' in visit {} but never recorded its end.\n     resuming that fallback directly: {}",
+                            u.step, profile, u.visit, u.cmd
+                        );
+                    } else {
+                        eprintln!(
+                            "sfh: step '{}' started {} and never recorded an end.\n     resuming will run it again: {}",
+                            u.step, u.started, u.cmd
+                        );
+                    }
+                }
+                flow::ReplayPolicy::Stuck | flow::ReplayPolicy::Fail => {
+                    let (code, word) = match policy {
+                        flow::ReplayPolicy::Stuck => (4, "stuck"),
+                        _ => (1, "failed"),
+                    };
+                    let why = format!(
+                        "step '{}' started {} and never recorded an end. It declares effects: {effects} with replay.unfinished: {}, so sfh will not launch it again without knowing whether its effects already happened.",
+                        u.step,
+                        u.started,
+                        policy.as_str()
+                    );
+                    // Nothing is spawned, and the workspace and every partial
+                    // artifact stay exactly where they are for a human to look
+                    // at. This is a decision handed back, not a failure.
+                    let mut log = contain::append_private(&dir.join("log.jsonl"))
+                        .map_err(|e| format!("cannot open log: {e}"))?;
+                    // Nothing ran this attempt, so the total active time is
+                    // exactly what was already restored - carried forward
+                    // rather than recomputed, for the same reason the other
+                    // three run_end sites now record it durably (P1-03):
+                    // this is the run's own strongest remaining source once
+                    // status.json goes missing or stale.
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "run_end", "state": word,
+                               "exit": code, "error": why.clone(),
+                               "replay_refused": policy.as_str(), "step": u.step,
+                               "elapsed_sec": resumed.elapsed_sec}),
+                    )?;
+                    mark_terminal_status(&dir, word, code, &why)?;
+                    if opts.as_json {
+                        machine::emit(&machine::error_envelope(
+                            "run",
+                            machine::ErrorCode::ReplayRefused,
+                            &why,
+                            code,
+                            json!({
+                                "run_dir": dir.display().to_string(),
+                                "state": word,
+                                "terminal": true,
+                                "step": u.step,
+                                "effects": effects,
+                                "replay_unfinished": policy.as_str(),
+                            }),
+                        ));
+                    } else {
+                        eprintln!("sfh: {why}");
+                        eprintln!(
+                            "sfh: the workspace and partial artifacts are preserved in {}",
+                            dir.display()
+                        );
+                    }
+                    return Ok(code);
+                }
             }
         }
         run_dir = dir;
@@ -2419,6 +2942,95 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         contain::mkdir_private(&d)
             .map_err(|e| format!("cannot create run dir {}: {e}", d.display()))?;
         run_dir = abs(&d);
+    }
+    // ---- inherit an earlier run's spend into this fresh one ----
+    // Resolved AFTER the run dir exists, because the ancestor has to be told
+    // apart from the run being started, and with no flow to check against: the
+    // ancestor ran a different flow, which is the premise of the whole feature.
+    let carry = (|| -> Result<Option<CarriedBudget>, String> {
+        let dir =
+            match &opts.carry_budget_from {
+                None => return Ok(None),
+                Some(_) if is_resume => return Err(
+                    "--carry-budget-from starts a NEW run that inherits an earlier run's spend; \
+                     --resume continues the earlier run itself. They answer different questions, \
+                     so pick one: resume when the flow is unchanged, carry when you had to fix it."
+                        .into(),
+                ),
+                Some(dir) => abs(dir),
+            };
+        if dir == run_dir {
+            return Err("--carry-budget-from cannot name the run it is starting".into());
+        }
+        // A run that is still spending has no final total. Carrying from it
+        // would take a snapshot the ancestor immediately invalidates, and the
+        // numbers in both runs would then be wrong in a way nothing downstream
+        // could detect. See carry_source_is_final for exactly what "final"
+        // means and is proven from - in particular, an unreadable or absent
+        // status.json no longer carries anyway (P1-02): it used to say
+        // nothing either way and let the carry through regardless.
+        carry_source_is_final(&dir)
+            .map_err(|e| format!("--carry-budget-from {}: {e}", dir.display()))?;
+        let prior = load_resume_for_flow(&dir, None)
+            .map_err(|e| format!("--carry-budget-from {}: {e}", dir.display()))?;
+        // A corrected flow may have renamed, split or removed steps. Laps
+        // are only enforceable against an id that still exists, so the two
+        // groups are separated and both are reported.
+        let (visits, mut dropped): (BTreeMap<String, u32>, Vec<String>) =
+            prior.visits.into_iter().fold(
+                (BTreeMap::new(), Vec::new()),
+                |(mut keep, mut drop), (step, visit)| {
+                    if flow.find_step(&step).is_some() {
+                        keep.insert(step, visit);
+                    } else {
+                        drop.push(step);
+                    }
+                    (keep, drop)
+                },
+            );
+        // `prior.visits` is a HashMap, so without this the dropped list -
+        // and therefore the message and the durable record - would come out
+        // in a different order on every run.
+        dropped.sort_unstable();
+        Ok(Some(CarriedBudget {
+            from: dir,
+            visits,
+            dropped,
+            steps: prior.total,
+            cost_usd: prior.cost_usd,
+            elapsed_sec: prior.elapsed_sec,
+        }))
+    })();
+    let carried = match carry {
+        Ok(c) => c,
+        Err(e) => {
+            // The run dir was created just above, and a carry that never got
+            // off the ground must not leave an empty one behind for `runs
+            // list`, `runs clean` and the next run's name counter to trip
+            // over. remove_dir, never remove_dir_all: nothing has been written
+            // into it yet, so a non-recursive delete does the whole job and
+            // can never grow into deleting a real run. A resumed dir and a
+            // --run-dir handed in by the detaching parent are not ours to
+            // remove.
+            if !is_resume && opts.run_dir.is_none() {
+                let _ = std::fs::remove_dir(&run_dir);
+            }
+            return Err(e);
+        }
+    };
+    if let Some(c) = &carried {
+        // Counters only. Nothing that would make this look like a resume:
+        // no outputs, no sessions, no routing position, no workspace.
+        resumed.total = c.steps;
+        resumed.cost_usd = c.cost_usd;
+        resumed.elapsed_sec = c.elapsed_sec;
+        resumed.visits = c.visits.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        // Said here rather than next to the durable event, so a `--dry-run`
+        // that never opens a log still tells the caller what this run would
+        // start with. Silence would make the flag look like a no-op.
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: {}", c.summary());
+        }
     }
     // Defense-in-depth: even though `name` is charset-validated, confirm the
     // resolved run dir is actually under the runs root (guards symlink tricks).
@@ -2458,6 +3070,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     }
     let notes_file = run_dir.join("notes.md");
 
+    // ---- workspace ----
+    // Decided from the flow's static shape (see Flow::workspace_plan), which is
+    // why a plan and a run always agree about it. A flow with no `workspace:`
+    // key resolves to `current` and creates nothing at all.
+    let workspace_plan = flow.workspace_plan()?;
+    for w in &workspace_plan.warnings {
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: warning: {w}");
+        }
+    }
+
     if opts.dry_run {
         let result = dry_run(
             &flow,
@@ -2467,6 +3090,14 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             &flow_dir,
             &notes_file,
             &needed_sessions,
+            DryRunExtras {
+                flow_path: &opts.flow_path,
+                workspace: &workspace_plan,
+                state_root: &state_root,
+                profiles: &opts.profiles,
+                as_json: opts.as_json,
+                save: opts.save_plan.clone(),
+            },
         );
         if let Err(e) = std::fs::remove_dir_all(&run_dir) {
             eprintln!(
@@ -2513,6 +3144,291 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             }
         }
     }
+    // ---- execution closure ----
+    // The flow fingerprint has always caught an edited flow. It cannot catch a
+    // profile overlay that swapped the model, a context file that was rewritten
+    // between the crash and the resume, or a CLI that upgraded itself - each of
+    // which changes what the run does while leaving the flow byte-identical.
+    let closure_now = build_closure(
+        &flow,
+        &opts.flow_path,
+        &opts.profiles,
+        &workspace_plan,
+        (!is_resume).then_some(&tool_versions),
+    )?;
+    if is_resume {
+        let recorded = contain::read_contained_opt(&run_dir, closure::FILE)?
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .as_ref()
+            .and_then(closure::Closure::from_json);
+        if let Some(before) = recorded {
+            // The versions probed at the original run are part of the closure,
+            // and a resume does not re-probe (that would be a second cost on a
+            // path that is meant to be cheap), so compare on the entries this
+            // attempt could actually reconstruct.
+            let mut now = closure_now.clone();
+            if let Some(tools) = before.get("tools") {
+                now.set("tools", tools.clone());
+            }
+            let changes = before.diff(&now);
+            if !changes.is_empty() {
+                if opts.force_resume {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "force_resume",
+                               "reason": "execution_closure_changed", "changes": changes}),
+                    )?;
+                    if !opts.quiet && !opts.as_json {
+                        eprintln!(
+                            "sfh: warning: --force-resume accepted a changed execution closure:"
+                        );
+                        for c in &changes {
+                            eprintln!("sfh:   {c}");
+                        }
+                    }
+                } else {
+                    return Err(format!(
+                        "{}: the execution closure changed since this run started, so resuming would continue a different piece of work:\n  {}\nRe-run from scratch, restore the inputs, or pass --force-resume to accept the change.",
+                        machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                        changes.join("\n  ")
+                    ));
+                }
+            }
+        }
+    } else {
+        let text = serde_json::to_string_pretty(&closure_now.to_json())
+            .map_err(|e| format!("cannot serialize the execution closure: {e}"))?;
+        contain::write_private_atomic(&run_dir.join(closure::FILE), text)
+            .map_err(|e| format!("cannot persist the execution closure: {e}"))?;
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "execution_closure",
+                   "fingerprint": closure_now.fingerprint(), "algo": closure::ALGO}),
+        )?;
+    }
+
+    // ---- managed workspace ----
+    // At most ONE per run, whatever the step or visit count: analyze, implement,
+    // test, review and every loop revisit share it, because they are all working
+    // on the same thing and a per-step worktree would hide each step's changes
+    // from the next.
+    let mut workspace: Option<workspace::Workspace> = None;
+    if is_resume {
+        if let Some(ws) = contain::read_contained_opt(&run_dir, workspace::MANIFEST)?
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .as_ref()
+            .and_then(workspace::Workspace::from_manifest)
+        {
+            let checkpoint = resumed.workspace_checkpoint.clone();
+            let unfinished = resumed.unfinished_step.is_some();
+            if workspace_plan.verify_on_resume {
+                match workspace::detect_drift(&ws, checkpoint.as_deref(), unfinished) {
+                    workspace::Drift::None => {}
+                    workspace::Drift::Missing => {
+                        return Err(format!(
+                            "{}: the managed workspace {} no longer exists, so this run cannot continue where it left off",
+                            machine::ErrorCode::WorkspaceMissing.as_str(),
+                            ws.path.display()
+                        ))
+                    }
+                    workspace::Drift::Unknown(why) => {
+                        return Err(format!(
+                            "{}: sfh cannot fingerprint the workspace {} ({why}), so it cannot tell whether anything changed",
+                            machine::ErrorCode::WorkspaceDrift.as_str(),
+                            ws.path.display()
+                        ))
+                    }
+                    workspace::Drift::Changed { unfinished } => {
+                        if opts.adopt_workspace {
+                            let now = workspace::fingerprint(&ws.path)?;
+                            log_event(
+                                &mut log,
+                                json!({"ts": utc_stamp(), "event": "workspace_adopted",
+                                       "workspace_id": ws.id, "path": ws.path.display().to_string(),
+                                       "from": checkpoint, "to": now}),
+                            )?;
+                            if !opts.quiet && !opts.as_json {
+                                eprintln!(
+                                    "sfh: --adopt-workspace accepted the current contents of {} as the new baseline",
+                                    ws.path.display()
+                                );
+                            }
+                        } else if unfinished {
+                            // A step was in flight when the run stopped, so the
+                            // difference is explainable. The replay policy - not
+                            // this check - decides what happens to that step.
+                            if !opts.quiet && !opts.as_json {
+                                eprintln!(
+                                    "sfh: warning: {} differs from its last checkpoint, which is consistent with the step that never finished",
+                                    ws.path.display()
+                                );
+                            }
+                        } else {
+                            return Err(format!(
+                                "{}: the managed workspace {} changed since this run's last checkpoint, and no step was in flight to explain it. Something outside this run edited it.\nPass --adopt-workspace to accept the current contents as the new baseline. (--force-resume is a different question: it waives the flow/closure check, not this one.)",
+                                machine::ErrorCode::WorkspaceDrift.as_str(),
+                                ws.path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            workspace = Some(ws);
+        }
+    } else if workspace_plan.resolved == flow::WorkspaceMode::GitWorktree {
+        // With no `root:`, the workspace is a worktree of the repository the
+        // CALLER is standing in - not of the repository the flow file happens
+        // to live in. A managed workspace replaces the caller's cwd, which is
+        // where every step ran before v1.2, so that is the directory it has to
+        // be about. It also makes a shared flow work: `sfh run
+        // /somewhere/else/flow.yaml` from your project operates on YOUR
+        // project. An explicit `root:` is resolved against the flow file, like
+        // every other path a flow declares.
+        let source = match &workspace_plan.root {
+            Some(r) => flow_dir.join(r),
+            None => std::env::current_dir()
+                .map_err(|e| format!("cannot resolve the current directory: {e}"))?,
+        };
+        let ws = workspace::create_git_worktree(
+            &source,
+            &state_root,
+            &name,
+            run_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.clone())
+                .as_str(),
+            workspace_plan.base.as_deref(),
+        )?;
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "workspace_created",
+                   "workspace_id": ws.id, "mode": ws.mode.as_str(),
+                   "path": ws.path.display().to_string(), "branch": ws.branch,
+                   "base_ref": ws.base_ref, "base_commit": ws.base_commit}),
+        )?;
+        if !opts.quiet && !opts.as_json {
+            eprintln!(
+                "sfh: workspace: {} (branch {})",
+                ws.path.display(),
+                ws.branch.as_deref().unwrap_or("-")
+            );
+        }
+        workspace = Some(ws);
+    } else if workspace_plan.resolved == flow::WorkspaceMode::Directory {
+        let root = workspace_plan
+            .root
+            .as_ref()
+            .expect("workspace_plan rejects directory mode without a root");
+        let path = flow_dir.join(root);
+        if !path.is_dir() {
+            return Err(format!(
+                "workspace.root {} is not a directory. sfh does not create a `directory` workspace - it is yours, and creating or removing it is not sfh's to do.",
+                path.display()
+            ));
+        }
+        workspace = Some(workspace::Workspace {
+            id: "primary".into(),
+            mode: flow::WorkspaceMode::Directory,
+            source_root: path.clone(),
+            path,
+            base_ref: None,
+            base_commit: None,
+            branch: None,
+            // NOT sfh's: no marker, no nonce, and therefore never removable.
+            created_by_sfh: false,
+            ownership_nonce: None,
+            cleanup: flow::WorkspaceCleanup::Keep,
+        });
+    }
+    let workspace_path: Option<PathBuf> = workspace.as_ref().map(|w| w.path.clone());
+    if let Some(ws) = &workspace {
+        if !is_resume {
+            let initial = (ws.mode == flow::WorkspaceMode::GitWorktree)
+                .then(|| workspace::fingerprint(&ws.path).ok())
+                .flatten();
+            let text = serde_json::to_string_pretty(&ws.to_json(initial.as_deref()))
+                .map_err(|e| format!("cannot serialize the workspace manifest: {e}"))?;
+            contain::write_private_atomic(&run_dir.join(workspace::MANIFEST), text)
+                .map_err(|e| format!("cannot persist the workspace manifest: {e}"))?;
+            if let Some(fp) = &initial {
+                log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "workspace_checkpoint",
+                           "workspace_id": ws.id, "at": "run_start", "fingerprint": fp}),
+                )?;
+            }
+        }
+    }
+
+    // ---- context snapshot ----
+    // P0-04: build_closure, above, pins every `kind: file` context by the
+    // bytes it read at that moment - but until now, a step's own context
+    // assembly (leaf::prepare_leaf -> context::build) opened the SAME
+    // declared path again, live, whenever that step happened to run. See
+    // snapshot_file_contexts's doc comment for the bug this closes; this is
+    // the run-start call that closes it, placed after the workspace is
+    // resolved (immediately above) so a context source that is only
+    // contained within the workspace - not the flow directory - validates
+    // exactly the way it will for every step that reads it.
+    //
+    // A resumed run keeps the ORIGINAL snapshot rather than capturing a new
+    // one, even under --force-resume. execution-closure.json is itself
+    // write-once - resuming never rewrites the copy on disk, force or not
+    // (see the closure check above, which reads it back but only ever WRITES
+    // it in the `!is_resume` branch) - so re-snapshotting on resume would
+    // freeze NEW bytes under a closure that still records the OLD hash: the
+    // exact closure/snapshot disagreement this feature must never produce.
+    // --force-resume's documented job is "let this run continue despite what
+    // moved outside it", not "rebase this run onto the new inputs" - that is
+    // what re-running from scratch is for, and a fresh run gets a fresh
+    // snapshot the ordinary way, from a fresh closure. See
+    // `snapshot_and_persist_context` for why a flow with no `kind: file`
+    // context at all leaves no manifest behind on that fresh capture.
+    let containment_now = context::Containment {
+        flow_dir: &flow_dir,
+        workspace: workspace_path.as_deref(),
+    };
+    let context_snapshot: Option<HashMap<String, Option<PathBuf>>> = if is_resume {
+        match load_context_snapshot(&run_dir)? {
+            ResumedSnapshot::Loaded(map) => Some(map),
+            ResumedSnapshot::NotPresent => None,
+            ResumedSnapshot::Corrupt(reason) => {
+                if opts.force_resume {
+                    log_event(
+                        &mut log,
+                        json!({"ts": utc_stamp(), "event": "force_resume",
+                               "reason": "context_snapshot_unreadable", "error": reason}),
+                    )?;
+                    if !opts.quiet && !opts.as_json {
+                        eprintln!(
+                            "sfh: warning: --force-resume continued past an unreadable context snapshot: {reason}"
+                        );
+                    }
+                    None
+                } else {
+                    return Err(format!(
+                        "{}: this run's context snapshot ({}) cannot be read ({reason}), so sfh cannot confirm every step would see the bytes execution-closure.json pinned.\nRe-run from scratch, or pass --force-resume to continue without that guarantee.",
+                        machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                        run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).display()
+                    ));
+                }
+            }
+        }
+    } else {
+        Some(snapshot_and_persist_context(
+            &flow,
+            &containment_now,
+            &run_dir,
+            &mut log,
+        )?)
+    };
+    // Held for the rest of this run: every prepare_leaf call from here on
+    // resolves its `kind: file` contexts through this pin instead of the
+    // live path. Dropping it (at function exit, or between tests that share
+    // a thread) hands the thread back with no pin active.
+    let _context_snapshot_guard = context_snapshot.map(context::activate_snapshot);
+
     let started = utc_stamp();
     let meta = json!({
         "schema_version": 1,
@@ -2522,6 +3438,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "flow_fingerprint_algo": FINGERPRINT_ALGO,
         "effective_config_fingerprint": effective_config_fp,
         "effective_config_fingerprint_algo": FINGERPRINT_ALGO,
+        "execution_closure_fingerprint": closure_now.fingerprint(),
+        "execution_closure_algo": closure::ALGO,
         "name": name,
         "started_utc": started,
         "os": std::env::consts::OS,
@@ -2529,6 +3447,16 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         "tools": tool_versions,
         "resumed": is_resume,
         "elapsed_sec": elapsed_before_attempt,
+        "workspace": workspace.as_ref().map(|w| json!({
+            "mode": w.mode.as_str(),
+            "path": w.path.display().to_string(),
+            "branch": w.branch,
+            "created_by_sfh": w.created_by_sfh,
+        })),
+        "unsafe_overrides": flow.unsafe_overrides(),
+        "profile_overlays": opts.profiles.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        // Absent for a run that started from zero, which is nearly all of them.
+        "carried_budget": carried.as_ref().map(CarriedBudget::to_json),
     });
     let meta_text = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
@@ -2538,6 +3466,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         &mut log,
         json!({"ts": utc_stamp(), "event": "run_start", "sfh_version": VERSION, "resumed": is_resume, "flow_fingerprint": flow_fp, "effective_config_fingerprint": effective_config_fp}),
     )?;
+    // Written as its own durable event, immediately after run_start and before
+    // anything is launched. A run that began with someone else's spend on the
+    // clock must say so in its own log: otherwise the numbers in status.json
+    // are unexplainable, and there is nothing linking the second attempt at a
+    // piece of work to the first.
+    if let Some(c) = &carried {
+        let mut e = c.to_json();
+        e["ts"] = json!(utc_stamp());
+        e["event"] = json!("budget_carried");
+        log_event(&mut log, e)?;
+    }
 
     // ---- live status file + heartbeat so a parent agent can poll liveness ----
     // The run-level activity clock: every child's reader thread stores the
@@ -2740,6 +3679,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         cost_usd,
                         elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs()),
                     ),
+                    workspace: workspace_path.as_deref(),
                     quiet: opts.quiet,
                     verbose: opts.verbose,
                 };
@@ -3096,6 +4036,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             cost_usd,
                             elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs()),
                         ),
+                        workspace: workspace_path.as_deref(),
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     }
@@ -3470,6 +4411,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                             output_file: d.out_file.display().to_string(),
                             exit: d.exit_code,
                             stderr_file: stderr_file_for(&d.out_file).display().to_string(),
+                            outcome: outcome_name(d),
+                            label: outcome_label(d),
                         },
                     );
                     if let (Some(tool), Some(sid)) = (&d.tool, &d.session_id) {
@@ -3906,7 +4849,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     let prep = leaf::prepare_leaf(&cx, step, visit, &gtag, &[], None)?;
                     log_event(
                         &mut log,
-                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep)}),
+                        json!({"ts": utc_stamp(), "event": "step_start", "step": step.id, "visit": visit, "cmd": prep.inv.describe(), "session_parent": session_parent_json(&prep), "protocol_expected": protocol::expected_kind(&prep.parse),
+                               "context_hash": prep.context_hash, "context_file": prep.context_file.as_ref().and_then(|p| file_name(p)),
+                               "workspace_id": workspace.as_ref().map(|w| w.id.clone())}),
                     )?;
                     leaf::exec_leaf(prep)
                 };
@@ -4017,6 +4962,8 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         output_file: d.out_file.display().to_string(),
                         exit: d.exit_code,
                         stderr_file: stderr_file_for(&d.out_file).display().to_string(),
+                        outcome: outcome_name(d),
+                        label: outcome_label(d),
                     },
                 );
                 let rt = d.chain_output.clone();
@@ -4108,6 +5055,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         tag: &gtag,
                         run_clock: &run_clock,
                         wall_deadline,
+                        workspace: workspace_path.as_deref(),
                         quiet: opts.quiet,
                         verbose: opts.verbose,
                     };
@@ -4339,15 +5287,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             .or_else(|| last_success.clone().filter(nonempty))
             .or_else(|| last_executed.clone().filter(nonempty))
     };
+    // Shared by meta.json's final write and the run_end event just below it:
+    // the two are meant to agree exactly (P1-03's restore precedence relies
+    // on that - see load_resume_for_flow), so both read it from the same
+    // computation rather than two calls that could drift apart.
+    let final_elapsed_sec = elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs());
     let mut meta_final = meta.clone();
     if let Some(m) = meta_final.as_object_mut() {
         m.insert("finished_utc".into(), json!(utc_stamp()));
         m.insert("leaf_runs".into(), json!(total));
         m.insert("cost_usd".into(), json!(cost_usd));
-        m.insert(
-            "elapsed_sec".into(),
-            json!(elapsed_before_attempt.saturating_add(flow_start.elapsed().as_secs())),
-        );
+        m.insert("elapsed_sec".into(), json!(final_elapsed_sec));
         m.insert(
             "status".into(),
             json!(match &result {
@@ -4392,6 +5342,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // Whatever finished work exists, handed back the way a failure hands it
     // back - a run the caller has to act on is exactly when it is needed.
     let emit_partial = |pick: &Option<String>| {
+        if opts.as_json {
+            return;
+        }
         if let Some(id) = pick {
             if let Some(o) = outputs.get(id) {
                 if !o.output.trim().is_empty() {
@@ -4402,11 +5355,55 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         }
     };
 
+    // The terminal workspace checkpoint, recorded before the outcome is
+    // published: whatever happens to the workspace next - an automatic cleanup,
+    // a human poking at it - the log already says what it held when the run
+    // stopped.
+    let final_state = match &result {
+        Ok(FlowEnd::Completed) => "done",
+        Ok(FlowEnd::Stuck { .. }) => "stuck",
+        Err(_) => "failed",
+    };
+    if let Some(ws) = &workspace {
+        if ws.mode == flow::WorkspaceMode::GitWorktree {
+            match workspace::fingerprint(&ws.path) {
+                Ok(fp) => log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "workspace_checkpoint",
+                           "workspace_id": ws.id, "at": "terminal", "fingerprint": fp}),
+                )?,
+                Err(e) => log_event(
+                    &mut log,
+                    json!({"ts": utc_stamp(), "event": "workspace_checkpoint",
+                           "workspace_id": ws.id, "at": "terminal", "fingerprint": serde_json::Value::Null,
+                           "error": e}),
+                )?,
+            }
+        }
+        // Cleanup can decline, and it can fail. Neither turns a successful run
+        // into a failed one: the work is done and recorded, and a worktree that
+        // could not be removed is a housekeeping note, not a result.
+        let outcome = workspace::cleanup_auto(ws, final_state);
+        if !matches!(outcome, workspace::Cleanup::NotApplicable) {
+            log_event(
+                &mut log,
+                json!({"ts": utc_stamp(), "event": "workspace_cleanup",
+                       "workspace_id": ws.id, "path": ws.path.display().to_string(),
+                       "outcome": outcome.as_json()}),
+            )?;
+            if let workspace::Cleanup::Failed(e) = &outcome {
+                if !opts.quiet && !opts.as_json {
+                    eprintln!("sfh: warning: could not remove the managed workspace: {e}");
+                }
+            }
+        }
+    }
+
     match result {
         Ok(FlowEnd::Completed) => {
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "ok", "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
             let emit_id = opts.emit.clone().or(last_success);
             let emit_id =
@@ -4418,7 +5415,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     .unwrap_or_default();
                 // Emit first: `sfh wait` treats a terminal status.json as "the
                 // output is ready", so the status must not go terminal before it.
-                print_emit(&out, max_emit, chain_files.get(id));
+                // In JSON mode the result travels inside the envelope instead,
+                // because stdout must hold the envelope and nothing else.
+                if !opts.as_json {
+                    print_emit(&out, max_emit, chain_files.get(id));
+                }
             } else if last_executed.is_none() {
                 // Rare, but leaving status.json on "running" would make this
                 // look like a run that got killed rather than one that ended.
@@ -4426,7 +5427,26 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 return Err("no step was executed".into());
             }
             finish("done", cost_usd, 0, emit_id.as_deref(), None)?;
-            if !opts.quiet {
+            if opts.as_json {
+                emit_run_envelope(RunEnvelope {
+                    ok: true,
+                    state: "done",
+                    exit_code: 0,
+                    run_dir: &run_dir,
+                    flow: &opts.flow_path,
+                    error: None,
+                    result: emit_id
+                        .as_deref()
+                        .and_then(|id| outputs.get(id))
+                        .map(|o| o.output.as_str()),
+                    result_file: emit_id.as_deref().and_then(|id| chain_files.get(id)),
+                    result_step: emit_id.as_deref(),
+                    max_emit,
+                    workspace: workspace.as_ref(),
+                    leaf_runs: total,
+                    cost_usd,
+                });
+            } else if !opts.quiet {
                 eprintln!(
                     "sfh: done. {} leaf runs, ${cost_usd:.4} reported. run dir: {}",
                     total,
@@ -4443,8 +5463,30 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             let msg = format!("routed to stuck after '{after}'");
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "stuck", "error": msg, "after": after, "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
+            if opts.as_json {
+                finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg))?;
+                emit_run_envelope(RunEnvelope {
+                    ok: false,
+                    state: "stuck",
+                    exit_code: 4,
+                    run_dir: &run_dir,
+                    flow: &opts.flow_path,
+                    error: Some((machine::ErrorCode::ReplayRefused, msg.as_str())),
+                    result: partial_pick
+                        .as_deref()
+                        .and_then(|id| outputs.get(id))
+                        .map(|o| o.output.as_str()),
+                    result_file: partial_pick.as_deref().and_then(|id| chain_files.get(id)),
+                    result_step: partial_pick.as_deref(),
+                    max_emit,
+                    workspace: workspace.as_ref(),
+                    leaf_runs: total,
+                    cost_usd,
+                });
+                return Ok(4);
+            }
             eprintln!("sfh: FLOW STUCK: {msg}");
             // Emit before the status goes terminal, for the same reason the
             // success path does: `sfh wait` reads a terminal status.json as
@@ -4458,8 +5500,30 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         Err(msg) => {
             log_event(
                 &mut log,
-                json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd}),
+                json!({"ts": utc_stamp(), "event": "run_end", "status": "failed", "error": msg, "leaf_runs": total, "cost_usd": cost_usd, "elapsed_sec": final_elapsed_sec}),
             )?;
+            if opts.as_json {
+                finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg))?;
+                emit_run_envelope(RunEnvelope {
+                    ok: false,
+                    state: "failed",
+                    exit_code: 1,
+                    run_dir: &run_dir,
+                    flow: &opts.flow_path,
+                    error: Some((run_failure_code(&msg), msg.as_str())),
+                    result: partial_pick
+                        .as_deref()
+                        .and_then(|id| outputs.get(id))
+                        .map(|o| o.output.as_str()),
+                    result_file: partial_pick.as_deref().and_then(|id| chain_files.get(id)),
+                    result_step: partial_pick.as_deref(),
+                    max_emit,
+                    workspace: workspace.as_ref(),
+                    leaf_runs: total,
+                    cost_usd,
+                });
+                return Ok(1);
+            }
             eprintln!("sfh: FLOW FAILED: {msg}");
             emit_partial(&partial_pick);
             finish("failed", cost_usd, 1, partial_pick.as_deref(), Some(&msg))?;
@@ -4468,6 +5532,324 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             Ok(1)
         }
     }
+}
+
+/// The terminal answer a `run --json` caller receives.
+struct RunEnvelope<'a> {
+    ok: bool,
+    state: &'static str,
+    exit_code: i32,
+    run_dir: &'a Path,
+    flow: &'a Path,
+    error: Option<(machine::ErrorCode, &'a str)>,
+    /// The emitted text, subject to the same `max_emit_chars` ceiling the human
+    /// path applies. `result_file` always names the complete text on disk, so a
+    /// caller that needs all of it never has to raise the ceiling.
+    result: Option<&'a str>,
+    result_file: Option<&'a PathBuf>,
+    result_step: Option<&'a str>,
+    max_emit: usize,
+    workspace: Option<&'a workspace::Workspace>,
+    leaf_runs: u32,
+    cost_usd: f64,
+}
+
+/// Which stable code a flow failure maps to.
+///
+/// The engine's failure messages are prose that is allowed to improve, so the
+/// mapping keys off the markers sfh itself writes. Anything unrecognised stays
+/// a plain flow failure rather than being forced into a code that would tell a
+/// caller something specific and wrong.
+fn run_failure_code(msg: &str) -> machine::ErrorCode {
+    for code in [
+        machine::ErrorCode::ExecutionClosureChanged,
+        machine::ErrorCode::WorkspaceMissing,
+        machine::ErrorCode::WorkspaceDrift,
+        machine::ErrorCode::WorkspaceUnowned,
+        machine::ErrorCode::WorkspaceBusy,
+        machine::ErrorCode::ReplayRefused,
+        machine::ErrorCode::PersistenceFailure,
+    ] {
+        if msg.contains(code.as_str()) {
+            return code;
+        }
+    }
+    if msg.contains("did not match its documented machine-readable format")
+        || msg.contains("not its documented machine-readable output")
+    {
+        return machine::ErrorCode::ProtocolInvalid;
+    }
+    if msg.contains("documented terminal record") || msg.contains("result envelope") {
+        return machine::ErrorCode::TerminalMissing;
+    }
+    if msg.contains("resume unverified") || msg.contains("resume mismatch") {
+        return machine::ErrorCode::SessionUnverified;
+    }
+    if msg.contains("persist") {
+        return machine::ErrorCode::PersistenceFailure;
+    }
+    machine::ErrorCode::FlowInvalid
+}
+
+fn emit_run_envelope(e: RunEnvelope<'_>) {
+    let truncated = e.result.map(|r| {
+        let n = r.chars().count();
+        if n > e.max_emit {
+            r.chars().take(e.max_emit).collect::<String>()
+        } else {
+            r.to_string()
+        }
+    });
+    let body = json!({
+        "state": e.state,
+        "terminal": true,
+        "run_id": e.run_dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+        "run_dir": e.run_dir.display().to_string(),
+        "flow": abs(e.flow).display().to_string(),
+        "result": truncated,
+        "result_step": e.result_step,
+        "result_file": e.result_file.map(|p| p.display().to_string()),
+        "result_truncated": e.result.map(|r| r.chars().count() > e.max_emit),
+        "leaf_runs": e.leaf_runs,
+        "cost_usd": e.cost_usd,
+        "workspace": e.workspace.map(|w| json!({
+            "path": w.path.display().to_string(),
+            "mode": w.mode.as_str(),
+            "branch": w.branch,
+        })),
+        "next_actions": next_actions_for(e.state, e.run_dir, e.flow, e.error),
+    });
+    match e.error {
+        Some((code, msg)) => machine::emit(&machine::error_envelope(
+            "run",
+            code,
+            msg,
+            e.exit_code,
+            body,
+        )),
+        None => machine::emit(&machine::envelope("run", e.ok, e.exit_code, body)),
+    }
+}
+
+/// Whether resuming `run_dir` right now, unchanged, would walk straight back
+/// into the same `stuck`: true (naming the step) only when the log's LAST
+/// recorded routing decision reached "stuck" through `on_max_visits`
+/// (`PositionVia::MaxVisits`).
+///
+/// That step's visit counter is already at the flow's declared ceiling, and
+/// `--resume` restores it as-is - see the "stuck" arm of the `position`
+/// handling in `load_resume_for_flow`: resetting the counter there would
+/// quietly undo the limit the flow set, which is exactly the escape hatch
+/// on_max_visits exists to close. So re-entering the step on resume
+/// re-triggers on_max_visits immediately, without running anything or
+/// spending anything new: a provable dead end, not just a likely one.
+///
+/// Any OTHER route to stuck - an explicit `goto: stuck` rule, an on_error
+/// stuck, a budget landing - depends on what the step actually does or
+/// decides when it runs again, which resuming can legitimately change (a
+/// human fixed what it was stuck on, or the AI answers differently this
+/// time). Only max_visits exhaustion is deterministic enough to refuse
+/// resume over.
+fn stuck_step_exhausted_max_visits(run_dir: &Path) -> Option<String> {
+    let text = contain::read_contained_opt(run_dir, "log.jsonl")
+        .ok()
+        .flatten()?;
+    let mut exhausted: Option<String> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("event").and_then(|x| x.as_str()) != Some("position") {
+            continue;
+        }
+        // Reassigned on every position event, terminal or not, so the
+        // result reflects the LOG'S LAST word - a later, non-max_visits
+        // position (a resumed attempt that got past it) must clear an
+        // earlier max_visits landing, not leave it lingering.
+        exhausted = (v.get("via").and_then(|x| x.as_str()) == Some("max_visits")).then(|| {
+            v.get("after")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
+    }
+    exhausted
+}
+
+/// Build one diagnosed `resume` or `carry_budget` action. `ok_field` is
+/// "resumable" or "carryable" - the review's own names for the two
+/// diagnoses, kept as the literal JSON key so a caller reads exactly what
+/// was asked for rather than a generic "runnable" flag that does not say
+/// which question it answers.
+///
+/// `argv` is present ONLY when `ok` is true: an unrunnable action is never
+/// handed a command to run verbatim (P1-09's central rule), but it is still
+/// reported - with `reason` and, when relevant, `requires` - so "nothing is
+/// runnable" is something the caller is TOLD, not left to infer from a
+/// shorter list.
+fn diagnosed_action(
+    kind: &str,
+    ok_field: &str,
+    ok: bool,
+    reason: String,
+    requires: &[&str],
+    argv: Vec<String>,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("kind".into(), json!(kind));
+    m.insert(ok_field.to_string(), json!(ok));
+    m.insert("reason".into(), json!(reason));
+    m.insert("requires".into(), json!(requires));
+    if ok {
+        m.insert("argv".into(), json!(argv));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Runnable follow-ups, as argv rather than prose, so a caller can act
+/// without parsing an instruction - "why" (and, mid-run, "wait") always
+/// qualify, but `resume` and `carry_budget` do not just because the state is
+/// `failed` or `stuck`: a persistence failure is not resumable, a stuck run
+/// that exhausted max_visits sticks again the instant it is resumed, and a
+/// workspace or execution-closure problem needs a specific flag before
+/// resuming can work at all (P1-09). Each is diagnosed here rather than
+/// assumed from the state alone, using the same durable facts a human would
+/// have to go check by hand: the classified failure code already computed
+/// for this envelope's `error`, the log's own last routing decision, and -
+/// for carry - the exact finality proof `--carry-budget-from` itself
+/// requires (`carry_source_is_final`, P1-02). An action this run cannot
+/// actually complete is never handed a command to run; only the diagnosis
+/// that explains why is.
+fn next_actions_for(
+    state: &str,
+    run_dir: &Path,
+    flow: &Path,
+    error: Option<(machine::ErrorCode, &str)>,
+) -> Vec<serde_json::Value> {
+    let rd = run_dir.display().to_string();
+    let mut out = vec![machine::next_action(
+        "why",
+        vec![
+            "sfh".into(),
+            "runs".into(),
+            "why".into(),
+            rd.clone(),
+            "--json".into(),
+        ],
+    )];
+    match state {
+        "running" => out.insert(
+            0,
+            machine::next_action(
+                "wait",
+                vec!["sfh".into(), "wait".into(), rd.clone(), "--json".into()],
+            ),
+        ),
+        "failed" | "stuck" => {
+            let (resumable, resume_reason, requires): (bool, String, Vec<&str>) = if state
+                == "stuck"
+            {
+                match stuck_step_exhausted_max_visits(run_dir) {
+                    Some(step) => (
+                        false,
+                        format!(
+                            "step '{step}' is stuck because it reached its declared max_visits; resuming walks back into the same step and sticks again immediately, without running anything. Raise max_visits (or change on_max_visits) in the flow, then resume."
+                        ),
+                        vec![],
+                    ),
+                    None => (
+                        true,
+                        "a human decision was requested; resuming continues from where the flow left off.".to_string(),
+                        vec![],
+                    ),
+                }
+            } else {
+                match error.map(|(c, _)| c) {
+                    Some(machine::ErrorCode::PersistenceFailure) => (
+                        false,
+                        "a required result could not be durably persisted, so this run is not resumable: replaying it risks re-running an effect whose completion cannot be verified. Verify the external side effect by hand, then start a fresh run.".to_string(),
+                        vec![],
+                    ),
+                    Some(machine::ErrorCode::WorkspaceMissing) => (
+                        false,
+                        "the managed workspace this run recorded no longer exists, so there is nothing here to resume into. Restore it, or start a fresh run.".to_string(),
+                        vec![],
+                    ),
+                    Some(machine::ErrorCode::WorkspaceDrift) => (
+                        true,
+                        "the managed workspace changed outside this run since its last checkpoint; --adopt-workspace accepts the current contents as the new baseline.".to_string(),
+                        vec!["--adopt-workspace"],
+                    ),
+                    Some(machine::ErrorCode::ExecutionClosureChanged) => (
+                        true,
+                        "the pinned execution inputs (profile, model, context or tool) changed since this run started; --force-resume accepts the change and continues.".to_string(),
+                        vec!["--force-resume"],
+                    ),
+                    _ => (
+                        true,
+                        "the run stopped before completing; resuming continues from the last durable checkpoint.".to_string(),
+                        vec![],
+                    ),
+                }
+            };
+            let mut resume_argv = vec![
+                "sfh".to_string(),
+                "run".into(),
+                flow.display().to_string(),
+                "--resume".into(),
+                rd.clone(),
+            ];
+            resume_argv.extend(requires.iter().map(|f| f.to_string()));
+            resume_argv.push("--json".into());
+            out.push(diagnosed_action(
+                "resume",
+                "resumable",
+                resumable,
+                resume_reason,
+                &requires,
+                resume_argv,
+            ));
+
+            // Offered alongside resume, not instead of it, because the two
+            // are answers to different diagnoses and only the reader knows
+            // which one they are looking at. A caller who concludes the FLOW
+            // was wrong cannot resume - correcting it invalidates the
+            // closure, as it should - and without this the only remaining
+            // move is a fresh run whose budget silently starts over. It
+            // depends on a DIFFERENT fact than resume does - not "can this
+            // run continue" but "is this run's spend final" - so it is
+            // diagnosed separately, via the same proof `--carry-budget-from`
+            // itself requires (P1-02). At the point this function is called
+            // that proof always succeeds (this run just wrote its own
+            // terminal status.json a few lines up), but it is still asked
+            // for rather than assumed: the two questions being answered by
+            // the same code, here and at the real carry attempt, is the
+            // point.
+            let carryable = carry_source_is_final(run_dir).is_ok();
+            let carry_reason = if carryable {
+                "this run's spend is final; a corrected flow can start fresh while keeping it on the books instead of silently resetting the budget.".to_string()
+            } else {
+                "this run's spend cannot yet be confirmed final, so carrying from it would risk a snapshot the source immediately invalidates.".to_string()
+            };
+            out.push(diagnosed_action(
+                "carry_budget",
+                "carryable",
+                carryable,
+                carry_reason,
+                &[],
+                vec![
+                    "sfh".into(),
+                    "run".into(),
+                    flow.display().to_string(),
+                    "--carry-budget-from".into(),
+                    rd,
+                    "--json".into(),
+                ],
+            ));
+        }
+        _ => {}
+    }
+    out
 }
 
 /// `chain` must be the file the emitted step's LAST visit wrote, not a path
@@ -4550,9 +5932,34 @@ fn write_aggregate(
             output_file: gfile.display().to_string(),
             exit: if failed { 1 } else { 0 },
             stderr_file: String::new(),
+            // A fan-out group runs no command of its own, so it has no exit
+            // code for an `outcomes:` table to describe.
+            outcome: String::new(),
+            label: String::new(),
         },
     );
     Ok(())
+}
+
+/// The outcome class an `outcomes:` entry gave a finished leaf, as text.
+///
+/// Empty when the flow declared nothing for the code the step exited with,
+/// which is the ordinary case and the reason routing on it fails closed rather
+/// than matching a default.
+fn outcome_name(d: &leaf::LeafDone) -> String {
+    d.outcome
+        .as_ref()
+        .map(|(r, _)| r.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// The free-form label from that same entry. sfh stores and compares it and
+/// never interprets it.
+fn outcome_label(d: &leaf::LeafDone) -> String {
+    d.outcome
+        .as_ref()
+        .and_then(|(_, l)| l.clone())
+        .unwrap_or_default()
 }
 
 fn note_marker(step: &str, visit: u32, output: &str) -> String {
@@ -4627,6 +6034,9 @@ struct CompactRun<'a, 'ctx> {
     /// counts as the run being alive.
     run_clock: &'a Arc<AtomicU64>,
     wall_deadline: Option<Instant>,
+    /// The summarizer runs where the rest of the run runs, so a compaction that
+    /// shells out sees the same working tree its step did.
+    workspace: Option<&'a Path>,
     quiet: bool,
     verbose: bool,
 }
@@ -4676,6 +6086,7 @@ fn prepare_compact(
         tag,
         run_clock,
         wall_deadline,
+        workspace: _,
         quiet,
         verbose,
     } = run;
@@ -4746,7 +6157,12 @@ fn prepare_compact(
         inv: execute::Invocation::Argv(argv),
         parse: built.parse,
         stdin_payload,
-        cwd: None,
+        // A compact summarizer only reads the text it was handed. It still runs
+        // in the run's workspace so a `cmd`-shaped summarizer sees the same
+        // tree, but it names no context of its own.
+        context_hash: None,
+        context_file: None,
+        cwd: run.workspace.map(PathBuf::from),
         timeout: timeout_sec.map(Duration::from_secs),
         wall_deadline: *wall_deadline,
         preassigned_session: None,
@@ -4765,6 +6181,14 @@ fn prepare_compact(
         access: Some(preset::Access::Read),
         session_parent: None,
         allow_empty: false,
+        // A step's `exit_conflict:` is a statement about the tool that step
+        // launches. The summarizer may be a different tool entirely, so it
+        // keeps its own adapter default rather than inheriting a licence the
+        // flow granted to something else.
+        exit_conflict: None,
+        // Same reasoning: the step's exit-code table describes the command that
+        // step runs, not the summarizer sfh launches on its behalf.
+        outcomes: BTreeMap::new(),
         retry: leaf::RetryCfg::default(),
         run_clock: Some(Arc::clone(run_clock)),
         quiet: *quiet,
@@ -4901,6 +6325,32 @@ fn one_line(s: &str, max: usize) -> String {
     out
 }
 
+/// What `plan` needs beyond the rendering itself: the structural decisions this
+/// flow would make, which is most of what a reviewer is actually checking.
+pub struct DryRunExtras<'a> {
+    pub flow_path: &'a Path,
+    pub workspace: &'a flow::WorkspacePlan,
+    pub state_root: &'a state::StateRoot,
+    pub profiles: &'a [PathBuf],
+    pub as_json: bool,
+    /// `plan --save`: where to keep the rendered prompts, context bundles and
+    /// machine plan so a human can read exactly what would be sent before
+    /// anyone pays for it. `Some(None)` means "save, and pick the default
+    /// location under the state root".
+    pub save: Option<Option<PathBuf>>,
+}
+
+impl DryRunExtras<'_> {
+    /// A short label for the saved plan directory.
+    fn workspace_name(&self) -> &str {
+        self.flow_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plan")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dry_run(
     flow: &flow::Flow,
     vars: &BTreeMap<String, String>,
@@ -4909,6 +6359,7 @@ fn dry_run(
     flow_dir: &Path,
     notes_file: &Path,
     needed_sessions: &HashSet<String>,
+    extras: DryRunExtras,
 ) -> Result<i32, String> {
     let step_ids = flow.step_ids();
     // `plan` has no real upstream results, but rendering them as empty made a
@@ -4926,6 +6377,8 @@ fn dry_run(
                     output_file: format!("[[steps.{id}.output_file]]"),
                     exit: 0,
                     stderr_file: format!("[[steps.{id}.stderr_file]]"),
+                    outcome: format!("[[steps.{id}.outcome]]"),
+                    label: format!("[[steps.{id}.label]]"),
                 },
             )
         })
@@ -4963,6 +6416,24 @@ fn dry_run(
             }
         }
     }
+    // In JSON mode stdout carries the envelope and nothing else, so the header
+    // a human wants goes to stderr instead of being printed and then having to
+    // be stripped by every caller.
+    if extras.as_json {
+        return dry_run_json(
+            flow,
+            vars,
+            tainted_vars,
+            run_dir,
+            flow_dir,
+            notes_file,
+            needed_sessions,
+            &extras,
+            &outputs,
+            &sessions,
+            &step_ids,
+        );
+    }
     println!("execution plan: commands are resolved but no process is started");
     println!(
         "temporary render dir (removed after this command): {}",
@@ -4972,6 +6443,13 @@ fn dry_run(
     for warning in flow::strict_warnings(flow) {
         println!("warning: {warning}");
     }
+    for warning in flow.replay_warnings() {
+        println!("warning: {warning}");
+    }
+    println!(
+        "workspace: {}",
+        serde_json::to_string(&extras.workspace.to_json()).unwrap_or_default()
+    );
     // The one goto that never appears in any step's route:, so a reader of the
     // flow cannot see it by following the steps. Print it where the jump is
     // declared - at the top, with the flow, not against any step.
@@ -5010,6 +6488,10 @@ fn dry_run(
         // the whole declared budget - which is what a prompt reviewer wants to
         // see, and it exercises the `unlimited` spelling for undeclared axes.
         budget: leaf::BudgetVars::new(&flow.defaults, 0.0, 0),
+        // A plan renders what the flow WOULD do; it never creates a workspace,
+        // so leaves render against the caller's cwd exactly as `plan` always
+        // has. The workspace the run would use is reported separately above.
+        workspace: None,
         quiet: true,
         verbose: false,
     };
@@ -5083,6 +6565,7 @@ fn dry_run(
                 tag: &s.id,
                 run_clock: &plan_clock,
                 wall_deadline: None,
+                workspace: None,
                 quiet: true,
                 verbose: false,
             };
@@ -5116,6 +6599,16 @@ fn dry_run(
             if let Some(c) = &r.when_stderr_matches {
                 cond.push(format!("stderr matches {c:?}"));
             }
+            // A predicate missing from this list prints as "always", which is
+            // not a cosmetic slip: the plan then shows two unconditional rules
+            // on one step - a shape `validate` refuses - and the reader cannot
+            // see which branch the flow will actually take.
+            if let Some(c) = &r.when_label_is {
+                cond.push(format!("label is {c:?}"));
+            }
+            if let Some(c) = &r.when_outcome_is {
+                cond.push(format!("outcome is {}", c.as_str()));
+            }
             if let Some(m) = &r.when_members {
                 let quantifier = match (m.all, m.at_least) {
                     (Some(true), _) => "all".to_string(),
@@ -5133,7 +6626,519 @@ fn dry_run(
         }
         println!();
     }
+    if let Some(explicit) = &extras.save {
+        let dir = save_plan(run_dir, explicit.as_deref(), &extras)?;
+        println!("plan saved to {}", dir.display());
+    }
     Ok(0)
+}
+
+/// Copy a plan's rendered artifacts out of the temporary render directory.
+///
+/// That directory is removed the moment `plan` returns, so `--save` is what
+/// turns a plan into something a human can actually read line by line - the
+/// full prompts, the assembled context bundles and their manifests, and the
+/// machine plan - and then approve, or not.
+fn save_plan(
+    render_dir: &Path,
+    explicit: Option<&Path>,
+    extras: &DryRunExtras,
+) -> Result<PathBuf, String> {
+    let dir = match explicit {
+        Some(d) => d.to_path_buf(),
+        None => extras.state_root.plans_dir().ok_or_else(|| {
+            "plan --save needs a directory, or a --state-dir (SFH_STATE_DIR) to put one under"
+                .to_string()
+        })?,
+    };
+    let dir = dir.join(format!(
+        "{}-{}",
+        utc_stamp(),
+        crate::workspace::sanitize(extras.workspace_name())
+    ));
+    contain::mkdir_private(&dir)
+        .map_err(|e| format!("cannot create the plan directory {}: {e}", dir.display()))?;
+    let entries = std::fs::read_dir(render_dir)
+        .map_err(|e| format!("cannot read the render dir {}: {e}", render_dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Regular files only, and no recursion: everything a plan renders is a
+        // flat artifact sfh itself just wrote.
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(name) = path.file_name() {
+            std::fs::copy(&path, dir.join(name))
+                .map_err(|e| format!("cannot save {}: {e}", path.display()))?;
+        }
+    }
+    Ok(dir)
+}
+
+/// `plan --json`: the same resolution the human plan does, as one envelope.
+///
+/// Still spawns nothing and still creates no workspace. Every invocation it
+/// reports is the REDACTED form, so a plan can be pasted into an issue without
+/// carrying the prompt - which is exactly the text most likely to be sensitive.
+#[allow(clippy::too_many_arguments)]
+fn dry_run_json(
+    flow: &flow::Flow,
+    vars: &BTreeMap<String, String>,
+    tainted_vars: &HashSet<String>,
+    run_dir: &Path,
+    flow_dir: &Path,
+    notes_file: &Path,
+    needed_sessions: &HashSet<String>,
+    extras: &DryRunExtras,
+    outputs: &BTreeMap<String, template::StepOutput>,
+    sessions: &HashMap<String, leaf::SessionInfo>,
+    step_ids: &HashSet<String>,
+) -> Result<i32, String> {
+    let cx = leaf::PrepCtx {
+        flow,
+        vars,
+        outputs,
+        step_ids,
+        run_dir,
+        flow_dir,
+        notes_file,
+        sessions,
+        needed_sessions,
+        tainted_vars,
+        run_clock: None,
+        wall_deadline: None,
+        budget: leaf::BudgetVars::new(&flow.defaults, 0.0, 0),
+        workspace: None,
+        quiet: true,
+        verbose: false,
+    };
+    let mut steps = Vec::new();
+    for s in &flow.steps {
+        let mut invocations = Vec::new();
+        let mut push = |label: String, p: &leaf::Prepared| {
+            invocations.push(json!({
+                "label": label,
+                "cmd": p.inv.describe(),
+                "tool": p.tool,
+                "access": p.access.map(|a| a.as_str()),
+                "protocol": protocol::expected_kind(&p.parse),
+                "cwd": p.cwd.as_ref().map(|c| c.display().to_string()),
+                "context_hash": p.context_hash,
+            }));
+        };
+        match (&s.parallel, &s.foreach) {
+            (Some(children), _) => {
+                for c in children {
+                    let p = leaf::prepare_leaf(&cx, c, 1, &c.id, &[], None)?;
+                    push(format!("member:{}", c.id), &p);
+                }
+            }
+            (None, Some(_)) => {
+                let p = leaf::prepare_leaf(
+                    &cx,
+                    s,
+                    1,
+                    &format!("{}.i0", s.id),
+                    &[
+                        ("item", "<item>".to_string()),
+                        ("item_index", "0".to_string()),
+                    ],
+                    None,
+                )?;
+                push("per-item".into(), &p);
+            }
+            _ => {
+                let p = leaf::prepare_leaf(&cx, s, 1, &s.id, &[], None)?;
+                push("main".into(), &p);
+            }
+        }
+        for fb in &s.fallback {
+            let p = leaf::prepare_leaf(&cx, s, 1, &format!("{}.fb-{fb}", s.id), &[], Some(fb))?;
+            push(format!("fallback:{fb}"), &p);
+        }
+        steps.push(json!({
+            "step": s.id,
+            "kind": describe_kind(flow, s),
+            "effects": s.effects(flow).as_str(),
+            "replay_unfinished": s.replay_policy(flow).as_str(),
+            "context": s.context,
+            "context_delivery": s.context_delivery().as_str(),
+            "invocations": invocations,
+            "route": s.route.iter().map(|r| json!({"goto": r.goto})).collect::<Vec<_>>(),
+        }));
+    }
+    // The closure a real run would pin, built the same way, so `plan --json`
+    // answers "would resuming this run still be the same run" before there is
+    // a run at all.
+    let cl = build_closure(
+        flow,
+        extras.flow_path,
+        extras.profiles,
+        extras.workspace,
+        None,
+    )?;
+    let mut warnings = flow::strict_warnings(flow);
+    warnings.extend(flow.replay_warnings());
+    warnings.extend(extras.workspace.warnings.iter().cloned());
+    let body = json!({
+        "flow": abs(extras.flow_path).display().to_string(),
+        "flow_name": flow.name,
+        "state_dir": extras.state_root.explicit().map(|p| p.display().to_string()),
+        "runs_dir": extras.state_root.runs_dir().display().to_string(),
+        "profile_overlays": extras.profiles.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "workspace": extras.workspace.to_json(),
+        "contexts": flow.context_plan(extras.flow_path)?.to_json(),
+        "execution_closure": cl.to_json(),
+        "replay": flow.replay_summary(),
+        "unsafe_overrides": flow.unsafe_overrides(),
+        "static_max_leaves": flow.static_max_leaves(),
+        "vars": vars,
+        "steps": steps,
+        "warnings": warnings,
+    });
+    let saved = match &extras.save {
+        Some(explicit) => Some(save_plan(run_dir, explicit.as_deref(), extras)?),
+        None => None,
+    };
+    let mut body = body;
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "saved_to".into(),
+            json!(saved.as_ref().map(|p| p.display().to_string())),
+        );
+    }
+    machine::emit(&machine::envelope("plan", true, 0, body));
+    Ok(0)
+}
+
+/// Everything outside the flow file that decides what this run does.
+///
+/// `tool_versions` is passed in when a real run has already probed them, and
+/// omitted by `plan`, which must not spawn anything: a plan therefore pins the
+/// same inputs minus the versions it is not allowed to go and look up.
+fn build_closure(
+    flow: &flow::Flow,
+    flow_path: &Path,
+    profiles: &[PathBuf],
+    workspace: &flow::WorkspacePlan,
+    tool_versions: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<closure::Closure, String> {
+    let mut cl = closure::Closure::new();
+    cl.set("sfh_version", json!(VERSION));
+    cl.set_file("flow", flow_path);
+    // The merged configuration is pinned by DIGEST, not embedded: the full
+    // document is several kilobytes of JSON that would drown the closure file
+    // a human is meant to read when a resume is refused, and the digest answers
+    // the only question the closure asks - did it change.
+    cl.set(
+        "effective_config",
+        json!({ "sha256": sha256::hex(flow.effective_config_json()?.as_bytes()) }),
+    );
+    for (i, p) in profiles.iter().enumerate() {
+        cl.set_file(&format!("profile_overlay.{i}"), p);
+    }
+    // Context files are pinned by CONTENT: an edited TASK.md changes what the
+    // run means, while leaving the flow byte-identical.
+    let flow_dir = flow_path.parent().unwrap_or(Path::new("."));
+    for (name, source) in &flow.contexts {
+        match source.kind() {
+            Ok("file") => {
+                let raw = source.file.clone().unwrap_or_default();
+                cl.set_file(
+                    &format!("context.{name}"),
+                    &context::resolve_source_path(flow_dir, &raw),
+                );
+            }
+            // An inline or template context is already part of the flow's
+            // bytes, but pinning it by name keeps the closure readable and
+            // survives a future where a template can reach outside the file.
+            Ok(kind) => {
+                cl.set(
+                    &format!("context.{name}"),
+                    json!({"kind": kind, "sha256": sha256::hex(
+                        source.inline.as_deref().or(source.template.as_deref()).unwrap_or("").as_bytes()
+                    )}),
+                );
+            }
+            Err(e) => return Err(format!("contexts.{name}: {e}")),
+        }
+    }
+    cl.set(
+        "workspace",
+        json!({
+            "mode": workspace.resolved.as_str(),
+            "root": workspace.root,
+            "base": workspace.base,
+        }),
+    );
+    cl.set("unsafe_overrides", json!(flow.unsafe_overrides()));
+    if let Some(tools) = tool_versions {
+        cl.set("tools", serde_json::Value::Object(tools.clone()));
+    }
+    Ok(cl)
+}
+
+/// Where every `kind: file` context's frozen copy lives, relative to the run
+/// dir, and the durable record of what run start managed to pin.
+const CONTEXT_SNAPSHOT_DIR: &str = "context-snapshot";
+const CONTEXT_SNAPSHOT_MANIFEST: &str = "context-snapshot.json";
+
+/// What `snapshot_file_contexts` produced: the in-memory registry handed
+/// straight to `context::activate_snapshot`, and the same per-source facts
+/// written to BOTH the durable manifest and the run log (they answer the same
+/// question - "what did this run actually read" - for two different
+/// readers, so there is exactly one place that computes the answer).
+#[derive(Debug)]
+struct ContextSnapshot {
+    registry: HashMap<String, Option<PathBuf>>,
+    sources: Vec<serde_json::Value>,
+    /// Whether the flow declared at least one `kind: file` context at all -
+    /// the same fact that already decides, below, whether this function
+    /// creates `CONTEXT_SNAPSHOT_DIR`. Deliberately NOT the same thing as
+    /// `sources` being non-empty: a source that WAS declared but failed
+    /// validation (a missing required file, a refused symlink) is deferred
+    /// rather than recorded - see the `Err` arm below - so `sources` stays
+    /// empty for that case too, and collapsing the two would make "this flow
+    /// asked for nothing" indistinguishable from "this flow asked for
+    /// something sfh could not get". `snapshot_and_persist_context` uses this
+    /// field, not `sources`, to decide whether a manifest is worth writing at
+    /// all.
+    has_file_contexts: bool,
+}
+
+/// Freeze every `kind: file` context this flow declares, once, so the rest of
+/// this run reads the SAME bytes `build_closure` just pinned instead of
+/// opening the declared path again on every step.
+///
+/// P0-04: without this, an edited TASK.md between the `analyze` and
+/// `implement` steps of one run silently changed what `implement` was
+/// handed, while execution-closure.json went on recording the hash from
+/// before the edit - the run's own record of what it read disagreed with
+/// what it actually read, and no resume was involved.
+///
+/// Unconditional over `flow.contexts` - the same set `build_closure` iterates
+/// above, not just the sources some step happens to name - so the run's
+/// pinned copies and the closure's pinned hashes are always talking about the
+/// same files. `inline` and `template` sources are left alone: an inline
+/// source is already part of the flow's own bytes, and a template is
+/// deliberately re-rendered per step (it may read `{{steps.x.output}}`,
+/// which does not exist yet at run start, so freezing it here would be
+/// wrong, not merely unnecessary).
+///
+/// A source that fails validation outright here - a symlink without
+/// `allow_external`, a required file that is missing - is left OUT of the
+/// registry rather than aborting the run. sfh has never refused a run merely
+/// for DECLARING a broken context nobody uses; that lenience is preserved by
+/// deferring to `context::build`'s own live-path fallback, which raises
+/// exactly the same error the first time some step actually names it.
+fn snapshot_file_contexts(
+    flow: &flow::Flow,
+    containment: &context::Containment,
+    run_dir: &Path,
+) -> Result<ContextSnapshot, String> {
+    let file_contexts: Vec<(&String, &flow::ContextSource)> = flow
+        .contexts
+        .iter()
+        .filter(|(_, s)| matches!(s.kind(), Ok("file")))
+        .collect();
+    let has_file_contexts = !file_contexts.is_empty();
+    let mut registry: HashMap<String, Option<PathBuf>> = HashMap::new();
+    let mut sources = Vec::new();
+    if file_contexts.is_empty() {
+        return Ok(ContextSnapshot {
+            registry,
+            sources,
+            has_file_contexts,
+        });
+    }
+    let snapshot_dir = run_dir.join(CONTEXT_SNAPSHOT_DIR);
+    contain::mkdir_private(&snapshot_dir).map_err(|e| {
+        format!(
+            "cannot persist context snapshot: cannot create {}: {e}",
+            snapshot_dir.display()
+        )
+    })?;
+    for (name, source) in file_contexts {
+        let raw = source.file.clone().unwrap_or_default();
+        let external = source.allow_external.unwrap_or(false);
+        let optional = source.optional.unwrap_or(false);
+        match context::read_file_source(name, &raw, external, containment, optional) {
+            Ok(Some(text)) => {
+                // Named by a digest of the CONTEXT NAME, never the declared
+                // path: a name is a flow-author identifier, but the identical
+                // name reused across an unrelated OS's path separators or
+                // reserved characters would turn straight into a path
+                // injection if used as a file name verbatim (the same reason
+                // render_bundle escapes a name before it can forge a
+                // delimiter). The declared path is preserved as plain data in
+                // `source`, below, for a human reading the manifest.
+                let file_name = format!("{}.snapshot", sha256::hex(name.as_bytes()));
+                let abs_path = snapshot_dir.join(&file_name);
+                contain::write_private_atomic(&abs_path, &text).map_err(|e| {
+                    format!("cannot persist context snapshot for contexts.{name}: {e}")
+                })?;
+                registry.insert(name.clone(), Some(abs_path));
+                sources.push(json!({
+                    "name": name, "source": raw, "state": "captured",
+                    "sha256": sha256::hex(text.as_bytes()), "bytes": text.len() as u64,
+                    "snapshot": format!("{CONTEXT_SNAPSHOT_DIR}/{file_name}"),
+                }));
+            }
+            Ok(None) => {
+                registry.insert(name.clone(), None);
+                sources.push(json!({"name": name, "source": raw, "state": "absent"}));
+            }
+            // Deferred, not fatal - see the doc comment above.
+            Err(_) => {}
+        }
+    }
+    Ok(ContextSnapshot {
+        registry,
+        sources,
+        has_file_contexts,
+    })
+}
+
+/// Snapshot this flow's `kind: file` contexts at run start (see
+/// `snapshot_file_contexts`, immediately above) and persist the result for a
+/// later `--resume` to read back - UNLESS there is nothing to persist. A flow
+/// that declares no `kind: file` context at all always produces an empty
+/// registry and an empty `sources` list, and writing `CONTEXT_SNAPSHOT_MANIFEST`
+/// for that is a manifest that documents nothing, paid for with an atomic
+/// write and an fsync'd log line at the start of every single run - including
+/// the overwhelming majority of flows that never touch this feature.
+///
+/// Skipping it is safe on resume specifically BECAUSE there was nothing to
+/// pin: `ResumedSnapshot::NotPresent`'s own doc comment already treats "no
+/// manifest at all" and "a flow that declared no `kind: file` context" as
+/// the same, harmless case - both fall every step back to a live read. And a
+/// live read is exactly what a step in THIS run would already do: with no
+/// `kind: file` context declared, `context::build`'s snapshot lookup is never
+/// even consulted for a "file" kind here, so there is no pinned fact for a
+/// resume to disagree with in the first place. See
+/// `context::snapshot_lookup`'s doc comment for the underlying design fact
+/// this leans on - an empty pinned map and no pin at all are indistinguishable
+/// to any lookup, by construction.
+///
+/// Returns the registry to pin for the rest of THIS run either way - an empty
+/// one has the identical effect on `context::activate_snapshot` whether or
+/// not it is ever written down, so the guard the caller installs is
+/// unaffected by which branch below ran.
+fn snapshot_and_persist_context(
+    flow: &flow::Flow,
+    containment: &context::Containment,
+    run_dir: &Path,
+    log: &mut std::fs::File,
+) -> Result<HashMap<String, Option<PathBuf>>, String> {
+    let snap = snapshot_file_contexts(flow, containment, run_dir)?;
+    if snap.has_file_contexts {
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .map_err(|e| format!("cannot serialize the context snapshot: {e}"))?;
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .map_err(|e| format!("cannot persist context snapshot: {e}"))?;
+        // Recorded the same way the closure fingerprint is, right below the
+        // event that pins it, so "what this run actually read" is answerable
+        // from log.jsonl alone without also locating the manifest file.
+        log_event(
+            log,
+            json!({"ts": utc_stamp(), "event": "context_snapshot", "sources": snap.sources}),
+        )?;
+    }
+    Ok(snap.registry)
+}
+
+/// What a resumed run finds for the context snapshot the ORIGINAL attempt
+/// captured.
+#[derive(Debug)]
+enum ResumedSnapshot {
+    /// No manifest at all: a run dir from before this feature existed, or one
+    /// whose flow declared no `kind: file` context. Steps fall back to the
+    /// live path, exactly as every run did before this fix - there is
+    /// nothing to disagree with, because nothing was ever pinned.
+    NotPresent,
+    /// Read back and validated; every step now sees exactly what run start
+    /// pinned, the same as a fresh run would.
+    Loaded(HashMap<String, Option<PathBuf>>),
+    /// The manifest is there but sfh cannot make sense of its CONTENT - which
+    /// should be impossible for a file only sfh ever writes, atomically, into
+    /// a private run dir. Treated as an execution-closure-level problem (the
+    /// caller offers the same refusal and the same --force-resume escape
+    /// hatch the closure mismatch above does) rather than silently falling
+    /// back to live reads that might not agree with what
+    /// execution-closure.json pinned.
+    Corrupt(String),
+}
+
+/// Read back what `snapshot_file_contexts` recorded, so a resume pins its
+/// steps to the SAME bytes the original attempt did rather than capturing a
+/// fresh copy of whatever is on disk now - see the resume-semantics comment
+/// at this function's call site for why re-capturing on resume would be
+/// wrong even under --force-resume.
+fn load_context_snapshot(run_dir: &Path) -> Result<ResumedSnapshot, String> {
+    // Contained, no-follow read: a run dir is untrusted input on --resume
+    // (rev_break #6 already treats meta.json and log.jsonl this way), so a
+    // symlink planted at this fixed name is refused unconditionally rather
+    // than folded into the waivable "Corrupt" case below.
+    let Some(text) = contain::read_contained_opt(run_dir, CONTEXT_SNAPSHOT_MANIFEST)? else {
+        return Ok(ResumedSnapshot::NotPresent);
+    };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST} is not valid JSON: {e}"
+            )))
+        }
+    };
+    let Some(entries) = v.get("sources").and_then(|s| s.as_array()) else {
+        return Ok(ResumedSnapshot::Corrupt(format!(
+            "{CONTEXT_SNAPSHOT_MANIFEST} has no 'sources' array"
+        )));
+    };
+    let mut map = HashMap::new();
+    for entry in entries {
+        let Some(name) = entry.get("name").and_then(|x| x.as_str()) else {
+            return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST}: an entry has no 'name'"
+            )));
+        };
+        match entry.get("state").and_then(|x| x.as_str()) {
+            Some("absent") => {
+                map.insert(name.to_string(), None);
+            }
+            Some("captured") => {
+                let Some(rel) = entry.get("snapshot").and_then(|x| x.as_str()) else {
+                    return Ok(ResumedSnapshot::Corrupt(format!(
+                        "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} is 'captured' but names no snapshot file"
+                    )));
+                };
+                // A path that resolves outside run_dir means the run dir was
+                // tampered with, not merely that the record is stale - the
+                // same class of attack meta.json is already read contained
+                // against - so it is propagated unconditionally (rev_break
+                // #6) instead of folded into the waivable case below.
+                match contain::contained_opt(run_dir, rel)? {
+                    Some(path) => {
+                        map.insert(name.to_string(), Some(path));
+                    }
+                    None => {
+                        return Ok(ResumedSnapshot::Corrupt(format!(
+                            "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name}'s pinned snapshot {rel} is missing"
+                        )))
+                    }
+                }
+            }
+            other => {
+                return Ok(ResumedSnapshot::Corrupt(format!(
+                "{CONTEXT_SNAPSHOT_MANIFEST}: contexts.{name} has an unrecognised state {other:?}"
+            )))
+            }
+        }
+    }
+    Ok(ResumedSnapshot::Loaded(map))
 }
 
 fn log_event(f: &mut std::fs::File, mut v: serde_json::Value) -> Result<(), String> {
@@ -5175,7 +7180,10 @@ where
             f,
             json!({"ts": utc_stamp(), "event": "step_start", "step": id, "parent": group,
                    "visit": visit, "cmd": prep.inv.describe(),
-                   "session_parent": session_parent_json(prep)}),
+                   "session_parent": session_parent_json(prep),
+                   "protocol_expected": protocol::expected_kind(&prep.parse),
+                   "context_hash": prep.context_hash,
+                   "context_file": prep.context_file.as_ref().and_then(|p| file_name(p))}),
         )?;
     }
     Ok(())
@@ -5489,6 +7497,23 @@ fn evaluate_route(
             }
         }
         if matched {
+            if let Some(want) = &r.when_label_is {
+                // Rendered like the other text conditions, then compared for
+                // equality. A step with no declared outcome has no label, and
+                // an empty label never matches - fail closed, the same way
+                // when_exit does without a recorded output.
+                let want = template::render(want, ctx)?;
+                let got = ctx.outputs.get(&step.id).map(|o| o.label.as_str());
+                matched = !want.is_empty() && got == Some(want.as_str());
+            }
+        }
+        if matched {
+            if let Some(want) = r.when_outcome_is {
+                matched =
+                    ctx.outputs.get(&step.id).map(|o| o.outcome.as_str()) == Some(want.as_str());
+            }
+        }
+        if matched {
             if let Some(t) = &r.when_stderr_matches {
                 let t = template::render(t, ctx)?;
                 let rx = regex::Regex::new(&t)
@@ -5655,6 +7680,23 @@ fn log_step_end_with_next(
             "chain_file": file_name(&d.out_file).map(|n| n.replace(".out.txt", ".chain.txt")),
             "out_file": file_name(&d.out_file),
             "cmd": d.cmd, "session": session,
+            "harness_diagnostic": d.harness_diagnostic.as_deref().map(|s| one_line(s, 500)),
+            // Additive protocol evidence (spec 15.1). A reader that predates
+            // these keys sees the same event it always did; a reader that wants
+            // them can tell "the tool failed" from "sfh could not verify that
+            // the tool finished" without re-parsing the raw artifact.
+            "protocol_state": d.protocol.protocol.as_str(),
+            "terminal_seen": d.protocol.terminal_seen,
+            "terminal_success": d.protocol.terminal_success,
+            "final_message_seen": d.protocol.final_message_seen,
+            "malformed_records": d.protocol.malformed_records,
+            // What this step's exit code was DECLARED to mean, when the flow
+            // said. Persisted so a resumed run routes on the same answer the
+            // live one did instead of re-deriving it from an exit code sfh may
+            // already have normalized. Null for the ordinary step, and for
+            // every run written before these keys existed.
+            "outcome": d.outcome.as_ref().map(|(r, _)| r.as_str()),
+            "outcome_label": d.outcome.as_ref().and_then(|(_, l)| l.clone()),
             // Which OS produced this step. A log is routinely read on a
             // different machine from the one that wrote it, and "it passes on
             // mine" is exactly the class of report this answers.
@@ -5791,6 +7833,358 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- P0-04: the execution closure pins context files, but steps must
+    // read the SAME bytes, not the live file ----
+
+    fn context_flow(contexts_yaml: &str) -> flow::Flow {
+        serde_yaml_ng::from_str(&format!(
+            "name: t\ncontexts:\n{contexts_yaml}steps:\n  - id: a\n    cmd: [\"echo\", \"x\"]\n"
+        ))
+        .expect("test flow parses")
+    }
+
+    #[test]
+    fn snapshot_file_contexts_freezes_file_sources_and_leaves_inline_and_template_untouched() {
+        let dir = std::env::temp_dir().join(format!("sfh-snap-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "do the thing").unwrap();
+        let flow = context_flow(
+            "  task:\n    file: \"TASK.md\"\n  notes:\n    file: \"notes.md\"\n    optional: true\n  rules:\n    inline: \"be nice\"\n  live:\n    template: \"{{vars.x}}\"\n",
+        );
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+
+        // Only the two `kind: file` sources are captured at all.
+        assert_eq!(snap.registry.len(), 2, "{:?}", snap.registry.keys());
+        assert!(
+            !snap.registry.contains_key("rules"),
+            "inline is flow bytes already, never snapshotted"
+        );
+        assert!(
+            !snap.registry.contains_key("live"),
+            "a template must stay dynamic, never snapshotted"
+        );
+
+        let task_path = snap
+            .registry
+            .get("task")
+            .cloned()
+            .flatten()
+            .expect("task captured");
+        assert_eq!(std::fs::read_to_string(&task_path).unwrap(), "do the thing");
+        assert!(
+            task_path.starts_with(run_dir.join(CONTEXT_SNAPSHOT_DIR)),
+            "{}",
+            task_path.display()
+        );
+        assert_eq!(
+            snap.registry.get("notes"),
+            Some(&None),
+            "optional and missing is pinned as absent"
+        );
+
+        assert_eq!(snap.sources.len(), 2);
+        let by_name = |n: &str| snap.sources.iter().find(|s| s["name"] == n).unwrap();
+        assert_eq!(by_name("task")["state"], "captured");
+        assert_eq!(by_name("task")["source"], "TASK.md");
+        assert_eq!(
+            by_name("task")["sha256"],
+            sha256::hex("do the thing".as_bytes())
+        );
+        assert_eq!(by_name("notes")["state"], "absent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_file_contexts_defers_rather_than_aborts_a_source_that_fails_containment() {
+        // A symlink without allow_external fails read_file_source's check.
+        // snapshot_file_contexts must not let one bad declaration abort a run
+        // whose steps might never even name it - it just leaves that name
+        // unpinned, so context::build's live fallback raises the same error
+        // it always has, the first time something actually asks for it.
+        let dir =
+            std::env::temp_dir().join(format!("sfh-snap-symlink-{}", contain::random_nonce()));
+        let outside = dir.join("outside");
+        contain::mkdir_private(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "TOP SECRET").unwrap();
+        let flow_dir = dir.join("flow");
+        contain::mkdir_private(&flow_dir).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), flow_dir.join("link.txt")).unwrap();
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&run_dir).unwrap();
+        let flow = context_flow("  esc:\n    file: \"link.txt\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        assert!(
+            !snap.registry.contains_key("esc"),
+            "a source that fails validation must not be pinned at all: {:?}",
+            snap.registry.get("esc")
+        );
+        assert!(snap.sources.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_context_snapshot_that_cannot_be_persisted_fails_the_run_instead_of_falling_back_to_live_reads(
+    ) {
+        // The whole point of this feature is that a step never reads the
+        // live path once a run has started; a snapshot sfh could not write
+        // must not be the one case that quietly reopens that hole. It has to
+        // fail run start the same way an unwritable execution-closure.json
+        // or meta.json already does.
+        let dir =
+            std::env::temp_dir().join(format!("sfh-snap-nowrite-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "content").unwrap();
+        // A plain FILE sits where snapshot_file_contexts needs to create the
+        // context-snapshot/ DIRECTORY, so mkdir_private fails.
+        std::fs::write(run_dir.join(CONTEXT_SNAPSHOT_DIR), "not a directory").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        let err = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap_err();
+        assert!(err.contains("persist"), "{err}");
+        assert_eq!(
+            run_failure_code(&err),
+            machine::ErrorCode::PersistenceFailure,
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_context_snapshot_round_trips_what_snapshot_file_contexts_wrote() {
+        let dir = std::env::temp_dir().join(format!("sfh-snap-rt-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "the original text").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n  notes:\n    file: \"notes.md\"\n    optional: true\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .unwrap();
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .unwrap();
+
+        let loaded = match load_context_snapshot(&run_dir).unwrap() {
+            ResumedSnapshot::Loaded(map) => map,
+            _ => panic!("expected the round-tripped manifest to load cleanly"),
+        };
+        assert_eq!(loaded.get("notes"), Some(&None));
+        let task_path = loaded.get("task").cloned().flatten().expect("task loaded");
+        assert_eq!(
+            std::fs::read_to_string(&task_path).unwrap(),
+            "the original text"
+        );
+
+        // No manifest at all: an older run dir, not a fault.
+        let bare_run_dir = dir.join("bare-run");
+        contain::mkdir_private(&bare_run_dir).unwrap();
+        assert!(matches!(
+            load_context_snapshot(&bare_run_dir).unwrap(),
+            ResumedSnapshot::NotPresent
+        ));
+
+        // A manifest that exists but is not valid JSON must be reported, not
+        // silently treated as "nothing pinned".
+        let broken_run_dir = dir.join("broken-run");
+        contain::mkdir_private(&broken_run_dir).unwrap();
+        contain::write_private_atomic(&broken_run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), "not json")
+            .unwrap();
+        assert!(matches!(
+            load_context_snapshot(&broken_run_dir).unwrap(),
+            ResumedSnapshot::Corrupt(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flow that declares no `contexts:` at all used to still get
+    /// `context-snapshot.json` written into its run dir - a manifest naming
+    /// zero sources, on every single run, paid for with an atomic write and
+    /// an fsync'd log line for a feature the flow never touches. This is the
+    /// exact scenario a live `sfh run` against such a flow reproduces; see
+    /// `snapshot_and_persist_context`'s doc comment for why skipping both
+    /// artifacts here is safe on a later `--resume`.
+    #[test]
+    fn a_flow_with_no_file_contexts_persists_no_snapshot_manifest_directory_or_log_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-snap-persist-empty-{}",
+            contain::random_nonce()
+        ));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        // No `contexts:` key whatsoever - `#[serde(default)]` gives `flow.contexts`
+        // an empty map, exactly like a flow author who never wrote the block.
+        let flow: flow::Flow =
+            serde_yaml_ng::from_str("name: t\nsteps:\n  - id: a\n    cmd: [\"echo\", \"x\"]\n")
+                .expect("test flow parses");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let mut log = std::fs::File::create(run_dir.join("log.jsonl")).unwrap();
+
+        let registry =
+            snapshot_and_persist_context(&flow, &containment, &run_dir, &mut log).unwrap();
+
+        assert!(registry.is_empty());
+        assert!(
+            !run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).exists(),
+            "a flow with nothing to pin must not leave a manifest naming zero sources"
+        );
+        assert!(
+            !run_dir.join(CONTEXT_SNAPSHOT_DIR).exists(),
+            "a flow with nothing to pin must not create the snapshot directory either"
+        );
+        drop(log);
+        let events: Vec<String> = std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            !events.contains(&"context_snapshot".to_string()),
+            "no event should be logged for a snapshot that pinned nothing: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the test above: a flow that DOES declare a `kind:
+    /// file` context must keep getting the manifest, the snapshot directory
+    /// and the log event exactly as before - this fix only removes the
+    /// artifacts for a run with nothing to pin, never for one that has
+    /// something.
+    #[test]
+    fn a_flow_with_a_file_context_still_persists_the_manifest_directory_and_log_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-snap-persist-nonempty-{}",
+            contain::random_nonce()
+        ));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        std::fs::write(flow_dir.join("TASK.md"), "do the thing").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+        let mut log = std::fs::File::create(run_dir.join("log.jsonl")).unwrap();
+
+        let registry =
+            snapshot_and_persist_context(&flow, &containment, &run_dir, &mut log).unwrap();
+
+        assert_eq!(registry.len(), 1);
+        assert!(
+            run_dir.join(CONTEXT_SNAPSHOT_MANIFEST).exists(),
+            "a flow that names a file context must still get a manifest"
+        );
+        assert!(
+            run_dir.join(CONTEXT_SNAPSHOT_DIR).is_dir(),
+            "the frozen copy must still land in the snapshot directory"
+        );
+        drop(log);
+        let events: Vec<String> = std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            events.contains(&"context_snapshot".to_string()),
+            "the run log must still record what this run pinned: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resumed_run_keeps_reading_the_original_snapshot_even_after_the_live_file_changes_before_the_resume(
+    ) {
+        // The resume-semantics decision: --resume (and --force-resume) never
+        // re-capture. A resumed run reads back exactly what the FIRST attempt
+        // pinned, so remaining steps see the same definition of the work the
+        // already-completed steps did - never a mix of the two.
+        let dir = std::env::temp_dir().join(format!("sfh-snap-resume-{}", contain::random_nonce()));
+        let flow_dir = dir.join("flow");
+        let run_dir = dir.join("run");
+        contain::mkdir_private(&flow_dir).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        let task = flow_dir.join("TASK.md");
+        std::fs::write(&task, "v1: what the first attempt saw").unwrap();
+        let flow = context_flow("  task:\n    file: \"TASK.md\"\n");
+        let containment = context::Containment {
+            flow_dir: &flow_dir,
+            workspace: None,
+        };
+
+        // ---- the original (non-resumed) attempt ----
+        let snap = snapshot_file_contexts(&flow, &containment, &run_dir).unwrap();
+        let manifest_text = serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "sources": snap.sources,
+        }))
+        .unwrap();
+        contain::write_private_atomic(&run_dir.join(CONTEXT_SNAPSHOT_MANIFEST), manifest_text)
+            .unwrap();
+
+        // Something outside the run edits TASK.md before the run is resumed.
+        std::fs::write(&task, "v2: edited after the crash, before the resume").unwrap();
+
+        // ---- the resumed attempt ----
+        let registry = match load_context_snapshot(&run_dir).unwrap() {
+            ResumedSnapshot::Loaded(map) => map,
+            _ => panic!("expected a loaded snapshot"),
+        };
+        let _guard = context::activate_snapshot(registry);
+        let mut r = |_: &str| -> Result<String, String> { Ok(String::new()) };
+        let bundle =
+            context::build(&flow, &["task".to_string()], &containment, None, &mut r).unwrap();
+        assert!(
+            bundle.text.contains("v1: what the first attempt saw"),
+            "{}",
+            bundle.text
+        );
+        assert!(!bundle.text.contains("v2:"), "{}", bundle.text);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn every_leaf_run_claim_obeys_the_total_limit() {
@@ -5952,6 +8346,8 @@ mod tests {
             when_last_line_is: when_last_line_is.map(String::from),
             when_last_line_matches: None,
             when_exit: None,
+            when_label_is: None,
+            when_outcome_is: None,
             when_stderr_matches: None,
             when_members: None,
             goto: "end".to_string(),
@@ -6021,6 +8417,8 @@ mod tests {
             output_file: String::new(),
             exit,
             stderr_file: stderr_file.to_string(),
+            outcome: String::new(),
+            label: String::new(),
         }
     }
 
@@ -7036,5 +9434,461 @@ mod tests {
         assert!(effort_vocab_warning("opencode", "whatever").is_none());
         assert!(effort_vocab_warning("pi", "off").is_none());
         assert!(effort_vocab_warning("pi", "ultra").is_some());
+    }
+
+    // ---- P1-02: --carry-budget-from must PROVE the source is done, not
+    // just fail to prove it is still going ----
+
+    fn carry_final_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-carry-final-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn carry_refuses_a_source_with_no_status_json_and_no_terminal_event_in_its_log() {
+        let dir = carry_final_test_dir("no-proof");
+        // A log that looks exactly like a run still in progress: a step
+        // started, and nothing durable says it ever stopped.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"step_start\",\"step\":\"a\",\"visit\":1}\n",
+        )
+        .unwrap();
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(
+            err.contains("cannot confirm"),
+            "expected a refusal explaining the proof is missing, got: {err}"
+        );
+        assert!(
+            err.contains("sfh wait") && err.contains("sfh stop"),
+            "the refusal must say how to resolve it, same as the still-going case: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_the_log_holds_a_durable_run_end_event_even_with_no_status_json() {
+        let dir = carry_final_test_dir("run-end-proof");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":0.5,\"elapsed_sec\":10}\n",
+        )
+        .unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_the_owning_process_is_confirmed_gone_and_the_log_lands_on_a_terminal_position(
+    ) {
+        let dir = carry_final_test_dir("dead-owner-proof");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"fail\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        // A live pid whose recorded start time does not match is a reused
+        // pid, not the original owner - confirmed gone, the same reasoning
+        // watch::owner_verifiably_dead's own tests exercise directly.
+        contain::write_nonce(&dir, std::process::id(), Some(1), "tok").unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_still_refuses_a_terminal_looking_log_when_the_owning_process_cannot_be_confirmed_gone()
+    {
+        let dir = carry_final_test_dir("ambiguous-owner");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        // No sfh-nonce at all: nothing here rules out the owning process
+        // still being alive and about to log run_end a moment later.
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(err.contains("cannot confirm"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_refuses_a_source_that_status_json_says_is_still_running_even_if_its_log_has_a_run_end()
+    {
+        let dir = carry_final_test_dir("still-running");
+        // Deliberately contradictory: status.json must win when it can be
+        // read, because it is the freshest signal there is - a stale-but-
+        // still-present run_end from an earlier attempt must not override a
+        // status.json that says this run is going right now.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":5}\n",
+        )
+        .unwrap();
+        let status =
+            serde_json::json!({"state": "running", "pid": std::process::id(), "cost_usd": 1.0});
+        contain::write_private_atomic(&dir.join("status.json"), status.to_string()).unwrap();
+        let err = carry_source_is_final(&dir).unwrap_err();
+        assert!(err.contains("still going"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn carry_is_allowed_when_status_json_clearly_reads_a_terminal_state() {
+        let dir = carry_final_test_dir("clean-status");
+        let status = serde_json::json!({"state": "failed", "pid": 0});
+        contain::write_private_atomic(&dir.join("status.json"), status.to_string()).unwrap();
+        assert!(carry_source_is_final(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_terminal_evidence_only_trusts_the_logs_last_position_not_an_earlier_one() {
+        let dir = carry_final_test_dir("last-position-wins");
+        // A first attempt got stuck; a resumed second attempt got past it
+        // and is now mid-step, with no terminal marker of its own yet. The
+        // earlier stuck landing must not leak through as proof.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"a\",\"next\":\"stuck\",\"via\":\"rule\"}\n\
+             {\"event\":\"position\",\"after\":\"a\",\"next\":\"b\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        let (run_end, terminal) = log_terminal_evidence(&dir).unwrap();
+        assert!(!run_end);
+        assert!(
+            !terminal,
+            "a later non-terminal position must supersede the earlier stuck landing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P1-03: active time carried across --carry-budget-from must be
+    // durable, not dependent on status.json surviving ----
+
+    #[test]
+    fn elapsed_restore_prefers_run_end_then_meta_then_status_then_the_carried_floor() {
+        let base = std::env::temp_dir().join(format!(
+            "sfh-elapsed-precedence-{}",
+            contain::random_nonce()
+        ));
+        contain::mkdir_private(&base).unwrap();
+
+        // status.json only: the last-resort source.
+        let status_only = base.join("status-only");
+        contain::mkdir_private(&status_only).unwrap();
+        std::fs::write(status_only.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &status_only.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&status_only).unwrap().elapsed_sec, 10);
+
+        // meta.json beats a smaller status.json.
+        let meta_over_status = base.join("meta-over-status");
+        contain::mkdir_private(&meta_over_status).unwrap();
+        std::fs::write(
+            meta_over_status.join("log.jsonl"),
+            "{\"event\":\"run_start\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &meta_over_status.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &meta_over_status.join("meta.json"),
+            serde_json::json!({"elapsed_sec": 20}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&meta_over_status).unwrap().elapsed_sec, 20);
+
+        // A durable run_end beats both meta.json and status.json.
+        let run_end_over_both = base.join("run-end-over-both");
+        contain::mkdir_private(&run_end_over_both).unwrap();
+        std::fs::write(
+            run_end_over_both.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\",\"elapsed_sec\":30}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &run_end_over_both.join("status.json"),
+            serde_json::json!({"elapsed_sec": 10}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &run_end_over_both.join("meta.json"),
+            serde_json::json!({"elapsed_sec": 20}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_resume(&run_end_over_both).unwrap().elapsed_sec, 30);
+
+        // With nothing durable at all, the carried floor still holds.
+        let floor_only = base.join("floor-only");
+        contain::mkdir_private(&floor_only).unwrap();
+        std::fs::write(
+            floor_only.join("log.jsonl"),
+            "{\"event\":\"budget_carried\",\"elapsed_sec\":40}\n",
+        )
+        .unwrap();
+        assert_eq!(load_resume(&floor_only).unwrap().elapsed_sec, 40);
+
+        // The floor wins even over a SMALLER durable value: this is a
+        // synthetic, adversarial log (a real run_end can never report less
+        // than what was durably carried in), built only to prove the floor
+        // is applied unconditionally, the way a hand-edited log is tested
+        // elsewhere in this file.
+        let floor_over_run_end = base.join("floor-over-run-end");
+        contain::mkdir_private(&floor_over_run_end).unwrap();
+        std::fs::write(
+            floor_over_run_end.join("log.jsonl"),
+            "{\"event\":\"budget_carried\",\"elapsed_sec\":40}\n{\"event\":\"run_end\",\"status\":\"ok\",\"elapsed_sec\":5}\n",
+        )
+        .unwrap();
+        assert_eq!(load_resume(&floor_over_run_end).unwrap().elapsed_sec, 40);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn carried_active_time_survives_two_hops_of_carry_even_when_every_status_json_is_gone() {
+        // Simulates A -> B (--carry-budget-from A) -> C (--carry-budget-from
+        // B), with status.json absent at EVERY hop: not merely stale, gone
+        // outright, as if each run's status.json had already been cleaned up
+        // by the time the next carry looked for it. Only the run_end events -
+        // and the budget_carried events a real carry closure would write from
+        // what it read back - survive. Before P1-03 this chain lost B's own
+        // 50s the moment C tried to carry from B, because the only place B's
+        // total lived was status.json.
+        let base =
+            std::env::temp_dir().join(format!("sfh-elapsed-chain-{}", contain::random_nonce()));
+        contain::mkdir_private(&base).unwrap();
+
+        let a = base.join("a");
+        contain::mkdir_private(&a).unwrap();
+        std::fs::write(
+            a.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":100}\n",
+        )
+        .unwrap();
+        let a_elapsed = load_resume(&a).unwrap().elapsed_sec;
+        assert_eq!(
+            a_elapsed, 100,
+            "A's own total must survive with no status.json at all"
+        );
+
+        let b = base.join("b");
+        contain::mkdir_private(&b).unwrap();
+        std::fs::write(
+            b.join("log.jsonl"),
+            format!(
+                "{{\"event\":\"budget_carried\",\"elapsed_sec\":{a_elapsed}}}\n\
+                 {{\"event\":\"run_end\",\"status\":\"failed\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":150}}\n"
+            ),
+        )
+        .unwrap();
+        let b_elapsed = load_resume(&b).unwrap().elapsed_sec;
+        assert_eq!(
+            b_elapsed, 150,
+            "B must recover A's 100s PLUS its own 50s, from run_end alone"
+        );
+
+        let c = base.join("c");
+        contain::mkdir_private(&c).unwrap();
+        std::fs::write(
+            c.join("log.jsonl"),
+            format!(
+                "{{\"event\":\"budget_carried\",\"elapsed_sec\":{b_elapsed}}}\n\
+                 {{\"event\":\"run_end\",\"status\":\"ok\",\"leaf_runs\":1,\"cost_usd\":1.0,\"elapsed_sec\":175}}\n"
+            ),
+        )
+        .unwrap();
+        let c_elapsed = load_resume(&c).unwrap().elapsed_sec;
+        assert_eq!(
+            c_elapsed, 175,
+            "C must recover the full chain's 175s - B's carried total plus C's own 25s"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- P1-09: next_actions_for must diagnose resume/carry, not assume
+    // them from the terminal state alone ----
+
+    fn next_actions_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-next-actions-{tag}-{}",
+            contain::random_nonce()
+        ));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stuck_step_exhausted_max_visits_names_the_step_only_when_the_last_position_says_so() {
+        let dir = next_actions_test_dir("max-visits-detect");
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            None,
+            "no log at all is not evidence of anything"
+        );
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            None,
+            "an explicit goto: stuck rule is not a max_visits dead end"
+        );
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stuck_step_exhausted_max_visits(&dir),
+            Some("loopy".to_string())
+        );
+        // A later, non-max_visits position (a subsequent resumed attempt
+        // that got past it) must clear the earlier landing.
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n\
+             {\"event\":\"position\",\"after\":\"loopy\",\"next\":\"next_step\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        assert_eq!(stuck_step_exhausted_max_visits(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_done_run_offers_only_why() {
+        let dir = PathBuf::from("/does-not-need-to-exist");
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("done", &dir, &flow, None);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["kind"], "why");
+    }
+
+    #[test]
+    fn next_actions_for_a_persistence_failure_does_not_offer_resume_but_still_offers_carry() {
+        let dir = next_actions_test_dir("persistence-failure");
+        // A healthy terminal status.json, so the carry diagnosis (a
+        // separate question from resumability) resolves cleanly and this
+        // test isolates the resume diagnosis.
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "failed", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let error = Some((
+            machine::ErrorCode::PersistenceFailure,
+            "step 'x': required result artifacts could not be persisted",
+        ));
+        let actions = next_actions_for("failed", &dir, &flow, error);
+
+        let resume = actions
+            .iter()
+            .find(|a| a["kind"] == "resume")
+            .expect("a resume diagnosis is always present, even when refused");
+        assert_eq!(resume["resumable"], false);
+        assert!(
+            resume.get("argv").is_none(),
+            "an action that cannot succeed must carry no argv to run: {resume}"
+        );
+        assert!(resume["reason"].as_str().unwrap().contains("persist"));
+
+        let carry = actions
+            .iter()
+            .find(|a| a["kind"] == "carry_budget")
+            .expect("a carry diagnosis is always present");
+        assert_eq!(carry["carryable"], true);
+        assert!(carry.get("argv").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_stuck_run_that_exhausted_max_visits_does_not_offer_resume() {
+        let dir = next_actions_test_dir("stuck-max-visits");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"loopy\",\"next\":\"stuck\",\"via\":\"max_visits\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "stuck", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("stuck", &dir, &flow, None);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], false);
+        assert!(resume["reason"].as_str().unwrap().contains("max_visits"));
+        assert!(resume.get("argv").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_an_ordinary_stuck_landing_still_offers_resume() {
+        let dir = next_actions_test_dir("stuck-ordinary");
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"position\",\"after\":\"review\",\"next\":\"stuck\",\"via\":\"rule\"}\n",
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "stuck", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let actions = next_actions_for("stuck", &dir, &flow, None);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], true);
+        let argv: Vec<String> = resume["argv"]
+            .as_array()
+            .expect("a runnable action carries argv")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(argv.contains(&"--resume".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_actions_for_a_workspace_drift_failure_offers_resume_with_adopt_workspace_baked_in() {
+        let dir = next_actions_test_dir("workspace-drift");
+        contain::write_private_atomic(
+            &dir.join("status.json"),
+            serde_json::json!({"state": "failed", "pid": 0}).to_string(),
+        )
+        .unwrap();
+        let flow = PathBuf::from("flow.yaml");
+        let error = Some((
+            machine::ErrorCode::WorkspaceDrift,
+            "SFH_WORKSPACE_DRIFT: the managed workspace changed",
+        ));
+        let actions = next_actions_for("failed", &dir, &flow, error);
+        let resume = actions.iter().find(|a| a["kind"] == "resume").unwrap();
+        assert_eq!(resume["resumable"], true);
+        assert_eq!(resume["requires"], serde_json::json!(["--adopt-workspace"]));
+        let argv: Vec<String> = resume["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            argv.contains(&"--adopt-workspace".to_string()),
+            "a caller executing this argv verbatim must not be missing the flag the diagnosis named: {argv:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

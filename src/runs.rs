@@ -142,6 +142,32 @@ impl StepSummary {
     }
 }
 
+/// P1-08: `cost_usd` used to be the only cost field a row reported, and it
+/// answers a specific question - "what is this run's position against
+/// max_cost_usd" - that is NOT the same as "what did this run itself
+/// spend" the moment `--carry-budget-from` is involved. Four questions,
+/// four fields, each named for exactly what it answers:
+///
+/// - `own_cost_usd`: what THIS run itself spent, carried inheritance
+///   excluded.
+/// - `carried_cost_usd`: what it inherited from an earlier run via
+///   `--carry-budget-from`, spent by neither this run nor computed by it.
+/// - `budget_position_usd`: own + carried - what `max_cost_usd` is actually
+///   judged against, i.e. the same number `cost_usd` has always reported.
+/// - `lineage_cost_usd`: the total spent across this run's WHOLE carry
+///   ancestry, back to a run that carried nothing - but ONLY when every
+///   ancestor in that chain is still present and readable. `runs clean`
+///   deletes old run dirs; a descendant's `carried_budget.cost_usd` survives
+///   that deletion (it was captured durably at carry time), so
+///   `budget_position_usd` stays correct, but nothing can re-verify an
+///   ancestor that is gone - so this is `None` rather than a value nothing
+///   backs, instead of quietly reusing `budget_position_usd` and calling it
+///   a lineage total it may not be.
+///
+/// `cost_usd` is kept, identical to `budget_position_usd`, so an existing
+/// JSON consumer reading `.cost_usd` keeps getting the same number it
+/// always did; new callers get the labelled fields instead of having to
+/// guess which quantity `cost_usd` was.
 #[derive(Serialize)]
 struct RunSummary {
     run_dir: String,
@@ -152,7 +178,24 @@ struct RunSummary {
     failed: u64,
     visit: u64,
     repeat: u64,
+    /// Kept for backward compatibility with existing JSON consumers;
+    /// identical to `budget_position_usd`. New code should read the
+    /// labelled fields below instead - this one does not say which of the
+    /// four quantities it is.
     cost_usd: f64,
+    own_cost_usd: f64,
+    /// How much of `budget_position_usd` this run INHERITED from an earlier
+    /// one via `--carry-budget-from` rather than spending itself. Zero for
+    /// the ordinary run that carried nothing. Never negative and never
+    /// larger than the run's own total: a hand-edited meta.json must not be
+    /// able to turn a fleet total into a refund (see `summary`'s clamp).
+    carried_cost_usd: f64,
+    budget_position_usd: f64,
+    /// `None` when this run's carry ancestry cannot be fully verified right
+    /// now (an ancestor run dir was cleaned, or its meta.json cannot be
+    /// read) - see the struct doc comment. Never a partial sum standing in
+    /// for the real total.
+    lineage_cost_usd: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -259,6 +302,46 @@ fn opt_string(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// The maximum number of `--carry-budget-from` hops `lineage_is_resolvable`
+/// walks before giving up. A real ancestry is never remotely this long;
+/// hitting the bound means `carried_budget.from` cycles back on itself
+/// (by accident, or by a hand-edited meta.json) rather than naming a real
+/// ancestor, so it is itself treated as proof the chain cannot be trusted.
+const MAX_LINEAGE_HOPS: usize = 10_000;
+
+/// Whether `dir`'s complete `--carry-budget-from` ancestry - back to a run
+/// that carried nothing - is still present and its meta.json still
+/// readable, hop by hop. `runs clean` deletes old run dirs; this is what
+/// lets `lineage_cost_usd` notice when that has happened to one of THIS
+/// run's ancestors, rather than silently reporting a total that stopped
+/// being verifiable the moment the evidence for one hop was gone.
+fn lineage_is_resolvable(dir: &Path) -> bool {
+    let mut current = dir.to_path_buf();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..MAX_LINEAGE_HOPS {
+        // A dir this walk has already visited means `carried_budget.from`
+        // cycles back on itself - not a real ancestry, and not something to
+        // report a total for.
+        if !seen.insert(current.clone()) {
+            return false;
+        }
+        let m = meta(&current);
+        if m.is_null() {
+            return false;
+        }
+        match m
+            .get("carried_budget")
+            .and_then(|c| c.get("from"))
+            .and_then(Value::as_str)
+        {
+            Some(from) => current = PathBuf::from(from),
+            // An origin that carried nothing: the chain is complete.
+            None => return true,
+        }
+    }
+    false
+}
+
 fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
     let m = meta(dir);
     let s = status(dir);
@@ -271,11 +354,31 @@ fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
     let failed = steps.iter().map(|x| x.failed).sum();
     let visit = steps.iter().map(|x| x.visit).max().unwrap_or(0);
     let repeat = steps.iter().map(|x| x.repeat).max().unwrap_or(0);
-    let cost_usd = m
+    // What max_cost_usd is actually judged against - own spend plus
+    // whatever was carried in. This is what `cost_usd` has always reported;
+    // `budget_position_usd` is the same number under the name that says so.
+    let budget_position_usd = m
         .get("cost_usd")
         .or_else(|| s.get("cost_usd"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    // Never negative and never larger than the run's own total: a hand-edited
+    // meta.json must not be able to turn a fleet total into a refund.
+    let carried_cost_usd = m
+        .get("carried_budget")
+        .and_then(|c| c.get("cost_usd"))
+        .and_then(Value::as_f64)
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .unwrap_or(0.0)
+        .min(budget_position_usd.max(0.0));
+    // What this run itself spent, carried inheritance backed out. The clamp
+    // above guarantees this is never negative for a non-negative
+    // budget_position_usd.
+    let own_cost_usd = budget_position_usd - carried_cost_usd;
+    // Resolvable exactly when every ancestor this run's own carried_cost_usd
+    // depends on can still be independently verified; see the doc comment on
+    // `RunSummary::lineage_cost_usd`.
+    let lineage_cost_usd = lineage_is_resolvable(dir).then_some(budget_position_usd);
     RunSummary {
         run_dir: dir.display().to_string(),
         status,
@@ -285,7 +388,11 @@ fn summary(dir: &Path, steps: &[StepSummary]) -> RunSummary {
         failed,
         visit,
         repeat,
-        cost_usd,
+        cost_usd: budget_position_usd,
+        own_cost_usd,
+        carried_cost_usd,
+        budget_position_usd,
+        lineage_cost_usd,
     }
 }
 
@@ -312,9 +419,21 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
     // `f64::sum()` uses the additive identity -0.0 for an empty iterator on
     // supported Rust versions, which surfaced as the nonsensical `$-0.0000`
     // when no runs existed. Start the fold from an explicit positive zero.
-    let total_cost_usd = selected
+    //
+    // A run started with --carry-budget-from reports its ANCESTOR's spend
+    // inside its own budget_position_usd, because that is the number its
+    // max_cost_usd is judged against. The ancestor's row reports those same
+    // dollars, so a plain sum of the rows bills the carried spend once per
+    // hop - which is exactly the miscount this listing exists to prevent.
+    // Sum what each SELECTED row actually spent, i.e. own_cost_usd - this is
+    // named total_own_cost_usd below for exactly that reason (P1-08): it is
+    // not a lineage total (an ancestor outside --limit, or already cleaned,
+    // contributes nothing to it either), and it is not each row's
+    // budget_position_usd summed either. `total_cost_usd` is kept, equal to
+    // it, for existing JSON consumers.
+    let total_own_cost_usd = selected
         .iter()
-        .fold(0.0_f64, |total, run| total + run.summary.cost_usd);
+        .fold(0.0_f64, |total, run| total + run.summary.own_cost_usd);
 
     if as_json {
         let runs: Vec<&RunSummary> = selected.iter().map(|r| &r.summary).collect();
@@ -322,7 +441,8 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "runs": runs,
-                "total_cost_usd": total_cost_usd,
+                "total_cost_usd": total_own_cost_usd,
+                "total_own_cost_usd": total_own_cost_usd,
             }))
             .expect("serializing run summaries cannot fail")
         );
@@ -333,13 +453,30 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
         println!("no runs under {}", root.display());
     } else {
         println!(
-            "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>10}  RUN DIR",
-            "STATUS", "STARTED(UTC)", "EXIT", "OK", "FAILED", "VISIT", "REPEAT", "COST_USD"
+            "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>9} {:>11} {:>11} {:>12}  RUN DIR",
+            "STATUS",
+            "STARTED(UTC)",
+            "EXIT",
+            "OK",
+            "FAILED",
+            "VISIT",
+            "REPEAT",
+            "OWN_USD",
+            "CARRIED_USD",
+            "BUDGET_USD",
+            "LINEAGE_USD"
         );
         for run in &selected {
             let r = &run.summary;
+            // A dash, not a number, when the ancestry cannot be verified -
+            // never a value that looks like a total but silently is not one
+            // (P1-08).
+            let lineage = r
+                .lineage_cost_usd
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>10.4}  {}",
+                "{:<10} {:<16} {:>4} {:>4} {:>6} {:>5} {:>6} {:>9.4} {:>11.4} {:>11.4} {:>12}  {}",
                 r.status.as_deref().unwrap_or("-"),
                 r.started_utc.as_deref().unwrap_or("-"),
                 r.exit
@@ -349,12 +486,15 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
                 r.failed,
                 r.visit,
                 r.repeat,
-                r.cost_usd,
+                r.own_cost_usd,
+                r.carried_cost_usd,
+                r.budget_position_usd,
+                lineage,
                 r.run_dir
             );
         }
     }
-    println!("\ntotal cost: ${total_cost_usd:.4}");
+    println!("\ntotal own cost across the {} run(s) listed: ${total_own_cost_usd:.4} (excludes carried spend, and excludes any ancestor outside this listing)", selected.len());
     0
 }
 
@@ -392,6 +532,17 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
             .map(|x| x.to_string())
             .unwrap_or_else(|| "-".to_string())
     );
+    // Said out loud, because otherwise the total at the bottom looks like money
+    // this run spent and part of it belongs to an earlier one.
+    if run.summary.carried_cost_usd > 0.0 {
+        println!(
+            "carried : ${:.4} of the total was inherited from {}",
+            run.summary.carried_cost_usd,
+            m.get("carried_budget")
+                .map(|c| get(c, "from"))
+                .unwrap_or("-")
+        );
+    }
     if let Some(b) = &run.budget_landed {
         println!(
             "budget  : landed on {} after ${:.4} / {}s -> goto {}",
@@ -432,7 +583,20 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
             step.cost_usd,
         );
     }
-    println!("\ntotal cost: ${:.4}", run.summary.cost_usd);
+    println!(
+        "\nown cost: ${:.4}   budget position (own + carried, judged against max_cost_usd): ${:.4}",
+        run.summary.own_cost_usd, run.summary.budget_position_usd
+    );
+    // Only worth a line when this run actually has ancestry to report on;
+    // for an ordinary run lineage_cost_usd is just own_cost_usd again.
+    if run.summary.carried_cost_usd > 0.0 {
+        match run.summary.lineage_cost_usd {
+            Some(v) => println!("lineage cost (this run's full --carry-budget-from ancestry): ${v:.4}"),
+            None => println!(
+                "lineage cost: not resolvable - an ancestor in the --carry-budget-from chain is missing or unreadable (see `carried` above)"
+            ),
+        }
+    }
     0
 }
 
@@ -454,6 +618,7 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     };
     let mut last = Value::Null;
     let mut position = Value::Null;
+    let mut last_failed_step = Value::Null;
     let mut unfinished: BTreeMap<String, Value> = BTreeMap::new();
     let mut fanout: BTreeMap<String, Value> = BTreeMap::new();
     let mut fallbacks: BTreeMap<String, Value> = BTreeMap::new();
@@ -482,6 +647,9 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
             }
             "step_end" => {
                 unfinished.remove(&key);
+                if event.get("exit").and_then(Value::as_i64).unwrap_or(1) != 0 {
+                    last_failed_step = event.clone();
+                }
                 if event
                     .get("next_fallback")
                     .and_then(Value::as_str)
@@ -517,8 +685,39 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     let state = get(&status, "state").to_string();
     let error = opt_string(&status, "error");
     let current = opt_string(&status, "current_step");
+    let harness_diagnostic = (last_failed_step.get("step").and_then(Value::as_str)
+        == current.as_deref())
+    .then(|| {
+        last_failed_step
+            .get("harness_diagnostic")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+    .flatten();
+    // A step whose structured protocol never completed failed for a reason no
+    // amount of reading the tool's own stderr explains: sfh refused to certify
+    // a turn nobody proved had finished. Surfaced separately from the free-text
+    // diagnostic so a machine caller can branch on it (spec 15.3). Absent from
+    // logs written before v1.2, which read as `null`.
+    let protocol_failure = last_failed_step
+        .get("protocol_state")
+        .and_then(Value::as_str)
+        .filter(|s| matches!(*s, "invalid" | "missing_terminal"))
+        .map(|s| {
+            serde_json::json!({
+                "step": last_failed_step.get("step"),
+                "protocol_state": s,
+                "terminal_seen": last_failed_step.get("terminal_seen"),
+                "final_message_seen": last_failed_step.get("final_message_seen"),
+                "malformed_records": last_failed_step.get("malformed_records"),
+            })
+        });
     let explanation = if let Some(error) = &error {
-        error.clone()
+        match &harness_diagnostic {
+            Some(diagnostic) => format!("{error}: {diagnostic}"),
+            None => error.clone(),
+        }
     } else if let Some(checkpoint) = fallbacks.values().next_back() {
         format!(
             "a failed attempt durably selected fallback profile '{}'; resume will continue that profile in the same visit",
@@ -546,6 +745,8 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
         "state": state,
         "current_step": current,
         "error": error,
+        "harness_diagnostic": harness_diagnostic,
+        "protocol_failure": protocol_failure,
         "explanation": explanation,
         "last_event": last,
         "last_position": position,
@@ -634,6 +835,310 @@ pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
     0
 }
 
+// ---------------------------------------------------------------------------
+// `sfh workspaces` - the managed working environments runs left behind.
+//
+// Every operation here is bounded by one rule: sfh removes only a path it can
+// prove it created, and it never discards uncommitted work without being told
+// to in so many words. Both checks are made immediately before the deletion,
+// not once at the start, because between a decision and its execution a path
+// can be swapped for something else entirely.
+// ---------------------------------------------------------------------------
+
+/// The workspace a run recorded, if any.
+fn workspace_of(dir: &Path) -> Option<crate::workspace::Workspace> {
+    let v = read_json(dir, crate::workspace::MANIFEST);
+    crate::workspace::Workspace::from_manifest(&v)
+}
+
+/// What a workspace looks like right now, as opposed to when it was recorded.
+fn workspace_row(dir: &Path) -> Option<Value> {
+    let ws = workspace_of(dir)?;
+    let st = status(dir);
+    let state = get(&st, "state").to_string();
+    let exists = ws.path.is_dir();
+    let dirty = exists
+        .then(|| crate::workspace::is_dirty(&ws.path).ok())
+        .flatten();
+    let owned = crate::workspace::verify_ownership(&ws);
+    Some(serde_json::json!({
+        "run_dir": dir.display().to_string(),
+        "run_state": state,
+        "workspace_id": ws.id,
+        "mode": ws.mode.as_str(),
+        "path": ws.path.display().to_string(),
+        "branch": ws.branch,
+        "base_commit": ws.base_commit,
+        "source_root": ws.source_root.display().to_string(),
+        "exists": exists,
+        "dirty": dirty,
+        "sfh_owned": owned.is_ok(),
+        "ownership": owned.err(),
+        "cleanup": ws.cleanup.as_str(),
+    }))
+}
+
+fn emit_ws(command: &str, ok: bool, body: Value, as_json: bool, human: impl FnOnce()) -> i32 {
+    if as_json {
+        crate::machine::emit(&crate::machine::envelope(
+            command,
+            ok,
+            if ok { 0 } else { 1 },
+            body,
+        ));
+    } else {
+        human();
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+pub fn workspaces_list(root: &Path, as_json: bool) -> i32 {
+    let rows: Vec<Value> = run_dirs(root)
+        .into_iter()
+        .rev()
+        .filter_map(|d| workspace_row(&d))
+        .collect();
+    let printable = rows.clone();
+    emit_ws(
+        "workspaces list",
+        true,
+        serde_json::json!({"workspaces": rows, "runs_dir": root.display().to_string()}),
+        as_json,
+        || {
+            if printable.is_empty() {
+                println!("no managed workspaces recorded under {}", root.display());
+                return;
+            }
+            for w in &printable {
+                println!(
+                    "{}  {}  {}  {}{}",
+                    get(w, "run_state"),
+                    get(w, "mode"),
+                    get(w, "path"),
+                    if w["exists"].as_bool() == Some(true) {
+                        ""
+                    } else {
+                        "(gone) "
+                    },
+                    match w["dirty"].as_bool() {
+                        Some(true) => "DIRTY",
+                        Some(false) => "clean",
+                        None => "dirty:unknown",
+                    }
+                );
+            }
+        },
+    )
+}
+
+pub fn workspaces_show(dir: &Path, as_json: bool) -> i32 {
+    match workspace_row(dir) {
+        Some(row) => {
+            let printable = row.clone();
+            emit_ws("workspaces show", true, row, as_json, || {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&printable).unwrap_or_default()
+                );
+            })
+        }
+        None => {
+            if as_json {
+                crate::machine::emit(&crate::machine::error_envelope(
+                    "workspaces show",
+                    crate::machine::ErrorCode::WorkspaceMissing,
+                    "this run recorded no managed workspace",
+                    1,
+                    serde_json::json!({"run_dir": dir.display().to_string()}),
+                ));
+            } else {
+                eprintln!("sfh: {} recorded no managed workspace", dir.display());
+            }
+            1
+        }
+    }
+}
+
+/// Remove the managed workspaces of runs that are finished and clean.
+///
+/// A workspace is a candidate only when its run reached a terminal state, its
+/// worktree has nothing uncommitted, and sfh owns it. Anything else is listed
+/// with the reason it was skipped - a `clean` that silently did nothing is
+/// indistinguishable from one that silently did too much.
+pub fn workspaces_clean(
+    root: &Path,
+    older_than_days: Option<u64>,
+    dry_run: bool,
+    as_json: bool,
+) -> i32 {
+    let cutoff = older_than_days.map(|d| {
+        std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(d * 86_400))
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+    for dir in run_dirs(root) {
+        let Some(ws) = workspace_of(&dir) else {
+            continue;
+        };
+        let path = ws.path.display().to_string();
+        if let Some(cutoff) = cutoff {
+            let modified = dir.metadata().and_then(|m| m.modified()).ok();
+            if modified.map(|m| m > cutoff).unwrap_or(true) {
+                skipped
+                    .push(serde_json::json!({"path": path, "reason": "newer than --older-than"}));
+                continue;
+            }
+        }
+        let state = get(&status(&dir), "state").to_string();
+        if !matches!(
+            state.as_str(),
+            "done" | "failed" | "stuck" | "stopped" | "dead"
+        ) {
+            skipped.push(serde_json::json!({"path": path, "reason": format!("the run is '{state}', not finished")}));
+            continue;
+        }
+        if state != "done" {
+            skipped.push(serde_json::json!({
+                "path": path,
+                "reason": format!("the run ended as '{state}'; its workspace holds the evidence and is kept")
+            }));
+            continue;
+        }
+        if !ws.path.is_dir() {
+            skipped.push(serde_json::json!({"path": path, "reason": "already gone"}));
+            continue;
+        }
+        if let Err(why) = crate::workspace::verify_ownership(&ws) {
+            skipped.push(serde_json::json!({"path": path, "reason": why}));
+            continue;
+        }
+        match crate::workspace::is_dirty(&ws.path) {
+            Ok(true) => {
+                skipped.push(serde_json::json!({
+                    "path": path,
+                    "reason": "uncommitted changes; use `sfh workspaces remove <run-dir> --discard` to drop them deliberately"
+                }));
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                skipped.push(serde_json::json!({"path": path, "reason": format!("cannot tell whether it is dirty: {e}")}));
+                continue;
+            }
+        }
+        if dry_run {
+            removed.push(serde_json::json!({"path": path, "action": "would remove"}));
+            continue;
+        }
+        match crate::workspace::remove_worktree(&ws) {
+            Ok(()) => removed.push(serde_json::json!({"path": path, "action": "removed"})),
+            Err(e) => skipped.push(serde_json::json!({"path": path, "reason": e})),
+        }
+    }
+    let (r, s) = (removed.clone(), skipped.clone());
+    emit_ws(
+        "workspaces clean",
+        true,
+        serde_json::json!({"removed": removed, "skipped": skipped, "dry_run": dry_run}),
+        as_json,
+        || {
+            for x in &r {
+                println!("{}: {}", get(x, "action"), get(x, "path"));
+            }
+            for x in &s {
+                println!("kept {}: {}", get(x, "path"), get(x, "reason"));
+            }
+            if r.is_empty() && s.is_empty() {
+                println!("no managed workspaces to clean");
+            }
+            println!("(the branch each workspace created is always kept)");
+        },
+    )
+}
+
+/// Remove one run's managed workspace. `--discard` is the only way sfh drops
+/// uncommitted work, and it still refuses a path it cannot prove it created.
+pub fn workspaces_remove(dir: &Path, discard: bool, as_json: bool) -> i32 {
+    let Some(ws) = workspace_of(dir) else {
+        if as_json {
+            crate::machine::emit(&crate::machine::error_envelope(
+                "workspaces remove",
+                crate::machine::ErrorCode::WorkspaceMissing,
+                "this run recorded no managed workspace",
+                1,
+                serde_json::json!({"run_dir": dir.display().to_string()}),
+            ));
+        } else {
+            eprintln!("sfh: {} recorded no managed workspace", dir.display());
+        }
+        return 1;
+    };
+    let fail = |code: crate::machine::ErrorCode, msg: String| -> i32 {
+        if as_json {
+            crate::machine::emit(&crate::machine::error_envelope(
+                "workspaces remove",
+                code,
+                &msg,
+                1,
+                serde_json::json!({"run_dir": dir.display().to_string()}),
+            ));
+        } else {
+            eprintln!("sfh: {msg}");
+        }
+        1
+    };
+    if let Err(why) = crate::workspace::verify_ownership(&ws) {
+        return fail(
+            crate::machine::ErrorCode::WorkspaceUnowned,
+            format!("refusing to remove {}: {why}", ws.path.display()),
+        );
+    }
+    if !discard {
+        match crate::workspace::is_dirty(&ws.path) {
+            Ok(true) => {
+                return fail(
+                    crate::machine::ErrorCode::WorkspaceDrift,
+                    format!(
+                        "{} has uncommitted changes. Commit them, or pass --discard to drop them.",
+                        ws.path.display()
+                    ),
+                )
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return fail(
+                    crate::machine::ErrorCode::WorkspaceDrift,
+                    format!("cannot tell whether {} is dirty: {e}", ws.path.display()),
+                )
+            }
+        }
+    }
+    match crate::workspace::remove_worktree(&ws) {
+        Ok(()) => {
+            let path = ws.path.display().to_string();
+            emit_ws(
+                "workspaces remove",
+                true,
+                serde_json::json!({"removed": path, "branch_kept": ws.branch}),
+                as_json,
+                || {
+                    println!("removed {path}");
+                    if let Some(b) = &ws.branch {
+                        println!("the branch {b} is kept");
+                    }
+                },
+            )
+        }
+        Err(e) => fail(crate::machine::ErrorCode::WorkspaceUnowned, e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,5 +1173,142 @@ mod tests {
         assert_eq!(step.repeat, 1);
         assert_eq!(step.ok, 3);
         assert_eq!(step.failed, 1);
+    }
+
+    // ---- P1-08: a run's cost fields must be individually correct, and a
+    // lineage total must be absent rather than wrong when an ancestor is
+    // gone ----
+
+    fn cost_fields_test_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sfh-runs-cost-{tag}-{}", contain::random_nonce()));
+        contain::mkdir_private(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn own_carried_and_budget_position_cost_fields_are_individually_correct() {
+        let base = cost_fields_test_dir("fields");
+
+        let ancestor = base.join("ancestor");
+        contain::mkdir_private(&ancestor).unwrap();
+        std::fs::write(ancestor.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &ancestor.join("meta.json"),
+            serde_json::json!({"cost_usd": 2.0}).to_string(),
+        )
+        .unwrap();
+
+        let child = base.join("child");
+        contain::mkdir_private(&child).unwrap();
+        std::fs::write(child.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &child.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 5.0,
+                "carried_budget": {"cost_usd": 2.0, "from": ancestor.display().to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let s = summary(&child, &[]);
+        assert_eq!(
+            s.budget_position_usd, 5.0,
+            "own + carried - what max_cost_usd is judged against"
+        );
+        assert_eq!(s.carried_cost_usd, 2.0, "what this run inherited");
+        assert_eq!(
+            s.own_cost_usd, 3.0,
+            "what this run itself spent: budget position minus carried"
+        );
+        assert_eq!(
+            s.cost_usd, 5.0,
+            "cost_usd is kept for existing consumers, identical to budget_position_usd"
+        );
+        assert_eq!(
+            s.lineage_cost_usd,
+            Some(5.0),
+            "the ancestor is present and readable, so the lineage total is resolvable"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn lineage_cost_usd_is_absent_rather_than_wrong_when_an_ancestor_is_gone() {
+        let base = cost_fields_test_dir("gone-ancestor");
+        // Names an ancestor that was never created here, simulating `runs
+        // clean` having removed it after the carry that recorded it.
+        let cleaned_ancestor = base.join("cleaned-ancestor");
+
+        let child = base.join("child");
+        contain::mkdir_private(&child).unwrap();
+        std::fs::write(child.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &child.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 5.0,
+                "carried_budget": {"cost_usd": 2.0, "from": cleaned_ancestor.display().to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let s = summary(&child, &[]);
+        // The clamp still protects these three: they are durable in THIS
+        // run's own meta.json and do not need the ancestor to still exist.
+        assert_eq!(s.budget_position_usd, 5.0);
+        assert_eq!(s.carried_cost_usd, 2.0);
+        assert_eq!(s.own_cost_usd, 3.0);
+        // But the lineage total cannot be independently re-verified, so it
+        // must be absent rather than a value nothing backs (P1-08) - never
+        // silently substituted with budget_position_usd or a partial sum.
+        assert_eq!(s.lineage_cost_usd, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_hand_edited_carried_cost_cannot_exceed_the_runs_own_total_or_go_negative() {
+        let dir = cost_fields_test_dir("clamp");
+        std::fs::write(dir.join("log.jsonl"), "{\"event\":\"run_start\"}\n").unwrap();
+        contain::write_private_atomic(
+            &dir.join("meta.json"),
+            serde_json::json!({
+                "cost_usd": 3.0,
+                // Hand-edited to claim MORE was carried than the run's own
+                // total: must clamp to 3.0, never turn into a refund via a
+                // negative own_cost_usd.
+                "carried_budget": {"cost_usd": 999.0, "from": "/nowhere"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let s = summary(&dir, &[]);
+        assert_eq!(s.carried_cost_usd, 3.0);
+        assert_eq!(s.own_cost_usd, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lineage_is_resolvable_refuses_a_cycle_instead_of_looping_forever() {
+        let base = cost_fields_test_dir("cycle");
+        let a = base.join("a");
+        let b = base.join("b");
+        contain::mkdir_private(&a).unwrap();
+        contain::mkdir_private(&b).unwrap();
+        contain::write_private_atomic(
+            &a.join("meta.json"),
+            serde_json::json!({"carried_budget": {"from": b.display().to_string()}}).to_string(),
+        )
+        .unwrap();
+        contain::write_private_atomic(
+            &b.join("meta.json"),
+            serde_json::json!({"carried_budget": {"from": a.display().to_string()}}).to_string(),
+        )
+        .unwrap();
+        assert!(!lineage_is_resolvable(&a));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

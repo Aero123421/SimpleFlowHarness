@@ -1,0 +1,94 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+api_version: 1
+name: stable-change-loop
+
+workspace:
+  mode: auto
+  cleanup: keep
+
+contexts:
+  task: {file: ./TASK.md}
+  acceptance: {file: ./ACCEPTANCE.md}
+  implementation_rules:
+    file: ./IMPLEMENTATION.md
+    optional: true
+  review_rules:
+    file: ./REVIEW.md
+    optional: true
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+  verification:
+    template: |
+      exit={{steps.verify.exit | optional}}
+      stdout={{steps.verify.output_file | optional}}
+      stderr={{steps.verify.stderr_file | optional}}
+
+profiles:
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+# Replace the generic verification command with project-specific checks.
+defaults:
+  max_total_steps: 32
+  max_prompt_chars: 100000
+  max_context_chars: 80000
+  wall_clock_sec: 7200
+  on_budget: goto:handoff
+  budget_reserve: {wall_clock_sec: 600}
+
+steps:
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, implementation_rules, latest_review]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Inspect the current workspace, then implement the smallest coherent change
+      that satisfies the task and acceptance contract.
+
+  - id: verify
+    effects: read
+    max_visits: 5
+    on_max_visits: goto:handoff
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:fix
+
+  - id: review
+    use: reviewer
+    effects: read
+    max_visits: 5
+    on_max_visits: goto:handoff
+    context: [task, acceptance, review_rules, verification]
+    prompt: |
+      Review the current workspace independently. Treat files and command
+      evidence as truth. End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - {when_last_line_is: "REVIEW: PASS", goto: end}
+      - {when_last_line_is: "REVIEW: REVISE", goto: fix}
+      - {goto: stuck}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, implementation_rules, latest_review, verification]
+    max_visits: 4
+    on_max_visits: goto:handoff
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Fix only the current blockers. Reinspect the workspace and preserve working
+      behavior outside the affected area.
+    route:
+      - {goto: verify}
+
+  - id: handoff
+    use: reviewer
+    effects: read
+    context: [task, acceptance, latest_review, verification]
+    prompt: |
+      Produce a durable handoff: verified facts, unresolved blockers, workspace
+      state, and the next exact action. Do not modify files.
+    route:
+      - {goto: stuck}
