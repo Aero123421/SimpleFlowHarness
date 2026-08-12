@@ -2595,8 +2595,18 @@ fn log_terminal_evidence(dir: &Path) -> Result<(bool, bool), String> {
 /// assumed.
 fn carry_source_is_final(dir: &Path) -> Result<(), String> {
     if let Ok(snap) = watch::read(dir) {
+        // `pid_alive` first, and not merely because a gone process has no start
+        // time to compare: a ZOMBIE keeps its /proc entry, so the recorded start
+        // time still matches long after the process is dead, and "wedged" stayed
+        // true forever on any host that does not reap orphans. The carry was
+        // then refused with a message naming `sfh wait` and `sfh stop` - neither
+        // of which can clear a zombie - so the only documented route out of a
+        // SIGKILLed run was closed. Liveness is the question being asked here;
+        // the start time only tells the original owner from a stranger wearing
+        // its pid (rev_break #8), and is worth asking about a live pid alone.
         let wedged = snap.state == "dead"
             && snap.pid_start.is_some()
+            && execute::pid_alive(snap.pid)
             && execute::pid_start_time(snap.pid) == snap.pid_start;
         if snap.state == "running" || wedged {
             return Err(format!(

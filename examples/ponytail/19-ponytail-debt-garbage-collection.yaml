@@ -1,0 +1,106 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: recurring entropy control—harvest deliberate simplifications, fix one item, stop.
+api_version: 1
+name: ponytail-debt-garbage-collection
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:16000}}
+
+profiles:
+  auditor: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 24
+  max_parallel: 2
+  max_prompt_chars: 110000
+  max_context_chars: 85000
+
+steps:
+  - id: harvest
+    use: auditor
+    effects: read
+    context: [task, project_rules, ponytail, simplicity]
+    prompt: |
+      Scan the repository for deliberate `ponytail:` ceiling comments and nearby
+      complexity drift. Build a ranked ledger containing the stated ceiling,
+      whether the upgrade signal is now present, and the smallest current action.
+      Do not edit files.
+
+      End with:
+      DECISION: STOP
+      when no item has evidence for action, or:
+      DECISION: APPLY
+      when exactly one item is ready.
+
+    route:
+      - {when_last_line_is: "DECISION: STOP", goto: end}
+      - {when_last_line_is: "DECISION: APPLY", goto: implement}
+      - {goto: stuck}
+
+  - id: implement
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Apply only the single evidence-backed action selected by the ledger.
+      If the original simple ceiling still holds, remove no code merely to create activity.
+
+      Ledger:
+      {{steps.harvest.output | truncate:20000}}
+
+  - id: verify
+    effects: read
+    cmd: ["git", "diff", "--check"]
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Confirm behavior and the stated ceiling/upgrade signal.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Confirm the change reduces or justifiably upgrades owned complexity
+          and stays limited to one debt item.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review]
+    max_visits: 2
+    on_max_visits: goto:stuck
+    prompt: |
+      Correct only the selected debt item. Do not turn recurring garbage
+      collection into a repository-wide rewrite.
+    route:
+      - {goto: verify}

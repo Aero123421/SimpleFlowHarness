@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: one-shot, read-only complexity audit; it does not apply fixes.
+api_version: 1
+name: ponytail-whole-repo-audit
+
+workspace:
+  mode: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  simplicity: {file: ./prompts/ponytail-review.md}
+
+profiles:
+  auditor: {tool: codex, access: read}
+
+defaults:
+  max_total_steps: 2
+  max_prompt_chars: 120000
+  max_context_chars: 80000
+  max_emit_chars: 120000
+
+steps:
+  - id: audit
+    use: auditor
+    effects: read
+    context: [task, project_rules, simplicity]
+    prompt: |
+      Audit the entire repository for unnecessary complexity.
+      Do not modify files.
+
+      Rank findings by the largest safe deletion first. For each finding use:
+      delete:, reuse:, stdlib:, native:, yagni:, or shrink:.
+      Name the path, what to remove, and the concrete replacement.
+      Keep correctness, security, performance, and accessibility findings out of
+      this report unless they explain why a proposed deletion is unsafe.
+
+      End with a short net estimate of lines and dependencies that could be removed.
+    route:
+      - {goto: end}

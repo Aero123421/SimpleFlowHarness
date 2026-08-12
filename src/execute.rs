@@ -764,11 +764,69 @@ pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    if unsafe { libc::kill(pid as i32, 0) } == 0 {
-        return true;
-    }
-    // EPERM: it exists, it just is not ours to signal.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let signalable = if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        true
+    } else {
+        // EPERM: it exists, it just is not ours to signal.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    // A zombie answers kill(pid, 0) exactly as a live process does - the pid is
+    // still in the table, holding an exit status nobody has collected - but it
+    // is not running, and where PID 1 does not reap orphans it never will be.
+    // That host is not exotic: it is every container started without an init,
+    // which is precisely where a `--detach` run lives. Counting a zombie as
+    // alive made a SIGKILLed run read `running` until its heartbeat went stale,
+    // told `sfh stop` to verify ownership of a process whose /proc/<pid>/exe a
+    // zombie no longer has (so the stop was refused), and left
+    // `--carry-budget-from` refusing permanently (see `carry_source_is_final`).
+    signalable && !pid_is_zombie(pid)
+}
+
+/// Whether this pid names a process that has already exited and is only waiting
+/// for its parent to collect the status (state `Z`).
+///
+/// Linux: the state character is field 3 of /proc/<pid>/stat - the first token
+/// after the parenthesized `comm`, which may itself contain spaces and
+/// parentheses, so it is split off at the LAST ')' exactly as `pid_start_time`
+/// does with the same string.
+///
+/// Anything it cannot read answers `false`: "not provably a zombie". Liveness
+/// is only ever narrowed here by positive evidence, never widened by the
+/// absence of it, which keeps every caller's fail-closed reading intact.
+#[cfg(target_os = "linux")]
+fn pid_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        == Some("Z")
+}
+
+/// Every other Unix, macOS included: "cannot tell", which reads as
+/// not-a-zombie and so leaves liveness exactly as it was before this check
+/// existed.
+///
+/// Not a stub for want of trying. macOS cannot answer through `proc_pidinfo`
+/// at all - both BSD-info flavors reach the process through `proc_find`, which
+/// skips a `SZOMB` entry by design, so every flavor reports "no such process"
+/// for precisely the case being asked about. The call that does see zombies is
+/// the `KERN_PROC_PID` sysctl, and libc exposes neither `kinfo_proc` nor
+/// `extern_proc` on Apple targets: reading `p_stat` would mean hand-computing
+/// its offset inside a large layout-sensitive struct, and getting that wrong
+/// fails in the dangerous direction - a live process misread as dead lets
+/// `sfh stop` skip a real one and lets a carry run against a run still
+/// spending.
+///
+/// The trade is worth taking because the condition is not durable here. This
+/// bug needs a PID 1 that does not reap orphans; macOS's is launchd, which
+/// always does, so a detached run's zombie is collected in the moment rather
+/// than outliving the run. On Linux - where a container's PID 1 is routinely
+/// not an init at all - it is durable, and that is where the check is
+/// implemented.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_is_zombie(_pid: u32) -> bool {
+    false
 }
 
 /// The start time of a process, as an opaque u64 that is unique per pid on one
@@ -1501,6 +1559,56 @@ pub fn is_transient_failure(stderr: &str, stdout: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A process that has exited but has not been reaped still answers
+    /// `kill(pid, 0)`, so `pid_alive` used to call it alive. Where PID 1 does
+    /// not reap orphans - every container started without an init, which is
+    /// where a `--detach` run lives - that answer never changed, and it is the
+    /// answer `sfh status`, `sfh stop` and `--carry-budget-from` are all built
+    /// on.
+    ///
+    /// Reaped here at the end rather than left behind: a test that leaks a
+    /// zombie into a suite which itself runs under a non-reaping init is the
+    /// bug it is testing for.
+    ///
+    /// Linux only, because that is where `pid_is_zombie` can answer. macOS
+    /// reaches every process through `proc_find`, which skips a `SZOMB` entry
+    /// by design, so no `proc_pidinfo` flavor can see the state this asserts
+    /// on - see `pid_is_zombie` for why reading it the one way that works is
+    /// not worth the ABI assumption, and why the condition is not durable
+    /// under launchd anyway.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_is_not_alive_even_though_it_still_answers_signal_zero() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a child that exits at once");
+        let pid = child.id();
+        // Wait for the exit WITHOUT reaping, so the pid is a zombie held open
+        // by this process still owing it a wait().
+        for _ in 0..200 {
+            if pid_is_zombie(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            pid_is_zombie(pid),
+            "the child should be an unreaped zombie by now"
+        );
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "a zombie must still answer signal 0 - that is what made this a bug"
+        );
+        assert!(
+            !pid_alive(pid),
+            "a zombie is not running, so pid_alive must not say it is"
+        );
+        let _ = child.wait();
+    }
 
     #[test]
     fn the_windows_wsl_launcher_is_recognised_wherever_it_is_spelled() {

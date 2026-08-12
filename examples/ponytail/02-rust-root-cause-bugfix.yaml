@@ -1,0 +1,133 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# Pattern: reproduce first, fix the shared root cause, then run independent reviews.
+api_version: 1
+name: ponytail-rust-root-cause-bugfix
+
+workspace:
+  mode: auto
+  cleanup: auto
+
+contexts:
+  task: {file: ./inputs/TASK.md}
+  acceptance: {file: ./inputs/ACCEPTANCE.md}
+  project_rules:
+    file: ./inputs/PROJECT_RULES.md
+    optional: true
+  ponytail: {file: ./prompts/ponytail-core.md}
+  planning: {file: ./prompts/planner.md}
+  correctness: {file: ./prompts/correctness-review.md}
+  simplicity: {file: ./prompts/ponytail-review.md}
+  latest_review:
+    template: |
+      {{steps.review.output | optional | truncate:18000}}
+  latest_test:
+    template: |
+      {{steps.verify.stderr_file | optional}}
+
+profiles:
+  analyst: {tool: codex, access: read}
+  builder: {tool: pi, access: write}
+  reviewer: {tool: codex, access: read}
+  builder_fallback: {tool: codex, access: write}
+
+defaults:
+  max_total_steps: 32
+  max_parallel: 2
+  max_prompt_chars: 120000
+  max_context_chars: 90000
+
+steps:
+  - id: investigate
+    use: analyst
+    effects: read
+    context: [task, acceptance, project_rules, ponytail, planning]
+    retry: {max: 1, backoff_sec: 5}
+    retry_on: transient
+    prompt: |
+      Reproduce the reported Rust defect conceptually from the code.
+      Trace every caller of the function or shared path most likely responsible.
+      Identify one root-cause correction and the smallest regression test that
+      would fail before the fix. Do not edit files.
+
+  - id: add_regression
+    use: builder
+    fallback: [builder_fallback]
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      Add exactly one focused regression test for the root cause described below.
+      Do not implement the fix yet. Keep the test at the narrowest stable public
+      or shared boundary that demonstrates the defect.
+
+      Investigation:
+      {{steps.investigate.output | truncate:16000}}
+
+  - id: prove_failure
+    effects: workspace
+    cmd: ["cargo", "test", "--release"]
+    on_error: goto:implement
+    route:
+      # Exit 0 means the failure did NOT reproduce, so there is nothing to
+      # root-cause yet: stop rather than let a model invent a fix. Any other
+      # exit is the expected reproduction. The catch-all is written out because
+      # an implicit fall-through silently follows step order, and step order is
+      # exactly what an edit to this file is most likely to change.
+      - {when_exit: 0, goto: stuck}
+      - {goto: implement}
+
+  - id: implement
+    use: builder
+    fallback: [builder_fallback]
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail]
+    prompt: |
+      The regression check failed as expected. Implement the smallest shared
+      root-cause fix. Do not patch each caller separately unless the callers
+      genuinely have different contracts.
+
+      Investigation:
+      {{steps.investigate.output | truncate:16000}}
+
+  - id: verify
+    effects: workspace
+    cmd: ["cargo", "test", "--release"]
+    timeout_sec: 1800
+    on_error: goto:fix
+
+  - id: review
+    parallel:
+      - id: correctness_review
+        use: reviewer
+        effects: read
+        context: [task, acceptance, project_rules, correctness]
+        on_error: continue
+        prompt: |
+          Review the current Rust change and the regression test.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+      - id: simplicity_review
+        use: reviewer
+        effects: read
+        context: [task, project_rules, simplicity]
+        on_error: continue
+        prompt: |
+          Review the diff for duplicate guards, unnecessary abstractions,
+          new dependencies, and fixes placed below the shared root cause.
+          End with exactly REVIEW: PASS or REVIEW: REVISE.
+    max_parallel: 2
+    route:
+      - when_members: {last_line_is: "REVIEW: PASS", all: true}
+        goto: end
+      - {goto: fix}
+
+  - id: fix
+    use: builder
+    fallback: [builder_fallback]
+    effects: workspace
+    context: [task, acceptance, project_rules, ponytail, latest_review, latest_test]
+    max_visits: 3
+    on_max_visits: goto:stuck
+    prompt: |
+      Fix only verified blockers. Preserve the regression test and keep the
+      correction at the shared root cause. Do not broaden the refactor.
+    route:
+      - {goto: verify}

@@ -1,0 +1,26 @@
+# The simplest portable overlay for this pack: everything on Codex, for when
+# that is the only CLI installed.
+#
+#   sfh validate 08-existing-diff-dual-review.yaml \
+#     --profiles profiles.single-codex.example.yaml
+#
+# This is NOT a flow. Every name must sit under `profiles:`.
+#
+# Note what collapsing to one CLI costs: flows 08 and 09 fan out to reviewers
+# meant to be independent, and pointing them all at the same tool and model
+# makes their agreement much weaker evidence than it looks. Fine for a dry run,
+# not for deciding whether a diff is correct.
+profiles:
+  planner: {tool: codex, access: read}
+  analyst: {tool: codex, access: read}
+  auditor: {tool: codex, access: read}
+  selector: {tool: codex, access: read}
+  evaluator: {tool: codex, access: read}
+  reviewer: {tool: codex, access: read}
+  correctness_reviewer: {tool: codex, access: read}
+  simplicity_reviewer: {tool: codex, access: read}
+  second_reviewer: {tool: codex, access: read}
+  security_reviewer: {tool: codex, access: read}
+  builder: {tool: codex, access: write}
+  maintainer: {tool: codex, access: write}
+  builder_fallback: {tool: codex, access: write}

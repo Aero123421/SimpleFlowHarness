@@ -462,6 +462,8 @@ sfh はどの adapter についても **minimum version を固定していませ
 - 組み込み構文ガイド: ターミナルで `sfh guide` を実行
 - CLIヘルプ: `sfh --help` または `sfh <command> --help`
 - サンプルワークフロー: [examples/](examples/) ディレクトリ (`research.yaml`, `hypotheses.yaml`, `parallel-ideas.yaml`)
+- 実務向けflow集: [examples/ponytail/](examples/ponytail/) — regression-first bugfix、依存削減、独立レビューcouncil、migration dry-run、release gateなど20本。`--profiles` で自分のprojectのCLI構成に差し替えて使います。
+- flowをAIに書かせる: [skills/](skills/) — sfhの設計規則をauthoring agentへ渡す[Agent Skills](https://agentskills.io/specification) 9本。`cp -R skills/sfh-* .agents/skills/` で導入します。YAMLを**書く側**のAIを導くもので、sfh本体に `skills:` キーはありません。
 - ガイドライン・ポリシー:
   - [CONTRIBUTING.md](CONTRIBUTING.md)
   - [SECURITY.md](SECURITY.md)
