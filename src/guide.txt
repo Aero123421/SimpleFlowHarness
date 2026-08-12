@@ -13,8 +13,7 @@ steps:
     prompt: "{{steps.build.stderr_file}}: read this file and fix the failure"
     route: [{goto: build}]
 ```
-This form behaves the same on every OS. Pin verified AI CLIs with `require_version: ">=1.2, <2.0"`; mismatch fails before any flow step.
-Use `sh -c` only to join commands (Windows needs Git Bash); pass long input as `{{prompt_file}}` instead of shell quoting it.
+Portable: pin AI CLIs with `require_version: ">=1.2, <2.0"`; use `sh -c` only to join commands (Windows needs Git Bash), and pass long input as `{{prompt_file}}`.
 AI GOAL VERDICT — require exactly one final-line token and fail closed:
 ```yaml
 api_version: 1
@@ -86,6 +85,8 @@ sfh wait <run-dir> --json        # blocks, then {ok, state, result, result_file}
 sfh status <run-dir> --json      # add --json to stop/workspaces too
 ```
 Pass the run dir explicitly; omission selects the NEWEST. Branch on stable `error.code`, not messages.
+YAML route entries are mappings: `{goto: fix}` needs a space; `on_error: goto:fix` is the intentional scalar spelling.
+`max_total_steps` excludes retry attempts (`plan`/`runs show` expose them); Codex/Agy/Cursor/cmd report no USD, so pair cost limits with wall time.
 PROTOCOL SALVAGE: set `on_error: continue`, then `{when_protocol_is: invalid, goto: salvage}`; failed output remains in `steps.X.outputs`.
 WORKSPACE AND CONTEXT — opt-in; omit both and every step runs in the caller's cwd as before:
 ```yaml
@@ -103,8 +104,7 @@ steps:
     cmd: ["sh", "-c", "true"]
 ```
 `--state-dir` keeps workspaces out of the repository; `--profiles f.yaml` swaps tools without editing the flow.
-A resume is refused if the flow, an overlay, a context file or a tool version moved (--force-resume), or if the
-workspace changed with no unfinished step to explain it (--adopt-workspace). They are different questions.
+A resume refuses changed flow/overlay/context/tool version (`--force-resume`) separately from unexplained workspace drift (`--adopt-workspace`).
 If you had to FIX the flow, resume is not the tool: `--carry-budget-from <run-dir>` starts a new run holding the
 old one's spend (steps, per-step visits, cost, time), so a corrected retry does not silently reset its budget.
 Details: README. If unsure: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.

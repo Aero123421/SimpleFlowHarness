@@ -3,7 +3,7 @@ api_version: 1
 name: managed-context-separation
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: keep
 
 contexts:
@@ -33,6 +33,7 @@ steps:
     on_max_visits: goto:stuck
     cmd: ["git", "diff", "--check"]
     on_error: goto:fix
+    route: [{goto: review}]
 
   - id: review
     use: reviewer

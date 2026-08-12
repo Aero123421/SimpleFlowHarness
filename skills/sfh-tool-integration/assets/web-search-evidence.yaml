@@ -23,17 +23,15 @@ profiles:
 
 steps:
   - id: search
-    effects: external
-    # A query, not a write: repeating it after a crash costs one more search
-    # and cannot double-apply anything. `validate --strict` flags external +
-    # rerun on principle, because it cannot see inside the command; the
-    # justification has to live here, next to the decision it explains.
+    # A network query is still read-only; effects describes mutation scope.
+    effects: read
     replay: {unfinished: rerun}
     cmd: ["web-search-cli", "search", "--json", "--limit", "20", "--query", "{{vars.query}}"]
     timeout_sec: 180
     retry: {max: 2, backoff_sec: 10}
     retry_on: transient
     on_error: goto:handoff
+    route: [{goto: validate_results}]
 
   - id: validate_results
     effects: read
@@ -42,6 +40,7 @@ steps:
       - .agents/skills/sfh-tool-integration/scripts/validate_search_results.py
       - "{{steps.search.output_file}}"
     on_error: goto:handoff
+    route: [{goto: synthesize}]
 
   - id: synthesize
     use: synthesizer

@@ -27,13 +27,11 @@ profiles:
 
 steps:
   - id: watch_ci
-    effects: external
-    # `validate --strict` flags external + rerun, and it is right to ask. The
-    # answer here is that this step only OBSERVES a run that already exists:
-    # it is pinned to an exact run ID and head SHA and never triggers, reruns,
-    # or cancels anything. Watching the same run twice costs a second poll and
-    # nothing else, so rerun keeps a crashed resume cheap. Change this to
-    # `stuck` the moment the command gains the power to start or cancel a run.
+    # effects describes mutation, not whether a command crosses the network.
+    # This command only observes a pinned run and never triggers/cancels it.
+    effects: read
+    # Watching the same run twice only repeats the read. Change effects to
+    # external and replay to stuck if this command ever gains mutation power.
     replay: {unfinished: rerun}
     cmd:
       - python

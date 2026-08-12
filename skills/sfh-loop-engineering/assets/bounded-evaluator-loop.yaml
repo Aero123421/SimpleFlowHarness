@@ -2,7 +2,7 @@
 api_version: 1
 name: bounded-independent-evaluator-loop
 
-workspace: {mode: auto, cleanup: keep}
+workspace: {mode: git-worktree, cleanup: keep}
 
 contexts:
   task: {file: ./TASK.md}
@@ -45,6 +45,7 @@ steps:
     on_max_visits: goto:handoff
     cmd: ["git", "diff", "--check"]
     on_error: goto:improve
+    route: [{goto: evaluate}]
 
   - id: evaluate
     use: evaluator

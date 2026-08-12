@@ -22,11 +22,9 @@ profiles:
 steps:
   - id: research
     use: mcp_researcher
-    effects: external
-    # Declared external because it leaves the machine, kept rerun because the
-    # allowlisted MCP tools only read. `validate --strict` will flag the pair;
-    # that warning is the reminder to re-check the allowlist, not a defect.
-    # If a mutating tool is ever added to this profile, this must become stuck.
+    # Network reads are effects: read. If a mutating tool enters the allowlist,
+    # change this to external and make unfinished replay stuck.
+    effects: read
     replay: {unfinished: rerun}
     context: [mcp_policy]
     timeout_sec: 1200

@@ -2,7 +2,7 @@
 api_version: 1
 name: failure-to-regression-eval
 
-workspace: {mode: auto, cleanup: keep}
+workspace: {mode: git-worktree, cleanup: keep}
 
 contexts:
   incident: {file: ./INCIDENT.md}
@@ -60,6 +60,7 @@ steps:
     effects: read
     cmd: ["python", "-m", "pytest", "-q"]
     on_error: goto:fix
+    route: [{goto: review}]
 
   - id: review
     use: reviewer

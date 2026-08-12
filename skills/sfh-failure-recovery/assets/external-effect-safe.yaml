@@ -13,6 +13,7 @@ steps:
     cmd: ["external-cli", "plan", "--operation-id", "{{vars.operation_id}}"]
     timeout_sec: 300
     on_error: goto:handoff
+    route: [{goto: apply}]
 
   - id: apply
     effects: external
@@ -21,15 +22,16 @@ steps:
     cmd: ["external-cli", "apply", "--operation-id", "{{vars.operation_id}}"]
     timeout_sec: 600
     on_error: goto:handoff
+    route: [{goto: verify}]
 
   - id: verify
-    effects: external
+    effects: read
     # The deliberate contrast with `apply` above. `apply` mutates, so it is
     # `stuck` + `retry_on: never`: sfh cannot tell a crash before the write
     # from a crash after it. `verify` only reads the operation's status, so
     # asking twice is the same question. This is the whole point of the file:
     # the replay policy follows what the step DOES, not which system it talks
-    # to. `validate --strict` flags both because it cannot read the command.
+    # to. `effects` describes mutation, not whether the network is involved.
     replay: {unfinished: rerun}
     cmd: ["external-cli", "status", "--operation-id", "{{vars.operation_id}}"]
     timeout_sec: 300

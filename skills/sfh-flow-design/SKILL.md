@@ -2,17 +2,17 @@
 name: sfh-flow-design
 description: >
   Design, write, or refactor SimpleFlowHarness (sfh) YAML workflows. Use when turning a task, engineering process, review loop, CI process, research process, or tool chain into a stable sfh flow; when choosing steps, routes, workspaces, contexts, profiles, retries, budgets, and terminal states; or when an AI-authored sfh flow is vague, brittle, or uses invented syntax.
-compatibility: Requires SimpleFlowHarness v1.5 syntax for the bundled examples. Use the installed sfh guide and schema as the final authority.
+compatibility: Requires SimpleFlowHarness v1.6 syntax for the bundled examples. Use the installed sfh guide and schema as the final authority.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.5.x"
+  target-sfh: "1.6.x"
 ---
 
 # Design sfh flows as explicit state machines
 
 Use this skill before writing or substantially changing an sfh YAML file.
 
-This is an **authoring skill**. Do not add a `skills:` key to the generated flow: sfh v1.5 has no such key. Runtime instructions belong in existing `contexts:` or in provider-native configuration.
+This is an **authoring skill**. Do not add a `skills:` key to the generated flow: sfh v1.6 has no such key. Runtime instructions belong in existing `contexts:` or in provider-native configuration.
 
 ## Start with the execution contract
 
@@ -77,6 +77,12 @@ Activate `sfh-context-workspace` for detailed choices.
 - external mutation normally needs `effects: external`, no blind logical retry, and `replay.unfinished: stuck`.
 
 Activate `sfh-failure-recovery` when any of these matter.
+
+## Bound retries and budgets
+
+- `max_total_steps` counts logical leaf runs, not the process attempts inside one `retry`. Inspect `max_attempts` in `sfh plan --json` and actual `attempts` in `sfh runs show`.
+- A wall-clock `budget_reserve` pre-empts the next retry during backoff; it does not kill an attempt already running. Reserve enough for the complete `on_budget` handoff.
+- `max_cost_usd` sees only adapter-reported USD. Claude, OpenCode, Grok, and Pi report it; Codex, Agy, Cursor, and custom `cmd:` steps do not. Pair the cost ceiling with `wall_clock_sec` when coverage is incomplete.
 
 ## Authoring workflow
 

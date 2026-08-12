@@ -72,7 +72,7 @@ Do not route every failure to salvage: transport failure, timeout, an explicit t
 
 ## Budgets
 
-Long loops need `max_total_steps`, `max_visits`, timeouts, and wall-clock/cost ceilings. If using `on_budget`, reserve enough for the complete handoff/landing chain; a zero reserve lands too late.
+Long loops need `max_total_steps`, `max_visits`, timeouts, and wall-clock/cost ceilings. Retry attempts occur inside one leaf run and do not consume `max_total_steps`; inspect their declared maximum in `plan` and actual count in `runs show`. During retry backoff, the wall-clock reserve threshold pre-empts the next attempt and takes `on_budget`, while an already-running attempt remains subject to the hard deadline. Reserve enough for the complete handoff/landing chain; a zero reserve lands too late.
 
 ## Error messages are evidence
 

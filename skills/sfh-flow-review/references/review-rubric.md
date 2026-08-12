@@ -40,6 +40,7 @@
 ## Workspace and context
 
 - writers isolated appropriately
+- run artifacts outside any writer-visible current workspace
 - no concurrent overlapping writers
 - cwd/root explicit enough
 - context role-specific and bounded
