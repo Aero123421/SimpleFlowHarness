@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
 # Configure the allowlisted MCP servers/tools in a machine-local profile overlay.
 api_version: 1
 name: mcp-read-only-evidence

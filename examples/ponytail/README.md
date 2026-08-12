@@ -1,6 +1,6 @@
 # SFH × Ponytail-inspired Harness Flow Pack
 
-`sfh v1.5`向けの、Ponytailの思想をプロンプトとループ設計へ落とし込んだ20本のサンプルフローです。
+`sfh v1.6`向けの、Ponytailの思想をプロンプトとループ設計へ落とし込んだ20本のサンプルフローです。
 
 これはPonytail本体の再配布ではなく、公開されている思想を要約・再構成した**非公式の参考例**です。
 Ponytailがインストールされていなくても、`prompts/`のcontextだけで動作するようにしています。

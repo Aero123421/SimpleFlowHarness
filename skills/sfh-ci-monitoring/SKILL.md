@@ -2,10 +2,10 @@
 name: sfh-ci-monitoring
 description: >
   Design SimpleFlowHarness YAML for triggering, locating, watching, diagnosing, and reacting to CI runs such as GitHub Actions. Use when a flow polls CI, waits for checks, repairs failures, downloads logs or artifacts, handles flaky/infrastructure failures, or must avoid monitoring the wrong run, looping forever, or blindly rerunning broken CI.
-compatibility: Examples use sfh v1.5 plus GitHub CLI `gh`; adapt the same identity and outcome rules to other CI providers.
+compatibility: Examples use sfh v1.6 plus GitHub CLI `gh`; adapt the same identity and outcome rules to other CI providers.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.5.x"
+  target-sfh: "1.6.x"
 ---
 
 # Monitor an exact CI execution, not “whatever is latest”

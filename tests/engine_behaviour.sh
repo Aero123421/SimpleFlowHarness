@@ -1666,6 +1666,7 @@ JSON
 # and this test never reaches the containment check it is named for. The nonce
 # file is "<pid> <nonce>"; F-6 has its own tests for the mismatch cases.
 printf '99999 deadbeef\n' > s11-run/sfh-nonce
+printf '{"event":"run_end","status":"ok"}\n' > s11-run/log.jsonl
 "$SFH" wait s11-run > s11.out 2>s11.err
 s11_rc=$?
 if grep -qF "TOP-SECRET-S11" s11.out; then
@@ -1712,6 +1713,8 @@ if have_symlinks; then
   "nonce": "deadbeef"
 }
 JSON
+  printf '99999 deadbeef\n' > s11-sym-run/sfh-nonce
+  printf '{"event":"run_end","status":"ok"}\n' > s11-sym-run/log.jsonl
   "$SFH" wait s11-sym-run > s11-sym.out 2>s11-sym.err
   s11s_rc=$?
   if grep -qF "TOP-SECRET-S11-SYM" s11-sym.out; then
@@ -5104,7 +5107,7 @@ rm -f "$LEGACY_DIR/execution-closure.json" "$LEGACY_DIR/workspace.json"
 python3 - "$LEGACY_DIR" <<'PY'
 import json, sys
 d = sys.argv[1]
-m = json.load(open(d + "/meta.json"))
+m = json.load(open(d + "/meta.json", encoding="utf-8"))
 for k in ["execution_closure_fingerprint", "execution_closure_algo", "workspace",
           "unsafe_overrides", "profile_overlays"]:
     m.pop(k, None)
@@ -5476,7 +5479,7 @@ check "replay: the default still re-runs an unfinished step" 0 $?
 # --- machine JSON ------------------------------------------------------------
 "$SFH" run compat.yaml --runs-dir mj-runs --json > mj.json 2> mj.err
 check "machine: run --json exits 0" 0 $?
-if python3 -c "import json,sys; json.load(open('mj.json'))" 2>/dev/null; then
+if python3 -c "import json,sys; json.load(open('mj.json', encoding='utf-8'))" 2>/dev/null; then
   echo "ok   - machine: run --json stdout is parseable JSON and nothing else"
   pass=$((pass + 1))
 else
@@ -5491,7 +5494,7 @@ contains "machine: the envelope carries the result" '"result"' mj.json
 # A config error is an envelope too - the case a caller most needs to parse.
 "$SFH" run does-not-exist.yaml --json > mjerr.json 2> mjerr.err
 check "machine: a config error exits 2" 2 $?
-if python3 -c "import json,sys; json.load(open('mjerr.json'))" 2>/dev/null; then
+if python3 -c "import json,sys; json.load(open('mjerr.json', encoding='utf-8'))" 2>/dev/null; then
   echo "ok   - machine: a config error still answers with JSON"
   pass=$((pass + 1))
 else
@@ -5509,7 +5512,7 @@ contains "machine: status --json says whether the target was implicit" '"implici
 contains "machine: an omitted run dir is reported as implicit" '"implicit_target": true' mjs2.json
 "$SFH" wait "$MJ_DIR" --json > mjw.json 2>/dev/null
 check "machine: wait --json exits with the flow's code" 0 $?
-if python3 -c "import json,sys; json.load(open('mjw.json'))" 2>/dev/null; then
+if python3 -c "import json,sys; json.load(open('mjw.json', encoding='utf-8'))" 2>/dev/null; then
   echo "ok   - machine: wait --json stdout is pure JSON"
   pass=$((pass + 1))
 else
@@ -5526,7 +5529,7 @@ steps:
 YAML
 "$SFH" plan planj.yaml --json > mjp.json 2> mjp.err
 check "machine: plan --json exits 0" 0 $?
-if python3 -c "import json,sys; json.load(open('mjp.json'))" 2>/dev/null; then
+if python3 -c "import json,sys; json.load(open('mjp.json', encoding='utf-8'))" 2>/dev/null; then
   echo "ok   - machine: plan --json stdout is pure JSON"
   pass=$((pass + 1))
 else
@@ -5547,7 +5550,7 @@ contains "machine: plan reports the execution closure" '"execution_closure"' mjp
 # --- preflight: local capability, no model calls -----------------------------
 "$SFH" preflight --json > pf.json 2> pf.err
 check "preflight: a flowless survey exits 0" 0 $?
-if python3 -c "import json,sys; json.load(open('pf.json'))" 2>/dev/null; then
+if python3 -c "import json,sys; json.load(open('pf.json', encoding='utf-8'))" 2>/dev/null; then
   echo "ok   - preflight: --json stdout is pure JSON"
   pass=$((pass + 1))
 else
@@ -6006,7 +6009,7 @@ YAML
 "$SFH" run transient.yaml --runs-dir "$WORK_NATIVE/transient-runs" > transient.out 2>&1
 check "transient: a deterministic command failure still fails" 1 $?
 not_contains "transient: a test name mentioning 502 does not re-run the suite" \
-  "transient failure" transient.out
+  "retryable failure" transient.out
 TRANSIENT_RUNS="$(grep -cF '"event":"step_end"' "$(ls -d "$WORK"/transient-runs/*/ | head -1)"/log.jsonl)"
 check "transient: so the command ran exactly once" 1 "$TRANSIENT_RUNS"
 
@@ -6023,7 +6026,7 @@ steps:
 YAML
 "$SFH" run transient-net.yaml --runs-dir "$WORK_NATIVE/transient-net-runs" > transient-net.out 2>&1
 check "transient: a genuine network failure still fails after its retry" 1 $?
-contains "transient: and it really was retried" "transient failure" transient-net.out
+contains "transient: and it really was retried" "retryable failure" transient-net.out
 
 # A preset step's chain output IS the tool's own report, so it keeps being read.
 cat > transient-tool.yaml <<YAML
@@ -6041,7 +6044,7 @@ steps:
 YAML
 "$SFH" run transient-tool.yaml --runs-dir "$WORK_NATIVE/transient-tool-runs" > transient-tool.out 2>&1
 contains "transient: a preset tool reporting a rate limit is still retried" \
-  "transient failure" transient-tool.out
+  "retryable failure" transient-tool.out
 
 # --- outcomes: an exit code carries two facts and sfh could only read one ----
 # "The process ended cleanly" is transport. "The work is done" is semantics. A
@@ -6070,7 +6073,7 @@ YAML
 "$SFH" run outcomes.yaml --runs-dir "$WORK_NATIVE/outcomes-runs" > outcomes.out 2>&1
 check "outcomes: a declared 'continue' is not a failure" 0 $?
 contains "outcomes: and the run carried on to the labelled route" "REVIEWED" outcomes.out
-not_contains "outcomes: a deliberate answer is never retried" "transient failure" outcomes.out
+not_contains "outcomes: a deliberate answer is never retried" "retryable failure" outcomes.out
 OUT_RUN="$(ls -d "$WORK"/outcomes-runs/*/ | head -1)"
 # The claim "no retry was considered" is what this counts: `continue` is not a
 # failure, so the gate must have been launched exactly once even though the
@@ -6118,7 +6121,7 @@ YAML
 "$SFH" run outcomes-retry.yaml --runs-dir "$WORK_NATIVE/outcomes-retry-runs" > outcomes-retry.out 2>&1
 check "outcomes: a declared retryable still fails after its retries" 1 $?
 contains "outcomes: and it really was retried, with no needle in sight" \
-  "transient failure" outcomes-retry.out
+  "retryable failure" outcomes-retry.out
 
 # ...and 'fail' means never, even when the text looks transient.
 cat > outcomes-final.yaml <<YAML
@@ -6135,7 +6138,7 @@ YAML
 "$SFH" run outcomes-final.yaml --runs-dir "$WORK_NATIVE/outcomes-final-runs" > outcomes-final.out 2>&1
 check "outcomes: a declared final failure fails" 1 $?
 not_contains "outcomes: and is not retried despite transient-looking stderr" \
-  "transient failure" outcomes-final.out
+  "retryable failure" outcomes-final.out
 
 # A rule that can never match is caught before anything is spent.
 cat > outcomes-bad.yaml <<'YAML'

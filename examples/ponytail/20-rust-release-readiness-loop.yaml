@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.5.0/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
 # Pattern: deterministic release gates plus independent correctness and simplicity review.
 # This flow prepares evidence only; it does not tag, publish, merge, or discard work.
 api_version: 1

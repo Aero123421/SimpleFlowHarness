@@ -2,7 +2,7 @@
 
 Agent Skills for designing, reviewing, and improving SimpleFlowHarness YAML workflows.
 
-These skills teach an authoring agent how to use sfh v1.5 primitives. They do not add a `skills:` key to the sfh flow format. Runtime instructions for an AI step belong in existing named `contexts:` or in the selected CLI's native skill system.
+These skills teach an authoring agent how to use sfh v1.6 primitives. They do not add a `skills:` key to the sfh flow format. Runtime instructions for an AI step belong in existing named `contexts:` or in the selected CLI's native skill system.
 
 Install at project scope:
 

@@ -2,10 +2,10 @@
 name: sfh-eval-engineering
 description: >
   Turn failures, regressions, flaky behavior, weak prompts, and unsuccessful sfh runs into reusable evaluations and better harnesses. Use when improving a flow through evidence, creating regression-first repair loops, separating quality and regression suites, promoting repeated review feedback into deterministic checks or repository guidance, or diagnosing why an agent loop keeps failing.
-compatibility: Uses sfh v1.5 commands, contexts, artifacts, loops, budgets, and recovery semantics.
+compatibility: Uses sfh v1.6 commands, contexts, artifacts, loops, budgets, and recovery semantics.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.5.x"
+  target-sfh: "1.6.x"
 ---
 
 # Improve the harness from failures, not from prompt inflation

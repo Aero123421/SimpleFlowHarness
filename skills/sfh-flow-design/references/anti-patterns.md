@@ -28,7 +28,7 @@ Better: deterministic verification plus an independent reviewer. Fresh reviewer 
 
 Bad: two agents edit the same worktree concurrently.
 
-Better: serialize writers or split work into independently mergeable workspaces outside v1.5's one-worktree flow.
+Better: serialize writers or split work into independently mergeable workspaces outside v1.6's one-worktree flow.
 
 ## Implicit latest remote object
 

@@ -34,7 +34,7 @@ Use explicit `max_visits`, `max_total_steps`, wall-clock budget, and `handoff`/`
 
 ### Non-progress handoff
 
-sfh v1.5 does not expose a generic route predicate for repeated output hashes. Use a bounded loop and have the handoff step report repeated blockers. Where non-progress can be mechanically detected, write a command gate that returns a stable exit code and map it through `outcomes`.
+sfh v1.6 does not expose a generic route predicate for repeated output hashes. Use a bounded loop and have the handoff step report repeated blockers. Where non-progress can be mechanically detected, write a command gate that returns a stable exit code and map it through `outcomes`.
 
 ## Do not “fix” convergence with randomness
 

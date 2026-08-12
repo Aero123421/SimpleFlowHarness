@@ -17,7 +17,12 @@ import yaml
 
 PRESET_TOOLS = {"codex", "claude", "opencode", "grok", "agy", "pi", "cursor"}
 SHELLS = {"sh", "bash", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"}
-NETWORK_PROGRAMS = {"curl", "wget", "gh", "web-search", "web-search-cli", "mcp"}
+MUTATING_REMOTE_PREFIXES = {
+    ("gh", "issue", "create"),
+    ("gh", "pr", "create"),
+    ("gh", "release", "create"),
+    ("gh", "workflow", "run"),
+}
 TERMINALS = {"end", "fail", "stuck"}
 
 
@@ -134,8 +139,24 @@ def main() -> int:
                 script = str(cmd[2])
                 if "{{" in script:
                     add(findings, "warning", "SFH032", label, "template expansion appears inside shell-parsed text")
-            if base in NETWORK_PROGRAMS and eff == "read":
-                add(findings, "warning", "SFH033", label, "network/remote command is declared read; consider effects: external for honest replay analysis")
+            lowered = [str(arg).lower() for arg in cmd]
+            mutates_remote = any(
+                tuple(lowered[: len(prefix)]) == prefix for prefix in MUTATING_REMOTE_PREFIXES
+            )
+            mutates_remote |= base == "curl" and any(
+                raw == "-F"
+                or arg in {"--data", "--data-binary", "--data-raw", "--form", "-d"}
+                or arg.startswith(("--data=", "--data-binary=", "--data-raw=", "--form="))
+                or arg in {"post", "put", "patch", "delete"}
+                for raw, arg in zip((str(item) for item in cmd[1:]), lowered[1:])
+            )
+            mutates_remote |= base == "wget" and any(
+                arg.startswith(("--post-data", "--post-file"))
+                or arg in {"--method=post", "--method=put", "--method=patch", "--method=delete"}
+                for arg in lowered[1:]
+            )
+            if mutates_remote and eff == "read":
+                add(findings, "warning", "SFH033", label, "command appears to mutate remote state but effects is read; declare effects: external")
             if len(cmd) >= 3 and base == "gh" and str(cmd[1:3]) == "['run', 'watch']":
                 tail = [str(x) for x in cmd[3:]]
                 if not tail or tail[0].startswith("-"):

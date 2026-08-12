@@ -53,4 +53,4 @@ Document and test the mapping before using it in `outcomes`.
 
 ## Secrets
 
-sfh v1.5 `--var` is not a secret channel. Use the external tool's credential store, environment injection outside the flow, or a secret manager. Do not print environment values or authorization headers.
+sfh v1.6 `--var` is not a secret channel. Use the external tool's credential store, environment injection outside the flow, or a secret manager. Do not print environment values or authorization headers.

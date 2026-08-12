@@ -1,5 +1,59 @@
 # Changelog
 
+このCHANGELOGはrepository maintainer向けのリリース記録として日本語で記述します。
+利用者向け概要は英語版`README.md`を正とし、日本語版`README.ja.md`を併記します。
+
+## v1.6.0 — 2026-08-12
+
+v1.5.1の全体レビューと、AI利用者による実地検証から得た問題をまとめて修正した
+minor releaseです。既存flowの基本構造は維持したまま、実行前検証、再開・監視の
+整合性、機械インターフェース、長時間runの運用を強化しました。
+
+### 実行所有権と監視をfail-closedに
+
+- run directoryへ排他的leaseを導入し、live runに対する並行`--resume`や同一
+  `--run-dir`への二重起動を、stepをspawnする前に拒否します。所有者のpidと開始時刻を
+  照合し、pid再利用にも対応しました。
+- `status` / `wait` / `runs show`が`done`、`failed`、`stuck`を報告する前に、
+  `status.json`と永続`log.jsonl`の最終`run_end`が一致することを確認します。
+  監視系とresume系が同じrunへ異なる答えを出す状態を解消しました。
+- macOSでもzombieを終了済みと判定します。`--runs-dir`はフラグ順序にかかわらず
+  `--state-dir`より優先されます。
+
+### flowの互換性と制御を実行前に確認
+
+- defaults、profile、stepに`require_version`を追加しました。対象CLIの実測versionを
+  副作用なしで照合し、不一致や判定不能は何もspawnせず拒否します。`plan`と
+  `preflight`にも宣言・実測結果を表示します。
+- routeへ`when_protocol_is: plain|valid|missing_terminal|invalid`を追加しました。
+  protocol driftで得た生出力を専用salvage stepへ渡せます。
+- `validate --strict`が、end/failへ到達不能な制御グラフと、暗黙fall-throughで
+  AI/write stepへ入る経路を検出します。大規模な直列flowの検証はほぼ線形へ改善しました。
+- USDを報告しないtoolだけのflowに`max_cost_usd`が指定された場合、上限が実効性を
+  持たないことを`validate`と`preflight`で警告します。
+
+### 失敗、予算、長時間runの運用
+
+- protocol failure、terminal missing、stuckなどの安定した`error.code`を
+  `run` / `status` / `wait`で一貫して返します。usageを含む早期`--json`エラーも
+  stdoutの機械envelopeになりました。
+- retry backoff中にもwall-clock budget landingを評価し、次のprocessを起動する前に
+  `on_budget`へ着地します。`plan`とrun集計にretry mode、最大試行数、実試行数を追加し、
+  retryが`max_total_steps`の外側であることを明示しました。
+- state rootへopt-inのrun retention policyを追加しました。live run、不確実な所有権、
+  残存managed worktreeは常に保持します。
+- `runs why`の機械的な停止理由、protocol診断の重複、retry文言、route構文エラーを
+  改善しました。
+
+### 同梱skills、例、CI
+
+- 9本のAgent Skillをv1.6のworkspace隔離、共有build cache、protocol salvage、retry、
+  USD計上範囲へ更新しました。全skill assetとREADME/guide例は
+  `validate --strict`を通ります。
+- 同梱flowのschema pinをv1.6.0へ更新しました。
+- rootの散文Markdownや`docs/`だけの変更では重い3 OS build/install jobをskipし、
+  code、schema、skills、examples、workflowの変更では従来どおり全検証を走らせます。
+
 ## v1.5.1 — 2026-08-09
 
 同梱物だけのreleaseです。**engineは1.5.0から1行も変わっていません。** flow fileの
