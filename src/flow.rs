@@ -715,7 +715,7 @@ pub struct Step {
     pub on_error: Option<String>,
     /// fail (default) | continue | goto:<id> - when max_visits is exhausted.
     pub on_max_visits: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_routes")]
     pub route: Vec<Route>,
     /// Run these child steps concurrently; the step's output is the aggregation.
     pub parallel: Option<Vec<Step>>,
@@ -775,6 +775,36 @@ pub struct Step {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub env_remove: Vec<String>,
+}
+
+fn deserialize_routes<'de, D>(deserializer: D) -> Result<Vec<Route>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct RoutesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for RoutesVisitor {
+        type Value = Vec<Route>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(
+                "a sequence of route mappings; use `route: [{goto: <step>}]` or `route:\n  - {goto: <step>}`",
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut routes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(route) = seq.next_element()? {
+                routes.push(route);
+            }
+            Ok(routes)
+        }
+    }
+
+    deserializer.deserialize_seq(RoutesVisitor)
 }
 
 impl Step {
@@ -3784,6 +3814,15 @@ mod tests {
             large <= small.saturating_mul(8) + std::time::Duration::from_millis(500),
             "validation grew too quickly: 2k={small:?}, 8k={large:?}"
         );
+    }
+
+    #[test]
+    fn scalar_route_error_shows_the_required_yaml_mapping_shape() {
+        let error =
+            parse("api_version: 1\nsteps:\n  - id: a\n    cmd: [echo, ok]\n    route: goto:fix\n")
+                .unwrap_err();
+        assert!(error.contains("a sequence of route mappings"), "{error}");
+        assert!(error.contains("route: [{goto: <step>}]"), "{error}");
     }
 
     #[test]

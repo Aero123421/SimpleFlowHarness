@@ -2279,7 +2279,13 @@ fn exec_once(p: Prepared) -> LeafDone {
         })
         .flatten();
     if let Some(why) = &protocol_failure {
-        stderr_clean.push_str(&format!("\nsfh: {why}\n"));
+        // Streaming observers surface their bounded diagnostic before parsed
+        // evidence is finalized. `failure_reason` can then return that exact
+        // same diagnosis; persist it once while retaining genuinely distinct
+        // parse and protocol failures.
+        if harness_diagnostic.as_deref() != Some(why.as_str()) {
+            stderr_clean.push_str(&format!("\nsfh: {why}\n"));
+        }
         harness_diagnostic.get_or_insert_with(|| why.clone());
         if let Err(e) = contain::write_private_atomic(&p.err_file, &stderr_clean) {
             persistence_error.get_or_insert_with(|| {

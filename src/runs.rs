@@ -329,6 +329,22 @@ fn opt_string(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+fn position_explanation(position: &Value) -> Option<String> {
+    let next = position.get("next").and_then(Value::as_str)?;
+    match position
+        .get("via")
+        .and_then(Value::as_str)
+        .filter(|via| !via.is_empty())
+    {
+        Some(via) => Some(format!(
+            "the last durable routing decision selected '{next}' via {via}"
+        )),
+        None => Some(format!(
+            "the last durable routing decision selected '{next}'"
+        )),
+    }
+}
+
 /// The maximum number of `--carry-budget-from` hops `lineage_is_resolvable`
 /// walks before giving up. A real ancestry is never remotely this long;
 /// hitting the bound means `carried_budget.from` cycles back on itself
@@ -773,8 +789,8 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     } else if !unfinished.is_empty() {
         "one or more leaves started without a durable step_end; resume will run those leaves again"
             .into()
-    } else if let Some(next) = position.get("next").and_then(Value::as_str) {
-        format!("the last durable routing decision selected '{next}'")
+    } else if let Some(explanation) = position_explanation(&position) {
+        explanation
     } else if state == "done" {
         "the run completed successfully".into()
     } else {
@@ -1442,6 +1458,19 @@ mod tests {
         step.record(&serde_json::json!({"event": "aggregate_end", "attempts": 99}));
 
         assert_eq!(step.attempts, 4);
+    }
+
+    #[test]
+    fn durable_position_explanation_names_the_mechanical_reason() {
+        let position = serde_json::json!({
+            "event": "position",
+            "next": "stuck",
+            "via": "max_visits",
+        });
+        assert_eq!(
+            position_explanation(&position).as_deref(),
+            Some("the last durable routing decision selected 'stuck' via max_visits")
+        );
     }
 
     // ---- P1-08: a run's cost fields must be individually correct, and a

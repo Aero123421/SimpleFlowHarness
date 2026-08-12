@@ -803,28 +803,29 @@ fn pid_is_zombie(pid: u32) -> bool {
         == Some("Z")
 }
 
-/// Every other Unix, macOS included: "cannot tell", which reads as
-/// not-a-zombie and so leaves liveness exactly as it was before this check
-/// existed.
-///
-/// Not a stub for want of trying. macOS cannot answer through `proc_pidinfo`
-/// at all - both BSD-info flavors reach the process through `proc_find`, which
-/// skips a `SZOMB` entry by design, so every flavor reports "no such process"
-/// for precisely the case being asked about. The call that does see zombies is
-/// the `KERN_PROC_PID` sysctl, and libc exposes neither `kinfo_proc` nor
-/// `extern_proc` on Apple targets: reading `p_stat` would mean hand-computing
-/// its offset inside a large layout-sensitive struct, and getting that wrong
-/// fails in the dangerous direction - a live process misread as dead lets
-/// `sfh stop` skip a real one and lets a carry run against a run still
-/// spending.
-///
-/// The trade is worth taking because the condition is not durable here. This
-/// bug needs a PID 1 that does not reap orphans; macOS's is launchd, which
-/// always does, so a detached run's zombie is collected in the moment rather
-/// than outliving the run. On Linux - where a container's PID 1 is routinely
-/// not an init at all - it is durable, and that is where the check is
-/// implemented.
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS's proc_pidinfo APIs skip zombies, while KERN_PROC_PID would require a
+/// layout-sensitive private struct. `/bin/ps` is the stable system interface
+/// that does expose the process state. An absolute path avoids PATH selection;
+/// failure or ambiguous output still answers false and preserves fail-closed
+/// liveness.
+#[cfg(target_os = "macos")]
+fn pid_is_zombie(pid: u32) -> bool {
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('Z')
+}
+
+/// Other Unix targets have no portable process-state interface. "Cannot tell"
+/// reads as not-a-zombie and leaves liveness fail-closed.
+#[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 fn pid_is_zombie(_pid: u32) -> bool {
     false
 }
@@ -1571,13 +1572,9 @@ mod tests {
     /// zombie into a suite which itself runs under a non-reaping init is the
     /// bug it is testing for.
     ///
-    /// Linux only, because that is where `pid_is_zombie` can answer. macOS
-    /// reaches every process through `proc_find`, which skips a `SZOMB` entry
-    /// by design, so no `proc_pidinfo` flavor can see the state this asserts
-    /// on - see `pid_is_zombie` for why reading it the one way that works is
-    /// not worth the ABI assumption, and why the condition is not durable
-    /// under launchd anyway.
-    #[cfg(target_os = "linux")]
+    /// Linux reads procfs; macOS asks its stable `/bin/ps` interface. Both must
+    /// narrow liveness only after positively observing state Z.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_zombie_is_not_alive_even_though_it_still_answers_signal_zero() {
         let mut child = Command::new("sh")

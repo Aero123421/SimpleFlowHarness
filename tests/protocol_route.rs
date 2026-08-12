@@ -35,6 +35,14 @@ fn protocol_failure_can_route_to_a_salvage_step() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(run_dir.join("salvage.out.txt").exists());
+    let stderr = std::fs::read_to_string(run_dir.join("drifted.err.txt")).unwrap();
+    assert_eq!(
+        stderr
+            .matches("machine-readable protocol did not hold")
+            .count(),
+        1,
+        "the sfh protocol diagnosis must be persisted exactly once: {stderr}"
+    );
     let log = std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap();
     assert!(
         log.lines().any(|line| {
