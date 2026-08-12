@@ -415,6 +415,8 @@ Puts `runs`, `workspaces`, `plans` and `doctor` under one directory. `--runs-dir
 
 `--json` on `run`, `plan`, `wait`, `stop`, `status`, `preflight` and `workspaces` makes stdout an envelope and nothing else — progress and warnings go to stderr, and a configuration error is still an envelope rather than prose. `validate --json` and `runs list|show|why --json` predate the envelope and still print their own bare JSON: no `schema_version`, no `command`, no `exit_code`, no stable error code. Check the response for `schema_version` before relying on the header fields below — its absence means you are looking at one of those four. See [docs/machine-api.md](docs/machine-api.md) for the full contract, every header field, and the exact shape the bare-JSON holdouts answer with instead.
 
+That guarantee includes argument errors: `sfh run --json`, or any other envelope command with bad arguments, returns `SFH_USAGE` on stdout. The four legacy bare-JSON commands likewise return `{"ok":false,"error":"..."}` rather than empty stdout.
+
 ```bash
 sfh preflight flow.yaml --json          # free: no model calls
 sfh plan      flow.yaml --json --save   # what would run; starts nothing

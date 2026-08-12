@@ -57,6 +57,23 @@ fn get<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("-")
 }
 
+fn bare_json_error(as_json: bool, dir: &Path, message: &str) -> i32 {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": false,
+                "run_dir": dir.display().to_string(),
+                "error": message,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        eprintln!("sfh: {message}");
+    }
+    2
+}
+
 #[derive(Default)]
 struct StepAccumulator {
     exit: Option<i64>,
@@ -502,12 +519,18 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
     match contain::read_contained_opt(dir, "log.jsonl") {
         Ok(Some(_)) => {}
         Ok(None) => {
-            eprintln!("sfh: {} is not an sfh run directory", dir.display());
-            return 2;
+            return bare_json_error(
+                as_json,
+                dir,
+                &format!("{} is not an sfh run directory", dir.display()),
+            );
         }
         Err(e) => {
-            eprintln!("sfh: refusing unsafe run directory {}: {e}", dir.display());
-            return 2;
+            return bare_json_error(
+                as_json,
+                dir,
+                &format!("refusing unsafe run directory {}: {e}", dir.display()),
+            );
         }
     }
     let run = details(dir);
@@ -608,12 +631,18 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     let log = match contain::read_contained_opt(dir, "log.jsonl") {
         Ok(Some(log)) => log,
         Ok(None) => {
-            eprintln!("sfh: {} is not an sfh run directory", dir.display());
-            return 2;
+            return bare_json_error(
+                as_json,
+                dir,
+                &format!("{} is not an sfh run directory", dir.display()),
+            );
         }
         Err(e) => {
-            eprintln!("sfh: cannot safely read {}/log.jsonl: {e}", dir.display());
-            return 2;
+            return bare_json_error(
+                as_json,
+                dir,
+                &format!("cannot safely read {}/log.jsonl: {e}", dir.display()),
+            );
         }
     };
     let mut last = Value::Null;

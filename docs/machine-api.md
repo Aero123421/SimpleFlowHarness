@@ -160,6 +160,11 @@ these four incorrectly.
   here is a bare string-or-`null` from the run's `status.json`, which looks
   superficially like the envelope's `error` field but is not shaped like it.
 
+These legacy commands still honor the basic stdout guarantee on early
+failures. Missing arguments, unknown flags, and a missing/unsafe run directory
+produce valid bare JSON with `"ok": false` and a prose `"error"` string;
+they never leave stdout empty when `--json` was requested.
+
 This is a real trap, not just a hypothetical one: a `run --json` envelope's
 own `next_actions` routinely suggests `sfh runs why <dir> --json` as the next
 call, and that response is one of the four bare-JSON shapes above, not
@@ -168,6 +173,6 @@ another envelope. Detect which kind of response you have by checking for
 
 **Intended direction, not yet scheduled:** unifying `validate` and `runs
 list|show|why` onto the envelope is the known fix for this gap. It has not
-happened as of 1.4.0 because it is a breaking change to four response shapes
+happened as of 1.6.0 because it is a breaking change to four response shapes
 at once, and it is out of scope for the fixes in this document — treat the
 shapes above as current fact, not as something about to change underfoot.

@@ -417,6 +417,8 @@ sfh run flow.yaml --state-dir ~/.local/state/sfh     # または SFH_STATE_DIR
 
 `run` / `plan` / `wait` / `stop` / `status` / `preflight` / `workspaces` で `--json` を付けると、stdout は envelope だけになります。進捗と warning は stderr へ回り、設定エラーであっても prose ではなく envelope が返ります。`validate --json` と `runs list|show|why --json` はenvelopeより前からあるcommandで、今も独自のbare JSONを返します — `schema_version` も `command` も `exit_code` も安定した error code もありません。以下のheader fieldに頼る前に、応答に `schema_version` があるか確認してください。無ければこの4つのどれかです。全fieldの契約とbare JSON側の正確な形は [docs/machine-api.md](docs/machine-api.md) を参照してください。
 
+この保証は引数エラーにも適用されます。`sfh run --json`などenvelope対象commandの不正な引数はstdoutへ`SFH_USAGE`を返します。4つの旧bare JSON commandも、stdoutを空にせず`{"ok":false,"error":"..."}`を返します。
+
 ```bash
 sfh preflight flow.yaml --json          # 無料: model 呼び出しなし
 sfh plan      flow.yaml --json --save   # 何が動くか。何も起動しない

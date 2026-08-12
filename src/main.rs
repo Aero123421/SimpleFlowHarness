@@ -215,9 +215,13 @@ fn main() {
             0
         }
         Some(other) => {
-            eprintln!("sfh: unknown command '{other}'\n");
-            eprint!("{HELP}");
-            2
+            if requested_json(&args[1..]) {
+                usage_err_for(other, true, &format!("unknown command '{other}'"))
+            } else {
+                eprintln!("sfh: unknown command '{other}'\n");
+                eprint!("{HELP}");
+                2
+            }
         }
     };
     std::process::exit(code);
@@ -253,6 +257,41 @@ fn usage_err(msg: &str) -> i32 {
     2
 }
 
+fn requested_json(rest: &[String]) -> bool {
+    rest.iter().any(|arg| arg == "--json")
+}
+
+fn usage_err_for(command: &str, as_json: bool, msg: &str) -> i32 {
+    if as_json {
+        machine::emit(&machine::error_envelope(
+            command,
+            machine::ErrorCode::Usage,
+            msg,
+            2,
+            serde_json::json!({"state": "usage_error", "terminal": true}),
+        ));
+        2
+    } else {
+        usage_err(msg)
+    }
+}
+
+fn bare_json_err(as_json: bool, msg: &str) -> i32 {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": false,
+                "error": msg,
+            }))
+            .unwrap_or_default()
+        );
+        2
+    } else {
+        usage_err(msg)
+    }
+}
+
 fn need<'a>(rest: &'a [String], i: &mut usize, what: &str) -> Result<&'a String, String> {
     *i += 1;
     rest.get(*i).ok_or_else(|| format!("{what} needs a value"))
@@ -272,6 +311,11 @@ fn parse_vars_flag(
 }
 
 fn cmd_run(rest: &[String]) -> i32 {
+    cmd_run_for(rest, "run")
+}
+
+fn cmd_run_for(rest: &[String], command: &str) -> i32 {
+    let as_json = requested_json(rest);
     let mut flow_path: Option<PathBuf> = None;
     let mut opts = engine::RunOpts::default();
     let mut i = 0;
@@ -359,36 +403,61 @@ fn cmd_run(rest: &[String]) -> i32 {
             }
         };
         if let Err(e) = r {
-            return usage_err(&e);
+            return usage_err_for(command, as_json, &e);
         }
         i += 1;
     }
     let Some(fp) = flow_path else {
-        return usage_err("usage: sfh run <flow.yaml> [--var k=v]... [--emit id] [--resume dir] [--dry-run] [-v] [-q]");
+        let usage = if command == "plan" {
+            "usage: sfh plan <flow.yaml> [--var k=v]... [--save [dir]] [--json]"
+        } else {
+            "usage: sfh run <flow.yaml> [--var k=v]... [--emit id] [--resume dir] [--dry-run] [-v] [-q]"
+        };
+        return usage_err_for(command, as_json, usage);
     };
     opts.flow_path = fp;
     if opts.resume.is_some() && opts.resume_latest {
-        return usage_err("--resume and --resume-latest are mutually exclusive");
+        return usage_err_for(
+            command,
+            as_json,
+            "--resume and --resume-latest are mutually exclusive",
+        );
     }
     if opts.force_resume && opts.resume.is_none() && !opts.resume_latest {
-        return usage_err("--force-resume requires --resume or --resume-latest");
+        return usage_err_for(
+            command,
+            as_json,
+            "--force-resume requires --resume or --resume-latest",
+        );
     }
     if opts.adopt_workspace && opts.resume.is_none() && !opts.resume_latest {
-        return usage_err("--adopt-workspace requires --resume or --resume-latest");
+        return usage_err_for(
+            command,
+            as_json,
+            "--adopt-workspace requires --resume or --resume-latest",
+        );
     }
     if opts.carry_budget_from.is_some() && (opts.resume.is_some() || opts.resume_latest) {
-        return usage_err(
+        return usage_err_for(
+            command,
+            as_json,
             "--carry-budget-from and --resume are different answers: resume continues the earlier run when the flow is unchanged, carry starts a new run when you had to fix the flow",
         );
     }
     if opts.verbose && opts.quiet {
-        return usage_err("--verbose and --quiet are mutually exclusive");
+        return usage_err_for(
+            command,
+            as_json,
+            "--verbose and --quiet are mutually exclusive",
+        );
     }
     if opts.as_json && opts.verbose {
-        return usage_err("--json and --verbose are mutually exclusive (JSON mode keeps stdout to the envelope alone)");
+        return usage_err_for(command, as_json, "--json and --verbose are mutually exclusive (JSON mode keeps stdout to the envelope alone)");
     }
     if opts.detach && opts.dry_run {
-        return usage_err(
+        return usage_err_for(
+            command,
+            as_json,
             "--detach and --dry-run do nothing together (a dry run has nothing to detach)",
         );
     }
@@ -396,6 +465,7 @@ fn cmd_run(rest: &[String]) -> i32 {
 }
 
 fn cmd_plan(rest: &[String]) -> i32 {
+    let as_json = requested_json(rest);
     let mut flow_files = 0usize;
     let mut i = 0usize;
     while i < rest.len() {
@@ -405,7 +475,7 @@ fn cmd_plan(rest: &[String]) -> i32 {
             // cannot quietly become something plan does not mean.
             "--var" | "--profiles" | "--state-dir" | "--runs-dir" => {
                 if i + 1 >= rest.len() {
-                    return usage_err(&format!("{} needs a value", rest[i]));
+                    return usage_err_for("plan", as_json, &format!("{} needs a value", rest[i]));
                 }
                 i += 1;
             }
@@ -415,11 +485,13 @@ fn cmd_plan(rest: &[String]) -> i32 {
                     i += 1;
                 }
             }
-            flag if flag.starts_with('-') => return usage_err(&format!("unknown flag '{flag}'")),
+            flag if flag.starts_with('-') => {
+                return usage_err_for("plan", as_json, &format!("unknown flag '{flag}'"))
+            }
             _ => {
                 flow_files += 1;
                 if flow_files > 1 {
-                    return usage_err("more than one flow file given");
+                    return usage_err_for("plan", as_json, "more than one flow file given");
                 }
             }
         }
@@ -427,10 +499,11 @@ fn cmd_plan(rest: &[String]) -> i32 {
     }
     let mut args = rest.to_vec();
     args.push("--dry-run".into());
-    cmd_run(&args)
+    cmd_run_for(&args, "plan")
 }
 
 fn cmd_preflight(rest: &[String]) -> i32 {
+    let requested_json = requested_json(rest);
     let mut flow_path: Option<PathBuf> = None;
     let mut state_dir: Option<PathBuf> = None;
     let mut profiles: Vec<PathBuf> = Vec::new();
@@ -467,15 +540,21 @@ fn cmd_preflight(rest: &[String]) -> i32 {
             }
         };
         if let Err(e) = r {
-            return usage_err(&e);
+            return usage_err_for("preflight", requested_json, &e);
         }
         i += 1;
     }
     if !profiles.is_empty() && flow_path.is_none() {
-        return usage_err("--profiles needs a flow file to apply the overlay to");
+        return usage_err_for(
+            "preflight",
+            requested_json,
+            "--profiles needs a flow file to apply the overlay to",
+        );
     }
     if probe_binaries && flow_path.is_none() {
-        return usage_err(
+        return usage_err_for(
+            "preflight",
+            requested_json,
             "--probe-binaries needs a flow file: a flowless survey only ever probes each adapter's own default launcher, which is already probed without it",
         );
     }
@@ -491,6 +570,7 @@ fn cmd_preflight(rest: &[String]) -> i32 {
 
 fn cmd_workspaces(rest: &[String]) -> i32 {
     let sub = rest.first().map(String::as_str).unwrap_or("list");
+    let requested_json = requested_json(rest);
     if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
         let usage = match sub {
             "list" => "sfh workspaces list [--runs-dir d] [--state-dir d] [--json]",
@@ -560,7 +640,7 @@ fn cmd_workspaces(rest: &[String]) -> i32 {
             )),
         };
         if let Err(e) = r {
-            return usage_err(&e);
+            return usage_err_for(&format!("workspaces {sub}"), requested_json, &e);
         }
         i += 1;
     }
@@ -569,16 +649,26 @@ fn cmd_workspaces(rest: &[String]) -> i32 {
         "list" => runs::workspaces_list(&root.runs_dir(), as_json),
         "show" => match target {
             Some(d) => runs::workspaces_show(&d, as_json),
-            None => usage_err("usage: sfh workspaces show <run-dir>"),
+            None => usage_err_for(
+                "workspaces show",
+                requested_json,
+                "usage: sfh workspaces show <run-dir>",
+            ),
         },
         "clean" => runs::workspaces_clean(&root.runs_dir(), days, dry_run, as_json),
         "remove" => match target {
             Some(d) => runs::workspaces_remove(&d, discard, as_json),
-            None => usage_err("usage: sfh workspaces remove <run-dir> [--discard]"),
+            None => usage_err_for(
+                "workspaces remove",
+                requested_json,
+                "usage: sfh workspaces remove <run-dir> [--discard]",
+            ),
         },
-        other => usage_err(&format!(
-            "unknown workspaces subcommand '{other}' (list/show/clean/remove)"
-        )),
+        other => usage_err_for(
+            &format!("workspaces {other}"),
+            requested_json,
+            &format!("unknown workspaces subcommand '{other}' (list/show/clean/remove)"),
+        ),
     }
 }
 
@@ -647,6 +737,12 @@ enum Watch {
 }
 
 fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
+    let requested_json = requested_json(rest);
+    let command = match mode {
+        Watch::Status => "status",
+        Watch::Wait => "wait",
+        Watch::Stop => "stop",
+    };
     let mut runs_dir: Option<PathBuf> = None;
     let mut state_dir: Option<PathBuf> = None;
     let mut target: Option<PathBuf> = None;
@@ -692,12 +788,12 @@ fn cmd_watch(rest: &[String], mode: Watch) -> i32 {
             }
         };
         if let Err(e) = r {
-            return usage_err(&e);
+            return usage_err_for(command, requested_json, &e);
         }
         i += 1;
     }
     if as_json && quiet {
-        return usage_err("--json and --quiet are mutually exclusive (JSON mode already keeps stdout to the envelope alone)");
+        return usage_err_for(command, requested_json, "--json and --quiet are mutually exclusive (JSON mode already keeps stdout to the envelope alone)");
     }
     let runs_dir = state::StateRoot::resolve(state_dir.as_deref(), runs_dir.as_deref()).runs_dir();
     match mode {
@@ -752,6 +848,7 @@ fn cmd_doctor(rest: &[String]) -> i32 {
 }
 
 fn cmd_validate(rest: &[String]) -> i32 {
+    let requested_json = requested_json(rest);
     let mut flow_path: Option<PathBuf> = None;
     let mut vars: Vec<(String, String)> = Vec::new();
     let mut strict = false;
@@ -762,19 +859,21 @@ fn cmd_validate(rest: &[String]) -> i32 {
         match rest[i].as_str() {
             "--var" => {
                 if let Err(e) = parse_vars_flag(rest, &mut i, &mut vars) {
-                    return usage_err(&e);
+                    return bare_json_err(requested_json, &e);
                 }
             }
             "--profiles" => match need(rest, &mut i, "--profiles") {
                 Ok(v) => profiles.push(PathBuf::from(v)),
-                Err(e) => return usage_err(&e),
+                Err(e) => return bare_json_err(requested_json, &e),
             },
             "--strict" => strict = true,
             "--json" => as_json = true,
-            s if s.starts_with('-') => return usage_err(&format!("unknown flag '{s}'")),
+            s if s.starts_with('-') => {
+                return bare_json_err(requested_json, &format!("unknown flag '{s}'"))
+            }
             s => {
                 if flow_path.is_some() {
-                    return usage_err("more than one flow file given");
+                    return bare_json_err(requested_json, "more than one flow file given");
                 }
                 flow_path = Some(PathBuf::from(s));
             }
@@ -782,7 +881,10 @@ fn cmd_validate(rest: &[String]) -> i32 {
         i += 1;
     }
     let Some(fp) = flow_path else {
-        return usage_err("usage: sfh validate <flow.yaml> [--var k=v]...");
+        return bare_json_err(
+            requested_json,
+            "usage: sfh validate <flow.yaml> [--var k=v]...",
+        );
     };
     if strict || as_json || !profiles.is_empty() {
         engine::validate_with_options(&fp, &vars, strict, as_json, &profiles)
@@ -844,6 +946,7 @@ fn cmd_runs(rest: &[String]) -> i32 {
     let mut as_json = false;
     let mut target: Option<PathBuf> = None;
     let sub = rest.first().map(String::as_str).unwrap_or("list");
+    let requested_json = requested_json(rest);
     if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
         let usage = match sub {
             "list" => "sfh runs list [--runs-dir d] [-n N] [--json]",
@@ -905,7 +1008,7 @@ fn cmd_runs(rest: &[String]) -> i32 {
             )),
         };
         if let Err(e) = r {
-            return usage_err(&e);
+            return bare_json_err(requested_json, &e);
         }
         i += 1;
     }
@@ -913,16 +1016,17 @@ fn cmd_runs(rest: &[String]) -> i32 {
         "list" => runs::list(&runs_dir, limit, as_json),
         "show" => match target {
             Some(d) => runs::show(&d, as_json),
-            None => usage_err("usage: sfh runs show <run-dir>"),
+            None => bare_json_err(requested_json, "usage: sfh runs show <run-dir>"),
         },
         "why" => match target {
             Some(d) => runs::why(&d, as_json),
-            None => usage_err("usage: sfh runs why <run-dir> [--json]"),
+            None => bare_json_err(requested_json, "usage: sfh runs why <run-dir> [--json]"),
         },
         "clean" => runs::clean(&runs_dir, days, keep, dry),
-        other => usage_err(&format!(
-            "unknown runs subcommand '{other}' (list/show/why/clean)"
-        )),
+        other => bare_json_err(
+            requested_json,
+            &format!("unknown runs subcommand '{other}' (list/show/why/clean)"),
+        ),
     }
 }
 
