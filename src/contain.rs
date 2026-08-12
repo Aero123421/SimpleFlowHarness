@@ -10,6 +10,12 @@ pub struct RunLease {
     _file: std::fs::File,
 }
 
+/// The lock file `try_run_lease` claims inside a run directory. Named here so
+/// the few places that have to reason about the directory's own contents -
+/// deciding whether a run dir is still empty, or removing one that never got
+/// off the ground - agree with the claim itself instead of repeating a literal.
+pub const RUN_LOCK: &str = "sfh-run.lock";
+
 #[derive(Debug)]
 pub enum RunLeaseError {
     Busy,
@@ -19,7 +25,7 @@ pub enum RunLeaseError {
 /// Try to claim `dir` without following a planted final-component symlink.
 /// The returned handle must stay alive for the whole run attempt.
 pub fn try_run_lease(dir: &Path) -> Result<RunLease, RunLeaseError> {
-    let path = dir.join("sfh-run.lock");
+    let path = dir.join(RUN_LOCK);
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;

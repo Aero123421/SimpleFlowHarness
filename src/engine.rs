@@ -2731,7 +2731,7 @@ fn acquire_run_lease(
     let has_existing_artifact = std::fs::read_dir(dir)
         .map_err(|error| format!("cannot inspect run directory {}: {error}", dir.display()))?
         .filter_map(Result::ok)
-        .any(|entry| entry.file_name() != "sfh-run.lock");
+        .any(|entry| entry.file_name() != std::ffi::OsStr::new(contain::RUN_LOCK));
     if has_existing_artifact {
         return Err(format!(
             "--run-dir {} is not empty; choose a new or empty path, or use --resume for an existing run",
@@ -2955,7 +2955,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let inherited_nonce = std::env::var("SFH_NONCE")
         .ok()
         .filter(|nonce| !nonce.trim().is_empty());
-    let _run_lease: Option<contain::RunLease>;
+    let mut _run_lease: Option<contain::RunLease>;
     if opts.dry_run {
         run_dir = std::env::temp_dir().join(format!("sfh-plan-{}", leaf::gen_uuid()));
         contain::mkdir_private(&run_dir).map_err(|e| {
@@ -3203,7 +3203,17 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // can never grow into deleting a real run. A resumed dir and a
             // --run-dir handed in by the detaching parent are not ours to
             // remove.
+            //
+            // The one thing the directory does hold by now is this attempt's
+            // own lease file, so the lease is dropped (releasing the OS lock,
+            // and on Windows closing the handle that would otherwise refuse
+            // the delete outright) and that one named file is removed first.
+            // Removing only the lock keeps the safety property intact: any
+            // OTHER entry still makes remove_dir fail and leaves the directory
+            // exactly where it is.
             if !is_resume && opts.run_dir.is_none() {
+                _run_lease = None;
+                let _ = std::fs::remove_file(run_dir.join(contain::RUN_LOCK));
                 let _ = std::fs::remove_dir(&run_dir);
             }
             return Err(e);
