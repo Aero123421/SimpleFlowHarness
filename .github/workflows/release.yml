@@ -51,17 +51,35 @@ jobs:
           git ls-files --error-unmatch release-signers.json >/dev/null
           git diff --quiet HEAD -- release-content-manifest.txt
           python3 scripts/release_assets.py content-manifest --check
-          apple_team_id="$(jq -er '
-            if (keys | sort) != ["apple_team_id", "schema_version", "windows_codesign_cert_sha256"]
-              or .schema_version != 1
-              or (.apple_team_id | type) != "string"
-              or (.apple_team_id | test("^[A-Z0-9]{10}$") | not)
-              or (.windows_codesign_cert_sha256 | type) != "string"
-              or (.windows_codesign_cert_sha256 | test("^[0-9a-f]{64}$") | not)
-            then error("release-signers.json is incomplete or invalid")
-            else .apple_team_id end
-          ' release-signers.json)"
-          windows_pin="$(jq -er '.windows_codesign_cert_sha256' release-signers.json)"
+          python3 - <<'PY' > release-signer-values.txt
+          import json
+          import re
+
+          with open("release-signers.json", encoding="ascii") as stream:
+              document = json.load(stream)
+          expected = {
+              "schema_version",
+              "apple_team_id",
+              "windows_codesign_cert_sha256",
+          }
+          apple = document.get("apple_team_id")
+          windows = document.get("windows_codesign_cert_sha256")
+          if (
+              set(document) != expected
+              or document.get("schema_version") != 1
+              or (apple is not None and not re.fullmatch(r"[A-Z0-9]{10}", apple))
+              or (
+                  windows is not None
+                  and not re.fullmatch(r"[0-9a-f]{64}", windows)
+              )
+          ):
+              raise SystemExit("release-signers.json is incomplete or invalid")
+          print(apple or "")
+          print(windows or "")
+          PY
+          test "$(wc -l < release-signer-values.txt)" -eq 2
+          apple_team_id="$(sed -n '1p' release-signer-values.txt)"
+          windows_pin="$(sed -n '2p' release-signer-values.txt)"
           grep -F "## v$version " CHANGELOG.md
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
@@ -103,29 +121,49 @@ jobs:
       WINDOWS_CODESIGN_TIMESTAMP_URL_SET: ${{ secrets.WINDOWS_CODESIGN_TIMESTAMP_URL != '' }}
       RELEASE_ADMIN_READ_TOKEN_SET: ${{ secrets.RELEASE_ADMIN_READ_TOKEN != '' }}
     steps:
-      - name: Require native signing and notarization credentials
+      - name: Validate optional native signing credentials
         shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ needs.release-contract.outputs.apple_team_id }}
+          WINDOWS_CODESIGN_CERT_SHA256: ${{ needs.release-contract.outputs.windows_codesign_cert_sha256 }}
         run: |
           set -euo pipefail
-          missing=()
-          for name in \
-            APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 \
-            APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD \
-            APPLE_SIGNING_IDENTITY \
-            APPLE_NOTARY_KEY_ID \
-            APPLE_NOTARY_ISSUER_ID \
-            APPLE_NOTARY_KEY_P8_BASE64 \
-            WINDOWS_CODESIGN_PFX_BASE64 \
-            WINDOWS_CODESIGN_PFX_PASSWORD \
-            WINDOWS_CODESIGN_TIMESTAMP_URL \
-            RELEASE_ADMIN_READ_TOKEN
-          do
-            state_name="${name}_SET"
-            if [ "${!state_name}" != "true" ]; then missing+=("$name"); fi
-          done
-          if [ "${#missing[@]}" -ne 0 ]; then
-            printf 'Missing required Actions secrets: %s\n' "${missing[*]}" >&2
+          [ "$RELEASE_ADMIN_READ_TOKEN_SET" = true ] || {
+            echo "Missing required Actions secret: RELEASE_ADMIN_READ_TOKEN" >&2
             exit 1
+          }
+          require_group() {
+            label="$1"
+            shift
+            missing=()
+            for name in "$@"; do
+              state_name="${name}_SET"
+              if [ "${!state_name}" != true ]; then missing+=("$name"); fi
+            done
+            if [ "${#missing[@]}" -ne 0 ]; then
+              printf '%s signing is enabled but secrets are missing: %s\n' \
+                "$label" "${missing[*]}" >&2
+              exit 1
+            fi
+          }
+          if [ -n "$APPLE_TEAM_ID" ]; then
+            require_group Apple \
+              APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 \
+              APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD \
+              APPLE_SIGNING_IDENTITY \
+              APPLE_NOTARY_KEY_ID \
+              APPLE_NOTARY_ISSUER_ID \
+              APPLE_NOTARY_KEY_P8_BASE64
+          else
+            echo "Apple signer pin is unset; macOS assets will be unsigned"
+          fi
+          if [ -n "$WINDOWS_CODESIGN_CERT_SHA256" ]; then
+            require_group Windows \
+              WINDOWS_CODESIGN_PFX_BASE64 \
+              WINDOWS_CODESIGN_PFX_PASSWORD \
+              WINDOWS_CODESIGN_TIMESTAMP_URL
+          else
+            echo "Windows signer pin is unset; Windows assets will be unsigned"
           fi
 
   build:
@@ -167,7 +205,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Sign Windows executable
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.release-contract.outputs.windows_codesign_cert_sha256 != ''
         shell: pwsh
         env:
           WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
@@ -222,7 +260,7 @@ jobs:
           }
 
       - name: Import Developer ID certificate and sign macOS executable
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.release-contract.outputs.apple_team_id != ''
         shell: bash
         env:
           APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
@@ -261,7 +299,7 @@ jobs:
           grep -E '^CodeDirectory .*flags=.*\(runtime\)' <<< "$signature"
 
       - name: Notarize macOS executable
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.release-contract.outputs.apple_team_id != ''
         shell: bash
         env:
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
@@ -291,7 +329,7 @@ jobs:
           --binary target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'sfh.exe' || 'sfh' }}
           --asset ${{ matrix.asset }}
       - name: Verify packaged Windows signature
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.release-contract.outputs.windows_codesign_cert_sha256 != ''
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -303,7 +341,7 @@ jobs:
             throw 'Packaged executable has no valid timestamped Authenticode signature'
           }
       - name: Verify packaged macOS signature
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && needs.release-contract.outputs.apple_team_id != ''
         shell: bash
         run: |
           set -euo pipefail

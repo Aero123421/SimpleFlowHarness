@@ -41,7 +41,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 
 The piped forms trust HTTPS and GitHub to deliver the installer script before it can verify anything locally; the script then verifies the platform archive's SHA-256 checksum. For a stronger bootstrap, download and verify the installer sidecar and GitHub attestation before execution as described in [docs/distribution.md](docs/distribution.md).
 
-The installer detects your OS and architecture, verifies the SHA-256 checksum, installs the binary and its version-matched resources, and updates your `PATH`. On Windows and macOS, an official network install also verifies the binary's native signature before executing it.
+The installer detects your OS and architecture, verifies the release-bound archive SHA-256, installs the binary and its version-matched resources, and updates your `PATH`. When a release is published with a Windows or macOS signer pin, the installer also verifies that native signature before executing it. v1.6.1 is published without native code signing; GitHub attestations and the immutable release remain available.
 You can inspect the [Shell](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.sh) and [PowerShell](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1) scripts prior to execution.
 To pin a specific version or customize installation behavior:
 - `SFH_VERSION=1.6.1`: Require the installer script's own release version. To install an older version, download that tag's installer first.

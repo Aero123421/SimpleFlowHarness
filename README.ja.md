@@ -43,7 +43,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 
 pipeで直接実行する形式は、localで検証する前のinstaller script取得をHTTPSとGitHubに委ねます。そのscriptが続いてplatform archiveのSHA-256を検証します。より強いbootstrapが必要な場合は、[docs/distribution.md](docs/distribution.md)の手順でinstallerのsidecarとGitHub attestationを検証してから実行してください。
 
-OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、binaryと同じversionのresourceの配置、`PATH` 設定までを行います。WindowsとmacOSの公式network installでは、downloadしたbinaryを実行する前にOS native署名も検証します。
+OSおよびCPUアーキテクチャを自動判定し、release固定のarchive SHA-256検証、binaryと同じversionのresourceの配置、`PATH` 設定までを行います。Windows/macOSの署名者pinが設定されたreleaseでは、downloadしたbinaryを実行する前にOS native署名も検証します。v1.6.1はnative code signingなしで公開し、GitHub attestationとimmutable releaseは利用できます。
 実行前に [Shell版](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.sh) および [PowerShell版](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1) の内容を確認できます。
 バージョン固定や設定変更オプション:
 - `SFH_VERSION=1.6.1`: installer script自身のrelease versionを要求。旧版を入れる場合は、そのtagのinstallerを先に取得します。

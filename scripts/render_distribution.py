@@ -76,27 +76,31 @@ def main() -> None:
     )
     parser.add_argument(
         "--apple-team-id",
-        required=True,
+        default="",
         help="Apple Developer Program Team ID embedded in the shell installer",
     )
     parser.add_argument(
         "--windows-codesign-cert-sha256",
-        required=True,
+        default="",
         help="SHA-256 fingerprint embedded in the PowerShell installer",
     )
     args = parser.parse_args()
 
     if not VERSION_RE.fullmatch(args.version):
         raise SystemExit(f"invalid release version: {args.version!r}")
-    if not APPLE_TEAM_ID_RE.fullmatch(args.apple_team_id):
+    if args.apple_team_id and not APPLE_TEAM_ID_RE.fullmatch(args.apple_team_id):
         raise SystemExit(f"invalid Apple Team ID: {args.apple_team_id!r}")
-    if not SHA256_RE.fullmatch(args.windows_codesign_cert_sha256):
+    if args.windows_codesign_cert_sha256 and not SHA256_RE.fullmatch(
+        args.windows_codesign_cert_sha256
+    ):
         raise SystemExit("invalid Windows code-signing certificate SHA-256")
 
     values = {
         "VERSION": args.version,
-        "APPLE_TEAM_ID": args.apple_team_id,
-        "WINDOWS_CODESIGN_CERT_SHA256": args.windows_codesign_cert_sha256.lower(),
+        "APPLE_TEAM_ID": args.apple_team_id or "UNSIGNED",
+        "WINDOWS_CODESIGN_CERT_SHA256": (
+            args.windows_codesign_cert_sha256.lower() or "UNSIGNED"
+        ),
     }
     values.update(
         {

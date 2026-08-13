@@ -11,8 +11,9 @@ intentionally stable-only: prerelease package versions and tags are rejected
 instead of being silently marked as the latest stable release. After the full
 CI gate, it publishes:
 
-- five platform archives and their SHA-256 sidecars, with Authenticode- or
-  Developer ID-signed executables where the platform supports native signing.
+- five platform archives and their SHA-256 sidecars. Windows Authenticode and
+  macOS Developer ID signing are applied when their reviewed publisher pin and
+  complete credential group are configured; otherwise the archive is unsigned.
   Every archive has the same resource packet alongside `sfh`/`sfh.exe`:
   `release-resources.txt` and every path it lists (`README*`, `AGENTS.md`,
   maintainer/security documents, `docs/`, `schema/`, `examples/`, `skills/`,
@@ -68,10 +69,13 @@ must not overlap in either direction. Both installers also reject a resource
 destination that overlaps the effective sfh state directory (`SFH_STATE_DIR`
 when set, otherwise the platform default).
 
-For an official network install, the PowerShell installer requires a valid,
-timestamped Authenticode signature before executing the staged Windows binary.
-On macOS, the shell installer requires both strict `codesign` verification and
-a successful Gatekeeper `spctl` assessment. `SFH_ASSET_DIR` is a trusted local
+For a natively signed official release, the PowerShell installer requires a
+valid, timestamped Authenticode signature before executing the staged Windows
+binary. On macOS, the shell installer requires both strict `codesign`
+verification and a successful Gatekeeper `spctl` assessment. An installer
+rendered with the explicit `UNSIGNED` publisher marker skips only that native
+signature gate; its embedded archive hash, resource manifest, and version gates
+remain mandatory. `SFH_ASSET_DIR` is a trusted local
 fixture override for installer development: it skips the network-path native
 signature, embedded manifest, and release-bound archive hash gates, so it must
 never point at untrusted or downloaded content. Do not store user data, runtime
@@ -82,7 +86,7 @@ Every rendered installer is release-bound. It embeds its stable version and
 all five platform archive hashes, and accepts only that version. To install an
 older release, first download and verify the installer from that exact tag;
 setting `SFH_VERSION` on a newer installer does not retarget it. Windows and
-macOS additionally pin the native publisher. The binary emits its embedded
+macOS additionally pin the native publisher when signing is enabled. The binary emits its embedded
 resource manifest, which the installer byte-compares to an independently built
 inventory of the extracted packet before changing a destination. On Linux,
 the independently verified installer and its embedded archive hash are the
@@ -231,11 +235,13 @@ $env:SFH_VERSION = $version
 & ./sfh-installer.ps1
 ```
 
-## Native signing prerequisites
+## Optional native signing
 
-Tagged releases fail closed before the build matrix starts unless all ten
-private signing/administration settings exist as secrets in the protected
-`release` environment:
+Every tagged release requires `RELEASE_ADMIN_READ_TOKEN` in the protected
+`release` environment. Native signing is optional per platform. A null entry in
+`release-signers.json` publishes that platform unsigned; a valid reviewed pin
+enables signing and makes the corresponding complete credential group
+mandatory:
 
 - `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64`
 - `APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD`
@@ -246,9 +252,9 @@ private signing/administration settings exist as secrets in the protected
 - `WINDOWS_CODESIGN_PFX_BASE64`
 - `WINDOWS_CODESIGN_PFX_PASSWORD`
 - `WINDOWS_CODESIGN_TIMESTAMP_URL`
-- `RELEASE_ADMIN_READ_TOKEN`
+- `RELEASE_ADMIN_READ_TOKEN` (always required)
 
-The Apple certificate must be a **Developer ID Application** certificate
+When `apple_team_id` is set, the Apple certificate must be a **Developer ID Application** certificate
 exported as password-protected PKCS#12. `APPLE_SIGNING_IDENTITY` is its full
 codesign identity. The notary values are an App Store Connect API key ID,
 issuer ID, and base64-encoded `.p8` key. Both macOS binaries are signed with the
@@ -259,7 +265,7 @@ cross-compiled on arm64. The ten-character Team ID reported by `codesign` is a
 public trust anchor stored in reviewed `release-signers.json`, not a secret
 that can be changed alongside the signing credential.
 
-The Windows certificate must be a password-protected Authenticode code-signing
+When `windows_codesign_cert_sha256` is set, the Windows certificate must be a password-protected Authenticode code-signing
 certificate in PFX form. `WINDOWS_CODESIGN_TIMESTAMP_URL` is the certificate
 provider's RFC 3161 timestamp endpoint; it is stored with the other release
 settings even though the URL itself is not confidential. SignTool must both
@@ -293,10 +299,12 @@ bypass or remove the environment to make the run advance.
    release minor changes; patch releases retain the compatible minor pin.
 2. Confirm release immutability is enabled, the owner-only `v*` creation
    ruleset, the no-bypass `v*` update/deletion ruleset, and the
-   reviewer-gated `release` environment are active, both public signer pins in
-   `release-signers.json` are set to the certificates being used, and all ten
-   release secrets above are configured in that environment. A normal branch/PR needs
-   no signing credentials; only a tag invokes the release workflow.
+   reviewer-gated `release` environment are active, and
+   `RELEASE_ADMIN_READ_TOKEN` is configured. For each platform being signed,
+   set its public pin in `release-signers.json` and configure the complete
+   corresponding secret group above. Leave the pin null for an explicitly
+   unsigned platform. A normal branch/PR needs no release secrets; only a tag
+   invokes the release workflow.
 3. Run:
 
    ```bash

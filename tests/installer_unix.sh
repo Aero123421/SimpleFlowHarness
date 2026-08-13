@@ -68,6 +68,8 @@ grep -F 'codesign --verify --strict "$STAGED_PATH"' \
 grep -F 'spctl --assess --type execute "$STAGED_PATH"' \
   "$REPO_ROOT/installers/sfh-installer.sh" >/dev/null
 grep -F 'TeamIdentifier=' "$REPO_ROOT/installers/sfh-installer.sh" >/dev/null
+grep -F 'if [ "$EXPECTED_APPLE_TEAM_ID" != "UNSIGNED" ]; then' \
+  "$REPO_ROOT/installers/sfh-installer.sh" >/dev/null
 grep -F '"$STAGED_PATH" __release-manifest >"$EMBEDDED_INVENTORY"' \
   "$REPO_ROOT/installers/sfh-installer.sh" >/dev/null
 grep -F 'cmp -s "$EMBEDDED_INVENTORY" "$STAGED_INVENTORY"' \
