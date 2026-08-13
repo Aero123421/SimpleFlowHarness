@@ -1057,23 +1057,66 @@ cat > background-exit.yaml <<'YAML'
 name: background-exit
 steps:
   - id: starts_background
-    cmd: ["sh", "-c", "sleep 30 & echo root-finished"]
-    timeout_sec: 10
+    cmd: ["sh", "-c", "sleep 300 & echo $! > background-child.pid; echo root-finished"]
+    # Keep the declared timeout well beyond the polling safety deadline below,
+    # so a missing prompt cleanup cannot pass when the timeout eventually kills it.
+    timeout_sec: 120
   - id: after
     cmd: ["echo", "background-reaped"]
 YAML
-start=$(date +%s)
-"$SFH" run background-exit.yaml -q > background-exit.out 2>&1
-check "a successful root does not leave its background tree alive" 0 $?
-contains "flow continues after reaping a successful leaf tree" "background-reaped" background-exit.out
-not_contains "successful leaf cleanup closes inherited output pipes" "output drain timed out" background-exit.out
-elapsed=$(( $(date +%s) - start ))
-if [ "$elapsed" -lt 8 ]; then
-  echo "ok   - successful leaf tree was reaped promptly (${elapsed}s)"
-  pass=$((pass + 1))
+"$SFH" run background-exit.yaml -q > background-exit.out 2>&1 &
+BACKGROUND_RUN_PID=$!
+BACKGROUND_RUN_WINPID="$(winpid_of "$BACKGROUND_RUN_PID")"
+BACKGROUND_CHILD_PID=""
+BACKGROUND_RUN_FINISHED=0
+BACKGROUND_CHILD_GONE=0
+# Process state is the assertion; this generous deadline only keeps a broken
+# cleanup from hanging CI. Neither the 300-second child nor the declared
+# 120-second step timeout can make a missing prompt cleanup pass first.
+for _ in $(seq 1 600); do
+  if [ -z "$BACKGROUND_CHILD_PID" ] && [ -s background-child.pid ]; then
+    BACKGROUND_CHILD_PID="$(tr -d '\r\n' < background-child.pid 2>/dev/null || true)"
+  fi
+  if ! kill -0 "$BACKGROUND_RUN_PID" 2>/dev/null; then
+    BACKGROUND_RUN_FINISHED=1
+  fi
+  if [ -n "$BACKGROUND_CHILD_PID" ] && ! kill -0 "$BACKGROUND_CHILD_PID" 2>/dev/null; then
+    BACKGROUND_CHILD_GONE=1
+  fi
+  if [ "$BACKGROUND_RUN_FINISHED" -eq 1 ] && [ "$BACKGROUND_CHILD_GONE" -eq 1 ]; then
+    break
+  fi
+  sleep 0.05
+done
+if [ -z "$BACKGROUND_CHILD_PID" ] && [ -s background-child.pid ]; then
+  BACKGROUND_CHILD_PID="$(tr -d '\r\n' < background-child.pid 2>/dev/null || true)"
+fi
+if [ -n "$BACKGROUND_CHILD_PID" ] && ! kill -0 "$BACKGROUND_CHILD_PID" 2>/dev/null; then
+  BACKGROUND_CHILD_GONE=1
+fi
+if [ "$BACKGROUND_RUN_FINISHED" -eq 1 ]; then
+  wait "$BACKGROUND_RUN_PID"
+  check "a successful root does not leave its background tree alive" 0 $?
+  contains "flow continues after reaping a successful leaf tree" "background-reaped" background-exit.out
+  not_contains "successful leaf cleanup closes inherited output pipes" "output drain timed out" background-exit.out
+  if [ "$BACKGROUND_CHILD_GONE" -eq 1 ]; then
+    echo "ok   - successful leaf tree's background child is no longer alive"
+    pass=$((pass + 1))
+  else
+    echo "FAIL - successful leaf tree left background child '${BACKGROUND_CHILD_PID:-unknown}' alive"
+    fail=$((fail + 1))
+  fi
 else
-  echo "FAIL - successful leaf tree cleanup stalled (${elapsed}s)"
+  echo "FAIL - successful leaf cleanup did not finish before the safety deadline"
   fail=$((fail + 1))
+  kill -KILL "$BACKGROUND_RUN_PID" 2>/dev/null || true
+  taskkill //PID "$BACKGROUND_RUN_WINPID" //T //F >/dev/null 2>&1 || true
+  wait "$BACKGROUND_RUN_PID" 2>/dev/null || true
+fi
+if [ -n "$BACKGROUND_CHILD_PID" ] && kill -0 "$BACKGROUND_CHILD_PID" 2>/dev/null; then
+  BACKGROUND_CHILD_WINPID="$(winpid_of "$BACKGROUND_CHILD_PID")"
+  kill -KILL "$BACKGROUND_CHILD_PID" 2>/dev/null || \
+    taskkill //PID "$BACKGROUND_CHILD_WINPID" //T //F >/dev/null 2>&1 || true
 fi
 
 # Ctrl+C is a run-level cancellation, not an ordinary leaf failure. In

@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 const EXAMPLE: &str = include_str!("../examples/research.yaml");
 const GUIDE: &str = include_str!("guide.txt");
+const RELEASE_CONTENT_MANIFEST: &str = include_str!("../release-content-manifest.txt");
 
 const HELP: &str = "\
 sfh - SimpleFlowHarness: chain AI CLI agents into staged flows
@@ -206,6 +207,10 @@ fn main() {
         Some("init") => cmd_init(&args[1..]),
         Some("guide") => cmd_guide(&args[1..]),
         Some("runs") => cmd_runs(&args[1..]),
+        Some("__release-manifest") if args.len() == 1 => {
+            print!("{RELEASE_CONTENT_MANIFEST}");
+            0
+        }
         Some("-V") | Some("--version") | Some("version") => {
             println!("sfh {}", env!("CARGO_PKG_VERSION"));
             0
@@ -1149,26 +1154,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn readme_quick_start_strictly_validates() {
-        let quick_start = include_str!("../README.md")
-            .split("## Quick Start")
+    fn quick_start_yaml<'a>(readme: &'a str, heading: &str) -> &'a str {
+        let quick_start = readme
+            .split(heading)
             .nth(1)
-            .expect("README has a Quick Start section");
-        let yaml = quick_start
+            .unwrap_or_else(|| panic!("README has a {heading} section"));
+        quick_start
             .split("```yaml")
             .nth(1)
             .and_then(|tail| tail.split("```").next())
             .expect("Quick Start has a closed YAML example")
-            .trim();
-        let path = std::env::temp_dir().join(format!(
-            "sfh-readme-quick-start-{}.yaml",
-            std::process::id()
-        ));
-        std::fs::write(&path, yaml).expect("write README Quick Start example");
-        let result = crate::engine::validate_with_options(&path, &[], true, false, &[]);
-        let _ = std::fs::remove_file(path);
-        assert_eq!(result, 0, "README Quick Start example is not strict-clean");
+            .trim()
+    }
+
+    #[test]
+    fn both_readme_quick_starts_strictly_validate_and_have_the_same_execution_shape() {
+        let readmes = [
+            ("english", include_str!("../README.md"), "## Quick Start"),
+            (
+                "japanese",
+                include_str!("../README.ja.md"),
+                "## クイックスタート",
+            ),
+        ];
+        let mut shapes = Vec::new();
+
+        for (language, readme, heading) in readmes {
+            let yaml = quick_start_yaml(readme, heading);
+            let path = std::env::temp_dir().join(format!(
+                "sfh-readme-{language}-quick-start-{}.yaml",
+                std::process::id()
+            ));
+            std::fs::write(&path, yaml).expect("write README Quick Start example");
+            let result = crate::engine::validate_with_options(&path, &[], true, false, &[]);
+            let _ = std::fs::remove_file(path);
+            assert_eq!(
+                result, 0,
+                "{language} README Quick Start example is not strict-clean"
+            );
+
+            let mut shape: serde_json::Value =
+                serde_yaml_ng::from_str(yaml).expect("Quick Start YAML parses");
+            for step in shape["steps"]
+                .as_array_mut()
+                .expect("Quick Start has a steps array")
+            {
+                step.as_object_mut()
+                    .expect("Quick Start step is a mapping")
+                    .remove("prompt");
+            }
+            shapes.push(shape);
+        }
+
+        assert_eq!(
+            shapes[0], shapes[1],
+            "English and Japanese Quick Starts differ beyond localized prompt text"
+        );
+    }
+
+    #[test]
+    fn readme_relative_links_resolve_inside_the_release_resource_tree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (name, readme) in [
+            ("README.md", include_str!("../README.md")),
+            ("README.ja.md", include_str!("../README.ja.md")),
+        ] {
+            for tail in readme.split("](").skip(1) {
+                let Some(target) = tail.split(')').next() else {
+                    continue;
+                };
+                if target.starts_with("https://")
+                    || target.starts_with("http://")
+                    || target.starts_with('#')
+                    || target.starts_with("mailto:")
+                {
+                    continue;
+                }
+                let path = target.split('#').next().unwrap_or(target);
+                assert!(
+                    root.join(path).exists(),
+                    "{name} links to missing release resource '{target}'"
+                );
+            }
+        }
     }
 
     #[test]

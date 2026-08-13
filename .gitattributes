@@ -9,5 +9,23 @@
 *.yaml text eol=lf
 *.yml  text eol=lf
 
+# Release resources are packaged on Linux, macOS, and Windows. Keep their
+# bytes stable so archive manifests and attestations do not depend on runner
+# checkout policy.
+*.md   text eol=lf
+*.json text eol=lf
+*.py   text eol=lf
+*.ps1  text eol=lf
+*.txt  text eol=lf
+LICENSE text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf
+*.rb text eol=lf
+
+# This file is embedded verbatim in every platform archive and is compared by
+# installers as the ownership and resource-layout contract.
+release-resources.txt text eol=lf
+
 # Rust sources: rustfmt writes LF, and a mixed tree makes every diff noisy.
 *.rs   text eol=lf
+.gitattributes text eol=lf

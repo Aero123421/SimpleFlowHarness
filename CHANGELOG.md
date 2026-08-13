@@ -3,6 +3,55 @@
 このCHANGELOGはrepository maintainer向けのリリース記録として日本語で記述します。
 利用者向け概要は英語版`README.md`を正とし、日本語版`README.ja.md`を併記します。
 
+## v1.6.1 - 2026-08-13
+
+v1.6.0の配布物を実際に展開・導入して監査し、repository内では成立していた
+documentation、examples、Agent Skillsへの導線がbinary利用者には届いていなかった
+問題を修正したpatch releaseです。engine、flow schema、machine API、resume形式は
+v1.6.0から変更していません。
+
+### 配布resourceを全installation channelへ
+
+- platform archiveへ日英README、CHANGELOG、利用規約・security文書、公開schema、
+  docs、examples、9本のAgent Skillsを同梱します。version固定installerはarchive hashの
+  自己参照を避けるため独立したRelease assetとして配布します。resource収録物は
+  `release-resources.txt`を単一のcontractとしてarchive作成、installer、Homebrew、
+  CIから共通利用し、欠落や想定外のmemberをfail closedで拒否します。
+- Shell/PowerShell installerはbinaryだけでなくresource treeもuser data directoryへ
+  transactionとrollbackを伴って配置します。Windowsではruntime state treeとresource
+  の既定配置先を分離します。Homebrewも同じtreeを`pkgshare`へ導入します。private inventory
+  で既存treeの全path、型、file hashを照合し、未知のstate、欠落、変更があれば一切置換
+  しません。非所有directory、壊れたarchive、linkやspecial fileも拒否します。
+- 同梱READMEのlocal linkとAgent Skillsのcopy手順が実際の配置先から解決すること、
+  installerを再実行しても一貫することをdistribution/installer testで固定しました。
+
+### Releaseの真正性と利用者向け情報
+
+- repositoryでImmutable Releasesを有効にしました。以後の公開済みReleaseではtagと
+  assetを差し替えられず、GitHubのRelease attestationでtag、commit、全assetを検証
+  できます。`v*` tagはrepository ownerだけが作成でき、作成後は誰もupdate/delete
+  できないrulesetで保護し、署名secretは
+  owner承認とtag policyを持つ`release` environmentへ限定します。workflow側でも全asset
+  hashをmanifestへ束ね、artifact attestationを発行し、Administration read-only tokenで
+  immutable設定を公開直前に確認します。
+- macOSはDeveloper ID署名とnotarization、WindowsはAuthenticode署名をreleaseの
+  必須gateにしました。署名credentialがないtag buildはunsigned binaryを公開せず
+  停止します。macOS x64もIntel runnerでnative build・実行してから公開します。公式
+  installerもdownloadしたbinaryのnative署名と固定したApple Team ID / Windows署名
+  証明書fingerprintをstaged実行前に検証します。
+- Release本文は自動生成されたPR一覧だけでなく、このCHANGELOGの該当versionを
+  掲載します。推奨one-line installer自身の検証境界と、attestationの確認方法も
+  distribution文書へ明記しました。
+
+### DocumentationとCI
+
+- 日英Quick Startを同じ`workspace`、`effects`、明示routeで揃え、両方を
+  `validate --strict`で検査します。旧版を導入する`SFH_VERSION=1.4.0`のcopy例も
+  現行release向けに修正しました。
+- Windows runnerの負荷で8秒へ届くと失敗していたprocess-tree testを、経過時間の
+  恣意的な閾値ではなく、子processの終了とpipe drainという観測可能な事実で判定する
+  ようにしました。
+
 ## v1.6.0 — 2026-08-12
 
 v1.5.1の全体レビューと、AI利用者による実地検証から得た問題をまとめて修正した
