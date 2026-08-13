@@ -39,11 +39,14 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1 | iex
 ```
 
-The installer detects your OS and architecture, verifies the SHA-256 checksum, extracts the binary, and updates your `PATH`.
-You can inspect the [Shell](installers/sfh-installer.sh) and [PowerShell](installers/sfh-installer.ps1) scripts prior to execution.
+The piped forms trust HTTPS and GitHub to deliver the installer script before it can verify anything locally; the script then verifies the platform archive's SHA-256 checksum. For a stronger bootstrap, download and verify the installer sidecar and GitHub attestation before execution as described in [docs/distribution.md](docs/distribution.md).
+
+The installer detects your OS and architecture, verifies the SHA-256 checksum, installs the binary and its version-matched resources, and updates your `PATH`. On Windows and macOS, an official network install also verifies the binary's native signature before executing it.
+You can inspect the [Shell](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.sh) and [PowerShell](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1) scripts prior to execution.
 To pin a specific version or customize installation behavior:
-- `SFH_VERSION=1.4.0`: Pin the target release version.
+- `SFH_VERSION=1.6.1`: Require the installer script's own release version. To install an older version, download that tag's installer first.
 - `SFH_INSTALL_DIR=/path/to/bin`: Specify a custom installation directory.
+- `SFH_DATA_DIR=/path/to/share/sfh`: Specify where the installer puts documentation, schemas, examples, and authoring skills.
 - `SFH_NO_MODIFY_PATH=1`: Skip automatic `PATH` modifications.
 
 ### Package Managers & Direct Downloads
@@ -54,6 +57,14 @@ brew install Aero123421/tap/sfh
 ```
 
 Pre-built binaries and SHA-256 checksums are available on [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest).
+
+### Installed Resources
+
+Each platform archive carries the same version-matched `docs/`, `examples/`, `schema/`, and `skills/` trees plus the project policy files. `release-resources.txt` is the authoritative list. When you unpack an archive directly, these paths sit beside the binary. The official installers copy them to `${SFH_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/sfh}` on macOS/Linux and `$env:SFH_DATA_DIR` (or `$env:LOCALAPPDATA\sfh-resources`) on Windows. Homebrew installs them under `$(brew --prefix sfh)/share/sfh`.
+
+`SFH_DATA_DIR` controls the installer destination only; the `sfh` runtime does not load resources or skills from it. The `skills/` directory contains optional authoring guidance for AIs that write flows, not a runtime feature or a flow `skills:` key. Relative links in this README resolve inside the installed resource directory, so they keep working offline.
+
+The installers refuse resource destinations that overlap either the binary destination or the effective sfh state directory. An upgrade requires both the installer's ownership marker and its private inventory: every previously installed path, file type, and hash must still match, with no additions. Choose a new or unmodified installer-managed directory for `SFH_DATA_DIR`; an edited tree is preserved and the upgrade stops. The Windows default `%LOCALAPPDATA%\sfh-resources` is a separate tree from `%LOCALAPPDATA%\sfh` runtime state, so upgrades do not replace runs or managed workspaces.
 
 ---
 
@@ -536,7 +547,7 @@ For complete reference material, explore:
 - CLI options: Run `sfh --help` or `sfh <command> --help`.
 - Sample workflows: Browse [examples/](examples/) (`research.yaml`, `hypotheses.yaml`, `parallel-ideas.yaml`, `managed-loop.yaml`, `workspace-smoke.yaml`).
 - Ready-made engineering flows: [examples/ponytail/](examples/ponytail/) — 20 flows for real repository work (regression-first bugfix, dependency elimination, independent review councils, migration dry runs, release-readiness gates). Point them at your own project with `--profiles`.
-- Writing flows with an AI: [skills/](skills/) — 9 [Agent Skills](https://agentskills.io/specification) that teach an authoring agent sfh's design rules. Install with `cp -R skills/sfh-* .agents/skills/`. These guide the AI that *writes* the YAML; sfh itself has no `skills:` key.
+- Writing flows with an AI: [skills/](skills/) — 9 [Agent Skills](https://agentskills.io/specification) that teach an authoring agent sfh's design rules. From the resource directory, install them with `cp -R skills/sfh-* .agents/skills/`. These guide the AI that *writes* the YAML; sfh itself has no `skills:` key.
 - Project governance & policies:
   - [CONTRIBUTING.md](CONTRIBUTING.md)
   - [SECURITY.md](SECURITY.md)

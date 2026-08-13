@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   verify:
     uses: ./.github/workflows/ci.yml
@@ -15,8 +19,15 @@ jobs:
 
   release-contract:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.contract.outputs.version }}
+      release_commit: ${{ steps.contract.outputs.release_commit }}
+      apple_team_id: ${{ steps.contract.outputs.apple_team_id }}
+      windows_codesign_cert_sha256: ${{ steps.contract.outputs.windows_codesign_cert_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - name: Tag, package, and changelog agree
         id: contract
         shell: bash
@@ -24,40 +35,102 @@ jobs:
           set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 |
             python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Release workflow publishes stable semantic versions only" >&2
+            exit 1
+          }
           test "$GITHUB_REF_NAME" = "v$version"
+          release_commit="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$release_commit" origin/main || {
+            echo "Release tags must point to a commit contained in origin/main" >&2
+            exit 1
+          }
+          git ls-files --error-unmatch release-resources.txt >/dev/null
+          git ls-files --error-unmatch release-content-manifest.txt >/dev/null
+          git ls-files --error-unmatch release-signers.json >/dev/null
+          git diff --quiet HEAD -- release-content-manifest.txt
+          python3 scripts/release_assets.py content-manifest --check
+          apple_team_id="$(jq -er '
+            if (keys | sort) != ["apple_team_id", "schema_version", "windows_codesign_cert_sha256"]
+              or .schema_version != 1
+              or (.apple_team_id | type) != "string"
+              or (.apple_team_id | test("^[A-Z0-9]{10}$") | not)
+              or (.windows_codesign_cert_sha256 | type) != "string"
+              or (.windows_codesign_cert_sha256 | test("^[0-9a-f]{64}$") | not)
+            then error("release-signers.json is incomplete or invalid")
+            else .apple_team_id end
+          ' release-signers.json)"
+          windows_pin="$(jq -er '.windows_codesign_cert_sha256' release-signers.json)"
           grep -F "## v$version " CHANGELOG.md
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      # A source archive was once distributed whose Cargo.toml disagreed with
-      # its own tag, and nothing in the archive itself could prove which one
-      # was wrong. This manifest lets a reviewer check a downloaded packet
-      # against the tag/commit/version sfh's own release job recorded, rather
-      # than trust the archive's self-description.
-      - name: Write release provenance manifest
+          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
+          echo "apple_team_id=$apple_team_id" >> "$GITHUB_OUTPUT"
+          echo "windows_codesign_cert_sha256=$windows_pin" >> "$GITHUB_OUTPUT"
+      # Build from the checked-out commit, never the working tree. The complete
+      # asset manifest and provenance are written after every platform packet
+      # has arrived in the publish job.
+      - name: Build tagged source archive
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.contract.outputs.version }}"
-          commit="$(git rev-parse HEAD)"
           archive="sfh-${version}-source.tar.gz"
-          mkdir -p provenance
-          # `git archive` of the checked-out commit, not the working tree, so
-          # this can never pick up an untracked or build-only file - it is the
-          # exact archive a reviewer's Cargo.toml and sha256 checks are about.
-          git archive --format=tar.gz --prefix="sfh-${version}/" -o "provenance/${archive}" HEAD
-          archive_sha256="$(shasum -a 256 "provenance/${archive}" | cut -d ' ' -f1)"
-          (cd provenance && shasum -a 256 "$archive" > "$archive.sha256")
-          python3 -c 'import json,sys; print(json.dumps({"version": sys.argv[1], "tag": sys.argv[2], "commit": sys.argv[3], "archive_sha256": sys.argv[4], "generated_utc": sys.argv[5]}, indent=2))' "$version" "$GITHUB_REF_NAME" "$commit" "$archive_sha256" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > provenance/provenance.json
-          cat provenance/provenance.json
-      - name: Stage release provenance
+          mkdir -p source-assets
+          git archive --format=tar.gz --prefix="sfh-${version}/" -o "source-assets/${archive}" HEAD
+          (cd source-assets && shasum -a 256 "$archive" > "$archive.sha256")
+      - name: Stage source archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-provenance
-          path: provenance/*
+          name: release-source
+          path: source-assets/*
           if-no-files-found: error
           retention-days: 1
 
-  build:
+  signing-contract:
     needs: [verify, release-contract]
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64_SET: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 != '' }}
+      APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD_SET: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD != '' }}
+      APPLE_SIGNING_IDENTITY_SET: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+      APPLE_NOTARY_KEY_ID_SET: ${{ secrets.APPLE_NOTARY_KEY_ID != '' }}
+      APPLE_NOTARY_ISSUER_ID_SET: ${{ secrets.APPLE_NOTARY_ISSUER_ID != '' }}
+      APPLE_NOTARY_KEY_P8_BASE64_SET: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 != '' }}
+      WINDOWS_CODESIGN_PFX_BASE64_SET: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 != '' }}
+      WINDOWS_CODESIGN_PFX_PASSWORD_SET: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD != '' }}
+      WINDOWS_CODESIGN_TIMESTAMP_URL_SET: ${{ secrets.WINDOWS_CODESIGN_TIMESTAMP_URL != '' }}
+      RELEASE_ADMIN_READ_TOKEN_SET: ${{ secrets.RELEASE_ADMIN_READ_TOKEN != '' }}
+    steps:
+      - name: Require native signing and notarization credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 \
+            APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD \
+            APPLE_SIGNING_IDENTITY \
+            APPLE_NOTARY_KEY_ID \
+            APPLE_NOTARY_ISSUER_ID \
+            APPLE_NOTARY_KEY_P8_BASE64 \
+            WINDOWS_CODESIGN_PFX_BASE64 \
+            WINDOWS_CODESIGN_PFX_PASSWORD \
+            WINDOWS_CODESIGN_TIMESTAMP_URL \
+            RELEASE_ADMIN_READ_TOKEN
+          do
+            state_name="${name}_SET"
+            if [ "${!state_name}" != "true" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -ne 0 ]; then
+            printf 'Missing required Actions secrets: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+  build:
+    needs: [verify, release-contract, signing-contract]
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -65,21 +138,23 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: sfh-windows-x64.zip
-          - os: macos-latest
+            run_binary: true
+          - os: macos-15
             target: aarch64-apple-darwin
             asset: sfh-macos-arm64.tar.gz
-          # Intel Mac is cross-built from the arm64 runner: the macos-13
-          # runner pool queues for tens of minutes or never starts.
-          - os: macos-latest
+            run_binary: true
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             asset: sfh-macos-x64.tar.gz
-            cross: true
+            run_binary: true
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: sfh-linux-x64.tar.gz
+            run_binary: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             asset: sfh-linux-arm64.tar.gz
+            run_binary: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,33 +165,163 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+
+      - name: Sign Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PFX_PASSWORD }}
+          WINDOWS_CODESIGN_CERT_SHA256: ${{ needs.release-contract.outputs.windows_codesign_cert_sha256 }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ secrets.WINDOWS_CODESIGN_TIMESTAMP_URL }}
         run: |
-          mkdir pkg
-          cp target/${{ matrix.target }}/release/sfh pkg/
-          cp README.md README.ja.md LICENSE pkg/
-          # Flat member names ("sfh", not "./sfh") so `tar xz sfh` works with GNU tar too.
-          tar czf ${{ matrix.asset }} -C pkg sfh README.md README.ja.md LICENSE
-          shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
-          # Verify the archive the way the README tells users to extract it.
-          # A cross-built binary cannot run on this host, so only unpack it.
-          mkdir verify && tar xzf ${{ matrix.asset }} -C verify sfh
-          if [ "${{ matrix.cross }}" != "true" ]; then ./verify/sfh --version; else file verify/sfh; fi
-      - name: Package (windows)
+          $ErrorActionPreference = 'Stop'
+          $binary = (Resolve-Path 'target/${{ matrix.target }}/release/sfh.exe').Path
+          $certificate = Join-Path $env:RUNNER_TEMP 'sfh-codesign.pfx'
+          try {
+            [IO.File]::WriteAllBytes(
+              $certificate,
+              [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64)
+            )
+            $signTool = Get-ChildItem `
+              -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+              -Filter signtool.exe -Recurse |
+              Where-Object { $_.DirectoryName -match '\\x64$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+            if (-not $signTool) { throw 'signtool.exe was not found' }
+            & $signTool sign /f $certificate `
+              /p $env:WINDOWS_CODESIGN_PFX_PASSWORD `
+              /fd SHA256 /tr $env:WINDOWS_CODESIGN_TIMESTAMP_URL /td SHA256 `
+              /d sfh $binary
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed: $LASTEXITCODE" }
+            & $signTool verify /pa /all /tw /v $binary
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed: $LASTEXITCODE" }
+            $signature = Get-AuthenticodeSignature -LiteralPath $binary
+            if ($signature.Status -ne 'Valid') {
+              throw "Authenticode status is not Valid: $($signature.Status)"
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              throw 'Authenticode signature has no trusted timestamp'
+            }
+            if ($env:WINDOWS_CODESIGN_CERT_SHA256 -notmatch '^[0-9A-Fa-f]{64}$') {
+              throw 'WINDOWS_CODESIGN_CERT_SHA256 must contain 64 hexadecimal characters'
+            }
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+              $signerHash = -join ($sha256.ComputeHash($signature.SignerCertificate.RawData) |
+                ForEach-Object { $_.ToString('x2') })
+            } finally {
+              $sha256.Dispose()
+            }
+            if ($signerHash -cne $env:WINDOWS_CODESIGN_CERT_SHA256.ToLowerInvariant()) {
+              throw 'Authenticode signer certificate does not match the pinned publisher'
+            }
+          } finally {
+            Remove-Item -LiteralPath $certificate -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Import Developer ID certificate and sign macOS executable
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ needs.release-contract.outputs.apple_team_id }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/sfh"
+          certificate="$RUNNER_TEMP/sfh-developer-id.p12"
+          keychain="$RUNNER_TEMP/sfh-signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          cleanup() {
+            rm -f "$certificate"
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          python3 -c 'import base64,os,sys; open(sys.argv[1], "wb").write(base64.b64decode(os.environ["APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64"], validate=True))' "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$APPLE_DEVELOPER_ID_APPLICATION_P12_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain"
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$binary"
+          codesign --verify --strict --verbose=2 "$binary"
+          signature="$(codesign --display --verbose=4 "$binary" 2>&1)"
+          grep -F 'Authority=Developer ID Application:' <<< "$signature"
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+          grep -Fx "TeamIdentifier=$APPLE_TEAM_ID" <<< "$signature"
+          grep -E '^Timestamp=.+' <<< "$signature"
+          ! grep -E '^Timestamp=(none|-)$' <<< "$signature"
+          grep -E '^CodeDirectory .*flags=.*\(runtime\)' <<< "$signature"
+
+      - name: Notarize macOS executable
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/sfh"
+          api_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          packet="$RUNNER_TEMP/sfh-${{ matrix.target }}-notarize.zip"
+          result="$RUNNER_TEMP/sfh-${{ matrix.target }}-notary-result.json"
+          cleanup() { rm -f "$api_key" "$packet" "$result"; }
+          trap cleanup EXIT
+          python3 -c 'import base64,os,sys; open(sys.argv[1], "wb").write(base64.b64decode(os.environ["APPLE_NOTARY_KEY_P8_BASE64"], validate=True))' "$api_key"
+          chmod 600 "$api_key"
+          ditto -c -k --keepParent "$binary" "$packet"
+          xcrun notarytool submit "$packet" \
+            --key "$api_key" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait --output-format json > "$result"
+          python3 -c 'import json,sys; result=json.load(open(sys.argv[1], encoding="utf-8")); assert result.get("status") == "Accepted", result' "$result"
+
+      - name: Package and verify complete release packet
+        run: >-
+          python scripts/release_assets.py package
+          --binary target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'sfh.exe' || 'sfh' }}
+          --asset ${{ matrix.asset }}
+      - name: Verify packaged Windows signature
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory pkg | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/sfh.exe pkg/
-          Copy-Item README.md, README.ja.md, LICENSE pkg/
-          Compress-Archive -Path pkg/* -DestinationPath ${{ matrix.asset }} -Force
-          $h = (Get-FileHash ${{ matrix.asset }} -Algorithm SHA256).Hash.ToLower()
-          # LF, not CRLF: Out-File's default trailing CRLF makes the filename
-          # unmatchable for `sha256sum -c` under Git Bash / WSL.
-          "$h  ${{ matrix.asset }}`n" | Out-File -Encoding ascii -NoNewline "${{ matrix.asset }}.sha256"
-          Expand-Archive ${{ matrix.asset }} -DestinationPath verify -Force
-          ./verify/sfh.exe --version
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:RUNNER_TEMP 'sfh-windows-signature-check'
+          Expand-Archive '${{ matrix.asset }}' -DestinationPath $staging -Force
+          $binary = Join-Path $staging 'sfh.exe'
+          $signature = Get-AuthenticodeSignature -LiteralPath $binary
+          if ($signature.Status -ne 'Valid' -or -not $signature.TimeStamperCertificate) {
+            throw 'Packaged executable has no valid timestamped Authenticode signature'
+          }
+      - name: Verify packaged macOS signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/sfh-${{ matrix.target }}-signature-check"
+          mkdir "$staging"
+          tar xzf "${{ matrix.asset }}" -C "$staging" sfh
+          codesign --verify --strict --verbose=2 "$staging/sfh"
+          signature="$(codesign --display --verbose=4 "$staging/sfh" 2>&1)"
+          grep -F 'Authority=Developer ID Application:' <<< "$signature"
+          grep -E '^Timestamp=.+' <<< "$signature"
+          ! grep -E '^Timestamp=(none|-)$' <<< "$signature"
+          grep -E '^CodeDirectory .*flags=.*\(runtime\)' <<< "$signature"
+      - name: Execute packaged binary
+        if: matrix.run_binary
+        run: >-
+          python scripts/release_assets.py run-archive
+          --archive ${{ matrix.asset }}
+          --binary-name ${{ runner.os == 'Windows' && 'sfh.exe' || 'sfh' }}
       - name: Stage release asset
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -128,7 +333,7 @@ jobs:
           retention-days: 1
 
   distribution-metadata:
-    needs: build
+    needs: [build, release-contract]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,19 +349,22 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           mkdir release-assets
-          cp installers/sfh-installer.sh release-assets/
-          cp installers/sfh-installer.ps1 release-assets/
           python3 scripts/render_distribution.py \
             --version "$version" \
             --checksums-dir binary-assets \
             --output-dir generated \
-            --release-assets-dir release-assets
+            --release-assets-dir release-assets \
+            --apple-team-id "$APPLE_TEAM_ID" \
+            --windows-codesign-cert-sha256 "$WINDOWS_CODESIGN_CERT_SHA256"
           (
             cd release-assets
             for asset in sfh-installer.sh sfh-installer.ps1 sfh.rb; do
               shasum -a 256 "$asset" > "$asset.sha256"
             done
           )
+        env:
+          APPLE_TEAM_ID: ${{ needs.release-contract.outputs.apple_team_id }}
+          WINDOWS_CODESIGN_CERT_SHA256: ${{ needs.release-contract.outputs.windows_codesign_cert_sha256 }}
       - name: Stage installers and package-manager metadata
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -166,20 +374,254 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: distribution-metadata
+    needs: [distribution-metadata, release-contract]
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download complete release set
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Publish release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+      - name: Write and verify complete release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          python3 scripts/release_assets.py provenance \
+            --directory dist \
+            --output dist/provenance.json \
+            --version "$version" \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "${{ needs.release-contract.outputs.release_commit }}"
+          python3 scripts/release_assets.py manifest \
+            --directory dist \
+            --output dist/SHA256SUMS \
+            --version "$version"
+          python3 scripts/release_assets.py verify-manifest \
+            --directory dist \
+            --manifest dist/SHA256SUMS \
+            --version "$version"
+          python3 scripts/release_assets.py release-notes \
+            --changelog CHANGELOG.md \
+            --tag "$GITHUB_REF_NAME" \
+            --output release-notes.md
+      - name: Prove the remote release boundary before creating a draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+          RELEASE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          setting="$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          if [ "$(jq -r '.enabled' <<< "$setting")" != true ]; then
+            echo "Repository release immutability must be enabled before draft creation" >&2
+            exit 1
+          fi
+          releases="$(GH_TOKEN="$RELEASE_TOKEN" gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100")"
+          existing="$(jq -r --arg tag "$GITHUB_REF_NAME" \
+            '.[][] | select(.tag_name == $tag) | .id' <<< "$releases")"
+          if [ -n "$existing" ]; then
+            echo "A release already exists for $GITHUB_REF_NAME (ID(s): $existing); refusing to reuse or mutate it" >&2
+            echo "Inspect it with: gh api repos/$GITHUB_REPOSITORY/releases/<ID>" >&2
+            echo "Delete only a confirmed stale draft with: gh api --method DELETE repos/$GITHUB_REPOSITORY/releases/<ID>" >&2
+            exit 1
+          fi
+          remote_refs="$(git ls-remote origin \
+            "refs/tags/$GITHUB_REF_NAME" \
+            "refs/tags/$GITHUB_REF_NAME^{}")"
+          remote_sha="$(awk -v peeled="refs/tags/$GITHUB_REF_NAME^{}" \
+            '$2 == peeled { print $1 }' <<< "$remote_refs")"
+          if [ -z "$remote_sha" ]; then
+            remote_sha="$(awk -v direct="refs/tags/$GITHUB_REF_NAME" \
+              '$2 == direct { print $1 }' <<< "$remote_refs")"
+          fi
+          test "$remote_sha" = "${{ needs.release-contract.outputs.release_commit }}"
+      - name: Create draft release and upload the complete asset set
+        id: draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          payload="$(jq -n \
+            --arg tag "$GITHUB_REF_NAME" \
+            --rawfile body release-notes.md \
+            '{tag_name:$tag,name:$tag,body:$body,draft:true,prerelease:false}')"
+          release="$(gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/releases" --input - <<< "$payload")"
+          release_id="$(jq -er '.id' <<< "$release")"
+          echo "id=$release_id" >> "$GITHUB_OUTPUT"
+          test "$(jq -r '.draft' <<< "$release")" = true
+          test "$(jq -r '.tag_name' <<< "$release")" = "$GITHUB_REF_NAME"
+          upload_url="$(jq -er '.upload_url | sub("\\{\\?name,label\\}$"; "")' \
+            <<< "$release")"
+          test "$upload_url" = \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets"
+          for asset in dist/*; do
+            name="$(basename "$asset")"
+            uploaded="$(curl --fail-with-body --silent --show-error \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              -H 'Content-Type: application/octet-stream' \
+              --data-binary "@$asset" \
+              "$upload_url?name=$name")"
+            test "$(jq -r '.name' <<< "$uploaded")" = "$name"
+            test "$(jq -r '.state' <<< "$uploaded")" = uploaded
+          done
+      - name: Verify the remote draft contains exactly the local asset set
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test -n "${{ steps.draft.outputs.id }}"
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}")"
+          test "$(jq -r '.draft' <<< "$release")" = true
+          test "$(jq -r '.tag_name' <<< "$release")" = "$GITHUB_REF_NAME"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}/assets?per_page=100" \
+            --jq '.[]' | jq -s '.' > remote-assets.json
+          python3 scripts/release_assets.py verify-remote-assets \
+            --directory dist \
+            --manifest dist/SHA256SUMS \
+            --remote-assets remote-assets.json \
+            --version "$version"
+      - name: Attest every release asset listed by SHA256SUMS
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          files: dist/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+          subject-checksums: dist/SHA256SUMS
+      - name: Attest the SHA256SUMS manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/SHA256SUMS
+      - name: Require repository release immutability
+        shell: bash
+        env:
+          # The immutable-releases endpoint requires repository Administration
+          # read access, which the workflow GITHUB_TOKEN cannot be granted.
+          GH_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          setting="$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          if [ "$(jq -r '.enabled' <<< "$setting")" != true ]; then
+            echo "Repository release immutability must be enabled before publishing" >&2
+            exit 1
+          fi
+      - name: Recheck remote asset digests immediately before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}")"
+          test "$(jq -r '.draft' <<< "$release")" = true
+          test "$(jq -r '.tag_name' <<< "$release")" = "$GITHUB_REF_NAME"
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}/assets?per_page=100" \
+            --jq '.[]' | jq -s '.' > final-remote-assets.json
+          python3 scripts/release_assets.py verify-remote-assets \
+            --directory dist \
+            --manifest dist/SHA256SUMS \
+            --remote-assets final-remote-assets.json \
+            --version "$version"
+          remote_refs="$(git ls-remote origin \
+            "refs/tags/$GITHUB_REF_NAME" \
+            "refs/tags/$GITHUB_REF_NAME^{}")"
+          remote_sha="$(awk -v peeled="refs/tags/$GITHUB_REF_NAME^{}" \
+            '$2 == peeled { print $1 }' <<< "$remote_refs")"
+          if [ -z "$remote_sha" ]; then
+            remote_sha="$(awk -v direct="refs/tags/$GITHUB_REF_NAME" \
+              '$2 == direct { print $1 }' <<< "$remote_refs")"
+          fi
+          test -n "$remote_sha"
+          test "$remote_sha" = "${{ needs.release-contract.outputs.release_commit }}"
+      # The API gate proves Immutable Releases will lock the tag and assets at
+      # this transition. Creation and upload stay in a draft until the exact
+      # remote digests and attestations have passed.
+      - name: Publish the completed draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          published="$(gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}" \
+            --input - <<JSON
+          {"draft":false,"make_latest":"true"}
+          JSON
+          )"
+          test "$(jq -r '.draft' <<< "$published")" = false
+          test "$(jq -r '.tag_name' <<< "$published")" = "$GITHUB_REF_NAME"
+          test "$(jq -r '.immutable' <<< "$published")" = true
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}/assets?per_page=100" \
+            --jq '.[]' | jq -s '.' > published-assets.json
+          python3 scripts/release_assets.py verify-remote-assets \
+            --directory dist \
+            --manifest dist/SHA256SUMS \
+            --remote-assets published-assets.json \
+            --version "${GITHUB_REF_NAME#v}"
+      - name: Remove this run's incomplete mutable release
+        if: ${{ always() && steps.draft.outputs.id != '' && (failure() || cancelled()) }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          endpoint="repos/$GITHUB_REPOSITORY/releases/${{ steps.draft.outputs.id }}"
+          api="https://api.github.com/$endpoint"
+          status="$(curl --silent --show-error --output cleanup-get.json \
+            --write-out '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$api")"
+          if [ "$status" = 404 ]; then exit 0; fi
+          if [ "$status" != 200 ]; then
+            cat cleanup-get.json >&2
+            exit 1
+          fi
+          release="$(cat cleanup-get.json)"
+          test "$(jq -r '.tag_name' <<< "$release")" = "$GITHUB_REF_NAME"
+          if [ "$(jq -r '.immutable' <<< "$release")" = true ]; then
+            echo "The failed run published an immutable release; manual review is required" >&2
+            exit 0
+          fi
+          status="$(curl --silent --show-error --output cleanup-delete.json \
+            --write-out '%{http_code}' -X DELETE \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "$api")"
+          if [ "$status" != 204 ]; then
+            cat cleanup-delete.json >&2
+            exit 1
+          fi
+          for attempt in 1 2 3 4 5; do
+            status="$(curl --silent --show-error --output cleanup-confirm.json \
+              --write-out '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "$api")"
+            if [ "$status" = 404 ]; then
+              exit 0
+            fi
+            if [ "$status" != 200 ]; then cat cleanup-confirm.json >&2; fi
+            sleep "$attempt"
+          done
+          echo "Incomplete mutable release still exists after cleanup" >&2
+          exit 1

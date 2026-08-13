@@ -26,9 +26,27 @@ class Sfh < Formula
 
   def install
     bin.install "sfh"
+    pkgshare.install "release-resources.txt",
+                     "AGENTS.md",
+                     "CHANGELOG.md",
+                     "CONTRIBUTING.md",
+                     "LICENSE",
+                     "README.ja.md",
+                     "README.md",
+                     "SECURITY.md",
+                     "SUPPORT.md",
+                     "docs",
+                     "examples",
+                     "schema",
+                     "skills",
+                     "tests"
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/sfh --version")
+    assert_predicate pkgshare/"release-resources.txt", :file?
+    assert_predicate pkgshare/"schema/flow.schema.json", :file?
+    assert_predicate pkgshare/"examples/mini-check.yaml", :file?
+    assert_predicate pkgshare/"skills/sfh-flow-design/SKILL.md", :file?
   end
 end

@@ -57,3 +57,14 @@ fn legacy_bare_json_commands_still_return_json_for_early_errors() {
         assert!(json["error"].is_string(), "args: {args:?}, json: {json}");
     }
 }
+
+#[test]
+fn release_binary_emits_the_exact_embedded_resource_manifest() {
+    let output = sfh(&["__release-manifest"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        include_bytes!("../release-content-manifest.txt")
+    );
+}

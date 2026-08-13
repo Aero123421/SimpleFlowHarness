@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Render Homebrew metadata from one release checksum set."""
+"""Render version-bound distribution metadata and installers."""
 
 from __future__ import annotations
 
 import argparse
 import re
-import shutil
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-.][0-9A-Za-z.-]+)?$")
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+APPLE_TEAM_ID_RE = re.compile(r"^[A-Z0-9]{10}$")
 PLACEHOLDER_RE = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 
 CHECKSUM_ASSETS = {
@@ -19,6 +19,7 @@ CHECKSUM_ASSETS = {
     "MACOS_X64_SHA256": "sfh-macos-x64.tar.gz",
     "LINUX_ARM64_SHA256": "sfh-linux-arm64.tar.gz",
     "LINUX_X64_SHA256": "sfh-linux-x64.tar.gz",
+    "WINDOWS_X64_SHA256": "sfh-windows-x64.zip",
 }
 
 
@@ -73,12 +74,30 @@ def main() -> None:
         type=Path,
         help="also stage sfh.rb for GitHub Releases",
     )
+    parser.add_argument(
+        "--apple-team-id",
+        required=True,
+        help="Apple Developer Program Team ID embedded in the shell installer",
+    )
+    parser.add_argument(
+        "--windows-codesign-cert-sha256",
+        required=True,
+        help="SHA-256 fingerprint embedded in the PowerShell installer",
+    )
     args = parser.parse_args()
 
     if not VERSION_RE.fullmatch(args.version):
         raise SystemExit(f"invalid release version: {args.version!r}")
+    if not APPLE_TEAM_ID_RE.fullmatch(args.apple_team_id):
+        raise SystemExit(f"invalid Apple Team ID: {args.apple_team_id!r}")
+    if not SHA256_RE.fullmatch(args.windows_codesign_cert_sha256):
+        raise SystemExit("invalid Windows code-signing certificate SHA-256")
 
-    values = {"VERSION": args.version}
+    values = {
+        "VERSION": args.version,
+        "APPLE_TEAM_ID": args.apple_team_id,
+        "WINDOWS_CODESIGN_CERT_SHA256": args.windows_codesign_cert_sha256.lower(),
+    }
     values.update(
         {
             placeholder: read_checksum(args.checksums_dir, asset)
@@ -95,7 +114,17 @@ def main() -> None:
 
     if args.release_assets_dir:
         args.release_assets_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(formula, args.release_assets_dir / "sfh.rb")
+        render(
+            ROOT / "installers/sfh-installer.sh",
+            args.release_assets_dir / "sfh-installer.sh",
+            values,
+        )
+        render(
+            ROOT / "installers/sfh-installer.ps1",
+            args.release_assets_dir / "sfh-installer.ps1",
+            values,
+        )
+        (args.release_assets_dir / "sfh.rb").write_bytes(formula.read_bytes())
 
 
 if __name__ == "__main__":

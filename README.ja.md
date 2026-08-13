@@ -41,11 +41,14 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1 | iex
 ```
 
-OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、展開、`PATH` 設定までを行います。
-実行前に [Shell版](installers/sfh-installer.sh) および [PowerShell版](installers/sfh-installer.ps1) の内容を確認できます。
+pipeで直接実行する形式は、localで検証する前のinstaller script取得をHTTPSとGitHubに委ねます。そのscriptが続いてplatform archiveのSHA-256を検証します。より強いbootstrapが必要な場合は、[docs/distribution.md](docs/distribution.md)の手順でinstallerのsidecarとGitHub attestationを検証してから実行してください。
+
+OSおよびCPUアーキテクチャを自動判定し、SHA-256検証、binaryと同じversionのresourceの配置、`PATH` 設定までを行います。WindowsとmacOSの公式network installでは、downloadしたbinaryを実行する前にOS native署名も検証します。
+実行前に [Shell版](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.sh) および [PowerShell版](https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh-installer.ps1) の内容を確認できます。
 バージョン固定や設定変更オプション:
-- `SFH_VERSION=1.4.0`: 特定のバージョンに固定。
+- `SFH_VERSION=1.6.1`: installer script自身のrelease versionを要求。旧版を入れる場合は、そのtagのinstallerを先に取得します。
 - `SFH_INSTALL_DIR=/path/to/bin`: インストール先ディレクトリの指定。
+- `SFH_DATA_DIR=/path/to/share/sfh`: installerがdocumentation、schema、example、authoring skillを置くdirectoryの指定。
 - `SFH_NO_MODIFY_PATH=1`: 永続的な `PATH` 変更を無効化。
 
 ### パッケージマネージャー・手動ダウンロード
@@ -56,6 +59,14 @@ brew install Aero123421/tap/sfh
 ```
 
 手動・オフライン導入用のバイナリおよびSHA-256ハッシュは [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest) から取得可能です。
+
+### インストールされるリソース
+
+各platform archiveには、binaryと同じversionの`docs/`、`examples/`、`schema/`、`skills/`とproject policy fileが入ります。正確な一覧は`release-resources.txt`が基準です。archiveを直接展開した場合はbinaryと同じdirectoryに置かれます。公式installerはmacOS/Linuxでは`${SFH_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/sfh}`、Windowsでは`$env:SFH_DATA_DIR`（未指定時は`$env:LOCALAPPDATA\sfh-resources`）へcopyします。Homebrewでは`$(brew --prefix sfh)/share/sfh`です。
+
+`SFH_DATA_DIR`はinstallerの配置先だけを指定し、sfh runtimeがresourceやskillを読み込む設定ではありません。`skills/`はflowを書くAI向けの任意のauthoring guidanceであり、runtime機能でもflowの`skills:` keyでもありません。このREADMEのrelative linkはインストール済みresource directory内で解決されるため、offlineでも利用できます。
+
+installerはresource配置先がbinary配置先または実効sfh state directoryと重なる設定を拒否します。upgradeにはinstaller自身のownership markerとprivate inventoryの両方が必要で、以前に配置した全pathの型とfile hashが一致し、追加物がない場合だけ置換します。`SFH_DATA_DIR`には新規directoryか未変更のinstaller管理directoryを指定してください。編集済みtreeは保持したままupgradeを停止します。Windowsの既定値`%LOCALAPPDATA%\sfh-resources`はruntime state tree `%LOCALAPPDATA%\sfh`と別treeなので、upgradeでrunやmanaged workspaceを置換しません。
 
 ---
 
@@ -69,14 +80,18 @@ name: test_and_repair
 defaults:
   max_visits: 3
   wall_clock_sec: 1800
+workspace:
+  mode: git-worktree
 
 steps:
   - id: test
     cmd: ["cargo", "test"]
+    effects: workspace
     on_error: goto:fix
 
   - id: ship
     cmd: ["sfh", "--version"]
+    effects: read
     route: [{goto: end}]
 
   - id: fix
@@ -514,7 +529,7 @@ sfh はどの adapter についても **minimum version を固定していませ
 - CLIヘルプ: `sfh --help` または `sfh <command> --help`
 - サンプルワークフロー: [examples/](examples/) ディレクトリ (`research.yaml`, `hypotheses.yaml`, `parallel-ideas.yaml`)
 - 実務向けflow集: [examples/ponytail/](examples/ponytail/) — regression-first bugfix、依存削減、独立レビューcouncil、migration dry-run、release gateなど20本。`--profiles` で自分のprojectのCLI構成に差し替えて使います。
-- flowをAIに書かせる: [skills/](skills/) — sfhの設計規則をauthoring agentへ渡す[Agent Skills](https://agentskills.io/specification) 9本。`cp -R skills/sfh-* .agents/skills/` で導入します。YAMLを**書く側**のAIを導くもので、sfh本体に `skills:` キーはありません。
+- flowをAIに書かせる: [skills/](skills/) — sfhの設計規則をauthoring agentへ渡す[Agent Skills](https://agentskills.io/specification) 9本。resource directoryで`cp -R skills/sfh-* .agents/skills/`を実行して導入します。YAMLを**書く側**のAIを導くもので、sfh本体に `skills:` キーはありません。
 - ガイドライン・ポリシー:
   - [CONTRIBUTING.md](CONTRIBUTING.md)
   - [SECURITY.md](SECURITY.md)
