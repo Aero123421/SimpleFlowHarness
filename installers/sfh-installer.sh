@@ -897,20 +897,22 @@ cp "$EXTRACT_DIR/sfh" "$STAGED_PATH"
 chmod 0755 "$STAGED_PATH"
 if [ -z "$ASSET_DIR" ]; then
   if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
-    if ! printf '%s\n' "$EXPECTED_APPLE_TEAM_ID" |
-      LC_ALL=C grep -Eq '^[A-Z0-9]{10}$'; then
-      fail "official macOS signer identity is not configured in this installer"
+    if [ "$EXPECTED_APPLE_TEAM_ID" != "UNSIGNED" ]; then
+      if ! printf '%s\n' "$EXPECTED_APPLE_TEAM_ID" |
+        LC_ALL=C grep -Eq '^[A-Z0-9]{10}$'; then
+        fail "official macOS signer identity is invalid in this installer"
+      fi
+      command_exists codesign || fail "codesign is required to verify the official macOS build"
+      command_exists spctl || fail "spctl is required to assess the official macOS build"
+      codesign --verify --strict "$STAGED_PATH" >/dev/null 2>&1 ||
+        fail "official macOS build failed codesign verification"
+      TEAM_ID="$(codesign --display --verbose=4 "$STAGED_PATH" 2>&1 |
+        awk -F= '/^TeamIdentifier=/ { print $2; exit }')"
+      [ "$TEAM_ID" = "$EXPECTED_APPLE_TEAM_ID" ] ||
+        fail "official macOS build signer identity does not match this release channel"
+      spctl --assess --type execute "$STAGED_PATH" >/dev/null 2>&1 ||
+        fail "official macOS build failed Gatekeeper assessment"
     fi
-    command_exists codesign || fail "codesign is required to verify the official macOS build"
-    command_exists spctl || fail "spctl is required to assess the official macOS build"
-    codesign --verify --strict "$STAGED_PATH" >/dev/null 2>&1 ||
-      fail "official macOS build failed codesign verification"
-    TEAM_ID="$(codesign --display --verbose=4 "$STAGED_PATH" 2>&1 |
-      awk -F= '/^TeamIdentifier=/ { print $2; exit }')"
-    [ "$TEAM_ID" = "$EXPECTED_APPLE_TEAM_ID" ] ||
-      fail "official macOS build signer identity does not match this release channel"
-    spctl --assess --type execute "$STAGED_PATH" >/dev/null 2>&1 ||
-      fail "official macOS build failed Gatekeeper assessment"
   fi
   EMBEDDED_INVENTORY="$TMP_DIR/embedded-resource-inventory.txt"
   "$STAGED_PATH" __release-manifest >"$EMBEDDED_INVENTORY" 2>/dev/null ||

@@ -759,29 +759,31 @@
         Copy-Item -LiteralPath $executable -Destination $staged
         Unblock-File -LiteralPath $staged -ErrorAction SilentlyContinue
         if (-not $AssetDir) {
-            if ($ExpectedSignerCertificateSha256 -notmatch '^[0-9a-f]{64}$') {
-                throw "Official Windows signer identity is not configured in this installer"
-            }
-            $signature = Get-AuthenticodeSignature -LiteralPath $staged
-            if ($signature.Status.ToString() -cne "Valid") {
-                throw "Official Windows build failed Authenticode verification: $($signature.Status)"
-            }
-            if (-not $signature.TimeStamperCertificate) {
-                throw "Official Windows build has no Authenticode timestamp certificate"
-            }
-            if (-not $signature.SignerCertificate) {
-                throw "Official Windows build has no signer certificate"
-            }
-            $signerHasher = [Security.Cryptography.SHA256]::Create()
-            try {
-                $signerDigest = [BitConverter]::ToString(
-                    $signerHasher.ComputeHash($signature.SignerCertificate.RawData)
-                ).Replace("-", "").ToLowerInvariant()
-            } finally {
-                $signerHasher.Dispose()
-            }
-            if ($signerDigest -cne $ExpectedSignerCertificateSha256) {
-                throw "Official Windows build signer identity does not match this release channel"
+            if ($ExpectedSignerCertificateSha256 -cne "UNSIGNED") {
+                if ($ExpectedSignerCertificateSha256 -notmatch '^[0-9a-f]{64}$') {
+                    throw "Official Windows signer identity is invalid in this installer"
+                }
+                $signature = Get-AuthenticodeSignature -LiteralPath $staged
+                if ($signature.Status.ToString() -cne "Valid") {
+                    throw "Official Windows build failed Authenticode verification: $($signature.Status)"
+                }
+                if (-not $signature.TimeStamperCertificate) {
+                    throw "Official Windows build has no Authenticode timestamp certificate"
+                }
+                if (-not $signature.SignerCertificate) {
+                    throw "Official Windows build has no signer certificate"
+                }
+                $signerHasher = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $signerDigest = [BitConverter]::ToString(
+                        $signerHasher.ComputeHash($signature.SignerCertificate.RawData)
+                    ).Replace("-", "").ToLowerInvariant()
+                } finally {
+                    $signerHasher.Dispose()
+                }
+                if ($signerDigest -cne $ExpectedSignerCertificateSha256) {
+                    throw "Official Windows build signer identity does not match this release channel"
+                }
             }
             $manifestProcessInfo = New-Object Diagnostics.ProcessStartInfo
             $manifestProcessInfo.FileName = $staged

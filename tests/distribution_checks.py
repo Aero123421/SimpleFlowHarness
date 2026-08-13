@@ -100,24 +100,31 @@ class DistributionChecks(unittest.TestCase):
         output: Path,
         release_assets: Path,
         version: str = "9.8.7",
+        native_signing: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        arguments = [
+            sys.executable,
+            str(RENDERER),
+            "--version",
+            version,
+            "--checksums-dir",
+            str(checksums),
+            "--output-dir",
+            str(output),
+            "--release-assets-dir",
+            str(release_assets),
+        ]
+        if native_signing:
+            arguments.extend(
+                [
+                    "--apple-team-id",
+                    TEST_APPLE_TEAM_ID,
+                    "--windows-codesign-cert-sha256",
+                    TEST_WINDOWS_SIGNER_SHA256,
+                ]
+            )
         return subprocess.run(
-            [
-                sys.executable,
-                str(RENDERER),
-                "--version",
-                version,
-                "--checksums-dir",
-                str(checksums),
-                "--output-dir",
-                str(output),
-                "--release-assets-dir",
-                str(release_assets),
-                "--apple-team-id",
-                TEST_APPLE_TEAM_ID,
-                "--windows-codesign-cert-sha256",
-                TEST_WINDOWS_SIGNER_SHA256,
-            ],
+            arguments,
             cwd=ROOT,
             check=False,
             text=True,
@@ -187,6 +194,41 @@ class DistributionChecks(unittest.TestCase):
             self.assertEqual(
                 {path.name for path in release_assets.iterdir()},
                 {"sfh-installer.ps1", "sfh-installer.sh", "sfh.rb"},
+            )
+
+    def test_renders_explicit_unsigned_installers_without_publisher_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            checksums_dir = work / "checksums"
+            checksums_dir.mkdir()
+            write_checksums(checksums_dir)
+
+            release_assets = work / "release"
+            result = self.run_renderer(
+                checksums_dir,
+                work / "generated",
+                release_assets,
+                native_signing=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            shell_installer = (release_assets / "sfh-installer.sh").read_text(
+                encoding="utf-8"
+            )
+            powershell_installer = (
+                release_assets / "sfh-installer.ps1"
+            ).read_text(encoding="utf-8")
+            self.assertIn("EXPECTED_APPLE_TEAM_ID='UNSIGNED'", shell_installer)
+            self.assertIn(
+                '$ExpectedSignerCertificateSha256 = "UNSIGNED"',
+                powershell_installer,
+            )
+            self.assertIn(
+                'if [ "$EXPECTED_APPLE_TEAM_ID" != "UNSIGNED" ]',
+                shell_installer,
+            )
+            self.assertIn(
+                'if ($ExpectedSignerCertificateSha256 -cne "UNSIGNED")',
+                powershell_installer,
             )
 
     def test_rejects_mismatched_checksum_filename(self) -> None:
@@ -846,6 +888,10 @@ class DistributionChecks(unittest.TestCase):
         self.assertIn("release-signers.json", workflow[contract:signing])
         self.assertIn('git rev-parse "$GITHUB_SHA^{commit}"', workflow[contract:signing])
         self.assertIn("needs: [verify, release-contract]", workflow[signing:build])
+        self.assertIn("Validate optional native signing credentials", workflow[signing:build])
+        self.assertIn("Apple signer pin is unset", workflow[signing:build])
+        self.assertIn("Windows signer pin is unset", workflow[signing:build])
+        self.assertIn("Missing required Actions secret: RELEASE_ADMIN_READ_TOKEN", workflow[signing:build])
         self.assertIn(
             "needs: [verify, release-contract, signing-contract]",
             workflow[build:publish],
@@ -870,6 +916,14 @@ class DistributionChecks(unittest.TestCase):
         self.assertIn("pinned publisher", workflow)
         self.assertIn("Authority=Developer ID Application:", workflow)
         self.assertIn('TeamIdentifier=$APPLE_TEAM_ID', workflow)
+        self.assertIn(
+            "runner.os == 'Windows' && needs.release-contract.outputs.windows_codesign_cert_sha256 != ''",
+            workflow,
+        )
+        self.assertIn(
+            "runner.os == 'macOS' && needs.release-contract.outputs.apple_team_id != ''",
+            workflow,
+        )
         self.assertIn("notarytool submit", workflow)
         self.assertIn('result.get("status") == "Accepted"', workflow)
         self.assertIn("^Timestamp=(none|-)$", workflow)

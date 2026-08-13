@@ -103,6 +103,7 @@ try {
         '{{WINDOWS_CODESIGN_CERT_SHA256}}',
         '{{WINDOWS_X64_SHA256}}',
         '{{VERSION}}',
+        'if ($ExpectedSignerCertificateSha256 -cne "UNSIGNED")',
         'Get-AuthenticodeSignature -LiteralPath $staged',
         '$signature.TimeStamperCertificate',
         '$signature.SignerCertificate.RawData',

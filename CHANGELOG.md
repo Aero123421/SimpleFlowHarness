@@ -34,11 +34,13 @@ v1.6.0から変更していません。
   owner承認とtag policyを持つ`release` environmentへ限定します。workflow側でも全asset
   hashをmanifestへ束ね、artifact attestationを発行し、Administration read-only tokenで
   immutable設定を公開直前に確認します。
-- macOSはDeveloper ID署名とnotarization、WindowsはAuthenticode署名をreleaseの
-  必須gateにしました。署名credentialがないtag buildはunsigned binaryを公開せず
-  停止します。macOS x64もIntel runnerでnative build・実行してから公開します。公式
-  installerもdownloadしたbinaryのnative署名と固定したApple Team ID / Windows署名
-  証明書fingerprintをstaged実行前に検証します。
+- macOS Developer ID署名/notarizationとWindows Authenticode署名は、review済みの
+  publisher pinと対応credentialが設定されたplatformで有効にします。有効にした
+  platformでは一部secretの欠落、署名失敗、pin不一致をfail closedで拒否し、公式
+  installerもstaged実行前にnative署名を検証します。v1.6.1はnative署名なしで公開し、
+  version固定installerに埋め込んだarchive hash、全asset attestation、immutable
+  Releaseを真正性の境界とします。macOS x64は署名有無にかかわらずIntel runnerで
+  native build・実行してから公開します。
 - Release本文は自動生成されたPR一覧だけでなく、このCHANGELOGの該当versionを
   掲載します。推奨one-line installer自身の検証境界と、attestationの確認方法も
   distribution文書へ明記しました。
