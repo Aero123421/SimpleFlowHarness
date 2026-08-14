@@ -201,5 +201,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked
       - name: Install and reject corrupted release
-        shell: pwsh
+        # The README command is commonly run in Windows PowerShell 5.1, so keep
+        # the installer smoke test on the inbox Windows shell rather than pwsh.
+        shell: powershell
         run: ./tests/installer_windows.ps1 -Binary ./target/release/sfh.exe

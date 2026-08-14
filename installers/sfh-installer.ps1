@@ -618,7 +618,21 @@
     }
 
     $version = Normalize-Version $RequestedVersion
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    # Windows PowerShell 5.1 can expose RuntimeInformation without OSArchitecture.
+    # PROCESSOR_ARCHITEW6432 reports the native architecture when running under WOW64.
+    $nativeArchitecture = if ($env:PROCESSOR_ARCHITEW6432) {
+        $env:PROCESSOR_ARCHITEW6432
+    } else {
+        $env:PROCESSOR_ARCHITECTURE
+    }
+    if ([string]::IsNullOrWhiteSpace($nativeArchitecture)) {
+        throw "Could not determine Windows CPU architecture"
+    }
+    $architecture = switch ($nativeArchitecture.ToUpperInvariant()) {
+        "AMD64" { "X64" }
+        "ARM64" { "Arm64" }
+        default { $nativeArchitecture }
+    }
     switch ($architecture) {
         "X64" { }
         "Arm64" {
