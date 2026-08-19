@@ -1,10 +1,17 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
 # Pattern: build and verify a migration, but stop for human approval before external effects.
+#
+# The one flow in this pack that `validate --strict` still reports on, and the
+# report is correct: no declared path reaches end or fail. That is the design.
+# A migration must not decide for itself that it may be applied, so every
+# successful path lands on stuck (exit 4) and hands the decision to a person.
+# CI validates this file without --strict for exactly this reason; do not
+# "fix" it by routing to end.
 api_version: 1
 name: ponytail-database-migration-dry-run
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: keep
 
 contexts:
@@ -43,6 +50,8 @@ steps:
       Prefer database-native constraints and operations over application-side
       emulation. Identify compatibility windows and the exact dry-run evidence.
       Do not edit files and do not apply the migration.
+    route:
+      - {goto: implement}
 
   - id: implement
     use: builder
@@ -54,6 +63,8 @@ steps:
 
       Plan:
       {{steps.plan.output | truncate:18000}}
+    route:
+      - {goto: dry_run}
 
   - id: dry_run
     effects: workspace
@@ -61,6 +72,8 @@ steps:
     cmd: ["python", "tools/migrate.py", "--dry-run"]
     timeout_sec: 1800
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

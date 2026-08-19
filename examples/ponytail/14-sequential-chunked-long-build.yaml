@@ -5,7 +5,7 @@ api_version: 1
 name: ponytail-sequential-chunked-build
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -48,6 +48,8 @@ steps:
       Output exactly one chunk per non-empty line, in dependency order.
       Each line must be a self-contained instruction and deterministic check.
       No heading, numbering, bullets, JSON, or commentary.
+    route:
+      - {goto: build_chunks}
 
   - id: build_chunks
     use: builder
@@ -78,6 +80,8 @@ steps:
     effects: read
     cmd: ["git", "diff", "--check"]
     on_error: goto:repair
+    route:
+      - {goto: review}
 
   - id: review
     use: reviewer

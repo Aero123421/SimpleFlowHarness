@@ -30,6 +30,7 @@
     $RequiredResources = @(
         "AGENTS.md"
         "CHANGELOG.md"
+        "CODE_OF_CONDUCT.md"
         "CONTRIBUTING.md"
         "LICENSE"
         "README.ja.md"
@@ -268,8 +269,8 @@
         $topLevel = $components[0]
         $allowedFiles = @(
             "sfh.exe", "release-resources.txt", "AGENTS.md", "CHANGELOG.md",
-            "CONTRIBUTING.md", "LICENSE", "README.ja.md", "README.md",
-            "SECURITY.md", "SUPPORT.md"
+            "CODE_OF_CONDUCT.md", "CONTRIBUTING.md", "LICENSE", "README.ja.md",
+            "README.md", "SECURITY.md", "SUPPORT.md"
         )
         $allowedDirectories = @("docs", "examples", "schema", "skills", "tests")
         if ($components.Count -eq 1 -and $topLevel -cin $allowedFiles) {

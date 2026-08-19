@@ -37,13 +37,16 @@ defaults:
 
 steps:
   - id: prep
+    effects: workspace
     cmd: ["git", "switch", "-c", "{{vars.branch}}"]
     on_error: goto:prep_existing
     route: [{ goto: prep_verify }]
   - id: prep_existing
+    effects: workspace
     cmd: ["git", "switch", "{{vars.branch}}"]
     route: [{ goto: prep_verify }]
   - id: prep_verify
+    effects: read
     cmd: ["git", "branch", "--show-current"]
     route:
       - when_last_line_contains: "{{vars.branch}}"
@@ -127,8 +130,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.s1_check.output | optional | tail:120}}
+    route:
+      - {goto: s1_check}
 
   - id: s1_check
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 2400
@@ -220,8 +226,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.s2_check.output | optional | tail:120}}
+    route:
+      - {goto: s2_check}
 
   - id: s2_check
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 2400
@@ -304,8 +313,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.s3_check.output | optional | tail:120}}
+    route:
+      - {goto: s3_check}
 
   - id: s3_check
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 2400
@@ -414,7 +426,10 @@ steps:
           `REVIEW-FAIL`(不足あり)を単独で書くこと。** それ以外の語を最後の行に書かないこと。
 
   # 合否は AI ではなく grep が数える。3体全員が PASS のときだけ先へ進む。
+    route:
+      - {goto: verdict}
   - id: verdict
+    effects: read
     cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS$' - || true); echo \"PASSES=$n\""]
     stdin: prompt
     prompt: "{{steps.review.outputs}}"
@@ -441,8 +456,11 @@ steps:
       ## 完了条件
       cargo fmt / clippy -D warnings / cargo test / cargo build --release /
       bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+    route:
+      - {goto: s_recheck}
 
   - id: s_recheck
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 2400
@@ -453,8 +471,10 @@ steps:
 
   # レビューが収束しなかったとき。成功を装わず、未解決のまま報告する。
   - id: unresolved
+    effects: read
     cmd: ["sh", "-c", "echo 'UNRESOLVED: reviewers did not reach unanimous pass within max_visits'; git --no-pager diff --stat main...HEAD"]
     route: [{ goto: end }]
 
   - id: wrap
+    effects: workspace
     cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED'; git --no-pager diff --stat main...HEAD 2>&1; echo '--- tests ---'; cargo test 2>&1 | tail -3; bash tests/engine_behaviour.sh 2>&1 | tail -2"]

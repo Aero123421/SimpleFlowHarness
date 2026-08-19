@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-audit-one-safe-cut
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -40,6 +40,8 @@ steps:
     prompt: |
       Audit the repository for over-engineering and rank concrete cuts.
       Do not modify files. Keep the report factual and path-specific.
+    route:
+      - {goto: choose}
 
   - id: choose
     use: selector
@@ -78,6 +80,8 @@ steps:
     effects: read
     cmd: ["git", "diff", "--check"]
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

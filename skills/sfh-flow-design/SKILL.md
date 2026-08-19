@@ -54,6 +54,37 @@ Do not ask an AI whether a command exited successfully. Do not interpret test na
 
 For detailed routing choices, activate `sfh-deterministic-gates`.
 
+## Choose the right completion evidence for each step
+
+sfh proves that a turn finished. It does not prove the artifact is correct. Those are different facts, and a step should ask for the one it actually needs.
+
+Preset (AI) steps default to `allow_empty: false`: a turn that exits cleanly with no final message is a failure, because an empty answer is not evidence of anything. That default is right for a reviewer whose verdict *is* the product, and wrong for a worker whose product is the diff.
+
+A worker whose prose is not the deliverable should say so and let commands prove the work:
+
+```yaml
+- id: implement
+  use: builder
+  effects: workspace
+  allow_empty: true      # the diff is the product, not the closing sentence
+  timeout_sec: 7200      # one hard deadline for the whole turn, tool use included
+  route: [{goto: verify}]
+```
+
+Then gate it: `fmt`, build, tests, schema validation, `git diff --check`.
+
+- Keep `allow_empty: false` where the final message is the evidence — a semantic reviewer whose exact `PASS` / `REVISE` line drives routing.
+- Do not make a model-authored `DONE` / `IMPLEMENTED` line the sole proof that code is correct when a command can check the artifact instead. That turns a formatting slip into a failed run and a confident sentence into a passed one.
+- `timeout_sec` is wall-clock for the entire leaf run, including the agent's own tool calls and the tests it starts. Size it for the whole turn, or split the work into smaller artifact-shaped steps. Workspace changes may survive a timed-out leaf, but repeated timeout is not a continuation mechanism.
+
+The shape to reach for:
+
+```text
+nondeterministic worker (allow_empty)
+  → deterministic artifact gates
+  → semantic reviewer only where judgment is genuinely required
+```
+
 ## Choose workspace and context explicitly
 
 - Read-only flow: `workspace.mode: current` is often enough.

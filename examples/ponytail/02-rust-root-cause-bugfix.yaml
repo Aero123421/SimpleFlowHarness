@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-rust-root-cause-bugfix
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -48,6 +48,8 @@ steps:
       Trace every caller of the function or shared path most likely responsible.
       Identify one root-cause correction and the smallest regression test that
       would fail before the fix. Do not edit files.
+    route:
+      - {goto: add_regression}
 
   - id: add_regression
     use: builder
@@ -61,6 +63,8 @@ steps:
 
       Investigation:
       {{steps.investigate.output | truncate:16000}}
+    route:
+      - {goto: prove_failure}
 
   - id: prove_failure
     effects: workspace
@@ -87,12 +91,16 @@ steps:
 
       Investigation:
       {{steps.investigate.output | truncate:16000}}
+    route:
+      - {goto: verify}
 
   - id: verify
     effects: workspace
     cmd: ["cargo", "test", "--release"]
     timeout_sec: 1800
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

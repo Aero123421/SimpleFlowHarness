@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.4.0/schema/flow.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json",
   "title": "sfh flow",
   "description": "A SimpleFlowHarness flow: staged AI CLI invocations with routing, parallelism and session continuation.",
   "type": "object",

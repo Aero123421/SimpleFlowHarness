@@ -51,6 +51,8 @@ steps:
       出力: 調査計画(目的 / 手順 / 成果物 / 検証方法)をMarkdownで。
 
   # 2) 計画レビュー: 別モデルで審査。NGなら plan へ差し戻し
+    route:
+      - {goto: review_plan}
   - id: review_plan
     use: reviewer
     prompt: |
@@ -92,6 +94,8 @@ steps:
       {{steps.plan.output}}
 
   # 4) 結果レビュー: NGなら execute へ差し戻し
+    route:
+      - {goto: review_execute}
   - id: review_execute
     use: reviewer
     prompt: |

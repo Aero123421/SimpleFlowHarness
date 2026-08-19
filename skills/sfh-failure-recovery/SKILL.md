@@ -16,12 +16,25 @@ Read [references/recovery-matrix.md](references/recovery-matrix.md).
 
 - **transport/infra:** rate limit, temporary network error, provider outage, hung stream
 - **protocol:** expected structured terminal record missing or malformed
+- **empty final message:** the turn completed and the protocol is valid, but the agent said nothing
+- **hard timeout:** `timeout_sec` expired for the whole leaf run, tool use included
 - **logical rejection:** tests failed, evaluator says revise, acceptance incomplete
 - **flow definition:** bad route, wrong binary, invalid ceiling, changed context
 - **external effect unknown:** process may have mutated outside state before crash
 - **persistence:** sfh could not durably record required artifacts
 
 These require different actions.
+
+### Four ways a long AI step "fails" that are not the same failure
+
+| What sfh saw | Message | What it means | Action |
+|---|---|---|---|
+| terminal record valid, chain empty | `the tool exited successfully but produced no final message` | the turn finished; the agent's closing prose is missing, not its work | if the artifact is the product, set `allow_empty: true` and gate the artifact |
+| no terminal record | `missing_terminal` protocol evidence | sfh cannot prove the turn ended | fail closed; salvage the raw output through `when_protocol_is` |
+| terminal record malformed | `invalid` protocol evidence | adapter drift or a truncated stream | `doctor` / `preflight`; do not accept raw text as an answer |
+| deadline expired | timeout | the author's wall-clock estimate was wrong, or the agent hung | resize `timeout_sec` for the whole turn, or split the step; `hang_after_sec` is the separate no-output signal |
+
+The first row is the one that surprises people. A workspace-writing agent can make a complete, correct change and still end its turn silently; with the preset default `allow_empty: false` sfh refuses it, correctly, because nothing proved the work — and the fix is to let a command prove it instead of demanding a sentence. See `sfh-flow-design`, "Choose the right completion evidence for each step".
 
 ## Mechanisms
 

@@ -33,6 +33,7 @@ defaults:
 # codex はオーバーエンジニアリング癖があるので、やらないことを明示する。
 steps:
   - id: prep
+    effects: workspace
     # `||` はシェル連結なので配列形式にはできない。vars.branch はこのフロー自身の
     # 変数(AI出力ではない)なので、明示したうえでシェル展開を許可している。
     unsafe_shell_template: true
@@ -42,6 +43,8 @@ steps:
   # ---------------------------------------------------------------- batch A
   # 順序上いちばん先。雛形を直さないと、あとで測る全ての数字が
   # 「自分のバグの性質」になる。
+    route:
+      - {goto: a_impl}
   - id: a_impl
     use: dev
     prompt: |
@@ -140,8 +143,11 @@ steps:
 
       前回の検証でこう言われている(初回は空):
       {{steps.a_check.output | optional | tail:120}}
+    route:
+      - {goto: a_check}
 
   - id: a_check
+    effects: workspace
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
     # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
     # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
@@ -232,8 +238,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.b_check.output | optional | tail:120}}
+    route:
+      - {goto: b_check}
 
   - id: b_check
+    effects: workspace
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
     # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
     # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
@@ -327,8 +336,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.c_check.output | optional | tail:120}}
+    route:
+      - {goto: c_check}
 
   - id: c_check
+    effects: workspace
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
     # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
     # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
@@ -428,8 +440,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.d_check.output | optional | tail:120}}
+    route:
+      - {goto: d_check}
 
   - id: d_check
+    effects: workspace
     # 配列形式 = 本物の POSIX シェル。文字列形式だと Windows では cmd /C 経由になり、
     # `;` も `$?` も bash の構文なので EXIT 行が出ず、&& の短絡でステップ自体が
     # 非ゼロ終了して on_error: fail に食われる(初回の実行でまさにこれを踏んだ)。
@@ -445,4 +460,5 @@ steps:
   # 配列形式。文字列形式で `;` を使ったせいで、この行は実際に Windows で
   # `fatal: ambiguous argument ';'` を出した。v0.9 の validate はこれを弾く。
   - id: wrap
+    effects: workspace
     cmd: ["sh", "-c", "git --no-pager diff --stat main...HEAD 2>&1; git --no-pager status --short 2>&1; echo '--- tests ---'; cargo test 2>&1 | tail -3"]

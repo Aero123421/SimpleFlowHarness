@@ -26,20 +26,7 @@ class Sfh < Formula
 
   def install
     bin.install "sfh"
-    pkgshare.install "release-resources.txt",
-                     "AGENTS.md",
-                     "CHANGELOG.md",
-                     "CONTRIBUTING.md",
-                     "LICENSE",
-                     "README.ja.md",
-                     "README.md",
-                     "SECURITY.md",
-                     "SUPPORT.md",
-                     "docs",
-                     "examples",
-                     "schema",
-                     "skills",
-                     "tests"
+    pkgshare.install {{PKGSHARE_RESOURCES}}
   end
 
   test do

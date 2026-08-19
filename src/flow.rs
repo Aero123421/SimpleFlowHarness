@@ -1832,8 +1832,18 @@ impl Flow {
     /// A USD ceiling can only judge values an adapter actually reports. cmd:
     /// steps and tokens-only adapters contribute zero dollars, which is not the
     /// same fact as spending nothing.
+    ///
+    /// The message names `defaults.wall_clock_sec` as an accepted backstop, so
+    /// honour it: three of this repository's own flows already carried
+    /// `wall_clock_sec` and were still told to add it, which is a warning that
+    /// cannot be resolved by doing what it asks. Wall time is enforceable
+    /// regardless of what an adapter reports, which is exactly the property the
+    /// unreported USD ceiling lacks.
     pub fn max_cost_coverage_warning(&self) -> Option<String> {
         self.defaults.max_cost_usd?;
+        if self.defaults.wall_clock_sec.is_some() {
+            return None;
+        }
         let tools = self.resolved_tools();
         if tools.iter().any(|tool| {
             crate::preset::adapter_info(&tool.tool)
@@ -4779,6 +4789,17 @@ mod tests {
         let command_only =
             load("defaults:\n  max_cost_usd: 5\nsteps:\n  - id: a\n    cmd: [echo, x]\n");
         assert!(command_only.max_cost_coverage_warning().is_some());
+
+        // The message asks for exactly this backstop, so having it has to end
+        // the warning. Before this, examples/selfhost-v08.yaml carried
+        // wall_clock_sec: 21600 and was still told to add wall_clock_sec.
+        let backstopped = load(
+            "defaults:\n  max_cost_usd: 5\n  wall_clock_sec: 3600\nsteps:\n  - id: a\n    tool: codex\n    access: read\n    prompt: x\n",
+        );
+        assert!(
+            backstopped.max_cost_coverage_warning().is_none(),
+            "wall_clock_sec is the enforceable backstop the warning names"
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ steps:
     effort: low
     prompt: |
       1+1 の答えを数字のみで出力してください。説明は不要。
+    route:
+      - {goto: b_claude}
 
   - id: b_claude
     tool: claude
@@ -34,6 +36,8 @@ steps:
     access: read
     prompt: |
       「opencode ok」とだけ出力してください。
+    route:
+      - {goto: d_grok}
 
   - id: d_grok
     tool: grok
@@ -41,6 +45,8 @@ steps:
     effort: low
     prompt: |
       「grok ok」とだけ出力してください。
+    route:
+      - {goto: e_agy}
 
   - id: e_agy
     tool: agy
@@ -48,6 +54,8 @@ steps:
     model: gemini-3.6-flash-low
     prompt: |
       「agy ok」とだけ出力してください。
+    route:
+      - {goto: f_pi}
 
   - id: f_pi
     tool: pi
@@ -55,7 +63,10 @@ steps:
     effort: low
     prompt: |
       「pi ok」とだけ出力してください。
+    route:
+      - {goto: done}
 
   - id: done
+    effects: read
     # `echo`はWindowsではshell builtinなので、固定文字列のstring形式にする。
     cmd: "echo all-presets-ok"

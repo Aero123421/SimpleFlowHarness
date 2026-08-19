@@ -41,10 +41,14 @@ defaults:
 
 steps:
   - id: windows_tests
+    effects: workspace
     cmd: ["cargo", "test"]
     on_error: goto:fix
+    route:
+      - {goto: unix_typecheck}
 
   - id: unix_typecheck
+    effects: workspace
     cmd: ["cargo", "clippy", "--target", "x86_64-unknown-linux-gnu",
           "--all-targets", "--", "-D", "warnings"]
     on_error: goto:fix
@@ -54,12 +58,22 @@ steps:
   # `git checkout -f` は ~/sfh 側の変更を捨てる — あちらは検証用の使い捨て。
   # bash -lc のスクリプトにテンプレートを書かないこと(シェルに再解釈されるため
   # sfh が拒否する)。ここは固定文字列でよい。このフロー自体がマシンローカルだから。
+    route:
+      - {goto: wsl_behaviour}
   - id: wsl_behaviour
+    effects: external
+    # Builds and tests inside another OS's filesystem, outside any workspace
+    # sfh manages. A resume cannot tell whether that already happened, so it
+    # stops for a human instead of repeating it.
+    replay: {unfinished: stuck}
     cmd: ["wsl", "-d", "Ubuntu-24.04", "--", "bash", "-lc",
           "cd ~/sfh && git fetch /mnt/d/AI/SimpleFlowHarness HEAD && git checkout -f FETCH_HEAD && cargo build --release && bash tests/engine_behaviour.sh ./target/release/sfh"]
     on_error: goto:fix
+    route:
+      - {goto: all_green}
 
   - id: all_green
+    effects: read
     cmd: ["sfh", "--version"]
     route: [{goto: end}]
 

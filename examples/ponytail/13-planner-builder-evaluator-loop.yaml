@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-planner-builder-evaluator
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -52,6 +52,8 @@ steps:
       Produce a small, dependency-ordered execution plan.
       Each chunk must name files, invariants, and a deterministic proof.
       Do not edit files.
+    route:
+      - {goto: build}
 
   - id: build
     use: builder
@@ -71,6 +73,8 @@ steps:
     effects: read
     cmd: ["git", "diff", "--check"]
     on_error: goto:improve
+    route:
+      - {goto: evaluate}
 
   - id: evaluate
     use: evaluator

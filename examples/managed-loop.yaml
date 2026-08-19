@@ -41,7 +41,7 @@ profiles:
 # per run rather than one per step. With this key removed, sfh creates nothing
 # and every step runs in the caller's cwd, exactly as before v1.2.
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 # What each step is handed, by name, in a fixed order, hashed. sfh does not
@@ -77,6 +77,8 @@ steps:
     prompt: |
       Read the current state of this workspace against the task above and
       list the decisions that have to be made. Do not change anything.
+    route:
+      - {goto: implement}
 
   - id: implement
     use: actor
@@ -87,11 +89,15 @@ steps:
 
       What the inspection found:
       {{steps.inspect.output}}
+    route:
+      - {goto: test}
 
   - id: test
     effects: workspace
     cmd: ["cargo", "test", "--locked"]
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     use: judge

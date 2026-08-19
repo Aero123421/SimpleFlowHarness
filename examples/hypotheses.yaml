@@ -25,6 +25,8 @@ steps:
       番号・記号・仮説以外の文章は一切書かないこと。
 
   # generateの出力行数ぶんワーカーが立ち上がる(実行時に個数が決まる)
+    route:
+      - {goto: verify}
   - id: verify
     foreach:
       from: "{{steps.generate.output}}"
@@ -39,6 +41,8 @@ steps:
       仮説 {{item_index}}: {{item}}
 
       根拠を示し、最後の行は必ず CONFIRMED / REJECTED / INCONCLUSIVE のいずれか1語のみにすること。
+    route:
+      - {goto: report}
 
   - id: report
     use: worker
