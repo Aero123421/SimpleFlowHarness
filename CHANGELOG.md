@@ -86,6 +86,13 @@ engine、flow schema、machine API、resume形式は互換です。同梱flowの
 - `CODE_OF_CONDUCT.md`をrelease resourceへ追加しました。他のpolicy fileは同梱
   されており、これだけが漏れていたため、offline install時にREADMEのlinkが
   切れていました。
+- installerが持つresource allowlistの重複をtestで固定しました。この重複は
+  意図的です — downloadしたarchiveを検証するinstallerは、そのarchive自身が申告する
+  「入っていてよいもの」を信用できないので、allowlistはinline でなければなりません。
+  ただし誰も複製の一致を検査しておらず、contractへ1件追加しただけで
+  shell/PowerShell installerの4つのinline listが取り残され、install job だけが
+  落ちました。`tests/distribution_checks.py`が両installerのmanifestとmember
+  allowlistを`release-resources.txt`と照合します。
 
 ### engineの修正
 

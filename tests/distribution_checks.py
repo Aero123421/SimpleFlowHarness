@@ -353,6 +353,90 @@ class DistributionChecks(unittest.TestCase):
             EXPECTED_RESOURCES,
         )
 
+    def test_every_installer_allowlist_matches_the_resource_contract(self) -> None:
+        """The installers repeat release-resources.txt. Keep the copies equal.
+
+        The repetition is deliberate, not sloppy: an installer validating a
+        downloaded archive cannot take the archive's own idea of what belongs in
+        it, so the allowlist has to be inline. That makes it a trust boundary
+        AND a duplicate, and nothing checked the duplicate - adding
+        CODE_OF_CONDUCT.md to the contract left four inline lists behind and
+        every install job failed while the whole rest of CI stayed green.
+
+        Checked here rather than in the installer suites because this is the
+        cheap check that names the real cause; those suites report it as a
+        rejected archive several layers downstream.
+        """
+        contract = [
+            line.strip()
+            for line in RESOURCE_CONTRACT.read_text(encoding="ascii").splitlines()
+            if line.strip()
+        ]
+        files = [entry for entry in contract if not entry.endswith("/")]
+        directories = [entry.rstrip("/") for entry in contract if entry.endswith("/")]
+
+        shell = (ROOT / "installers/sfh-installer.sh").read_text(encoding="utf-8")
+        powershell = (ROOT / "installers/sfh-installer.ps1").read_text(encoding="utf-8")
+
+        # The manifest each installer compares the archive's own copy against.
+        shell_paths = re.search(
+            r"EXPECTED_RESOURCE_PATHS='([^']*)'", shell
+        )
+        self.assertIsNotNone(shell_paths, "shell installer declares no resource manifest")
+        assert shell_paths is not None
+        self.assertEqual(shell_paths.group(1).splitlines(), contract)
+
+        powershell_paths = re.search(
+            r"\$RequiredResources = @\(\n(.*?)\n\s*\)", powershell, re.S
+        )
+        self.assertIsNotNone(
+            powershell_paths, "PowerShell installer declares no resource manifest"
+        )
+        assert powershell_paths is not None
+        self.assertEqual(
+            re.findall(r'"([^"]+)"', powershell_paths.group(1)), contract
+        )
+
+        # The member allowlists, which reject anything the contract does not name.
+        # Anchored on the rejection arm and read backwards: the shell installer
+        # has more than one `case "$member" in`, and a forward non-greedy match
+        # swallows the unsafe-path one in between.
+        rejection = '*) fail "archive contains an unexpected member'
+        self.assertIn(rejection, shell, "shell installer has no member allowlist")
+        head = shell.split(rejection, 1)[0]
+        allowlist = head[head.rindex('case "$member" in') + len('case "$member" in') :]
+        tokens = {
+            token.strip().rstrip(")")
+            for token in re.split(r"[|\\\n]", allowlist)
+            if token.strip().rstrip(")") and token.strip() != ";;"
+        }
+        self.assertEqual(
+            tokens,
+            {"sfh", "release-resources.txt", *files}
+            | {name for entry in directories for name in (entry, f"{entry}/*")},
+        )
+
+        powershell_files = re.search(
+            r"\$allowedFiles = @\(\n(.*?)\n\s*\)", powershell, re.S
+        )
+        self.assertIsNotNone(powershell_files, "PowerShell installer has no file allowlist")
+        assert powershell_files is not None
+        self.assertEqual(
+            sorted(re.findall(r'"([^"]+)"', powershell_files.group(1))),
+            sorted(["sfh.exe", "release-resources.txt", *files]),
+        )
+
+        powershell_directories = re.search(
+            r"\$allowedDirectories = @\(([^)]*)\)", powershell
+        )
+        self.assertIsNotNone(
+            powershell_directories, "PowerShell installer has no directory allowlist"
+        )
+        assert powershell_directories is not None
+        self.assertEqual(
+            re.findall(r'"([^"]+)"', powershell_directories.group(1)), directories
+        )
+
     def test_release_content_manifest_is_current_and_canonical(self) -> None:
         result = self.run_release_helper(
             "content-manifest", "--output", str(CONTENT_MANIFEST), "--check"

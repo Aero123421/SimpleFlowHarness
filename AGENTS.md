@@ -95,6 +95,11 @@ toolchain is pinned in `rust-toolchain.toml`.
   examples strictly validate and dry-run. A flow or example shipped here is held
   to the checks this project tells readers to run; the single exemption above is
   the whole list.
+- **`release-resources.txt` has deliberate inline duplicates, and they are
+  checked.** An installer validating a downloaded archive cannot take that
+  archive's own word for what belongs in it, so both installers repeat the
+  contract inline. `tests/distribution_checks.py` compares every copy; adding a
+  resource without updating them used to fail only the install jobs.
 - **A number in a validation report is measured, never recalled.**
   `tests/skills_checks.py` recomputes the ratios those reports state. The rule
   exists because a report claimed "4 of 18 top-level examples" when there were
