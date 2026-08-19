@@ -12,12 +12,14 @@ vars:
 
 steps:
   - id: draft
+    effects: read
     cmd: "echo draft"
     max_visits: 2
     on_max_visits: goto:verdict
     route: [{ goto: draft }]
 
   - id: verdict
+    effects: read
     cmd: "echo hello VERDICT: OK"
     route:
       - when_contains: "{{vars.topic}}"

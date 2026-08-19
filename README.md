@@ -10,6 +10,8 @@ English | [日本語](README.ja.md)
 
 The engine handles execution plumbing, routing, process lifecycle management, retries, and audit logging. It records process facts and follows declared routes, leaving task judgment to your commands and agents.
 
+**Contents** — [Why sfh?](#why-sfh) · [Installation](#installation) · [Quick Start](#quick-start) · [Core Concepts](#core-concepts--mental-model) · [Workspace, Context and Replay](#workspace-context-and-replay-v12) · [Driving sfh from a program](#driving-sfh-from-a-program) · [Artifacts & Schemas](#artifacts--public-schemas) · [More documentation](#progressive-disclosure--documentation)
+
 ---
 
 ## Why sfh?
@@ -299,6 +301,37 @@ Structured adapter drift remains fail-closed, but a flow can route the preserved
 
 `when_protocol_is` accepts `plain`, `valid`, `missing_terminal`, or `invalid` and composes with other predicates using the usual AND rule. It applies to leaf steps only; fan-out groups have no single protocol state. The state is recorded in `step_end`, so resume replays the same decision without re-running the tool.
 
+### `allow_empty:` — what counts as the step's answer
+
+Protocol evidence proves a turn **finished**. It does not prove the turn **said** anything, and those are separate facts. An agent can complete a real change and end without a closing message.
+
+Preset (AI) steps default to `allow_empty: false`, so that silent turn fails with:
+
+```text
+sfh: the tool exited successfully but produced no final message
+(set allow_empty: true if that is expected)
+```
+
+That default is right when the final message *is* the product — a reviewer whose exact `PASS` / `REVISE` line decides the route. It is wrong for a worker whose product is the diff:
+
+```yaml
+- id: implement
+  tool: pi
+  access: write
+  effects: workspace
+  allow_empty: true       # the diff is the answer, not the closing sentence
+  timeout_sec: 7200       # one deadline for the whole turn, the agent's own tool calls included
+  route: [{goto: verify}]
+
+- id: verify               # this is what proves the work, not a DONE line
+  effects: workspace
+  cmd: ["cargo", "test"]
+```
+
+`cmd:` steps default to `allow_empty: true`, because a command that prints nothing and exits 0 has already told you what happened through its exit code.
+
+Two rules follow. Do not make a model-authored `DONE` token the sole proof that code is correct when a command can check the artifact instead — a formatting slip then fails a good run, and a confident sentence passes a bad one. And size `timeout_sec` for the entire tool-using turn, not for the model's first reply; workspace changes may survive a timed-out leaf, but repeated timeout is not a continuation mechanism.
+
 ### Replay policy
 
 What a resume should do with a step that started and never recorded an end — the one case where sfh genuinely cannot know whether the work already happened.
@@ -548,10 +581,13 @@ For complete reference material, explore:
 - Sample workflows: Browse [examples/](examples/) (`research.yaml`, `hypotheses.yaml`, `parallel-ideas.yaml`, `managed-loop.yaml`, `workspace-smoke.yaml`).
 - Ready-made engineering flows: [examples/ponytail/](examples/ponytail/) — 20 flows for real repository work (regression-first bugfix, dependency elimination, independent review councils, migration dry runs, release-readiness gates). Point them at your own project with `--profiles`.
 - Writing flows with an AI: [skills/](skills/) — 9 [Agent Skills](https://agentskills.io/specification) that teach an authoring agent sfh's design rules. From the resource directory, install them with `cp -R skills/sfh-* .agents/skills/`. These guide the AI that *writes* the YAML; sfh itself has no `skills:` key.
+- Contracts and decision records: [docs/](docs/) — start at [docs/README.md](docs/README.md), which says which files are current and which are historical.
+- Contributing to sfh itself: [AGENTS.md](AGENTS.md) is the maintainer guide — the repository map, the CI gates, and the invariants every change is judged against. [CONTRIBUTING.md](CONTRIBUTING.md) is the process around it.
 - Project governance & policies:
   - [CONTRIBUTING.md](CONTRIBUTING.md)
   - [SECURITY.md](SECURITY.md)
   - [SUPPORT.md](SUPPORT.md)
+  - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
   - [LICENSE](LICENSE)
   - [Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)
 

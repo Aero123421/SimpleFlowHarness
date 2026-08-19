@@ -33,7 +33,7 @@ invariants.
 | `examples/`, `examples/ponytail/` | Top-level examples; 20 project-work flows with their own inputs/prompts |
 | `skills/` | Authoring knowledge for AIs that *write* flows. **Not a runtime feature** — flows have no `skills:` key; never invent one |
 | `tests/` | Shell/Python behaviour suites (`engine_behaviour.sh`, `independent_checks.sh`, `skills_checks.py`, `distribution_checks.py`) + fake-tool stub |
-| `docs/v1-backlog.md`, `docs/v1.6-backlog.md` | Decision records and the current work queue |
+| `docs/` | Contracts and decision records; [`docs/README.md`](docs/README.md) says which files are current and which are historical |
 
 ## Gates (all enforced by CI on every pushed branch, 3 OSes)
 
@@ -47,14 +47,27 @@ python3 tests/distribution_checks.py
 python3 tests/skills_checks.py
 bash tests/engine_behaviour.sh ./target/release/sfh
 bash tests/independent_checks.sh ./target/release/sfh
-for f in examples/*.yaml; do ./target/release/sfh validate "$f"; ./target/release/sfh plan "$f" >/dev/null; done
-for f in examples/ponytail/[0-9][0-9]-*.yaml skills/sfh-*/assets/*.yaml; do ./target/release/sfh validate "$f"; done
+for f in examples/*.yaml; do ./target/release/sfh validate "$f" --strict; ./target/release/sfh plan "$f" >/dev/null; done
+for f in examples/ponytail/[0-9][0-9]-*.yaml skills/sfh-*/assets/*.yaml; do ./target/release/sfh validate "$f" --strict; done
 ```
+
+`--strict`, not plain `validate`. The README teaches `validate --strict` and CI
+only ran the loose check, so 192 advisory findings accumulated across the
+bundled flows while the pack's own validation report said one deliberate
+resolution was all that remained. One flow is exempt by name
+(`examples/ponytail/17-database-migration-dry-run.yaml`, which lands every
+successful path on `stuck` so a person approves a migration); the exemption is
+named in `ci.yml`, in the flow's header, and in the pack's validation report,
+and `tests/skills_checks.py` checks all three still agree.
 
 Ponytail flows are additionally validated against every bundled profile
 overlay ("the overlay parses" and "the overlay applies to this flow" are
-different claims). On Windows, run the shell suites from Git Bash; they make
-no AI calls. The toolchain is pinned in `rust-toolchain.toml`.
+different claims). A docs-only change takes a light CI path, which still runs
+`tests/distribution_checks.py`: every path in `release-resources.txt` is
+hash-pinned in `release-content-manifest.txt`, so skipping that check let a
+docs commit strand the manifest and fail the next unrelated pull request.
+On Windows, run the shell suites from Git Bash; they make no AI calls. The
+toolchain is pinned in `rust-toolchain.toml`.
 
 ## Invariants — do not break these
 
@@ -78,6 +91,14 @@ no AI calls. The toolchain is pinned in `rust-toolchain.toml`.
   re-verified the live CLIs — not when editing nearby code. The bar for
   claiming `Enforced` access is a CLI-guaranteed whole-class boundary; when
   in doubt, `BestEffort` (see the P0-02 doc comment on `Enforcement`).
+- **Every bundled flow passes `validate --strict`**, and both READMEs' whole-flow
+  examples strictly validate and dry-run. A flow or example shipped here is held
+  to the checks this project tells readers to run; the single exemption above is
+  the whole list.
+- **A number in a validation report is measured, never recalled.**
+  `tests/skills_checks.py` recomputes the ratios those reports state. The rule
+  exists because a report claimed "4 of 18 top-level examples" when there were
+  17 and one was clean.
 - **`src/guide.txt` has a 110-line budget** and every YAML fence in it must
   validate and dry-run — both test-enforced. Anything added there has to earn
   a line.
@@ -103,13 +124,21 @@ no AI calls. The toolchain is pinned in `rust-toolchain.toml`.
 
 ## Where decisions live
 
+- **[GitHub issues](https://github.com/Aero123421/SimpleFlowHarness/issues) are
+  the work queue.** Start there before proposing new work. `docs/v1.6-backlog.md`
+  used to be described here as the queue, and while it was, the only open piece
+  of real work — a documentation gap a live run had already hit — lived in an
+  issue that nobody following this file would ever see.
+- `docs/v1.6-backlog.md` — boundaries deliberately left in place, and the
+  continuing evaluation items. Read it *after* the issues: a proposal that lands
+  on one of those boundaries has to argue the boundary first.
 - `CHANGELOG.md` — user-visible changes, with reasoning (recent entries in
   Japanese; earlier in English — a language policy decision is pending, see
   the backlog).
 - `docs/v1-backlog.md` — closed hardening rounds and accepted boundaries.
-- `docs/v1.6-backlog.md` — the current work queue with acceptance criteria.
-  Start there before proposing new work; finished items move to CHANGELOG.
 - `docs/machine-api.md` — the `--json` contract callers depend on.
+- `docs/README.md` — index of the shipped docs tree, and which files are
+  historical rather than current.
 
 ## Do not
 

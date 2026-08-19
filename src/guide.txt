@@ -38,7 +38,8 @@ steps:
   - id: revise
     tool: codex
     access: full
-    max_visits: 3
+    allow_empty: true          # preset default is false: a finished turn that says nothing fails closed.
+    max_visits: 3              # Set true when the artifact is the product, and let a gate prove it.
     on_max_visits: goto:degraded
     prompt: "Revise using: {{steps.review.output | optional}}"
     route: [{goto: review}]
@@ -84,8 +85,7 @@ sfh run       flow.yaml --json --detach   # returns {run_dir, next_actions:[{arg
 sfh wait <run-dir> --json        # blocks, then {ok, state, result, result_file}
 sfh status <run-dir> --json      # add --json to stop/workspaces too
 ```
-Pass the run dir explicitly; omission selects the NEWEST. Branch on stable `error.code`, not messages.
-YAML route entries are mappings: `{goto: fix}` needs a space; `on_error: goto:fix` is the intentional scalar spelling.
+Pass the run dir explicitly; omission selects the NEWEST. Branch on stable `error.code`, not messages. YAML route entries are mappings: `{goto: fix}` needs a space; `on_error: goto:fix` is the intentional scalar spelling.
 `max_total_steps` excludes retry attempts (`plan`/`runs show` expose them); Codex/Agy/Cursor/cmd report no USD, so pair cost limits with wall time.
 PROTOCOL SALVAGE: set `on_error: continue`, then `{when_protocol_is: invalid, goto: salvage}`; failed output remains in `steps.X.outputs`.
 WORKSPACE AND CONTEXT — opt-in; omit both and every step runs in the caller's cwd as before:

@@ -31,9 +31,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(printf 'README.md\0docs/note.md\0' | bash .github/scripts/ci_scope.sh)" = false
+          test "$(printf 'CHANGELOG.md\0docs/note.md\0' | bash .github/scripts/ci_scope.sh)" = false
           test "$(printf 'README.md\0src/main.rs\0' | bash .github/scripts/ci_scope.sh)" = true
           test "$(printf 'skills/sfh-flow-design/SKILL.md\0' | bash .github/scripts/ci_scope.sh)" = true
+          # Both READMEs hold whole flows that cargo test validates and dry-runs.
+          test "$(printf 'README.md\0' | bash .github/scripts/ci_scope.sh)" = true
+          test "$(printf 'README.ja.md\0' | bash .github/scripts/ci_scope.sh)" = true
       - name: Classify CI scope
         id: classify
         shell: bash
@@ -69,6 +72,21 @@ jobs:
           fi
           echo "heavy=$heavy" >> "$GITHUB_OUTPUT"
           echo "heavy=$heavy ($reason)" >> "$GITHUB_STEP_SUMMARY"
+
+  docs-checks:
+    # The light path is not "no checks". Every path in release-resources.txt -
+    # docs/ and the root policy files included - is hash-pinned in
+    # release-content-manifest.txt, so a docs-only commit that skipped the heavy
+    # matrix landed with a stale manifest and failed the NEXT, unrelated pull
+    # request on a file it had not touched. These checks read python and git
+    # only, no cargo build, so closing that hole costs seconds.
+    needs: changes
+    if: ${{ needs.changes.outputs.heavy == 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Resource contract, content manifest, and schema pins
+        run: python3 tests/distribution_checks.py
 
   dependency-audit:
     needs: changes
@@ -114,7 +132,14 @@ jobs:
           # Top-level example YAML files are flows. examples/profiles/ holds
           # --profiles overlay files, which are not flows and are not validated
           # as such.
-          for f in examples/*.yaml; do ./target/release/sfh validate "$f"; done
+          #
+          # --strict, not plain validate. The bundled flows used to carry 192
+          # advisory findings - implicit fall-through, undeclared effects, an
+          # unbounded USD ceiling - while the pack's own validation report said
+          # the only thing left was a deliberate workspace resolution. Teaching
+          # `validate --strict` in the README and not running it here is how
+          # that gap opened.
+          for f in examples/*.yaml; do ./target/release/sfh validate "$f" --strict; done
           # `validate` never opens a context file; `plan` does, and CONTRIBUTING
           # already tells contributors to run both over every example. Only
           # validate was gated, so examples/managed-loop.yaml shipped naming a
@@ -138,7 +163,18 @@ jobs:
           # wrapper, which made the pack's own documented --profiles command
           # fail on the first try.
           for f in examples/ponytail/[0-9][0-9]-*.yaml; do
-            ./target/release/sfh validate "$f"
+            case "$f" in
+              # 17 lands every successful path on stuck so a person decides
+              # whether a migration may be applied. --strict correctly reports
+              # that no declared path reaches end or fail; the flow says why in
+              # its own header. Naming the exception here keeps every other flow
+              # under the stricter gate instead of dropping the whole pack to
+              # plain validate.
+              *17-database-migration-dry-run.yaml)
+                ./target/release/sfh validate "$f" ;;
+              *)
+                ./target/release/sfh validate "$f" --strict ;;
+            esac
           done
           # Skill assets are authoring references and promise to satisfy the
           # stricter design checks they teach readers to run.

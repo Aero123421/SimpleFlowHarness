@@ -30,6 +30,7 @@ RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 EXPECTED_RESOURCES = [
     "AGENTS.md",
     "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "README.ja.md",
@@ -52,6 +53,20 @@ WINDOWS_ASSET = "sfh-windows-x64.zip"
 TEST_APPLE_TEAM_ID = "A1B2C3D4E5"
 TEST_WINDOWS_SIGNER_SHA256 = "ab" * 32
 DISTRIBUTION_ASSETS = ["sfh-installer.ps1", "sfh-installer.sh", "sfh.rb"]
+# The `$id` every published schema carries: a raw URL pinned to a release tag,
+# naming the file it lives in.
+SCHEMA_ID_RE = re.compile(
+    r"https://raw\.githubusercontent\.com/Aero123421/SimpleFlowHarness"
+    r"/v(\d+)\.(\d+)\.(\d+)/schema/([A-Za-z0-9._-]+\.json)"
+)
+
+
+def crate_version() -> tuple[int, int]:
+    """The (major, minor) of the crate this checkout would publish."""
+    with (ROOT / "Cargo.toml").open("rb") as manifest:
+        version = tomllib.load(manifest)["package"]["version"]
+    major, minor, _ = version.split(".", 2)
+    return int(major), int(minor)
 
 
 def write_checksums(directory: Path) -> dict[str, str]:
@@ -159,8 +174,16 @@ class DistributionChecks(unittest.TestCase):
                 self.assertIn(checksums[asset], formula_text)
             self.assertNotIn("{{", formula_text)
             self.assertIn('pkgshare.install "release-resources.txt"', formula_text)
-            for resource in EXPECTED_RESOURCES:
-                self.assertIn(f'"{resource.rstrip("/")}"', formula_text)
+            # Exact, not "contains": the formula's install list is generated
+            # from release-resources.txt, so an entry the contract dropped must
+            # disappear here too. It used to be a hand-maintained second copy.
+            block = formula_text.split("pkgshare.install ", 1)[1].split("\n  end", 1)[0]
+            installed = re.findall(r'"([^"]+)"', block)
+            self.assertEqual(
+                installed,
+                ["release-resources.txt"]
+                + [resource.rstrip("/") for resource in EXPECTED_RESOURCES],
+            )
 
             ruby = shutil.which("ruby")
             if ruby:
@@ -364,6 +387,44 @@ class DistributionChecks(unittest.TestCase):
             text = (ROOT / readme).read_text(encoding="utf-8")
             pins = re.findall(r"`SFH_VERSION=([^`]+)`", text)
             self.assertEqual(pins, [version], f"stale install pin in {readme}")
+
+    def test_published_schemas_identify_the_series_they_ship_in(self) -> None:
+        """A schema's `$id` is a claim about which published document it is.
+
+        Nothing checked it, so `flow.schema.json` said it was the v1.4.0
+        document for two minor releases while every bundled flow pinned the
+        v1.6.0 URL and the file itself had gained `require_version` and
+        `when_protocol_is`. A validator that resolves `$id` as the base URI
+        fetched a different schema than the one the flows named.
+
+        Patch releases republish the same schema bytes under a new tag, so the
+        pin tracks the minor series - the same rule `skills_checks.py` applies
+        to the flows' `$schema` headers, kept identical on purpose.
+        """
+        major, minor = crate_version()
+        schemas = sorted((ROOT / "schema").glob("*.json"))
+        self.assertTrue(schemas, "no published schemas found")
+        for path in schemas:
+            with self.subTest(schema=path.name):
+                document = json.loads(path.read_text(encoding="utf-8"))
+                identifier = document.get("$id")
+                self.assertIsNotNone(identifier, "schema declares no $id")
+                found = SCHEMA_ID_RE.fullmatch(identifier)
+                self.assertIsNotNone(
+                    found,
+                    f"$id must be a raw.githubusercontent URL pinned to a v* tag: {identifier}",
+                )
+                assert found is not None
+                self.assertEqual(
+                    (int(found.group(1)), int(found.group(2))),
+                    (major, minor),
+                    "schema $id pins a different minor series than this crate",
+                )
+                self.assertEqual(
+                    found.group(4),
+                    path.name,
+                    "schema $id names a different file than it lives in",
+                )
 
     def test_shared_packager_builds_complete_tar_and_zip_packets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

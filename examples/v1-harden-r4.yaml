@@ -50,6 +50,7 @@ defaults:
 
 steps:
   - id: prep_verify
+    effects: read
     cmd: ["git", "branch", "--show-current"]
     retry_on: never
     route:
@@ -98,8 +99,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f2.output | optional | tail:60}}
+    route:
+      - {goto: gate_f2}
 
   - id: gate_f2
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -149,8 +153,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f3.output | optional | tail:60}}
+    route:
+      - {goto: gate_f3}
 
   - id: gate_f3
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -194,8 +201,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f4.output | optional | tail:60}}
+    route:
+      - {goto: gate_f4}
 
   - id: gate_f4
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -240,8 +250,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f5.output | optional | tail:60}}
+    route:
+      - {goto: gate_f5}
 
   - id: gate_f5
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -253,6 +266,7 @@ steps:
 
   # バッチA 全体のゲート。挙動テストと examples の validate まで含む重いほう。
   - id: checkA
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -343,8 +357,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f1_f7.output | optional | tail:60}}
+    route:
+      - {goto: gate_f1_f7}
 
   - id: gate_f1_f7
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -390,8 +407,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f6.output | optional | tail:60}}
+    route:
+      - {goto: gate_f6}
 
   - id: gate_f6
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -447,8 +467,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f8_f9.output | optional | tail:60}}
+    route:
+      - {goto: gate_f8_f9}
 
   - id: gate_f8_f9
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -502,8 +525,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.gate_f10_f11.output | optional | tail:60}}
+    route:
+      - {goto: gate_f10_f11}
 
   - id: gate_f10_f11
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -514,6 +540,7 @@ steps:
       - goto: fix_f10_f11
 
   - id: checkB
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -544,6 +571,7 @@ steps:
     route: [{ goto: checkB }]
 
   - id: stage
+    effects: workspace
     cmd: ["git", "add", "-A"]
     retry_on: never
     route: [{ goto: review }]
@@ -721,8 +749,11 @@ steps:
       ## 完了条件
       cargo fmt / clippy -D warnings / cargo test / cargo build --release /
       bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+    route:
+      - {goto: checkC}
 
   - id: checkC
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     retry_on: never
@@ -738,10 +769,12 @@ steps:
   # 「11項目が全員一致で通った」run と区別できない。作業は run dir に残っているので
   # 失敗(exit 1 = 配管が壊れた、再実行しろ)でもない。第 3 の終端で申告する。
   - id: unresolved
+    effects: read
     cmd: ["sh", "-c", "echo 'UNRESOLVED: the 11-item checklist did not reach unanimous pass'; git --no-pager diff --stat main"]
     retry_on: never
     route: [{ goto: stuck }]
 
   - id: wrap
+    effects: workspace
     cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED THE 11-ITEM CHECKLIST'; git --no-pager diff --stat main; echo '--- unit ---'; cargo test 2>&1 | tail -3"]
     retry_on: never

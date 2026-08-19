@@ -5,7 +5,7 @@ api_version: 1
 name: ponytail-rust-release-readiness
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: keep
 
 contexts:
@@ -47,24 +47,32 @@ steps:
     effects: workspace
     cmd: ["cargo", "fmt", "--all", "--", "--check"]
     on_error: goto:fix
+    route:
+      - {goto: clippy}
 
   - id: clippy
     effects: workspace
     cmd: ["cargo", "clippy", "--release", "--locked", "--all-targets", "--", "-D", "warnings"]
     timeout_sec: 2400
     on_error: goto:fix
+    route:
+      - {goto: test}
 
   - id: test
     effects: workspace
     cmd: ["cargo", "test", "--release", "--locked"]
     timeout_sec: 3600
     on_error: goto:fix
+    route:
+      - {goto: package}
 
   - id: package
     effects: workspace
     cmd: ["cargo", "package", "--locked"]
     timeout_sec: 1800
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

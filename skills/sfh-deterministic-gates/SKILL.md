@@ -53,6 +53,19 @@ AI produces a structured report
 
 Exact last-line routing is a practical fallback. Always add a catch-all to `stuck`.
 
+### Do not use a verdict token as proof of work
+
+Protocol success proves the agent's turn completed. It does not prove the artifact is correct. A `*_DONE` line proves even less: it proves the model chose to type it.
+
+```text
+BAD:   implementation agent → exact DONE line → success
+GOOD:  implementation agent (allow_empty: true) → deterministic gates → review
+```
+
+Both halves of the bad line fail independently. A finished implementation that ends without a closing sentence hits the preset default `allow_empty: false` and fails a run that did real work; a broken implementation that ends with `DONE` passes one. Neither outcome is about the code.
+
+Reserve exact last-line verdicts for decisions no command can make, and let commands decide everything else.
+
 ## Fan-out votes
 
 Use `when_members`, not a grep over aggregated prose. A member votes only if its own run ended cleanly and its exact final line matches. Give children `on_error: continue` so the group can evaluate all member records.

@@ -32,15 +32,26 @@ Before submitting:
 ```bash
 cargo build --release --locked
 cargo deny check
+cargo package --locked
+python3 tests/distribution_checks.py
+python3 tests/skills_checks.py
 bash tests/engine_behaviour.sh ./target/release/sfh
 bash tests/independent_checks.sh ./target/release/sfh
 for f in examples/*.yaml; do
   ./target/release/sfh validate "$f" --strict
-  ./target/release/sfh plan "$f"
+  ./target/release/sfh plan "$f" > /dev/null
 done
-cargo package --locked
-python3 tests/distribution_checks.py
+for f in examples/ponytail/[0-9][0-9]-*.yaml skills/sfh-*/assets/*.yaml; do
+  ./target/release/sfh validate "$f" --strict
+done
 ```
+
+Every bundled flow is expected to be `--strict` clean. There is exactly one
+exemption — `examples/ponytail/17-database-migration-dry-run.yaml`, which lands
+every successful path on `stuck` so a person approves a migration — and it is
+named in `ci.yml`, in the flow's own header, and in the pack's validation
+report. [AGENTS.md](AGENTS.md) carries the canonical gate list; if this section
+and that one ever disagree, AGENTS.md is the one CI implements.
 
 On Windows, run the shell suites from Git Bash. They contain no real AI calls;
 the session behavior is exercised by a local Rust stub.
