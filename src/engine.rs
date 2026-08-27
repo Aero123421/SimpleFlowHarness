@@ -936,6 +936,11 @@ struct ResumeState {
     last_executed: Option<String>,
     last_success: Option<String>,
     completed: bool,
+    /// The run's last routing decision was `stuck`, so this resume is the human
+    /// intervention stuck exists to wait for. Changing a `--var` is the ordinary
+    /// shape of that fix, which is why the guard on changed overrides steps
+    /// aside here and nowhere else.
+    resumed_from_stuck: bool,
     /// The last durable workspace fingerprint this run recorded. A resume
     /// compares the workspace against it to tell "nothing moved" from "something
     /// outside this run edited it". Absent for a run with no managed workspace,
@@ -1727,6 +1732,11 @@ fn load_resume_for_flow(
             "position" => {
                 st.pending_route = None;
                 let next = v.get("next").and_then(|x| x.as_str()).unwrap_or("");
+                // Plain assignment, not an accumulation: the run is waiting on a
+                // human only if the LAST thing it decided was stuck. A run that
+                // stuck, was resumed, and then crashed somewhere else is an
+                // ordinary crash again.
+                st.resumed_from_stuck = next == "stuck";
                 if next == "end" || next == "fail" {
                     st.completed = true;
                     st.start = None;
@@ -2394,6 +2404,34 @@ fn check_effective_config_fingerprint(
     Ok(())
 }
 
+/// How the `--var` overrides on THIS command line differ from the ones the
+/// resumed run recorded, in the execution closure's `key: old -> new` shape.
+///
+/// Empty means they agree - and also that the run dir records no `vars` object
+/// at all, which only a dir written before the field existed does: there is
+/// nothing to compare against, so there is nothing to refuse.
+fn var_override_changes(meta: &serde_json::Value, overrides: &[(String, String)]) -> Vec<String> {
+    let Some(recorded) = meta.get("vars").and_then(|x| x.as_object()) else {
+        return Vec::new();
+    };
+    // The LAST --var for a key is the one that reaches the run, and the list is
+    // sorted like closure::diff so the same difference always reads the same.
+    let mut effective: BTreeMap<&str, &str> = BTreeMap::new();
+    for (k, v) in overrides {
+        effective.insert(k.as_str(), v.as_str());
+    }
+    effective
+        .into_iter()
+        .filter_map(|(k, v)| match recorded.get(k).and_then(|x| x.as_str()) {
+            Some(old) if old == v => None,
+            Some(old) => Some(format!("vars.{k}: {old:?} -> {v:?}")),
+            // A recorded value that is not a string was never restored into the
+            // run's vars either, so it reads as absent: fail closed.
+            None => Some(format!("vars.{k}: (absent) -> {v:?}")),
+        })
+        .collect()
+}
+
 struct Status {
     state: &'static str,
     step: String,
@@ -2908,10 +2946,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // (bin / cwd / argv[0]); an explicit --var is the user's own value and stays
     // trusted (rev_break #12).
     let mut tainted_vars: HashSet<String> = HashSet::new();
-    // --var overrides this resume accepted only because --force-resume waived
-    // the refusal below. Recorded once the log is open, so the change is in the
-    // run's own history rather than only in the operator's terminal.
+    // Changed `--var` overrides this resume went ahead with anyway, and why.
+    // Both are recorded once the log is open, so the change lives in the run's
+    // own history rather than only in the operator's terminal.
     let mut forced_var_changes: Vec<String> = Vec::new();
+    let mut stuck_var_changes: Vec<String> = Vec::new();
     if let Some(dir) = &resume_dir {
         let meta = resume_meta.as_ref().expect("resume meta read above");
         if !opts.force_resume {
@@ -2949,40 +2988,6 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 if let Some(s) = v.as_str() {
                     vars.insert(k.clone(), s.to_string());
                     tainted_vars.insert(k.clone());
-                }
-            }
-            // A --var that disagrees with the value this run recorded changes
-            // what the REST of the run means while the steps already completed
-            // stand under the old value - the same split the execution closure
-            // refuses for flow bytes, overlays and context files, and the one
-            // input it never covered. Checked here, before precheck and before
-            // the run dir is touched, so a refusal costs nothing; independent
-            // of the fingerprint checks above because it is a different claim.
-            // A recorded value that is not a string was never restored either,
-            // so it reads as absent (fail closed: the override is refused).
-            // A dir with no `vars` object at all predates the field and has
-            // nothing to compare against.
-            let mut effective: BTreeMap<&str, &str> = BTreeMap::new();
-            for (k, v) in &opts.vars {
-                effective.insert(k.as_str(), v.as_str());
-            }
-            let changes: Vec<String> = effective
-                .into_iter()
-                .filter_map(|(k, v)| match obj.get(k).and_then(|x| x.as_str()) {
-                    Some(recorded) if recorded == v => None,
-                    Some(recorded) => Some(format!("vars.{k}: {recorded:?} -> {v:?}")),
-                    None => Some(format!("vars.{k}: (absent) -> {v:?}")),
-                })
-                .collect();
-            if !changes.is_empty() {
-                if opts.force_resume {
-                    forced_var_changes = changes;
-                } else {
-                    return Err(format!(
-                        "{}: the --var overrides on this command differ from the ones this run recorded, so resuming would continue a different piece of work:\n  {}\nRe-run the resume with the recorded values (or without the overrides), or pass --force-resume to accept continuing with different variables.",
-                        machine::ErrorCode::ExecutionClosureChanged.as_str(),
-                        changes.join("\n  ")
-                    ));
                 }
             }
         }
@@ -3086,6 +3091,36 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 "{}: cannot tell where to resume from",
                 dir.display()
             ));
+        }
+        // A --var that disagrees with the value this run recorded changes what
+        // the REST of the run means while the steps already done stand under the
+        // old one - the split the execution closure refuses for flow bytes,
+        // overlays and context files, and the one input it never covered.
+        //
+        // A run that stopped at `stuck` is the exception, not an oversight:
+        // stuck is the terminal that exists so a human looks at the run and
+        // fixes what it is stuck on, and a corrected --var is the ordinary
+        // shape of that fix. Anywhere else the same edit is a silent swap.
+        //
+        // Placed here rather than beside the fingerprint checks because it
+        // needs the restored routing position, and still before any step is
+        // prepared, spawned or billed.
+        let var_changes = var_override_changes(
+            resume_meta.as_ref().expect("resume meta read above"),
+            &opts.vars,
+        );
+        if !var_changes.is_empty() {
+            if resumed.resumed_from_stuck {
+                stuck_var_changes = var_changes;
+            } else if opts.force_resume {
+                forced_var_changes = var_changes;
+            } else {
+                return Err(format!(
+                    "{}: the --var overrides on this command differ from the ones this run recorded, so resuming would continue a different piece of work:\n  {}\nA run that stopped at `stuck` takes a corrected --var as the fix it is waiting for; this one stopped elsewhere.\nRe-run the resume with the recorded values (or without the overrides), or pass --force-resume to accept continuing with different variables.",
+                    machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                    var_changes.join("\n  ")
+                ));
+            }
         }
         if let Some(u) = &resumed.unfinished_step {
             // The replay decision. A step that started and never recorded an
@@ -3419,9 +3454,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let elapsed_before_attempt = resumed.elapsed_sec;
     let mut log = contain::append_private(&run_dir.join("log.jsonl"))
         .map_err(|e| format!("cannot open log: {e}"))?;
-    // The refusal these were waived past is at the resume-meta block above,
-    // where it costs nothing; this is the accepted-anyway record, parallel to
-    // the execution closure's below.
+    // The two ways a changed --var got past the guard in the resume branch
+    // above. Both are durable: what a resumed run's variables were is not
+    // reconstructable from meta.json afterwards, because run_start overwrites
+    // it with the merged map this attempt used.
     if !forced_var_changes.is_empty() {
         log_event(
             &mut log,
@@ -3431,6 +3467,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
         if !opts.quiet && !opts.as_json {
             eprintln!("sfh: warning: --force-resume accepted changed --var overrides:");
             for c in &forced_var_changes {
+                eprintln!("sfh:   {c}");
+            }
+        }
+    }
+    if !stuck_var_changes.is_empty() {
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "vars_changed_on_resume",
+                   "context": "stuck", "changes": stuck_var_changes}),
+        )?;
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: resuming the stuck run with changed variables:");
+            for c in &stuck_var_changes {
                 eprintln!("sfh:   {c}");
             }
         }
