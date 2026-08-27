@@ -2908,6 +2908,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // (bin / cwd / argv[0]); an explicit --var is the user's own value and stays
     // trusted (rev_break #12).
     let mut tainted_vars: HashSet<String> = HashSet::new();
+    // --var overrides this resume accepted only because --force-resume waived
+    // the refusal below. Recorded once the log is open, so the change is in the
+    // run's own history rather than only in the operator's terminal.
+    let mut forced_var_changes: Vec<String> = Vec::new();
     if let Some(dir) = &resume_dir {
         let meta = resume_meta.as_ref().expect("resume meta read above");
         if !opts.force_resume {
@@ -2945,6 +2949,40 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 if let Some(s) = v.as_str() {
                     vars.insert(k.clone(), s.to_string());
                     tainted_vars.insert(k.clone());
+                }
+            }
+            // A --var that disagrees with the value this run recorded changes
+            // what the REST of the run means while the steps already completed
+            // stand under the old value - the same split the execution closure
+            // refuses for flow bytes, overlays and context files, and the one
+            // input it never covered. Checked here, before precheck and before
+            // the run dir is touched, so a refusal costs nothing; independent
+            // of the fingerprint checks above because it is a different claim.
+            // A recorded value that is not a string was never restored either,
+            // so it reads as absent (fail closed: the override is refused).
+            // A dir with no `vars` object at all predates the field and has
+            // nothing to compare against.
+            let mut effective: BTreeMap<&str, &str> = BTreeMap::new();
+            for (k, v) in &opts.vars {
+                effective.insert(k.as_str(), v.as_str());
+            }
+            let changes: Vec<String> = effective
+                .into_iter()
+                .filter_map(|(k, v)| match obj.get(k).and_then(|x| x.as_str()) {
+                    Some(recorded) if recorded == v => None,
+                    Some(recorded) => Some(format!("vars.{k}: {recorded:?} -> {v:?}")),
+                    None => Some(format!("vars.{k}: (absent) -> {v:?}")),
+                })
+                .collect();
+            if !changes.is_empty() {
+                if opts.force_resume {
+                    forced_var_changes = changes;
+                } else {
+                    return Err(format!(
+                        "{}: the --var overrides on this command differ from the ones this run recorded, so resuming would continue a different piece of work:\n  {}\nRe-run the resume with the recorded values (or without the overrides), or pass --force-resume to accept continuing with different variables.",
+                        machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                        changes.join("\n  ")
+                    ));
                 }
             }
         }
@@ -3381,6 +3419,22 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let elapsed_before_attempt = resumed.elapsed_sec;
     let mut log = contain::append_private(&run_dir.join("log.jsonl"))
         .map_err(|e| format!("cannot open log: {e}"))?;
+    // The refusal these were waived past is at the resume-meta block above,
+    // where it costs nothing; this is the accepted-anyway record, parallel to
+    // the execution closure's below.
+    if !forced_var_changes.is_empty() {
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "force_resume",
+                   "reason": "var_overrides_changed", "changes": forced_var_changes}),
+        )?;
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: warning: --force-resume accepted changed --var overrides:");
+            for c in &forced_var_changes {
+                eprintln!("sfh:   {c}");
+            }
+        }
+    }
 
     // Provenance: which sfh, which tool builds. Cheap, no AI calls. Probe only
     // the (tool, bin) pairs the flow actually resolves to: an unused profile's
