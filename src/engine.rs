@@ -5924,6 +5924,19 @@ struct RunEnvelope<'a> {
 /// mapping keys off the markers sfh itself writes. Anything unrecognised stays
 /// a plain flow failure rather than being forced into a code that would tell a
 /// caller something specific and wrong.
+///
+/// The one shape that had to stop falling through is the commonest failure of
+/// all: a step exited non-zero, timed out, or blew a budget, and the flow's own
+/// control flow ended the run. `SFH_FLOW_INVALID` told a machine caller its
+/// flow file was statically invalid - a wrong diagnosis that looks actionable,
+/// so a caller branching on it would go edit a flow that is fine. Those map to
+/// `SFH_STEP_FAILED` instead.
+///
+/// Both `run_inner`'s static load errors and its run-time errors arrive here,
+/// and flow.rs's validation vocabulary also says "failed" and "max_visits"
+/// about steps ("...can continue after the child failed...", "step 'x':
+/// on_max_visits must be..."). So the run-time arm matches the engine's literal
+/// message shapes, not those words.
 pub(crate) fn run_failure_code(msg: &str) -> machine::ErrorCode {
     for code in [
         machine::ErrorCode::ProtocolInvalid,
@@ -5958,6 +5971,18 @@ pub(crate) fn run_failure_code(msg: &str) -> machine::ErrorCode {
     }
     if msg.contains("persist") {
         return machine::ErrorCode::PersistenceFailure;
+    }
+    let step_failure = msg.starts_with("step '")
+        && (msg.contains("' failed - see ")
+            || msg.contains("routed to fail")
+            || msg.contains("' exhausted max_visits (")
+            || msg.contains("' exceeded max_visits ("));
+    if step_failure
+        || msg.starts_with("on_budget (")
+        || msg.starts_with("exceeded wall_clock_sec")
+        || msg.starts_with("spend guard:")
+    {
+        return machine::ErrorCode::StepFailed;
     }
     machine::ErrorCode::FlowInvalid
 }
@@ -10430,5 +10455,64 @@ mod tests {
             "a caller executing this argv verbatim must not be missing the flag the diagnosis named: {argv:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ordinary_step_failure_classifies_as_step_failed_not_flow_invalid() {
+        // Every literal shape the engine ends a run with. Kept as literals so a
+        // reworded message that no longer matches fails here rather than
+        // silently sliding back into SFH_FLOW_INVALID.
+        for msg in [
+            "step 'boom' failed - see /tmp/x",
+            "step 'boom' failed and on_error routed to fail",
+            "step 'boom' routed to fail",
+            "step 'loopy' exhausted max_visits (5)",
+            "step 'loopy' exceeded max_visits (5) - loop not converging (set on_max_visits: goto:<id> to degrade gracefully)",
+            "on_budget (max_cost_usd) routed to fail: $1.2000 spent, 30s elapsed",
+            "exceeded wall_clock_sec (60)",
+            "spend guard: $1.2000 reported so far, over max_cost_usd ($1.0000)",
+        ] {
+            assert_eq!(
+                run_failure_code(msg),
+                machine::ErrorCode::StepFailed,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_flow_error_that_merely_says_failed_or_max_visits_stays_flow_invalid() {
+        // flow.rs's validation vocabulary says both words about steps, and its
+        // errors reach run_failure_code by the same path a run-time failure
+        // does. Matching on the words alone would report a valid flow's
+        // run-time failure and an invalid flow's authoring error as the same
+        // thing.
+        for msg in [
+            "step 'x': on_max_visits must be fail/continue/goto:<id>",
+            "step 'x': on_max_visits goto is not allowed inside parallel:",
+            "step 'x': continue_from target 'y' is a child of parallel group 'g', whose on_error can continue after the child failed without creating a session",
+            "flow could not be parsed",
+        ] {
+            assert_eq!(
+                run_failure_code(msg),
+                machine::ErrorCode::FlowInvalid,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_carrying_message_still_wins_over_the_step_failure_shape() {
+        // apply_on_error prefixes the code when it has one, so the marker scan
+        // must stay ahead of the shape match or a protocol or ownership failure
+        // would be flattened into SFH_STEP_FAILED.
+        assert_eq!(
+            run_failure_code("SFH_RUN_BUSY: step 'boom' failed - see /tmp/x"),
+            machine::ErrorCode::RunBusy
+        );
+        assert_eq!(
+            run_failure_code("SFH_PROTOCOL_INVALID: step 'boom' failed - see /tmp/x"),
+            machine::ErrorCode::ProtocolInvalid
+        );
     }
 }

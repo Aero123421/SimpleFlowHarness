@@ -35,6 +35,8 @@ pub enum ErrorCode {
     Usage,
     /// The flow file could not be loaded or failed static validation.
     FlowInvalid,
+    /// A step failed at run time and the declared control flow ended the run.
+    StepFailed,
     /// A structured tool protocol did not hold (see src/protocol.rs).
     ProtocolInvalid,
     /// A structured protocol ended without its documented terminal record.
@@ -70,6 +72,7 @@ impl ErrorCode {
         match self {
             ErrorCode::Usage => "SFH_USAGE",
             ErrorCode::FlowInvalid => "SFH_FLOW_INVALID",
+            ErrorCode::StepFailed => "SFH_STEP_FAILED",
             ErrorCode::ProtocolInvalid => "SFH_PROTOCOL_INVALID",
             ErrorCode::TerminalMissing => "SFH_TERMINAL_MISSING",
             ErrorCode::SessionUnverified => "SFH_SESSION_UNVERIFIED",
@@ -91,6 +94,7 @@ impl ErrorCode {
         [
             Self::Usage,
             Self::FlowInvalid,
+            Self::StepFailed,
             Self::ProtocolInvalid,
             Self::TerminalMissing,
             Self::SessionUnverified,
@@ -216,6 +220,7 @@ mod tests {
         let all = [
             Usage,
             FlowInvalid,
+            StepFailed,
             ProtocolInvalid,
             TerminalMissing,
             SessionUnverified,
@@ -246,6 +251,7 @@ mod tests {
         for expected in [
             "SFH_USAGE",
             "SFH_FLOW_INVALID",
+            "SFH_STEP_FAILED",
             "SFH_PROTOCOL_INVALID",
             "SFH_TERMINAL_MISSING",
             "SFH_SESSION_UNVERIFIED",
