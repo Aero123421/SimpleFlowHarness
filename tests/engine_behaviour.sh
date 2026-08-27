@@ -3814,6 +3814,16 @@ else
   echo "FAIL - F3: the resumed max_visits run re-entered the exhausted step"
   fail=$((fail + 1))
 fi
+# ...and the human terminal has to say that, not hand out a resume command that
+# lands right back here. `--json` already reports resumable:false for this run.
+contains "F3: a max_visits stuck names the exhausted step and its cap" \
+  "reached its declared max_visits" f3mv1.err
+contains "F3: a max_visits stuck says a flow edit needs --force-resume" \
+  "--force-resume" f3mv1.err
+not_contains "F3: a max_visits stuck does not hand out a resume command" \
+  "resume with:" f3mv1.err
+contains "F3: an ordinary stuck still hands out the resume command" \
+  "resume with:" f3rr1.err
 
 cat > f3-basic.yaml <<'YAML'
 name: f3-basic
@@ -5227,6 +5237,34 @@ YAML
   check "workspace: a read-only auto flow runs" 0 $?
   WSR_TREES="$( ( cd wsrepo && git worktree list ) | wc -l | tr -d ' ')"
   check "workspace: a read-only auto flow creates no worktree" 2 "$WSR_TREES"
+  # A worktree branches from a COMMIT, so uncommitted work in the source repo is
+  # invisible to every step. That has to be said up front - the flow file itself
+  # is committed here so the control run starts from a genuinely clean repo.
+  rm -rf wsdirty && mkdir wsdirty
+  cat > "$WORK/wsdirty/wsd.yaml" <<'YAML'
+name: wsd
+workspace:
+  mode: git-worktree
+steps:
+  - id: look
+    effects: workspace
+    cmd: ["sh", "-c", "pwd"]
+YAML
+  ( cd wsdirty || exit
+    git init -q . && git config user.email t@t && git config user.name t
+    echo seed > seed.txt && git add -A && git commit -qm init
+  )
+  ( cd wsdirty && "$SFH" run wsd.yaml --state-dir "$WORK/wsdclean" > ../wsd1.out 2> ../wsd1.err )
+  check "workspace: a git-worktree run from a clean source repo succeeds" 0 $?
+  not_contains "workspace: a clean source repo is not warned about" \
+    "has uncommitted changes" wsd1.err
+  ( cd wsdirty && echo local-edit >> seed.txt )
+  ( cd wsdirty && "$SFH" run wsd.yaml --state-dir "$WORK/wsddirty" > ../wsd2.out 2> ../wsd2.err )
+  check "workspace: a git-worktree run from a dirty source repo still succeeds" 0 $?
+  contains "workspace: a dirty source repo is warned about by name" \
+    "has uncommitted changes" wsd2.err
+  contains "workspace: the warning says the worktree cannot see the changes" \
+    "will NOT see them" wsd2.err
   # sfh refuses to remove a directory it did not create.
   mkdir -p not-ours fake-run && printf 'x' > not-ours/keep.txt
   printf '{"schema_version":1,"workspace_id":"primary","mode":"git-worktree","source_root":"/nope","path":"%s","created_by_sfh":true,"ownership_nonce":"forged","cleanup":"auto"}\n' \

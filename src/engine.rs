@@ -800,8 +800,14 @@ fn claim_leaf_runs(
         )
     })?;
     if next > max_total {
+        // The count is not "steps in the flow": a foreach can fan out to 100
+        // members on its own, which collides with the default cap in a way the
+        // bare number does not explain. Name what is being counted and the key
+        // that raises it, so the answer does not need the source.
         return Err(format!(
-            "step '{step}' would bring total leaf runs to {next} over max_total_steps ({max_total})"
+            "step '{step}' would bring total leaf runs to {next} over max_total_steps ({max_total}). \
+             Every fan-out member, fallback and compact summarizer counts as one leaf run; raise \
+             defaults.max_total_steps if this scale is intended."
         ));
     }
     *total = next;
@@ -936,6 +942,11 @@ struct ResumeState {
     last_executed: Option<String>,
     last_success: Option<String>,
     completed: bool,
+    /// The run's last routing decision was `stuck`, so this resume is the human
+    /// intervention stuck exists to wait for. Changing a `--var` is the ordinary
+    /// shape of that fix, which is why the guard on changed overrides steps
+    /// aside here and nowhere else.
+    resumed_from_stuck: bool,
     /// The last durable workspace fingerprint this run recorded. A resume
     /// compares the workspace against it to tell "nothing moved" from "something
     /// outside this run edited it". Absent for a run with no managed workspace,
@@ -1727,6 +1738,11 @@ fn load_resume_for_flow(
             "position" => {
                 st.pending_route = None;
                 let next = v.get("next").and_then(|x| x.as_str()).unwrap_or("");
+                // Plain assignment, not an accumulation: the run is waiting on a
+                // human only if the LAST thing it decided was stuck. A run that
+                // stuck, was resumed, and then crashed somewhere else is an
+                // ordinary crash again.
+                st.resumed_from_stuck = next == "stuck";
                 if next == "end" || next == "fail" {
                     st.completed = true;
                     st.start = None;
@@ -2394,6 +2410,34 @@ fn check_effective_config_fingerprint(
     Ok(())
 }
 
+/// How the `--var` overrides on THIS command line differ from the ones the
+/// resumed run recorded, in the execution closure's `key: old -> new` shape.
+///
+/// Empty means they agree - and also that the run dir records no `vars` object
+/// at all, which only a dir written before the field existed does: there is
+/// nothing to compare against, so there is nothing to refuse.
+fn var_override_changes(meta: &serde_json::Value, overrides: &[(String, String)]) -> Vec<String> {
+    let Some(recorded) = meta.get("vars").and_then(|x| x.as_object()) else {
+        return Vec::new();
+    };
+    // The LAST --var for a key is the one that reaches the run, and the list is
+    // sorted like closure::diff so the same difference always reads the same.
+    let mut effective: BTreeMap<&str, &str> = BTreeMap::new();
+    for (k, v) in overrides {
+        effective.insert(k.as_str(), v.as_str());
+    }
+    effective
+        .into_iter()
+        .filter_map(|(k, v)| match recorded.get(k).and_then(|x| x.as_str()) {
+            Some(old) if old == v => None,
+            Some(old) => Some(format!("vars.{k}: {old:?} -> {v:?}")),
+            // A recorded value that is not a string was never restored into the
+            // run's vars either, so it reads as absent: fail closed.
+            None => Some(format!("vars.{k}: (absent) -> {v:?}")),
+        })
+        .collect()
+}
+
 struct Status {
     state: &'static str,
     step: String,
@@ -2908,6 +2952,11 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     // (bin / cwd / argv[0]); an explicit --var is the user's own value and stays
     // trusted (rev_break #12).
     let mut tainted_vars: HashSet<String> = HashSet::new();
+    // Changed `--var` overrides this resume went ahead with anyway, and why.
+    // Both are recorded once the log is open, so the change lives in the run's
+    // own history rather than only in the operator's terminal.
+    let mut forced_var_changes: Vec<String> = Vec::new();
+    let mut stuck_var_changes: Vec<String> = Vec::new();
     if let Some(dir) = &resume_dir {
         let meta = resume_meta.as_ref().expect("resume meta read above");
         if !opts.force_resume {
@@ -3048,6 +3097,36 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 "{}: cannot tell where to resume from",
                 dir.display()
             ));
+        }
+        // A --var that disagrees with the value this run recorded changes what
+        // the REST of the run means while the steps already done stand under the
+        // old one - the split the execution closure refuses for flow bytes,
+        // overlays and context files, and the one input it never covered.
+        //
+        // A run that stopped at `stuck` is the exception, not an oversight:
+        // stuck is the terminal that exists so a human looks at the run and
+        // fixes what it is stuck on, and a corrected --var is the ordinary
+        // shape of that fix. Anywhere else the same edit is a silent swap.
+        //
+        // Placed here rather than beside the fingerprint checks because it
+        // needs the restored routing position, and still before any step is
+        // prepared, spawned or billed.
+        let var_changes = var_override_changes(
+            resume_meta.as_ref().expect("resume meta read above"),
+            &opts.vars,
+        );
+        if !var_changes.is_empty() {
+            if resumed.resumed_from_stuck {
+                stuck_var_changes = var_changes;
+            } else if opts.force_resume {
+                forced_var_changes = var_changes;
+            } else {
+                return Err(format!(
+                    "{}: the --var overrides on this command differ from the ones this run recorded, so resuming would continue a different piece of work:\n  {}\nA run that stopped at `stuck` takes a corrected --var as the fix it is waiting for; this one stopped elsewhere.\nRe-run the resume with the recorded values (or without the overrides), or pass --force-resume to accept continuing with different variables.",
+                    machine::ErrorCode::ExecutionClosureChanged.as_str(),
+                    var_changes.join("\n  ")
+                ));
+            }
         }
         if let Some(u) = &resumed.unfinished_step {
             // The replay decision. A step that started and never recorded an
@@ -3381,6 +3460,36 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
     let elapsed_before_attempt = resumed.elapsed_sec;
     let mut log = contain::append_private(&run_dir.join("log.jsonl"))
         .map_err(|e| format!("cannot open log: {e}"))?;
+    // The two ways a changed --var got past the guard in the resume branch
+    // above. Both are durable: what a resumed run's variables were is not
+    // reconstructable from meta.json afterwards, because run_start overwrites
+    // it with the merged map this attempt used.
+    if !forced_var_changes.is_empty() {
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "force_resume",
+                   "reason": "var_overrides_changed", "changes": forced_var_changes}),
+        )?;
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: warning: --force-resume accepted changed --var overrides:");
+            for c in &forced_var_changes {
+                eprintln!("sfh:   {c}");
+            }
+        }
+    }
+    if !stuck_var_changes.is_empty() {
+        log_event(
+            &mut log,
+            json!({"ts": utc_stamp(), "event": "vars_changed_on_resume",
+                   "context": "stuck", "changes": stuck_var_changes}),
+        )?;
+        if !opts.quiet && !opts.as_json {
+            eprintln!("sfh: resuming the stuck run with changed variables:");
+            for c in &stuck_var_changes {
+                eprintln!("sfh:   {c}");
+            }
+        }
+    }
 
     // Provenance: which sfh, which tool builds. Cheap, no AI calls. Probe only
     // the (tool, bin) pairs the flow actually resolves to: an unused profile's
@@ -3576,6 +3685,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 ws.path.display(),
                 ws.branch.as_deref().unwrap_or("-")
             );
+            // The worktree branches from a COMMIT, so uncommitted work in the
+            // source repo is invisible to every step - the one workspace
+            // surprise that reads as the agent lying about the code. Advisory
+            // only: an unreadable dirtiness answer must neither block the run
+            // nor be reported as one.
+            if matches!(workspace::is_dirty(&ws.source_root), Ok(true)) {
+                eprintln!(
+                    "sfh: warning: {} has uncommitted changes; this workspace branches from commit \
+                     {} and will NOT see them - commit or stash first if the flow should work on them",
+                    ws.source_root.display(),
+                    ws.base_commit.as_deref().unwrap_or("-")
+                );
+            }
         }
         workspace = Some(ws);
     } else if workspace_plan.resolved == flow::WorkspaceMode::Directory {
@@ -5858,7 +5980,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             emit_partial(&partial_pick);
             finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg))?;
             eprintln!("sfh: run dir: {}", run_dir.display());
-            print_resume_hint();
+            // A max_visits stuck is the one stuck resume cannot move: the visit
+            // counter is not reset, so the exhausted step routes to stuck again
+            // before running anything. Handing out the resume hint here is an
+            // advice loop; --json already refuses to call this resumable.
+            match stuck_step_exhausted_max_visits(&run_dir) {
+                Some(step) => eprintln!(
+                    "sfh: step '{step}' reached its declared max_visits; resuming walks straight \
+                     back into it and sticks again without running anything. Raise max_visits (or \
+                     change on_max_visits) in the flow, then resume - editing the flow needs \
+                     --force-resume."
+                ),
+                None => print_resume_hint(),
+            }
             Ok(4)
         }
         Err(msg) => {
@@ -5924,6 +6058,19 @@ struct RunEnvelope<'a> {
 /// mapping keys off the markers sfh itself writes. Anything unrecognised stays
 /// a plain flow failure rather than being forced into a code that would tell a
 /// caller something specific and wrong.
+///
+/// The one shape that had to stop falling through is the commonest failure of
+/// all: a step exited non-zero, timed out, or blew a budget, and the flow's own
+/// control flow ended the run. `SFH_FLOW_INVALID` told a machine caller its
+/// flow file was statically invalid - a wrong diagnosis that looks actionable,
+/// so a caller branching on it would go edit a flow that is fine. Those map to
+/// `SFH_STEP_FAILED` instead.
+///
+/// Both `run_inner`'s static load errors and its run-time errors arrive here,
+/// and flow.rs's validation vocabulary also says "failed" and "max_visits"
+/// about steps ("...can continue after the child failed...", "step 'x':
+/// on_max_visits must be..."). So the run-time arm matches the engine's literal
+/// message shapes, not those words.
 pub(crate) fn run_failure_code(msg: &str) -> machine::ErrorCode {
     for code in [
         machine::ErrorCode::ProtocolInvalid,
@@ -5958,6 +6105,18 @@ pub(crate) fn run_failure_code(msg: &str) -> machine::ErrorCode {
     }
     if msg.contains("persist") {
         return machine::ErrorCode::PersistenceFailure;
+    }
+    let step_failure = msg.starts_with("step '")
+        && (msg.contains("' failed - see ")
+            || msg.contains("routed to fail")
+            || msg.contains("' exhausted max_visits (")
+            || msg.contains("' exceeded max_visits ("));
+    if step_failure
+        || msg.starts_with("on_budget (")
+        || msg.starts_with("exceeded wall_clock_sec")
+        || msg.starts_with("spend guard:")
+    {
+        return machine::ErrorCode::StepFailed;
     }
     machine::ErrorCode::FlowInvalid
 }
@@ -8634,6 +8793,11 @@ mod tests {
         claim_leaf_runs(&mut total, 1, 1, "primary").unwrap();
         let error = claim_leaf_runs(&mut total, 1, 1, "fallback").unwrap_err();
         assert!(error.contains("max_total_steps (1)"), "{error}");
+        // The number alone does not say what was counted or where to change it.
+        assert!(
+            error.contains("defaults.max_total_steps"),
+            "the refusal must name the key that raises the limit: {error}"
+        );
         assert_eq!(total, 1, "a rejected claim must not mutate the count");
     }
 
@@ -9123,6 +9287,224 @@ mod tests {
             "an absent exit restores as a failure code"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stopped run of a two-step flow with `topic` recorded as "alpha",
+    /// whose last routing decision was `next` ("two" for an ordinary crash,
+    /// "stuck" for a run waiting on a human). Returns (root, flow, run dir):
+    /// the caller resumes it with whatever `--var` set it wants to test.
+    fn stopped_run_with_recorded_var(tag: &str, next: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("sfh-var-{tag}-{}", contain::random_nonce()));
+        let run_dir = root.join("run");
+        contain::mkdir_private(&root).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        let flow_path = root.join("flow.yaml");
+        let flow_text = concat!(
+            "api_version: 1\n",
+            "name: varguard\n",
+            "vars:\n",
+            "  topic: \"unset\"\n",
+            "steps:\n",
+            "  - id: one\n",
+            "    cmd: [\"echo\", \"one\"]\n",
+            "  - id: two\n",
+            "    cmd: [\"echo\", \"{{vars.topic}}\"]\n",
+        );
+        std::fs::write(&flow_path, flow_text).unwrap();
+        let loaded = flow::load_with_overlays(&flow_path, &[]).expect("fixture flow loads");
+        let effective = loaded.effective_config_json().expect("effective config");
+        // Both fingerprints must match or check_flow_fingerprint /
+        // check_effective_config_fingerprint refuse first and the var guard is
+        // never reached - the point is to exercise it WITHOUT --force-resume.
+        let meta = json!({
+            "schema_version": 1,
+            "sfh_version": VERSION,
+            "flow": abs(&flow_path).display().to_string(),
+            "flow_fingerprint": fingerprint(flow_text),
+            "flow_fingerprint_algo": FINGERPRINT_ALGO,
+            "effective_config_fingerprint": fingerprint(&effective),
+            "effective_config_fingerprint_algo": FINGERPRINT_ALGO,
+            "name": "varguard",
+            "vars": {"topic": "alpha"},
+            "resumed": false,
+        });
+        std::fs::write(
+            run_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("log.jsonl"),
+            format!(
+                "{}{}\n",
+                "{\"event\":\"step_end\",\"step\":\"one\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false}\n",
+                json!({"event": "position", "after": "one", "next": next}),
+            ),
+        )
+        .unwrap();
+        (root, flow_path, run_dir)
+    }
+
+    fn resume_opts(
+        flow_path: &Path,
+        run_dir: &Path,
+        root: &Path,
+        vars: &[(&str, &str)],
+        force_resume: bool,
+    ) -> RunOpts {
+        RunOpts {
+            flow_path: flow_path.to_path_buf(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            runs_dir: Some(root.join("runs")),
+            state_dir: Some(root.join("state")),
+            resume: Some(run_dir.to_path_buf()),
+            force_resume,
+            quiet: true,
+            ..Default::default()
+        }
+    }
+
+    fn log_events(run_dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    /// Did the changed-`--var` guard refuse this attempt?
+    ///
+    /// The guard's whole verdict is its return value, so that is what these
+    /// tests read. Asking instead whether the run reached `run_start` would
+    /// answer a much larger question - the lease, the owner-liveness proof, the
+    /// nonce and the step itself all sit between the two - and make any
+    /// unrelated per-OS difference in that machinery read as a verdict here.
+    fn refused_for_changed_vars(outcome: &Result<i32, String>) -> bool {
+        matches!(outcome, Err(e)
+            if e.starts_with(machine::ErrorCode::ExecutionClosureChanged.as_str())
+                && e.contains("--var overrides on this command differ"))
+    }
+
+    #[test]
+    fn resume_refuses_a_var_override_that_disagrees_with_the_one_the_run_recorded() {
+        // The execution closure refuses a one-byte edit to a context file, but
+        // --var was never part of it: the steps already done keep the old value
+        // and everything after uses the new one, silently. Both a CHANGED value
+        // and a brand-new key are that same split.
+        // A fresh run dir per leg: an attempt leaves a lease file and, once it
+        // gets past this guard, a nonce and a status behind, and a later
+        // attempt in the same process reads those as ownership facts. Sharing
+        // one dir would mix that machinery into the verdict under test.
+        for (vars, expected) in [
+            (vec![("topic", "beta")], "vars.topic: \"alpha\" -> \"beta\""),
+            (
+                vec![("brand_new", "x")],
+                "vars.brand_new: (absent) -> \"x\"",
+            ),
+        ] {
+            let (root, flow_path, run_dir) = stopped_run_with_recorded_var("changed", "two");
+            let before = std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap();
+            let opts = resume_opts(&flow_path, &run_dir, &root, &vars, false);
+            let outcome = run_inner(&opts);
+            assert!(
+                refused_for_changed_vars(&outcome),
+                "a changed --var must refuse the resume: {outcome:?}"
+            );
+            let err = outcome.unwrap_err();
+            assert!(
+                err.starts_with(machine::ErrorCode::ExecutionClosureChanged.as_str()),
+                "run_failure_code keys on the marker prefix: {err}"
+            );
+            assert!(err.contains(expected), "the differing var is named: {err}");
+            assert!(
+                err.contains("--force-resume"),
+                "the refusal names the way past it: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap(),
+                before,
+                "the refusal must land before anything is executed or recorded"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // Re-passing the RECORDED value is how a var is un-tainted for an
+        // executed-privileged field; it must stay a no-op, not a refusal.
+        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("identical", "two");
+        let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "alpha")], false);
+        let outcome = run_inner(&opts);
+        assert!(
+            !refused_for_changed_vars(&outcome),
+            "an identical --var is not a changed one: {outcome:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn force_resume_accepts_changed_var_overrides_and_records_them_in_the_log() {
+        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("forced", "two");
+        let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], true);
+        let outcome = run_inner(&opts);
+        assert!(
+            !refused_for_changed_vars(&outcome),
+            "--force-resume must waive the refusal: {outcome:?}"
+        );
+
+        let events = log_events(&run_dir);
+        assert!(
+            events.iter().any(|e| e["event"] == "run_start"),
+            "--force-resume must let the resume start: {outcome:?}"
+        );
+        let forced = events
+            .iter()
+            .find(|e| e["event"] == "force_resume" && e["reason"] == "var_overrides_changed")
+            .expect("the waived change is recorded in the run's own history");
+        assert_eq!(
+            forced["changes"],
+            json!(["vars.topic: \"alpha\" -> \"beta\""]),
+            "the record names what moved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stuck_run_takes_a_changed_var_as_the_fix_it_was_waiting_for() {
+        // stuck is the terminal that hands the run back to a human, and a
+        // corrected --var is the ordinary fix. Refusing it there would have
+        // made the one workflow stuck exists for need --force-resume.
+        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("stuck", "stuck");
+        let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], false);
+        let outcome = run_inner(&opts);
+        assert!(
+            !refused_for_changed_vars(&outcome),
+            "a stuck run must take a changed --var without --force-resume: {outcome:?}"
+        );
+
+        let events = log_events(&run_dir);
+        assert!(
+            events.iter().any(|e| e["event"] == "run_start"),
+            "a stuck run must resume with a changed --var and no --force-resume: {outcome:?}"
+        );
+        let noted = events
+            .iter()
+            .find(|e| e["event"] == "vars_changed_on_resume")
+            .expect("the change is still recorded, allowed is not unremarked");
+        assert_eq!(noted["context"], "stuck");
+        assert_eq!(
+            noted["changes"],
+            json!(["vars.topic: \"alpha\" -> \"beta\""])
+        );
+        assert!(
+            !events.iter().any(|e| e["event"] == "force_resume"),
+            "the stuck path is not a forced resume"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -10430,5 +10812,64 @@ mod tests {
             "a caller executing this argv verbatim must not be missing the flag the diagnosis named: {argv:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ordinary_step_failure_classifies_as_step_failed_not_flow_invalid() {
+        // Every literal shape the engine ends a run with. Kept as literals so a
+        // reworded message that no longer matches fails here rather than
+        // silently sliding back into SFH_FLOW_INVALID.
+        for msg in [
+            "step 'boom' failed - see /tmp/x",
+            "step 'boom' failed and on_error routed to fail",
+            "step 'boom' routed to fail",
+            "step 'loopy' exhausted max_visits (5)",
+            "step 'loopy' exceeded max_visits (5) - loop not converging (set on_max_visits: goto:<id> to degrade gracefully)",
+            "on_budget (max_cost_usd) routed to fail: $1.2000 spent, 30s elapsed",
+            "exceeded wall_clock_sec (60)",
+            "spend guard: $1.2000 reported so far, over max_cost_usd ($1.0000)",
+        ] {
+            assert_eq!(
+                run_failure_code(msg),
+                machine::ErrorCode::StepFailed,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_static_flow_error_that_merely_says_failed_or_max_visits_stays_flow_invalid() {
+        // flow.rs's validation vocabulary says both words about steps, and its
+        // errors reach run_failure_code by the same path a run-time failure
+        // does. Matching on the words alone would report a valid flow's
+        // run-time failure and an invalid flow's authoring error as the same
+        // thing.
+        for msg in [
+            "step 'x': on_max_visits must be fail/continue/goto:<id>",
+            "step 'x': on_max_visits goto is not allowed inside parallel:",
+            "step 'x': continue_from target 'y' is a child of parallel group 'g', whose on_error can continue after the child failed without creating a session",
+            "flow could not be parsed",
+        ] {
+            assert_eq!(
+                run_failure_code(msg),
+                machine::ErrorCode::FlowInvalid,
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_carrying_message_still_wins_over_the_step_failure_shape() {
+        // apply_on_error prefixes the code when it has one, so the marker scan
+        // must stay ahead of the shape match or a protocol or ownership failure
+        // would be flattened into SFH_STEP_FAILED.
+        assert_eq!(
+            run_failure_code("SFH_RUN_BUSY: step 'boom' failed - see /tmp/x"),
+            machine::ErrorCode::RunBusy
+        );
+        assert_eq!(
+            run_failure_code("SFH_PROTOCOL_INVALID: step 'boom' failed - see /tmp/x"),
+            machine::ErrorCode::ProtocolInvalid
+        );
     }
 }

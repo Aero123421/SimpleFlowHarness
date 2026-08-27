@@ -199,6 +199,8 @@ SFH_EXECUTION_CLOSURE_CHANGED: the execution closure changed since this run star
   context.task: sha256:9bc86fb26f3c -> sha256:d1811c82b034
 ```
 
+`--var` の上書きも同じ規則に従います。記録された値と異なる `--var` での resume は同じ安定 code で拒否されます — 例外は `stuck` で停止した run（修正した `--var` こそが stuck が待っている人間の判断であり、`vars_changed_on_resume` event として記録されます）と、`--force-resume` による受け入れ（reason `var_overrides_changed` の `force_resume` event として記録）です。記録どおりの値を再指定することは常に許可されます。
+
 `--force-resume` はこれを意図的に受け入れ、`force_resume` event を記録します。後述の `--adopt-workspace` とは別の問いであり、片方がもう片方を免除することはありません。
 
 ---
@@ -455,7 +457,7 @@ sfh wait <run-dir> --json               # 完了までブロックし、結果�
 
 失敗には `schema_version` が変わらない限り意味が固定された code が付きます（現在は `1`）。message は改善され得るので、code で分岐してください。
 
-`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`
+`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_STEP_FAILED`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`
 
 **run directory は必ず明示してください。** path を省略したコマンドは最新の run を選び、`"implicit_target": true` を返します。agent が望む挙動であることは稀です。
 

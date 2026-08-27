@@ -197,6 +197,8 @@ SFH_EXECUTION_CLOSURE_CHANGED: the execution closure changed since this run star
   context.task: sha256:9bc86fb26f3c -> sha256:d1811c82b034
 ```
 
+`--var` overrides are held to the same rule: a resume whose `--var` differs from the value the run recorded is refused with the same stable code — unless the run stopped at `stuck`, where a corrected `--var` is exactly the fix the run is waiting for (recorded as a `vars_changed_on_resume` event), or `--force-resume` accepts it (recorded as a `force_resume` event with reason `var_overrides_changed`). Re-passing the recorded value is always allowed.
+
 `--force-resume` accepts that deliberately and records a `force_resume` event. It is a separate question from `--adopt-workspace` (below), and one flag never waives the other.
 
 ---
@@ -472,7 +474,7 @@ sfh wait <run-dir> --json               # blocks, then the result
 
 Failures carry a code whose meaning is fixed for as long as `schema_version` does not change (currently `1`) — branch on the code, not on the message, which is allowed to improve:
 
-`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`.
+`SFH_USAGE`, `SFH_FLOW_INVALID`, `SFH_STEP_FAILED`, `SFH_PROTOCOL_INVALID`, `SFH_TERMINAL_MISSING`, `SFH_SESSION_UNVERIFIED`, `SFH_EXECUTION_CLOSURE_CHANGED`, `SFH_WORKSPACE_MISSING`, `SFH_WORKSPACE_DRIFT`, `SFH_WORKSPACE_BUSY`, `SFH_RUN_BUSY`, `SFH_WORKSPACE_UNOWNED`, `SFH_REPLAY_REFUSED`, `SFH_PERSISTENCE_FAILURE`, `SFH_CAPABILITY_UNAVAILABLE`, `SFH_STUCK`, `SFH_INTERRUPTED`.
 
 **Always pass the run directory explicitly.** A command given no path selects the newest run and says so with `"implicit_target": true`, which is rarely what an agent wants.
 
