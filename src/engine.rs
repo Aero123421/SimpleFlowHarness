@@ -9204,6 +9204,162 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A crashed run of a two-step flow, stopped after `one`, with `topic`
+    /// recorded as "alpha". Returns (root, flow path, run dir): the caller
+    /// resumes it with whatever `--var` set it wants to test.
+    fn crashed_run_with_recorded_var(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("sfh-var-{tag}-{}", contain::random_nonce()));
+        let run_dir = root.join("run");
+        contain::mkdir_private(&root).unwrap();
+        contain::mkdir_private(&run_dir).unwrap();
+        let flow_path = root.join("flow.yaml");
+        let flow_text = concat!(
+            "api_version: 1\n",
+            "name: varguard\n",
+            "vars:\n",
+            "  topic: \"unset\"\n",
+            "steps:\n",
+            "  - id: one\n",
+            "    cmd: [\"echo\", \"one\"]\n",
+            "  - id: two\n",
+            "    cmd: [\"echo\", \"{{vars.topic}}\"]\n",
+        );
+        std::fs::write(&flow_path, flow_text).unwrap();
+        let loaded = flow::load_with_overlays(&flow_path, &[]).expect("fixture flow loads");
+        let effective = loaded.effective_config_json().expect("effective config");
+        // Both fingerprints must match or check_flow_fingerprint /
+        // check_effective_config_fingerprint refuse first and the var guard is
+        // never reached - the point is to exercise it WITHOUT --force-resume.
+        let meta = json!({
+            "schema_version": 1,
+            "sfh_version": VERSION,
+            "flow": abs(&flow_path).display().to_string(),
+            "flow_fingerprint": fingerprint(flow_text),
+            "flow_fingerprint_algo": FINGERPRINT_ALGO,
+            "effective_config_fingerprint": fingerprint(&effective),
+            "effective_config_fingerprint_algo": FINGERPRINT_ALGO,
+            "name": "varguard",
+            "vars": {"topic": "alpha"},
+            "resumed": false,
+        });
+        std::fs::write(
+            run_dir.join("meta.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("log.jsonl"),
+            concat!(
+                "{\"event\":\"step_end\",\"step\":\"one\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false}\n",
+                "{\"event\":\"position\",\"after\":\"one\",\"next\":\"two\"}\n",
+            ),
+        )
+        .unwrap();
+        (root, flow_path, run_dir)
+    }
+
+    fn resume_opts(
+        flow_path: &Path,
+        run_dir: &Path,
+        root: &Path,
+        vars: &[(&str, &str)],
+        force_resume: bool,
+    ) -> RunOpts {
+        RunOpts {
+            flow_path: flow_path.to_path_buf(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            runs_dir: Some(root.join("runs")),
+            state_dir: Some(root.join("state")),
+            resume: Some(run_dir.to_path_buf()),
+            force_resume,
+            quiet: true,
+            ..Default::default()
+        }
+    }
+
+    fn log_events(run_dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(run_dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .collect()
+    }
+
+    #[test]
+    fn resume_refuses_a_var_override_that_disagrees_with_the_one_the_run_recorded() {
+        // The execution closure refuses a one-byte edit to a context file, but
+        // --var was never part of it: the steps already done keep the old value
+        // and everything after uses the new one, silently. Both a CHANGED value
+        // and a brand-new key are that same split.
+        let (root, flow_path, run_dir) = crashed_run_with_recorded_var("changed");
+        let before = std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap();
+
+        for (vars, expected) in [
+            (vec![("topic", "beta")], "vars.topic: \"alpha\" -> \"beta\""),
+            (
+                vec![("brand_new", "x")],
+                "vars.brand_new: (absent) -> \"x\"",
+            ),
+        ] {
+            let opts = resume_opts(&flow_path, &run_dir, &root, &vars, false);
+            let err = run_inner(&opts).expect_err("a changed --var must refuse the resume");
+            assert!(
+                err.starts_with(machine::ErrorCode::ExecutionClosureChanged.as_str()),
+                "run_failure_code keys on the marker prefix: {err}"
+            );
+            assert!(err.contains(expected), "the differing var is named: {err}");
+            assert!(
+                err.contains("--force-resume"),
+                "the refusal names the way past it: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap(),
+                before,
+                "the refusal must cost nothing: the run dir is untouched"
+            );
+        }
+
+        // Re-passing the RECORDED value is how a var is un-tainted for an
+        // executed-privileged field; it must stay a no-op, not a refusal.
+        let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "alpha")], false);
+        let _ = run_inner(&opts);
+        assert!(
+            log_events(&run_dir)
+                .iter()
+                .any(|e| e["event"] == "run_start"),
+            "an identical --var must let the resume start"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn force_resume_accepts_changed_var_overrides_and_records_them_in_the_log() {
+        let (root, flow_path, run_dir) = crashed_run_with_recorded_var("forced");
+        let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], true);
+        let _ = run_inner(&opts);
+
+        let events = log_events(&run_dir);
+        assert!(
+            events.iter().any(|e| e["event"] == "run_start"),
+            "--force-resume must let the resume start"
+        );
+        let forced = events
+            .iter()
+            .find(|e| e["event"] == "force_resume" && e["reason"] == "var_overrides_changed")
+            .expect("the waived change is recorded in the run's own history");
+        assert_eq!(
+            forced["changes"],
+            json!(["vars.topic: \"alpha\" -> \"beta\""]),
+            "the record names what moved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn resume_replays_failed_on_error_control_without_reprobing() {
         let dir =
