@@ -9253,10 +9253,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A crashed run of a two-step flow, stopped after `one`, with `topic`
-    /// recorded as "alpha". Returns (root, flow path, run dir): the caller
-    /// resumes it with whatever `--var` set it wants to test.
-    fn crashed_run_with_recorded_var(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    /// A stopped run of a two-step flow with `topic` recorded as "alpha",
+    /// whose last routing decision was `next` ("two" for an ordinary crash,
+    /// "stuck" for a run waiting on a human). Returns (root, flow, run dir):
+    /// the caller resumes it with whatever `--var` set it wants to test.
+    fn stopped_run_with_recorded_var(tag: &str, next: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!("sfh-var-{tag}-{}", contain::random_nonce()));
         let run_dir = root.join("run");
         contain::mkdir_private(&root).unwrap();
@@ -9298,9 +9299,10 @@ mod tests {
         .unwrap();
         std::fs::write(
             run_dir.join("log.jsonl"),
-            concat!(
+            format!(
+                "{}{}\n",
                 "{\"event\":\"step_end\",\"step\":\"one\",\"visit\":1,\"exit\":0,\"timed_out\":false,\"interrupted\":false}\n",
-                "{\"event\":\"position\",\"after\":\"one\",\"next\":\"two\"}\n",
+                json!({"event": "position", "after": "one", "next": next}),
             ),
         )
         .unwrap();
@@ -9343,7 +9345,7 @@ mod tests {
         // --var was never part of it: the steps already done keep the old value
         // and everything after uses the new one, silently. Both a CHANGED value
         // and a brand-new key are that same split.
-        let (root, flow_path, run_dir) = crashed_run_with_recorded_var("changed");
+        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("changed", "two");
         let before = std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap();
 
         for (vars, expected) in [
@@ -9367,7 +9369,7 @@ mod tests {
             assert_eq!(
                 std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap(),
                 before,
-                "the refusal must cost nothing: the run dir is untouched"
+                "the refusal must land before anything is executed or recorded"
             );
         }
 
@@ -9387,7 +9389,7 @@ mod tests {
 
     #[test]
     fn force_resume_accepts_changed_var_overrides_and_records_them_in_the_log() {
-        let (root, flow_path, run_dir) = crashed_run_with_recorded_var("forced");
+        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("forced", "two");
         let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], true);
         let _ = run_inner(&opts);
 
@@ -9404,6 +9406,37 @@ mod tests {
             forced["changes"],
             json!(["vars.topic: \"alpha\" -> \"beta\""]),
             "the record names what moved"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stuck_run_takes_a_changed_var_as_the_fix_it_was_waiting_for() {
+        // stuck is the terminal that hands the run back to a human, and a
+        // corrected --var is the ordinary fix. Refusing it there would have
+        // made the one workflow stuck exists for need --force-resume.
+        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("stuck", "stuck");
+        let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], false);
+        let _ = run_inner(&opts);
+
+        let events = log_events(&run_dir);
+        assert!(
+            events.iter().any(|e| e["event"] == "run_start"),
+            "a stuck run must resume with a changed --var and no --force-resume"
+        );
+        let noted = events
+            .iter()
+            .find(|e| e["event"] == "vars_changed_on_resume")
+            .expect("the change is still recorded, allowed is not unremarked");
+        assert_eq!(noted["context"], "stuck");
+        assert_eq!(
+            noted["changes"],
+            json!(["vars.topic: \"alpha\" -> \"beta\""])
+        );
+        assert!(
+            !events.iter().any(|e| e["event"] == "force_resume"),
+            "the stuck path is not a forced resume"
         );
 
         let _ = std::fs::remove_dir_all(&root);
