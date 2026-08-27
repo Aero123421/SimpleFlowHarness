@@ -800,8 +800,14 @@ fn claim_leaf_runs(
         )
     })?;
     if next > max_total {
+        // The count is not "steps in the flow": a foreach can fan out to 100
+        // members on its own, which collides with the default cap in a way the
+        // bare number does not explain. Name what is being counted and the key
+        // that raises it, so the answer does not need the source.
         return Err(format!(
-            "step '{step}' would bring total leaf runs to {next} over max_total_steps ({max_total})"
+            "step '{step}' would bring total leaf runs to {next} over max_total_steps ({max_total}). \
+             Every fan-out member, fallback and compact summarizer counts as one leaf run; raise \
+             defaults.max_total_steps if this scale is intended."
         ));
     }
     *total = next;
@@ -3679,6 +3685,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 ws.path.display(),
                 ws.branch.as_deref().unwrap_or("-")
             );
+            // The worktree branches from a COMMIT, so uncommitted work in the
+            // source repo is invisible to every step - the one workspace
+            // surprise that reads as the agent lying about the code. Advisory
+            // only: an unreadable dirtiness answer must neither block the run
+            // nor be reported as one.
+            if matches!(workspace::is_dirty(&ws.source_root), Ok(true)) {
+                eprintln!(
+                    "sfh: warning: {} has uncommitted changes; this workspace branches from commit \
+                     {} and will NOT see them - commit or stash first if the flow should work on them",
+                    ws.source_root.display(),
+                    ws.base_commit.as_deref().unwrap_or("-")
+                );
+            }
         }
         workspace = Some(ws);
     } else if workspace_plan.resolved == flow::WorkspaceMode::Directory {
@@ -5961,7 +5980,19 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             emit_partial(&partial_pick);
             finish("stuck", cost_usd, 4, partial_pick.as_deref(), Some(&msg))?;
             eprintln!("sfh: run dir: {}", run_dir.display());
-            print_resume_hint();
+            // A max_visits stuck is the one stuck resume cannot move: the visit
+            // counter is not reset, so the exhausted step routes to stuck again
+            // before running anything. Handing out the resume hint here is an
+            // advice loop; --json already refuses to call this resumable.
+            match stuck_step_exhausted_max_visits(&run_dir) {
+                Some(step) => eprintln!(
+                    "sfh: step '{step}' reached its declared max_visits; resuming walks straight \
+                     back into it and sticks again without running anything. Raise max_visits (or \
+                     change on_max_visits) in the flow, then resume - editing the flow needs \
+                     --force-resume."
+                ),
+                None => print_resume_hint(),
+            }
             Ok(4)
         }
         Err(msg) => {
@@ -8762,6 +8793,11 @@ mod tests {
         claim_leaf_runs(&mut total, 1, 1, "primary").unwrap();
         let error = claim_leaf_runs(&mut total, 1, 1, "fallback").unwrap_err();
         assert!(error.contains("max_total_steps (1)"), "{error}");
+        // The number alone does not say what was counted or where to change it.
+        assert!(
+            error.contains("defaults.max_total_steps"),
+            "the refusal must name the key that raises the limit: {error}"
+        );
         assert_eq!(total, 1, "a rejected claim must not mutate the count");
     }
 

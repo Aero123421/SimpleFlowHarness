@@ -497,6 +497,15 @@ pub fn status(target: Option<&Path>, root: &Path, as_json: bool) -> i32 {
             flow_arg(&snap.flow),
             execute::shell_quote(&snap.dir.display().to_string())
         ),
+        // "dead" is a stale heartbeat, not a proof the owner is gone: a
+        // suspended or wedged process still holds the run's lease, so the
+        // resume advice would send the caller straight into SFH_RUN_BUSY.
+        // `sfh stop` already makes this distinction before killing anything.
+        "dead" if owner_may_still_be_alive(&snap) => println!(
+            "sfh: this run has stopped heartbeating but process {} is still alive (suspended or wedged); `sfh stop {}` verifies ownership and kills it; resume only after it is gone",
+            snap.pid,
+            execute::shell_quote(&snap.dir.display().to_string())
+        ),
         "stopped" | "dead" => println!(
             "sfh: this run was killed before it finished. resume with: sfh run {} --resume {}",
             flow_arg(&snap.flow),
@@ -875,6 +884,25 @@ pub fn owner_verifiably_dead(dir: &Path) -> Result<Option<bool>, String> {
         None => Some(false),
         Some(recorded) => Some(execute::pid_start_time(pid) != Some(recorded)),
     })
+}
+
+/// Whether the process this run recorded as its owner might still be running,
+/// using exactly the two facts `stop` weighs before it kills anything: the pid
+/// must be alive, and - when both the recorded and the live start time are
+/// known - they must be the same process (rev_break #8).
+///
+/// Fails closed toward "possibly alive": a live pid with no comparable start
+/// time cannot be ruled out, and the callers of this answer choose between
+/// "advise resume" and "advise stop first", where wrongly advising resume is
+/// the harmful direction (the lease is still held).
+fn owner_may_still_be_alive(snap: &Snapshot) -> bool {
+    if !execute::pid_alive(snap.pid) {
+        return false;
+    }
+    match (snap.pid_start, execute::pid_start_time(snap.pid)) {
+        (Some(recorded), Some(live)) => live == recorded,
+        _ => true,
+    }
 }
 
 /// Verify that a run directory genuinely belongs to sfh before killing its pid.
@@ -1339,6 +1367,76 @@ mod tests {
             "a live pid whose start time does not match the recording is a reused pid, not the original owner"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn owner_snapshot(pid: u32, pid_start: Option<u64>) -> Snapshot {
+        Snapshot {
+            dir: PathBuf::from("run"),
+            state: "dead",
+            reason: Some("no heartbeat".into()),
+            step: "work".into(),
+            steps_done: 1,
+            cost_usd: 0.0,
+            pid,
+            heartbeat_age_sec: 120,
+            exit_code: None,
+            emit_file: None,
+            emit_step: None,
+            error: None,
+            error_code: None,
+            flow: "flow.yaml".into(),
+            started: "2026-01-01T00:00:00Z".into(),
+            step_started: None,
+            last_output: None,
+            active_members: BTreeMap::new(),
+            fanout_total: 0,
+            fanout_completed: 0,
+            visit: None,
+            nonce: Some("tok".into()),
+            pid_start,
+        }
+    }
+
+    #[test]
+    fn a_live_recorded_owner_with_a_matching_start_time_is_not_ruled_out() {
+        let pid = std::process::id();
+        let snap = owner_snapshot(pid, execute::pid_start_time(pid));
+        assert!(
+            owner_may_still_be_alive(&snap),
+            "the calling test process is definitely still running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_owner_is_ruled_out_however_stale_the_heartbeat_is() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a trivial child");
+        let pid = child.id();
+        let start = execute::pid_start_time(pid);
+        child.wait().expect("wait for the child to exit");
+        assert!(!owner_may_still_be_alive(&owner_snapshot(pid, start)));
+    }
+
+    #[test]
+    fn a_live_pid_whose_start_time_disagrees_is_a_reused_pid_not_the_owner() {
+        // The number is alive, but as an unrelated process: the original owner
+        // is gone, so the run really is resumable.
+        assert!(!owner_may_still_be_alive(&owner_snapshot(
+            std::process::id(),
+            Some(1)
+        )));
+    }
+
+    #[test]
+    fn a_live_pid_with_no_recorded_start_time_leaves_the_owner_unruled_out() {
+        // Pre-1.x run dirs recorded no start time; pid_alive alone is advisory,
+        // so this must fail closed toward "do not advise resume".
+        assert!(owner_may_still_be_alive(&owner_snapshot(
+            std::process::id(),
+            None
+        )));
     }
 
     #[cfg(unix)]
