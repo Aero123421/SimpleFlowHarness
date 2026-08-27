@@ -3,6 +3,64 @@
 このCHANGELOGはrepository maintainer向けのリリース記録として日本語で記述します。
 利用者向け概要は英語版`README.md`を正とし、日本語版`README.ja.md`を併記します。
 
+## 未リリース
+
+v1.6.1配布物を実際にbuildし実runで検証した際に確定した問題の修正です。
+flow schema・exit code体系・`schema_version`は変更していません。log.jsonlへの
+追加はevent種の追加のみです。
+
+### 機械インターフェースの誤分類を修正
+
+- `SFH_STEP_FAILED`を安定エラー語彙へ追加しました（追加のみ、`schema_version`
+  は1のまま）。従来、実行時のstep失敗・予算/上限超過が`--json`で
+  `SFH_FLOW_INVALID`（文書上「静的検証エラー」）として返っており、安定codeで
+  分岐する呼び出し側に「flowの書き方が悪い」という誤った診断を与えていました。
+  `run`/`status`/`wait`の三面で一貫して新codeを返します。静的検証エラーの分類は
+  従来どおりです。
+
+### resumeの`--var`をexecution closureと同じ規則で保護
+
+- 記録された値と異なる`--var`でのresumeは`SFH_EXECUTION_CLOSURE_CHANGED`で
+  拒否します。context fileの1 byte編集は拒否されるのに`--var`の差し替えは
+  無警告で通り、完了済みstepと残りのstepが異なる変数で混成されていました。
+  例外は2つ: `stuck`で停止したrun（修正した`--var`はstuckが待つ人間の判断。
+  `vars_changed_on_resume` eventとして記録）と`--force-resume`
+  （reason `var_overrides_changed`で記録）。記録どおりの値の再指定は常に許可
+  され、tainted varの再信任経路もそのまま機能します。
+
+### ネストしたclaudeのセッション隔離を修復
+
+- claudeへ渡さない環境変数を、固定8名のリストから`CLAUDE`プレフィックス一括
+  除去へ変更しました（`ANTHROPIC_`は認証を壊すため掃かず、`ANTHROPIC_MODEL`
+  のみ従来どおり静的リストで除去）。実測（2026-08-27、Claude Code container
+  内のclaude 2.1.220→2.1.247）で、環境には40超の`CLAUDE*`変数が存在し、
+  8名の除去後もネストしたclaudeがHOST sessionのidを自分のsessionとして報告、
+  sfhはそれをstepのsessionとして永続記録していました。後続の`continue_from`
+  はhost会話へ接続してしまうため、固定リストではCLIの更新に恒常的に負けます。
+
+### 運用中に矛盾した案内を出す4箇所を修正
+
+- `on_max_visits`経由でstuckしたrunの人間向け出力が無条件に「resume with: …」
+  を提示していました。そのresumeは同じstepへ再入して即stuckし、また同じ案内が
+  出ます（JSONの`next_actions`は診断済みだったので、人間向けも同じ診断へ接続）。
+- suspend/wedge状態のrun（pid生存・heartbeat停止）に対する`sfh status`が
+  「killed before it finished. resume with: …」と案内し、従うと`SFH_RUN_BUSY`
+  で弾かれていました。所有者がまだ生きている可能性がある場合は`sfh stop`を
+  案内します。
+- `sfh runs list/clean`だけが`SFH_STATE_DIR`/`--state-dir`を解決せず、同じ
+  shellで`sfh status`と異なるrun集合を見せていました。`cmd_watch`と同じ
+  優先順位（`--runs-dir`が勝つ）で解決します。
+- fan-outが`max_total_steps`を超えたときのエラーに、何がleaf runとして数える
+  のか（member・fallback・compact summarizer）と`defaults.max_total_steps`の
+  引き上げ先を明記しました。foreach上限100件と既定100の衝突は実runで頻出です。
+
+### workspaceの未コミット変更に警告
+
+- dirtyなsource repositoryからmanaged worktreeを作る際、「このworkspaceは
+  base commitから分岐し、未コミット変更は見えない」ことを警告します。
+  「エージェントが自分の変更は存在しないと言う」という定番の混乱の予防で、
+  警告のみ（拒否はしません）。
+
 ## v1.6.1 - 2026-08-13
 
 v1.6.0の配布物を実際に展開・導入して監査し、repository内では成立していた

@@ -197,6 +197,8 @@ SFH_EXECUTION_CLOSURE_CHANGED: the execution closure changed since this run star
   context.task: sha256:9bc86fb26f3c -> sha256:d1811c82b034
 ```
 
+`--var` overrides are held to the same rule: a resume whose `--var` differs from the value the run recorded is refused with the same stable code — unless the run stopped at `stuck`, where a corrected `--var` is exactly the fix the run is waiting for (recorded as a `vars_changed_on_resume` event), or `--force-resume` accepts it (recorded as a `force_resume` event with reason `var_overrides_changed`). Re-passing the recorded value is always allowed.
+
 `--force-resume` accepts that deliberately and records a `force_resume` event. It is a separate question from `--adopt-workspace` (below), and one flag never waives the other.
 
 ---

@@ -199,6 +199,8 @@ SFH_EXECUTION_CLOSURE_CHANGED: the execution closure changed since this run star
   context.task: sha256:9bc86fb26f3c -> sha256:d1811c82b034
 ```
 
+`--var` の上書きも同じ規則に従います。記録された値と異なる `--var` での resume は同じ安定 code で拒否されます — 例外は `stuck` で停止した run（修正した `--var` こそが stuck が待っている人間の判断であり、`vars_changed_on_resume` event として記録されます）と、`--force-resume` による受け入れ（reason `var_overrides_changed` の `force_resume` event として記録）です。記録どおりの値を再指定することは常に許可されます。
+
 `--force-resume` はこれを意図的に受け入れ、`force_resume` event を記録します。後述の `--adopt-workspace` とは別の問いであり、片方がもう片方を免除することはありません。
 
 ---
