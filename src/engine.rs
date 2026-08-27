@@ -9339,15 +9339,29 @@ mod tests {
             .collect()
     }
 
+    /// Did the changed-`--var` guard refuse this attempt?
+    ///
+    /// The guard's whole verdict is its return value, so that is what these
+    /// tests read. Asking instead whether the run reached `run_start` would
+    /// answer a much larger question - the lease, the owner-liveness proof, the
+    /// nonce and the step itself all sit between the two - and make any
+    /// unrelated per-OS difference in that machinery read as a verdict here.
+    fn refused_for_changed_vars(outcome: &Result<i32, String>) -> bool {
+        matches!(outcome, Err(e)
+            if e.starts_with(machine::ErrorCode::ExecutionClosureChanged.as_str())
+                && e.contains("--var overrides on this command differ"))
+    }
+
     #[test]
     fn resume_refuses_a_var_override_that_disagrees_with_the_one_the_run_recorded() {
         // The execution closure refuses a one-byte edit to a context file, but
         // --var was never part of it: the steps already done keep the old value
         // and everything after uses the new one, silently. Both a CHANGED value
         // and a brand-new key are that same split.
-        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("changed", "two");
-        let before = std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap();
-
+        // A fresh run dir per leg: an attempt leaves a lease file and, once it
+        // gets past this guard, a nonce and a status behind, and a later
+        // attempt in the same process reads those as ownership facts. Sharing
+        // one dir would mix that machinery into the verdict under test.
         for (vars, expected) in [
             (vec![("topic", "beta")], "vars.topic: \"alpha\" -> \"beta\""),
             (
@@ -9355,8 +9369,15 @@ mod tests {
                 "vars.brand_new: (absent) -> \"x\"",
             ),
         ] {
+            let (root, flow_path, run_dir) = stopped_run_with_recorded_var("changed", "two");
+            let before = std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap();
             let opts = resume_opts(&flow_path, &run_dir, &root, &vars, false);
-            let err = run_inner(&opts).expect_err("a changed --var must refuse the resume");
+            let outcome = run_inner(&opts);
+            assert!(
+                refused_for_changed_vars(&outcome),
+                "a changed --var must refuse the resume: {outcome:?}"
+            );
+            let err = outcome.unwrap_err();
             assert!(
                 err.starts_with(machine::ErrorCode::ExecutionClosureChanged.as_str()),
                 "run_failure_code keys on the marker prefix: {err}"
@@ -9371,17 +9392,17 @@ mod tests {
                 before,
                 "the refusal must land before anything is executed or recorded"
             );
+            let _ = std::fs::remove_dir_all(&root);
         }
 
         // Re-passing the RECORDED value is how a var is un-tainted for an
         // executed-privileged field; it must stay a no-op, not a refusal.
+        let (root, flow_path, run_dir) = stopped_run_with_recorded_var("identical", "two");
         let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "alpha")], false);
-        let _ = run_inner(&opts);
+        let outcome = run_inner(&opts);
         assert!(
-            log_events(&run_dir)
-                .iter()
-                .any(|e| e["event"] == "run_start"),
-            "an identical --var must let the resume start"
+            !refused_for_changed_vars(&outcome),
+            "an identical --var is not a changed one: {outcome:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -9391,12 +9412,16 @@ mod tests {
     fn force_resume_accepts_changed_var_overrides_and_records_them_in_the_log() {
         let (root, flow_path, run_dir) = stopped_run_with_recorded_var("forced", "two");
         let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], true);
-        let _ = run_inner(&opts);
+        let outcome = run_inner(&opts);
+        assert!(
+            !refused_for_changed_vars(&outcome),
+            "--force-resume must waive the refusal: {outcome:?}"
+        );
 
         let events = log_events(&run_dir);
         assert!(
             events.iter().any(|e| e["event"] == "run_start"),
-            "--force-resume must let the resume start"
+            "--force-resume must let the resume start: {outcome:?}"
         );
         let forced = events
             .iter()
@@ -9418,12 +9443,16 @@ mod tests {
         // made the one workflow stuck exists for need --force-resume.
         let (root, flow_path, run_dir) = stopped_run_with_recorded_var("stuck", "stuck");
         let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], false);
-        let _ = run_inner(&opts);
+        let outcome = run_inner(&opts);
+        assert!(
+            !refused_for_changed_vars(&outcome),
+            "a stuck run must take a changed --var without --force-resume: {outcome:?}"
+        );
 
         let events = log_events(&run_dir);
         assert!(
             events.iter().any(|e| e["event"] == "run_start"),
-            "a stuck run must resume with a changed --var and no --force-resume"
+            "a stuck run must resume with a changed --var and no --force-resume: {outcome:?}"
         );
         let noted = events
             .iter()
