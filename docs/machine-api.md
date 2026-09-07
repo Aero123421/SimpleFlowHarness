@@ -65,7 +65,8 @@ README's "Driving sfh from a program" section for a concrete instance.
 
 Terminal `run`, `status`, and `wait` answers preserve one classification: a
 protocol failure is `SFH_PROTOCOL_INVALID` or `SFH_TERMINAL_MISSING` in all
-three commands, and a human-decision terminal is `SFH_STUCK`. The on-disk
+three commands, a human-decision terminal is `SFH_STUCK`, and an ordinary
+run-time step failure is `SFH_STEP_FAILED`. The on-disk
 `status.json` keeps its historical prose `error` string and records the same
 classification additively as `error_code`; `status --json` converts those to
 the envelope's required `{"code", "message"}` object.
@@ -86,6 +87,7 @@ allowed to be reworded at any time.
 | --- | --- |
 | `SFH_USAGE` | The command line itself was wrong. |
 | `SFH_FLOW_INVALID` | The flow file could not be loaded or failed static validation. |
+| `SFH_STEP_FAILED` | A flow step failed at run time (non-zero exit, timeout, failed fan-out, or an exhausted budget/visit ceiling) and the flow routed to failure. Distinct from `SFH_FLOW_INVALID`, which is a static authoring error. |
 | `SFH_PROTOCOL_INVALID` | A structured tool protocol did not hold (see `src/protocol.rs`). |
 | `SFH_TERMINAL_MISSING` | A structured protocol ended without its documented terminal record. |
 | `SFH_SESSION_UNVERIFIED` | A resume or fork could not prove it landed in the expected session. |

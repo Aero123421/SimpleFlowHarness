@@ -900,6 +900,10 @@ fn grok_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String
     }
 }
 
+/// The documented floor of the nested-claude scrub: names sfh has verified
+/// leak a host session into a child run. `claude_env_scrub` adds the live
+/// prefix sweep on top - these stay because they must be removed whether or
+/// not the launching process happens to carry them.
 const CLAUDE_ENV_SCRUB: [&str; 8] = [
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_CHILD_SESSION",
@@ -910,6 +914,71 @@ const CLAUDE_ENV_SCRUB: [&str; 8] = [
     "CLAUDE_CODE_HOST_SESSION_ID",
     "ANTHROPIC_MODEL",
 ];
+
+/// Runtime identity namespaces may grow as Claude adds host/session features.
+/// Operator configuration is deliberately outside this list: CLAUDE also names
+/// OAuth credentials, provider selection, config directories and safety policy.
+/// Scrubbing the whole prefix silently changes who a child authenticates as and
+/// which restrictions it inherits (PR #27 review, 2026-09-07).
+fn claude_host_env(name: &str) -> bool {
+    let canonical;
+    let name = if cfg!(windows) {
+        canonical = name.to_ascii_uppercase();
+        canonical.as_str()
+    } else {
+        name
+    };
+    CLAUDE_ENV_SCRUB.contains(&name)
+        || matches!(
+            name,
+            "CLAUDE_CODE_REMOTE"
+                | "CLAUDE_CODE_REMOTE_SESSION_ID"
+                | "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
+        )
+        || [
+            "CLAUDE_CODE_SESSION_",
+            "CLAUDE_CODE_HOST_",
+            "CLAUDE_CODE_CHILD_",
+            "CLAUDE_CODE_MESSAGING_",
+            "CLAUDE_CODE_CONTAINER_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// `CLAUDE_ENV_SCRUB` plus live host/session names, sorted and deduped.
+///
+/// A fixed blocklist goes stale on every CLI release. Live-verified 2026-08-27,
+/// claude 2.1.247 inside a Claude Code container: the environment carried ~20
+/// CLAUDE* variables (CLAUDE_CODE_MESSAGING_SOCKET,
+/// CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST, CLAUDE_CODE_CONTAINER_ID, ...), the
+/// 8-name scrub applied, and the nested claude still reported the HOST
+/// session id as its own - which the durable log then recorded as this step's
+/// session, so a later `continue_from` would run `claude -r <host-session-id>`
+/// and append the flow to the host agent's conversation.
+///
+/// Authentication and operator settings stay intact, including the documented
+/// CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_* and CLAUDE_CONFIG_DIR variables:
+/// https://code.claude.com/docs/en/env-vars . ANTHROPIC_MODEL alone retains its
+/// historical removal. Windows names are matched case-insensitively, just like
+/// the child's environment, while the original spelling is passed to removal.
+fn claude_env_scrub_from<I>(live_names: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut out: Vec<String> = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
+    out.extend(live_names.into_iter().filter(|n| claude_host_env(n)));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `claude_env_scrub_from` over this process's environment. A non-UTF8 name is
+/// skipped rather than lossily decoded - it does not occur in practice, and the
+/// static list still applies.
+fn claude_env_scrub() -> Vec<String> {
+    claude_env_scrub_from(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()))
+}
 
 /// claude read-level: hard guarantee via dontAsk + builtin-tool whitelist
 /// (plan mode is only a soft instruction when bypass is available).
@@ -1437,7 +1506,7 @@ pub fn build(
                 preassigned = Some(id.to_string());
             }
             a.extend(inp.extra.iter().cloned());
-            env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
+            env_remove = claude_env_scrub();
             parse = OutputParse::ClaudeJson;
             delivery = Delivery::Stdin;
         }
@@ -1668,7 +1737,7 @@ pub fn build_resume(
             a.push(session_id.to_string());
             claude_common(&mut a, &inp, &mut warnings);
             a.extend(inp.extra.iter().cloned());
-            env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
+            env_remove = claude_env_scrub();
             expect_session = Some(session_id.to_string());
             parse = OutputParse::ClaudeJson;
             delivery = Delivery::Stdin;
@@ -1930,7 +1999,7 @@ pub fn build_fork(
             a.push(child_session_id.to_string());
             claude_common(&mut a, &inp, &mut warnings);
             a.extend(inp.extra.iter().cloned());
-            env_remove = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
+            env_remove = claude_env_scrub();
             parse = OutputParse::ClaudeJson;
             delivery = Delivery::Stdin;
         }
@@ -2247,8 +2316,118 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--session-id" && w[1] == "uuid-1"));
         assert_eq!(b.preassigned_session.as_deref(), Some("uuid-1"));
+        // Membership, not an exact set: env_remove is now the live CLAUDE*
+        // sweep, whose size depends on the environment the tests run in. These
+        // two are the static floor and must be there regardless.
         assert!(b.env_remove.iter().any(|v| v == "CLAUDE_CODE_SESSION_ID"));
         assert!(b.env_remove.iter().any(|v| v == "ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn live_claude_host_identity_is_scrubbed_without_removing_operator_configuration() {
+        let live = [
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_SESSION_FUTURE_FIELD",
+            "CLAUDE_CODE_SESSION_FUTURE_FIELD",
+            "CLAUDE_CODE_CONTAINER_ID",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "CLAUDE_CODE_REMOTE_SESSION_ID",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_RESTRICTED",
+            "CLAUDE_CODE_MCP_ALLOWLIST_ENV",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_NEW_OPERATOR_OPTION",
+            "ANTHROPIC_API_KEY",
+            "PATH",
+            "XCLAUDE_NOT_A_PREFIX_MATCH",
+        ]
+        .into_iter()
+        .map(String::from);
+        let got = claude_env_scrub_from(live);
+
+        for name in [
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_SESSION_FUTURE_FIELD",
+            "CLAUDE_CODE_CONTAINER_ID",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "CLAUDE_CODE_REMOTE_SESSION_ID",
+        ] {
+            assert!(
+                got.iter().any(|v| v == name),
+                "{name}: inherited host/session identity must still be scrubbed"
+            );
+        }
+        for name in CLAUDE_ENV_SCRUB {
+            assert!(
+                got.iter().any(|v| v == name),
+                "{name}: the static list is the floor, not a fallback"
+            );
+        }
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "PATH",
+            "XCLAUDE_NOT_A_PREFIX_MATCH",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_RESTRICTED",
+            "CLAUDE_CODE_MCP_ALLOWLIST_ENV",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_NEW_OPERATOR_OPTION",
+        ] {
+            assert!(!got.iter().any(|v| v == name), "{name} must be left alone");
+        }
+
+        let mut canonical = got.clone();
+        canonical.sort();
+        canonical.dedup();
+        assert_eq!(got, canonical, "output is sorted and deduped");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_host_names_follow_windows_environment_case_rules() {
+        let got = claude_env_scrub_from([
+            "claude_code_session_id".to_string(),
+            "Claude_Code_Messaging_Socket".to_string(),
+            "claude_code_oauth_token".to_string(),
+        ]);
+        assert!(got.iter().any(|n| n == "claude_code_session_id"));
+        assert!(got.iter().any(|n| n == "Claude_Code_Messaging_Socket"));
+        assert!(!got.iter().any(|n| n == "claude_code_oauth_token"));
+    }
+
+    #[test]
+    fn claude_fresh_resume_and_fork_all_scrub_through_the_same_sweep() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        // The sweep reads the live environment, and naming a variable here
+        // would mean set_var - process-global state that corrupts whatever else
+        // is running in parallel (see the PATH comment in execute.rs's tests).
+        // Comparing each arm against the sweep's own output for this process
+        // proves all three route through it, whatever this environment holds.
+        let expected = claude_env_scrub();
+        let fresh = build("claude", inp(Access::Read, &[]), &bp, Some("uuid-1")).unwrap();
+        let resumed = build_resume("claude", "SESSION", inp(Access::Read, &[]), &bp).unwrap();
+        let forked = build_fork(
+            "claude",
+            "PARENT",
+            "CHILD",
+            inp(Access::Read, &[]),
+            &bp,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fresh.env_remove, expected, "build");
+        assert_eq!(resumed.env_remove, expected, "build_resume");
+        assert_eq!(forked.env_remove, expected, "build_fork");
     }
 
     #[test]

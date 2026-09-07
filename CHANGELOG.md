@@ -6,8 +6,13 @@
 ## Unreleased
 
 v1.6.1のrelease後、repository全体をもう一度実測して監査した結果の修正です。
-engine、flow schema、machine API、resume形式は互換です。同梱flowのYAMLは変わり
-ますが、変わったのは宣言の明示性だけで、解決される挙動は同一です。
+engine、flow schema、machine API、resume形式は互換です。同梱flowは主に既存の
+暗黙設定を明示しました。例外として`cross-os-gate.yaml`は外部buildが中断された
+場合に自動再実行せず`stuck`で確認を求めるようにし、不明な副作用の再実行を防ぎます。
+
+- `stuck`から再開した後に再びcrashした場合、古い`stuck`を理由に変更済み`--var`を
+  許可し続けないよう修正しました。新しいattemptの開始で例外を消費し、通常の
+  resumeでは再び`--force-resume`による明示的な許可が必要です。
 
 見つかった問題は9件のうち5件が同じ形をしていました — **「検証した」と述べている
 主張のほうが検証されていない**。gateはrepositoryの内側を検査し、repositoryが
@@ -109,6 +114,65 @@ engine、flow schema、machine API、resume形式は互換です。同梱flowの
 - `docs/README.md`を追加し、shipされるdocs treeのどれが現行でどれが歴史的記録かを
   示します。31KBの`docs/v1.1-spec.md`はどこからも参照されないまま全archiveへ同梱
   されていました。実装状況を実測した見出しを付け、未実装4項目を明示しています。
+
+v1.6.1配布物を実際にbuildし実runで検証した際に確定した問題の修正です。
+flow schema・exit code体系・`schema_version`は変更していません。log.jsonlへの
+追加はevent種の追加のみです。
+
+### 機械インターフェースの誤分類を修正
+
+- `SFH_STEP_FAILED`を安定エラー語彙へ追加しました（追加のみ、`schema_version`
+  は1のまま）。従来、実行時のstep失敗・予算/上限超過が`--json`で
+  `SFH_FLOW_INVALID`（文書上「静的検証エラー」）として返っており、安定codeで
+  分岐する呼び出し側に「flowの書き方が悪い」という誤った診断を与えていました。
+  `run`/`status`/`wait`の三面で一貫して新codeを返します。静的検証エラーの分類は
+  従来どおりです。
+
+### resumeの`--var`をexecution closureと同じ規則で保護
+
+- 記録された値と異なる`--var`でのresumeは`SFH_EXECUTION_CLOSURE_CHANGED`で
+  拒否します。context fileの1 byte編集は拒否されるのに`--var`の差し替えは
+  無警告で通り、完了済みstepと残りのstepが異なる変数で混成されていました。
+  例外は2つ: `stuck`で停止したrun（修正した`--var`はstuckが待つ人間の判断。
+  `vars_changed_on_resume` eventとして記録）と`--force-resume`
+  （reason `var_overrides_changed`で記録）。記録どおりの値の再指定は常に許可
+  され、tainted varの再信任経路もそのまま機能します。
+
+### ネストしたclaudeのセッション隔離を修復
+
+- claudeへ渡さない環境変数を、固定8名に加えてhost/sessionの名前空間から
+  検出します。`CLAUDE_CODE_OAUTH_TOKEN`、接続先の`CLAUDE_CODE_USE_*`、
+  `CLAUDE_CONFIG_DIR`、利用者の安全設定は保持し、`ANTHROPIC_MODEL`は
+  従来どおり除去します。Windowsでは環境変数名の大文字小文字を区別しません。実測（2026-08-27、Claude Code container
+  内のclaude 2.1.220→2.1.247）で、環境には40超の`CLAUDE*`変数が存在し、
+  8名の除去後もネストしたclaudeがHOST sessionのidを自分のsessionとして報告、
+  sfhはそれをstepのsessionとして永続記録していました。後続の`continue_from`
+  はhost会話へ接続してしまうため、session関連の名前空間も対象にします。
+  マージ前の検証では`CLAUDE`全体の除去が認証・接続先・安全設定も失わせる
+  回帰を確認したため、除去対象をhost/sessionに限定しました。
+
+### 運用中に矛盾した案内を出す4箇所を修正
+
+- `on_max_visits`経由でstuckしたrunの人間向け出力が無条件に「resume with: …」
+  を提示していました。そのresumeは同じstepへ再入して即stuckし、また同じ案内が
+  出ます（JSONの`next_actions`は診断済みだったので、人間向けも同じ診断へ接続）。
+- suspend/wedge状態のrun（pid生存・heartbeat停止）に対する`sfh status`が
+  「killed before it finished. resume with: …」と案内し、従うと`SFH_RUN_BUSY`
+  で弾かれていました。所有者がまだ生きている可能性がある場合は`sfh stop`を
+  案内します。
+- `sfh runs list/clean`だけが`SFH_STATE_DIR`/`--state-dir`を解決せず、同じ
+  shellで`sfh status`と異なるrun集合を見せていました。`cmd_watch`と同じ
+  優先順位（`--runs-dir`が勝つ）で解決します。
+- fan-outが`max_total_steps`を超えたときのエラーに、何がleaf runとして数える
+  のか（member・fallback・compact summarizer）と`defaults.max_total_steps`の
+  引き上げ先を明記しました。foreach上限100件と既定100の衝突は実runで頻出です。
+
+### workspaceの未コミット変更に警告
+
+- dirtyなsource repositoryからmanaged worktreeを作る際、「このworkspaceは
+  base commitから分岐し、未コミット変更は見えない」ことを警告します。
+  「エージェントが自分の変更は存在しないと言う」という定番の混乱の予防で、
+  警告のみ（拒否はしません）。
 
 ## v1.6.1 - 2026-08-13
 

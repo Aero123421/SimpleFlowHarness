@@ -104,7 +104,7 @@ steps:
     cmd: ["sh", "-c", "true"]
 ```
 `--state-dir` keeps workspaces out of the repository; `--profiles f.yaml` swaps tools without editing the flow.
-A resume refuses changed flow/overlay/context/tool version (`--force-resume`) separately from unexplained workspace drift (`--adopt-workspace`).
+A resume refuses changed flow/overlay/context/--var/tool version (`--force-resume`) separately from unexplained workspace drift (`--adopt-workspace`).
 If you had to FIX the flow, resume is not the tool: `--carry-budget-from <run-dir>` starts a new run holding the
 old one's spend (steps, per-step visits, cost, time), so a corrected retry does not silently reset its budget.
 Details: README. If unsure: `sfh validate flow.yaml` and `sfh run flow.yaml --dry-run`.

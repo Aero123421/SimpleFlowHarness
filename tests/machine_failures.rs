@@ -76,6 +76,46 @@ fn protocol_failure_keeps_the_same_stable_code_across_run_status_and_wait() {
 }
 
 #[test]
+fn an_ordinary_step_failure_is_classified_as_step_failed_everywhere() {
+    let sfh = env!("CARGO_BIN_EXE_sfh");
+    let base = temp_dir("step-failed-code");
+    let flow = base.join("flow.yaml");
+    let run_dir = base.join("run");
+    // sfh itself is the portable non-zero exit: an unknown flag is a usage
+    // error on every OS, with no shell quoting to get wrong.
+    let bin = sfh.replace('\\', "/").replace('"', "\\\"");
+    std::fs::write(
+        &flow,
+        format!("api_version: 1\nsteps:\n  - id: boom\n    cmd: [\"{bin}\", --not-a-real-flag]\n"),
+    )
+    .unwrap();
+
+    let run = Command::new(sfh)
+        .args(["run", flow.to_str().unwrap(), "--run-dir"])
+        .arg(&run_dir)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    let run_body = parse(&run);
+    assert_eq!(
+        run_body["error"]["code"], "SFH_STEP_FAILED",
+        "a valid flow whose step exited non-zero is not a static authoring error: {run_body}"
+    );
+
+    for command in ["status", "wait"] {
+        let (output, body) = watch(sfh, command, &run_dir);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            body["error"]["code"], "SFH_STEP_FAILED",
+            "{command}: {body}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
 fn max_visits_stuck_is_classified_as_stuck_everywhere() {
     let sfh = env!("CARGO_BIN_EXE_sfh");
     let base = temp_dir("stuck-code");

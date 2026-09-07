@@ -110,10 +110,10 @@ DOCTOR OPTIONS:
   without one it probes every preset and just reports which are absent.
 
 RUNS OPTIONS:
-  runs list [--runs-dir d] [-n N] [--json]
+  runs list [--runs-dir d] [--state-dir d] [-n N] [--json]
   runs show <run-dir> [--json]
   runs why  <run-dir> [--json]
-  runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]
+  runs clean [--runs-dir d] [--state-dir d] [--older-than DAYS] [--keep N] [--dry-run]
 
 WORKSPACE OPTIONS:
   workspaces list [--runs-dir d] [--state-dir d] [--json]
@@ -245,7 +245,7 @@ fn cmd_help(command: &str) -> i32 {
         "doctor" => "sfh doctor [flow.yaml] [--runs-dir d] [--state-dir d] [--timeout SEC]\nMakes REAL model calls, from an isolated scratch directory. `sfh preflight` is the free check.",
         "init" => "sfh init [file] [--force]",
         "guide" => "sfh guide",
-        "runs" => "sfh runs list|show|why|clean [options]",
+        "runs" => "sfh runs list|show|why|clean [options]\nlist and clean take [--runs-dir d] [--state-dir d]; show and why take an explicit <run-dir>.",
         "preflight" => "sfh preflight [flow.yaml] [--profiles file] [--state-dir d] [--json] [--probe-binaries]\nLocal capability check. Makes NO model calls - `sfh doctor` does that.\nA bin: override is resolved but never run unless --probe-binaries is given, which DOES execute its --help/--version.",
         "workspaces" => "sfh workspaces list|show|clean|remove [options]",
         _ => {
@@ -943,7 +943,11 @@ fn cmd_guide(rest: &[String]) -> i32 {
 }
 
 fn cmd_runs(rest: &[String]) -> i32 {
-    let mut runs_dir = PathBuf::from(".sfh").join("runs");
+    // Resolved through StateRoot like every other run-dir consumer: a shell
+    // with SFH_STATE_DIR set must not have `runs list` browsing one universe of
+    // runs while `status`/`wait`/`stop` resolve another.
+    let mut runs_dir: Option<PathBuf> = None;
+    let mut state_dir: Option<PathBuf> = None;
     let mut limit = 20usize;
     let mut days = 30u64;
     let mut keep = 5usize;
@@ -954,10 +958,10 @@ fn cmd_runs(rest: &[String]) -> i32 {
     let requested_json = requested_json(rest);
     if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
         let usage = match sub {
-            "list" => "sfh runs list [--runs-dir d] [-n N] [--json]",
+            "list" => "sfh runs list [--runs-dir d] [--state-dir d] [-n N] [--json]",
             "show" => "sfh runs show <run-dir> [--json]",
             "why" => "sfh runs why <run-dir> [--json]",
-            "clean" => "sfh runs clean [--runs-dir d] [--older-than DAYS] [--keep N] [--dry-run]",
+            "clean" => "sfh runs clean [--runs-dir d] [--state-dir d] [--older-than DAYS] [--keep N] [--dry-run]",
             "-h" | "--help" => "sfh runs list|show|why|clean [options]",
             _ => "sfh runs list|show|why|clean [options]",
         };
@@ -972,7 +976,10 @@ fn cmd_runs(rest: &[String]) -> i32 {
     while i < rest.len() {
         let r: Result<(), String> = match rest[i].as_str() {
             "--runs-dir" if sub == "list" || sub == "clean" => {
-                need(rest, &mut i, "--runs-dir").map(|v| runs_dir = PathBuf::from(v))
+                need(rest, &mut i, "--runs-dir").map(|v| runs_dir = Some(PathBuf::from(v)))
+            }
+            "--state-dir" if sub == "list" || sub == "clean" => {
+                need(rest, &mut i, "--state-dir").map(|v| state_dir = Some(PathBuf::from(v)))
             }
             flag @ ("-n" | "--limit") if sub == "list" => {
                 let label = flag.to_string();
@@ -1017,6 +1024,7 @@ fn cmd_runs(rest: &[String]) -> i32 {
         }
         i += 1;
     }
+    let runs_dir = state::StateRoot::resolve(state_dir.as_deref(), runs_dir.as_deref()).runs_dir();
     match sub {
         "list" => runs::list(&runs_dir, limit, as_json),
         "show" => match target {
@@ -1090,6 +1098,68 @@ mod tests {
         ] {
             assert_eq!(cmd_watch(&args, Watch::Status), 0);
         }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn runs_resolves_its_root_through_the_state_dir_and_still_lets_runs_dir_win() {
+        let base = std::env::temp_dir().join(format!(
+            "sfh-runs-state-root-{}-{}",
+            std::process::id(),
+            crate::contain::random_nonce()
+        ));
+        let state = base.join("state");
+        let elsewhere = base.join("elsewhere");
+        terminal_run(&state.join("runs"), "only-run");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let target = state.join("runs").join("only-run");
+        let state_arg = state.display().to_string();
+
+        assert_eq!(
+            cmd_runs(&["list".into(), "--state-dir".into(), state_arg.clone()]),
+            0,
+            "runs list must accept --state-dir"
+        );
+
+        // `clean` removes only what is measurably older than the cutoff, and
+        // --older-than 0 makes that cutoff zero seconds.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let clean_args = |root_flag: Option<(&str, String)>| {
+            let mut args: Vec<String> = vec![
+                "clean".into(),
+                "--state-dir".into(),
+                state_arg.clone(),
+                "--older-than".into(),
+                "0".into(),
+                "--keep".into(),
+                "0".into(),
+            ];
+            if let Some((flag, value)) = root_flag {
+                args.push(flag.into());
+                args.push(value);
+            }
+            args
+        };
+
+        // --runs-dir keeps its precedence over the state root, exactly as it
+        // does for status/wait/stop.
+        assert_eq!(
+            cmd_runs(&clean_args(Some((
+                "--runs-dir",
+                elsewhere.display().to_string()
+            )))),
+            0
+        );
+        assert!(
+            target.is_dir(),
+            "--runs-dir must decide which root `runs clean` acts on"
+        );
+
+        assert_eq!(cmd_runs(&clean_args(None)), 0);
+        assert!(
+            !target.exists(),
+            "`runs clean` must act on <state>/runs, not the hardcoded .sfh/runs"
+        );
         let _ = std::fs::remove_dir_all(base);
     }
 
