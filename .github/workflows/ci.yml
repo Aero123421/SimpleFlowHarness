@@ -192,6 +192,8 @@ jobs:
           done
       - name: Agent Skills structure and version claims
         run: python3 tests/skills_checks.py
+      - name: GitHub Actions polling helper checks
+        run: python3 tests/gh_ci_gate_checks.py
       - name: Engine behaviour (fake tools, no AI calls)
         shell: bash
         run: bash tests/engine_behaviour.sh ./target/release/sfh

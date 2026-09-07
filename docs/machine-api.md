@@ -90,7 +90,7 @@ allowed to be reworded at any time.
 | `SFH_STEP_FAILED` | A flow step failed at run time (non-zero exit, timeout, failed fan-out, or an exhausted budget/visit ceiling) and the flow routed to failure. Distinct from `SFH_FLOW_INVALID`, which is a static authoring error. |
 | `SFH_PROTOCOL_INVALID` | A structured tool protocol did not hold (see `src/protocol.rs`). |
 | `SFH_TERMINAL_MISSING` | A structured protocol ended without its documented terminal record. |
-| `SFH_SESSION_UNVERIFIED` | A resume or fork could not prove it landed in the expected session. |
+| `SFH_SESSION_UNVERIFIED` | A fresh, resumed, or forked session could not be proven to be the expected session. |
 | `SFH_EXECUTION_CLOSURE_CHANGED` | The pinned execution inputs differ from the run being resumed. |
 | `SFH_WORKSPACE_MISSING` | A managed workspace that should exist does not. |
 | `SFH_WORKSPACE_DRIFT` | A managed workspace changed underneath a resume. |

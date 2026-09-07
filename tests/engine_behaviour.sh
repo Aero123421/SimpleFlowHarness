@@ -270,6 +270,105 @@ else
   echo "ok   - the continuation was verified against the reported session id"
   pass=$((pass + 1))
 fi
+
+# A fresh Claude session whose id was assigned by sfh must report that same id
+# before sfh records it for a later continue_from. The stub can force the three
+# adversarial result shapes below without calling a real CLI.
+cat > fresh-session-mismatch.yaml <<YAML
+name: fresh-session-mismatch
+steps:
+  - id: first
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    args: ["--stub-session", "wrong-session"]
+    prompt: "open a session"
+  - id: second
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    continue_from: first
+    prompt: "continue it"
+YAML
+"$SFH" run fresh-session-mismatch.yaml --runs-dir fresh-session-mismatch-runs -q > fresh-session-mismatch.out 2> fresh-session-mismatch.err
+check "a fresh Claude session with a different reported id fails" 1 $?
+contains "fresh session mismatch is diagnosed neutrally" "fresh session mismatch" fresh-session-mismatch.err
+FRESH_MISMATCH_LOG="$(find fresh-session-mismatch-runs -type f -name 'log.jsonl' -print -quit)"
+not_contains "a mismatched fresh session is not recorded as usable" '"session":{"' "$FRESH_MISMATCH_LOG"
+contains "the fresh-session classification is durable" '"failure_code":"SFH_SESSION_UNVERIFIED"' "$FRESH_MISMATCH_LOG"
+FRESH_MISMATCH_DIR="$(dirname "$FRESH_MISMATCH_LOG")"
+"$SFH" status "$FRESH_MISMATCH_DIR" --json > fresh-session-status.json 2> fresh-session-status.err
+check "status returns the fresh-session classification" 1 $?
+contains "status exposes SFH_SESSION_UNVERIFIED" '"code": "SFH_SESSION_UNVERIFIED"' fresh-session-status.json
+"$SFH" wait "$FRESH_MISMATCH_DIR" --json > fresh-session-wait.json 2> fresh-session-wait.err
+check "wait returns the fresh-session classification" 1 $?
+contains "wait exposes SFH_SESSION_UNVERIFIED" '"code": "SFH_SESSION_UNVERIFIED"' fresh-session-wait.json
+
+# A crash after the failed leaf's step_end but before on_error is applied must
+# replay the durable classification as well as the declared goto:fail route.
+cat > fresh-session-goto-fail.yaml <<YAML
+name: fresh-session-goto-fail
+steps:
+  - id: first
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    args: ["--stub-session", "wrong-session"]
+    prompt: "open a session"
+    on_error: goto:fail
+  - id: second
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    continue_from: first
+    prompt: "continue it"
+YAML
+"$SFH" run fresh-session-goto-fail.yaml --runs-dir fresh-session-goto-fail-runs -q > fresh-session-goto-fail.out 2> fresh-session-goto-fail.err
+check "goto:fail preserves fresh-session classification" 1 $?
+FRESH_GOTO_LOG="$(find fresh-session-goto-fail-runs -type f -name 'log.jsonl' -print -quit)"
+contains "goto:fail records fresh-session classification" '"failure_code":"SFH_SESSION_UNVERIFIED"' "$FRESH_GOTO_LOG"
+FRESH_GOTO_DIR="$(dirname "$FRESH_GOTO_LOG")"
+awk '{ print } /"event":"step_end"/ && /"step":"first"/ { exit }' "$FRESH_GOTO_LOG" > "$FRESH_GOTO_DIR/log.trimmed"
+mv "$FRESH_GOTO_DIR/log.trimmed" "$FRESH_GOTO_DIR/log.jsonl"
+"$SFH" run fresh-session-goto-fail.yaml --resume "$FRESH_GOTO_DIR" -q > fresh-session-goto-resume.out 2> fresh-session-goto-resume.err
+check "pending fresh-session failure replays its classification" 1 $?
+contains "replayed goto:fail keeps SFH_SESSION_UNVERIFIED" 'SFH_SESSION_UNVERIFIED' fresh-session-goto-resume.err
+
+cat > fresh-session-missing.yaml <<YAML
+name: fresh-session-missing
+steps:
+  - id: first
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    args: ["--stub-no-session"]
+    prompt: "open a session"
+  - id: second
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    continue_from: first
+    prompt: "continue it"
+YAML
+"$SFH" run fresh-session-missing.yaml --runs-dir fresh-session-missing-runs -q > fresh-session-missing.out 2> fresh-session-missing.err
+check "a fresh Claude session with no reported id fails" 1 $?
+contains "missing fresh session id is diagnosed neutrally" "fresh session unverified" fresh-session-missing.err
+
+cat > fresh-session-error.yaml <<YAML
+name: fresh-session-error
+steps:
+  - id: first
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    args: ["--stub-error"]
+    prompt: "open a session"
+YAML
+"$SFH" run fresh-session-error.yaml --runs-dir fresh-session-error-runs -q > fresh-session-error.out 2> fresh-session-error.err
+check "an in-band Claude error cannot become a fresh-session success" 1 $?
+contains "the in-band Claude error is retained" "in-band failure" fresh-session-error.err
+not_contains "an in-band Claude error is not mislabeled as a fresh-session mismatch" "fresh session mismatch" fresh-session-error.err
+
 # Negative control. The same flow with the old stand-in must still fail, or the
 # check above proves nothing about the stub. Since 1.2 it fails EARLIER than it
 # used to: echo never prints claude's documented result envelope, so the
@@ -5599,6 +5698,70 @@ if python3 -c "import json,sys; json.load(open('mjw.json', encoding='utf-8'))" 2
 else
   echo "FAIL - machine: wait --json stdout was not pure JSON"
   fail=$((fail + 1))
+fi
+
+# A terminal run that records an emit file must fail closed when that required
+# result artifact disappears or becomes an outward symlink. The old JSON path
+# silently converted either read error to result:null and exit 0, while human
+# wait already rejected it. Keep a valid result control beside both failures.
+"$SFH" run compat.yaml --runs-dir mj-result-runs --emit here -q > /dev/null 2>&1
+MJ_RESULT_DIR="$(dirname "$(find mj-result-runs -type f -name 'log.jsonl' -print -quit)")"
+"$SFH" wait "$MJ_RESULT_DIR" --json > mjw-result.json 2> mjw-result.err
+check "machine: wait --json returns a recorded result" 0 $?
+if python3 - "mjw-result.json" <<'PY' >/dev/null 2>&1
+import json, sys
+answer = json.load(open(sys.argv[1], encoding="utf-8"))
+assert answer["ok"] is True
+assert answer["result"] is not None
+assert answer["result_file"]
+PY
+then
+  echo "ok   - machine: the valid wait result is present in the envelope"
+  pass=$((pass + 1))
+else
+  echo "FAIL - machine: the valid wait result was missing from the envelope"
+  fail=$((fail + 1))
+fi
+MJ_RESULT_FILE="$(python3 - "$MJ_RESULT_DIR/status.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["emit_file"] or "")
+PY
+)"
+if command -v cygpath > /dev/null 2>&1; then
+  MJ_RESULT_FILE_FS="$(cygpath -u "$MJ_RESULT_FILE")"
+else
+  MJ_RESULT_FILE_FS="$MJ_RESULT_FILE"
+fi
+rm -f "$MJ_RESULT_FILE_FS"
+"$SFH" wait "$MJ_RESULT_DIR" --json > mjw-missing.json 2> mjw-missing.err
+check "machine: wait --json rejects a missing result file" 2 $?
+contains "machine: missing result uses the persistence error code" \
+  '"code": "SFH_PERSISTENCE_FAILURE"' mjw-missing.json
+if python3 -c "import json; json.load(open('mjw-missing.json', encoding='utf-8'))" \
+  >/dev/null 2>&1; then
+  echo "ok   - machine: missing result refusal is a JSON envelope"
+  pass=$((pass + 1))
+else
+  echo "FAIL - machine: missing result refusal was not valid JSON"
+  fail=$((fail + 1))
+fi
+if have_symlinks; then
+  MJ_RESULT_SECRET="$(pwd)/mj-result-secret.txt"
+  printf 'TOP-SECRET-MJ-RESULT\n' > "$MJ_RESULT_SECRET"
+  MSYS=winsymlinks:nativestrict ln -s "$MJ_RESULT_SECRET" "$MJ_RESULT_FILE_FS"
+  "$SFH" wait "$MJ_RESULT_DIR" --json > mjw-symlink.json 2> mjw-symlink.err
+  check "machine: wait --json rejects an outward result symlink" 2 $?
+  contains "machine: outward result symlink uses the persistence error code" \
+    '"code": "SFH_PERSISTENCE_FAILURE"' mjw-symlink.json
+  not_contains "machine: outward result symlink is never emitted" \
+    'TOP-SECRET-MJ-RESULT' mjw-symlink.json
+else
+  echo "ok   - machine: outward result symlink checks (skipped: no native symlink support)"
+  pass=$((pass + 1))
+  echo "ok   - machine: outward result symlink code check (skipped: no native symlink support)"
+  pass=$((pass + 1))
+  echo "ok   - machine: outward result symlink leak check (skipped: no native symlink support)"
+  pass=$((pass + 1))
 fi
 # plan --json renders without starting anything.
 rm -f plan-spawn.marker

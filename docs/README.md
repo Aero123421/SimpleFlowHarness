@@ -16,6 +16,7 @@ the flow format. If a document here disagrees with the schema, the schema wins.
 | [`machine-api.md`](machine-api.md) | The `--json` contract: envelope shape, stable `SFH_*` error codes, exit codes. Read this before driving sfh from a program. |
 | [`distribution.md`](distribution.md) | How releases are built, signed, attested, and installed, and what each installation channel does and does not verify. |
 | [`v1.6-backlog.md`](v1.6-backlog.md) | Boundaries deliberately left in place, and where the live work queue is. |
+| [`cli-verification-2026-09-07.md`](cli-verification-2026-09-07.md) | Dated CLI versions, real session checks, discovered regressions, and the limits of that evidence. |
 
 ## Historical
 

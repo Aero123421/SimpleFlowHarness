@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -35,6 +36,7 @@ KNOWN_FAILURE = {
     "skipped",
     "neutral",
 }
+FETCH_TIMEOUT = "GitHub API request reached the watch deadline"
 
 
 def emit(payload: dict[str, Any], output: Path | None) -> None:
@@ -57,19 +59,33 @@ def emit(payload: dict[str, Any], output: Path | None) -> None:
     sys.stdout.flush()
 
 
-def fetch(repo: str, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
-    proc = subprocess.run(
-        ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+def fetch(
+    repo: str, run_id: str, timeout: float | None = None
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        proc = subprocess.run(
+            ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, FETCH_TIMEOUT
+    except (FileNotFoundError, OSError) as exc:
+        return None, f"could not execute gh: {exc}"
+    except UnicodeError as exc:
+        return None, f"GitHub API response was not valid UTF-8: {exc}"
     if proc.returncode != 0:
         return None, proc.stderr.strip() or f"gh api exited {proc.returncode}"
     try:
         value = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         return None, f"GitHub API response was not JSON: {exc}"
+    except UnicodeError as exc:
+        return None, f"GitHub API response was not valid UTF-8: {exc}"
     if not isinstance(value, dict):
         return None, "GitHub API response was not an object"
     return value, None
@@ -81,8 +97,38 @@ def watch(args: argparse.Namespace) -> int:
     last_state: tuple[str, object] | None = None
 
     while True:
-        value, error = fetch(args.repo, args.run_id)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            emit(
+                {
+                    "schema_version": 1,
+                    "kind": "ci_watch_timeout",
+                    "repo": args.repo,
+                    "run_id": args.run_id,
+                    "expected_sha": args.expected_sha,
+                    "observed_utc_epoch": int(time.time()),
+                    "error": "deadline reached before a terminal response was received",
+                },
+                output,
+            )
+            return 40
+
+        value, error = fetch(args.repo, args.run_id, timeout=remaining)
         now = int(time.time())
+        if error == FETCH_TIMEOUT:
+            emit(
+                {
+                    "schema_version": 1,
+                    "kind": "ci_watch_timeout",
+                    "repo": args.repo,
+                    "run_id": args.run_id,
+                    "expected_sha": args.expected_sha,
+                    "observed_utc_epoch": now,
+                    "error": "deadline reached before a terminal response was received",
+                },
+                output,
+            )
+            return 40
         if error is not None or value is None:
             payload = {
                 "schema_version": 1,
@@ -96,16 +142,16 @@ def watch(args: argparse.Namespace) -> int:
             emit(payload, output)
             return 10
 
-        observed_id = str(value.get("id", ""))
-        observed_sha = str(value.get("head_sha", ""))
-        status = str(value.get("status", ""))
+        observed_id_value = value.get("id", "")
+        observed_sha = value.get("head_sha", "")
+        status = value.get("status", "")
         conclusion = value.get("conclusion")
         payload = {
             "schema_version": 1,
             "kind": "github_actions_run",
             "repo": args.repo,
             "run_id": args.run_id,
-            "observed_id": observed_id,
+            "observed_id": str(observed_id_value),
             "expected_sha": args.expected_sha,
             "head_sha": observed_sha,
             "status": status,
@@ -120,6 +166,19 @@ def watch(args: argparse.Namespace) -> int:
             "observed_utc_epoch": now,
         }
 
+        if not (
+            isinstance(observed_id_value, (int, str))
+            and not isinstance(observed_id_value, bool)
+            and isinstance(observed_sha, str)
+            and isinstance(status, str)
+            and (conclusion is None or isinstance(conclusion, str))
+        ):
+            payload["kind"] = "ci_identity_or_protocol_error"
+            payload["error"] = "GitHub API response has invalid run identity or status types"
+            emit(payload, output)
+            return 30
+
+        observed_id = str(observed_id_value)
         if observed_id != str(args.run_id):
             payload["kind"] = "ci_identity_or_protocol_error"
             payload["error"] = "response run id does not match requested run id"
@@ -137,15 +196,21 @@ def watch(args: argparse.Namespace) -> int:
             last_state = state
 
         if status in RUNNING:
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 payload["kind"] = "ci_watch_timeout"
                 payload["error"] = "deadline reached before the run completed"
                 emit(payload, output)
                 return 40
-            time.sleep(args.interval)
+            time.sleep(min(args.interval, remaining))
             continue
 
         if status == "completed":
+            if time.monotonic() >= deadline:
+                payload["kind"] = "ci_watch_timeout"
+                payload["error"] = "deadline reached before a terminal response was accepted"
+                emit(payload, output)
+                return 40
             if conclusion in SUCCESS:
                 payload["kind"] = "ci_passed"
                 emit(payload, output)
@@ -177,8 +242,13 @@ def main() -> int:
     p.add_argument("--output", help="optional atomic JSON snapshot path")
     p.set_defaults(func=watch)
     args = parser.parse_args()
-    if args.interval <= 0 or args.timeout <= 0:
-        parser.error("--interval and --timeout must be > 0")
+    if not (
+        math.isfinite(args.interval)
+        and args.interval > 0
+        and math.isfinite(args.timeout)
+        and args.timeout > 0
+    ):
+        parser.error("--interval and --timeout must be finite and > 0")
     return int(args.func(args))
 
 

@@ -429,6 +429,10 @@ pub struct AdapterInfo {
     /// these in the CLI's own `--help` so a renamed or removed flag surfaces
     /// before a paid run instead of halfway through one.
     pub required_flags: &'static [&'static str],
+    /// Arguments between the program and `--help` when reading the CLI's
+    /// command-line facts. Some tools put the flags the adapter emits on a
+    /// subcommand's help page rather than on the top-level page.
+    pub help_args: &'static [&'static str],
     /// Known, documented gaps between what `access:` asks for and what the tool
     /// will actually hold to.
     pub known_gaps: &'static [&'static str],
@@ -453,13 +457,15 @@ pub const LAST_VERIFIED: &str = "2026-07-27";
 
 /// The per-tool literals `adapter_info` switches on, in the order they fill
 /// `AdapterInfo`: protocol, cost coverage, read/write/full enforcement,
-/// required flags, known gaps, and a documented minimum version (or `None`).
-/// Named so the match below reads as data, not a six-tuple clippy has to
+/// required flags, help subcommand arguments, known gaps, and a documented
+/// minimum version (or `None`). Named so the match below reads as data, not a
+/// seven-tuple clippy has to
 /// squint at.
 type AdapterFacts = (
     &'static str,
     Coverage,
     [Enforcement; 3],
+    &'static [&'static str],
     &'static [&'static str],
     &'static [&'static str],
     Option<&'static str>,
@@ -468,7 +474,7 @@ type AdapterFacts = (
 /// Metadata for one preset, or `None` for a name that is not a preset.
 pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
     use Enforcement::*;
-    let (protocol, cost, policy, flags, gaps, min_version): AdapterFacts = match tool {
+    let (protocol, cost, policy, flags, help_args, gaps, min_version): AdapterFacts = match tool {
         "codex" => (
             "codex-jsonl",
             Coverage::TokensOnly,
@@ -486,6 +492,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
                 "--output-last-message",
                 "--dangerously-bypass-approvals-and-sandbox",
             ],
+            &["exec"],
             &["access: full disables the sandbox entirely (--dangerously-bypass-approvals-and-sandbox)"],
             None,
         ),
@@ -509,6 +516,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
                 "--session-id",
                 "--fork-session",
             ],
+            &[],
             &[
                 "plan mode is advisory, so read is enforced by an explicit --tools allowlist rather than by a sandbox",
                 "MCP tools live in a permission namespace separate from --tools/--allowedTools, so an MCP server the project wires up is not covered by either allowlist",
@@ -525,6 +533,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
             // it does not name, so an unnamed capability defaults to open.
             [BestEffort, BestEffort, BestEffort],
             &["run", "--format", "--variant", "--agent", "--auto", "--fork"],
+            &["run"],
             &[
                 "read/write are enforced through OPENCODE_CONFIG_CONTENT, which merges with the user's own config",
                 "there is no OS sandbox, so write denies bash outright",
@@ -552,6 +561,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
                 "--resume",
                 "--fork-session",
             ],
+            &[],
             &[
                 "no OS sandbox; read is a permission-mode plus explicit --deny rules, and grok documents sandbox and permission as separate axes",
                 "MCPTool is a permission distinct from Edit/Write/Bash, so an MCP-provided tool is not covered by --deny Edit/Write/Bash",
@@ -583,6 +593,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
                 "-p",
                 "--conversation",
             ],
+            &[],
             &[
                 "exit codes are unreliable; sfh trusts the envelope's status field",
                 "no fork: a branch of an existing conversation is not available headlessly",
@@ -622,6 +633,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
                 "--session-id",
                 "--fork",
             ],
+            &[],
             &[
                 "no sandbox at all: access is expressed purely as a --tools allowlist, and write therefore excludes bash",
                 "--session-id CREATES a session when the id is not found in this cwd, so a resume is only trustworthy with the session marker",
@@ -649,6 +661,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
                 "--force",
                 "--resume",
             ],
+            &[],
             &[
                 "headless permissions are binary: deny-all without --force, approve-all with it, so access: write is refused rather than silently promoted",
                 "--resume creates a chat when the id is unknown, so sfh verifies the chat store on disk",
@@ -670,6 +683,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
         cost_coverage: cost,
         policy_coverage: policy,
         required_flags: flags,
+        help_args,
         known_gaps: gaps,
         exit_code_trustworthy: exit_code_trustworthy(tool),
     })
@@ -748,7 +762,10 @@ pub fn probe_hardening(tool: &str) -> ProbeHardening {
 }
 
 /// pi has no sandbox and no permission prompts: the only real lever is which
-/// tools get registered. Bare `pi` already has read+bash+edit+write.
+/// tools get registered. Bare `pi` already has read+bash+edit+write. Keep the
+/// default allowlist unchanged: Pi's PowerShell implementation itself rejects
+/// non-Windows hosts with `process.platform !== "win32"` in
+/// `getPowerShellConfig` (v0.85.1).
 fn pi_tools(access: Access) -> &'static str {
     match access {
         Access::Read => "read,grep,find,ls",
@@ -1089,7 +1106,11 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
             Some((f, v)) => (f.to_string(), Some(v.to_string())),
             None => (a.clone(), None),
         };
-        if GLOBAL_BYPASS_FLAGS.contains(&flag.as_str()) && access != Access::Full {
+        // Cursor documents -f as the short alias of --force; it is not a
+        // tool-independent alias (other CLIs use -f for unrelated values).
+        if (GLOBAL_BYPASS_FLAGS.contains(&flag.as_str()) || (tool == "cursor" && flag == "-f"))
+            && access != Access::Full
+        {
             return Some(Escalation {
                 arg: a.clone(),
                 reason: "bypasses all permission checks (= full access)".to_string(),
@@ -1100,18 +1121,35 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                 .clone()
                 .or_else(|| takes_value.then(|| args.get(i + 1).cloned()).flatten())
         };
+        // Clap accepts a value attached to a short option (for example,
+        // `-sdanger-full-access` and `-capproval_policy=on-request`). Keep
+        // the original argv element here because splitting on `=` turns the
+        // latter into a flag named `-capproval_policy`, hiding the config key.
+        let codex_short_value = |short: &str| -> Option<String> {
+            (a.starts_with(short) && !a.starts_with("--") && a.len() > short.len()).then(|| {
+                a[short.len()..]
+                    .strip_prefix('=')
+                    .unwrap_or(&a[short.len()..])
+                    .to_string()
+            })
+        };
         match tool {
             "codex" => {
                 // -s/--sandbox <mode>, a bare -c value element sandbox_mode=<mode>,
-                // OR the joined forms -c sandbox_mode=<mode> / --config=sandbox_mode=<mode>.
+                // the attached short form -csandbox_mode=<mode>, OR the joined
+                // forms -c sandbox_mode=<mode> / --config=sandbox_mode=<mode>.
                 let mode = if flag == "-s" || flag == "--sandbox" {
                     value_of(true)
+                } else if let Some(v) = codex_short_value("-s") {
+                    Some(v)
                 } else if flag == "sandbox_mode" {
                     Some(eq_value.clone().unwrap_or_default())
                 } else if flag == "-c" || flag == "--config" {
                     value_of(true).and_then(|v| {
                         config_kv(&v).and_then(|(k, val)| (k == "sandbox_mode").then_some(val))
                     })
+                } else if let Some(v) = codex_short_value("-c") {
+                    config_kv(&v).and_then(|(k, val)| (k == "sandbox_mode").then_some(val))
                 } else {
                     None
                 };
@@ -1134,13 +1172,15 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                 }
                 // approval_policy=<policy>: anything except "never" auto-approves
                 // at least some actions. Recognised both as a bare -c value element
-                // and inside the joined -c/--config forms.
+                // and inside the joined -c/--config or attached -c forms.
                 let approval = if flag == "approval_policy" {
                     eq_value.clone()
                 } else if flag == "-c" || flag == "--config" {
                     value_of(true).and_then(|v| {
                         config_kv(&v).and_then(|(k, val)| (k == "approval_policy").then_some(val))
                     })
+                } else if let Some(v) = codex_short_value("-c") {
+                    config_kv(&v).and_then(|(k, val)| (k == "approval_policy").then_some(val))
                 } else {
                     None
                 };
@@ -1167,7 +1207,15 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                 if flag == "--permission-mode" {
                     if let Some(v) = value_of(true) {
                         let clean = unquote(&v);
-                        if let Some(r) = permission_mode_rank(&clean) {
+                        // Auto may approve shell commands through a classifier;
+                        // it does not preserve the write tier's no-shell rule.
+                        // https://code.claude.com/docs/en/auto-mode-config
+                        let rank = if clean == "auto" {
+                            Some(2)
+                        } else {
+                            permission_mode_rank(&clean)
+                        };
+                        if let Some(r) = rank {
                             if let Some(e) = wider(
                                 a,
                                 format!(
@@ -1182,9 +1230,18 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             }
                         }
                     }
-                } else if flag == "--tools" || flag == "--allowedTools" {
-                    if let Some(v) = value_of(true) {
-                        let r = claude_tool_list_rank(&v);
+                } else if matches!(
+                    flag.as_str(),
+                    "--tools" | "--allowedTools" | "--allowed-tools"
+                ) {
+                    // Claude's <tools...> consumes every following value up
+                    // to the next option, including values after --tools=Read.
+                    // Inspecting only the first value misses [Read, Bash].
+                    for v in eq_value
+                        .iter()
+                        .chain(args.iter().skip(i + 1).take_while(|v| !v.starts_with('-')))
+                    {
+                        let r = claude_tool_list_rank(v);
                         if let Some(e) = wider(
                             a,
                             format!(
@@ -1249,7 +1306,7 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                             }
                         }
                     }
-                } else if flag == "--allow" {
+                } else if flag == "--allow" || flag == "--allowedTools" {
                     if let Some(v) = value_of(true) {
                         let head = v
                             .split(['(', ':', '='])
@@ -1334,22 +1391,82 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
     None
 }
 
-/// claude --tools/--allowedTools: Bash is a shell (= full), edit-family tools
-/// are the write tier, anything else (Read, Grep, WebFetch...) stays read.
+/// Claude accepts comma/space-separated tool rules and variadic argv values.
+/// Keep rule arguments together: Read(path with Edit in it) is still Read.
+/// Shell/code tools and the `default` all-tools selector grant full access.
+/// Verified with Claude 2.1.263 help and the official tools reference:
+/// https://code.claude.com/docs/en/tools-reference
 fn claude_tool_list_rank(list: &str) -> u8 {
-    let tools: Vec<String> = list
-        .split(',')
-        .map(|t| t.trim().trim_matches('"').to_lowercase())
-        .collect();
-    if tools.iter().any(|t| t.starts_with("bash")) {
-        2
-    } else if tools
-        .iter()
-        .any(|t| matches!(t.as_str(), "edit" | "write" | "multiedit" | "notebookedit"))
-    {
-        1
-    } else {
-        0
+    let mut depth = 0usize;
+    list.split(|ch: char| match ch {
+        '(' => {
+            depth = depth.saturating_add(1);
+            false
+        }
+        ')' => {
+            depth = depth.saturating_sub(1);
+            false
+        }
+        _ => depth == 0 && (ch == ',' || ch.is_whitespace()),
+    })
+    .map(|rule| {
+        let name = rule
+            .trim_matches(['\"', '\''])
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        match name.as_str() {
+            "bash" | "powershell" | "repl" | "monitor" | "default" => 2,
+            "edit" | "write" | "multiedit" | "notebookedit" => 1,
+            _ => 0,
+        }
+    })
+    .max()
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod claude_access_tests {
+    use super::*;
+
+    #[test]
+    fn claude_variadic_alias_and_shell_tools_cannot_widen_read_access() {
+        for values in [
+            vec!["--tools", "Read", "Bash"],
+            vec!["--tools=Read", "PowerShell"],
+            vec!["--tools", "Read Edit"],
+            vec!["--tools", "default"],
+            vec!["--allowed-tools", "Read", "Bash(git log *)"],
+            vec!["--allowedTools", "Read,PowerShell(Get-Content *)"],
+            vec!["--allowedTools=Read REPL"],
+            vec!["--tools", "Monitor"],
+        ] {
+            let args: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+            assert!(
+                find_escalation("claude", Access::Read, &args).is_some(),
+                "{values:?}"
+            );
+            assert!(
+                find_escalation("claude", Access::Full, &args).is_none(),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_read_rules_and_unrelated_option_values_remain_read() {
+        for values in [
+            vec!["--allowedTools", "Read(path with Edit in it)", "Grep"],
+            vec!["--tools", "Read Grep", "--model", "Bash"],
+            vec!["--tools", ""],
+        ] {
+            let args: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+            assert!(
+                find_escalation("claude", Access::Read, &args).is_none(),
+                "{values:?}"
+            );
+        }
     }
 }
 
@@ -1359,7 +1476,7 @@ fn pi_tool_list_rank(list: &str) -> u8 {
         .split(',')
         .map(|t| t.trim().trim_matches('"').to_lowercase())
         .collect();
-    if tools.iter().any(|t| t == "bash") {
+    if tools.iter().any(|t| t == "bash" || t == "powershell") {
         2
     } else if tools.iter().any(|t| t == "edit" || t == "write") {
         1
@@ -1878,7 +1995,7 @@ pub fn build_resume(
     })
 }
 
-/// The token codex's own `--help` has to contain for sfh to trust `exec fork`
+/// The token codex's own `exec --help` has to contain for sfh to trust `exec fork`
 /// on the installed binary (P1-07). Deliberately NOT folded into
 /// `AdapterInfo.required_flags`, which `preflight` checks on every run
 /// regardless of what the step asked for: a codex whose `--help` stays silent
@@ -1888,8 +2005,17 @@ pub fn build_resume(
 /// `None` (the caller could not read `--help` at all) is exactly as
 /// untrustworthy as help text that never mentions fork, so both fail closed
 /// the same way.
-fn codex_fork_confirmed(installed_help: Option<&str>) -> bool {
-    installed_help.is_some_and(|h| h.contains("fork"))
+pub(crate) fn codex_fork_confirmed(installed_help: Option<&str>) -> bool {
+    installed_help.is_some_and(|h| {
+        let has_exec_usage = h
+            .lines()
+            .any(|line| line.trim_start().starts_with("Usage: codex exec "));
+        let has_fork_command = h.lines().any(|line| {
+            let mut words = line.split_whitespace();
+            words.next() == Some("fork") && words.next().is_some()
+        });
+        has_exec_usage && has_fork_command
+    })
 }
 
 /// Build the command line to FORK a session: the child inherits the parent's
@@ -2144,6 +2270,12 @@ mod tests {
 
     fn paths() -> (PathBuf, PathBuf) {
         (PathBuf::from("/tmp/last.txt"), PathBuf::from("/tmp/p.txt"))
+    }
+
+    #[test]
+    fn help_args_select_the_subcommand_where_codex_and_opencode_publish_flags() {
+        assert_eq!(adapter_info("codex").unwrap().help_args, &["exec"][..]);
+        assert_eq!(adapter_info("opencode").unwrap().help_args, &["run"][..]);
     }
 
     #[test]
@@ -2522,10 +2654,22 @@ mod tests {
         assert!(!supports_fork("cursor"));
     }
 
-    /// codex's own `--help`, shaped enough to convince `codex_fork_confirmed`
+    /// codex's own `exec --help`, shaped enough to convince `codex_fork_confirmed`
     /// that this installed build has heard of `exec fork` - used wherever a
     /// test needs codex to actually clear the P1-07 capability gate.
-    const CODEX_HELP_WITH_FORK: &str = "usage: codex exec [OPTIONS] [PROMPT]\n\nSUBCOMMANDS:\n    resume    Resume a previous session\n    fork      Fork a previous session into a new one\n";
+    const CODEX_HELP_WITH_FORK: &str = "Usage: codex exec [OPTIONS] [PROMPT]\n\nCommands:\n  resume    Resume a previous session\n  fork      Fork a previous session into a new one\n";
+
+    #[test]
+    fn codex_fork_confirmation_requires_the_exec_fork_subcommand() {
+        let root_help =
+            "Usage: codex [OPTIONS] [PROMPT]\n\nCommands:\n  fork    Fork an interactive session\n";
+        let exec_without_fork =
+            "Usage: codex exec [OPTIONS] [PROMPT]\n\nCommands:\n  resume  Resume a previous session\n";
+        assert!(!codex_fork_confirmed(Some(root_help)));
+        assert!(!codex_fork_confirmed(Some(exec_without_fork)));
+        assert!(codex_fork_confirmed(Some(CODEX_HELP_WITH_FORK)));
+        assert!(!codex_fork_confirmed(None));
+    }
 
     #[test]
     fn fork_builds_a_child_session_for_every_supporting_tool() {
@@ -2838,6 +2982,16 @@ mod tests {
     #[test]
     fn escalation_detection_covers_each_tools_permission_levers() {
         for (tool, access, argv) in [
+            ("cursor", Access::Read, args(&["-f"])),
+            ("cursor", Access::Write, args(&["-f"])),
+            (
+                "claude",
+                Access::Write,
+                args(&["--permission-mode", "auto"]),
+            ),
+            ("claude", Access::Read, args(&["--permission-mode=auto"])),
+            ("grok", Access::Write, args(&["--allowedTools", "Bash(ls)"])),
+            ("grok", Access::Read, args(&["--allowedTools=Write"])),
             ("pi", Access::Read, args(&["--approve"])),
             ("pi", Access::Read, args(&["--tools", "read,edit"])),
             (
@@ -2845,6 +2999,13 @@ mod tests {
                 Access::Write,
                 args(&["-t", "read,bash,edit,write,grep,find,ls"]),
             ),
+            // Pi's native PowerShell tool is a shell on Windows. Check every
+            // spelling accepted by the argv scanner, including joined and
+            // quoted values, so a read/write step cannot smuggle it through.
+            ("pi", Access::Read, args(&["--tools", "PowerShell"])),
+            ("pi", Access::Write, args(&["-t", "\"POWERSHELL\""])),
+            ("pi", Access::Read, args(&["--tools=PoWeRsHeLl"])),
+            ("pi", Access::Write, args(&["-t=\"PowerShell\""])),
             ("opencode", Access::Read, args(&["--agent", "build"])),
             ("opencode", Access::Read, args(&["--agent=build"])),
             ("claude", Access::Read, args(&["--tools", "Read,Bash"])),
@@ -2954,6 +3115,22 @@ mod tests {
             &args(&["--config=sandbox_mode=\"danger-full-access\""])
         )
         .is_some());
+        // Clap also accepts the value attached to a one-letter option. These
+        // are each one argv element, so a split-on-`=` scan must retain the
+        // short option prefix while extracting its value.
+        assert!(find_escalation("codex", Access::Read, &args(&["-sdanger-full-access"])).is_some());
+        assert!(find_escalation(
+            "codex",
+            Access::Read,
+            &args(&["-csandbox_mode=\"danger-full-access\""])
+        )
+        .is_some());
+        assert!(find_escalation(
+            "codex",
+            Access::Read,
+            &args(&["-capproval_policy=on-request"])
+        )
+        .is_some());
         assert!(find_escalation(
             "codex",
             Access::Read,
@@ -2967,6 +3144,12 @@ mod tests {
             &args(&["--config=sandbox_mode=\"read-only\""])
         )
         .is_none());
+        assert!(
+            find_escalation("codex", Access::Read, &args(&["-csandbox_mode=read-only"])).is_none()
+        );
+        assert!(
+            find_escalation("codex", Access::Read, &args(&["-capproval_policy=never"])).is_none()
+        );
     }
 
     #[test]

@@ -41,7 +41,8 @@ pub enum ErrorCode {
     ProtocolInvalid,
     /// A structured protocol ended without its documented terminal record.
     TerminalMissing,
-    /// A resume or fork could not prove it landed in the expected session.
+    /// A fresh, resumed, or forked session could not be proven to be the
+    /// expected session.
     SessionUnverified,
     /// The pinned execution inputs differ from the run being resumed.
     ExecutionClosureChanged,
@@ -57,7 +58,7 @@ pub enum ErrorCode {
     WorkspaceUnowned,
     /// A replay policy refused to re-run an unfinished effect.
     ReplayRefused,
-    /// A required durable artifact could not be written.
+    /// A required durable artifact could not be persisted or read back.
     PersistenceFailure,
     /// A capability the flow requires is not available here.
     CapabilityUnavailable,

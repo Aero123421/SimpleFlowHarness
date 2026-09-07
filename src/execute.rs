@@ -165,13 +165,15 @@ impl Activity {
 }
 
 // ---------------------------------------------------------------------------
-// Process-tree ownership: children must never outlive sfh.
+// Process cleanup: owned children and process groups are terminated together.
 //
 // Windows: every child joins a job object created with KILL_ON_JOB_CLOSE, so
 // the OS reaps the whole tree even if sfh is force-killed.
-// Unix: each child gets its own session (so a timeout can kill the tree) plus,
-// on Linux, PR_SET_PDEATHSIG=SIGKILL. Ctrl+C/SIGTERM are handled by a signal
-// handler that kills every registered process group.
+// Unix: each child gets its own session (so a timeout can kill its process
+// group) plus, on Linux, PR_SET_PDEATHSIG=SIGKILL for the direct child.
+// Ctrl+C/SIGTERM handlers kill every registered process group. Descendants
+// that create another session/process group can escape this cleanup; this
+// is not OS-level process containment (see SECURITY.md).
 // ---------------------------------------------------------------------------
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -208,15 +210,20 @@ pub fn request_interrupt() {
     }
 }
 
-fn track(pid: i32) {
-    for slot in TRACKED.iter() {
+fn track_in(tracked: &[AtomicI32], pid: i32) -> Result<(), ()> {
+    for slot in tracked {
         if slot
             .compare_exchange(0, pid, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            return;
+            return Ok(());
         }
     }
+    Err(())
+}
+
+fn track(pid: i32) -> Result<(), ()> {
+    track_in(&TRACKED, pid)
 }
 
 fn untrack(pid: i32) {
@@ -1050,7 +1057,17 @@ pub fn run_cmd(
         }
     };
     let pid = child.id() as i32;
-    track(pid);
+    if track(pid).is_err() {
+        // An untracked child would outlive sfh on SIGTERM/SIGINT. Kill and
+        // reap it before returning the spawn-shaped error so the caller never
+        // observes a process that the guard cannot own.
+        kill_tree(&mut child);
+        let _ = child.wait();
+        return Err(format!(
+            "failed to spawn [{}]: process tracking table is full",
+            inv.describe()
+        ));
+    }
 
     let stdin_thread = stdin_data.map(|data| {
         let mut si = child.stdin.take().expect("stdin piped");
@@ -1113,7 +1130,7 @@ pub fn run_cmd(
     unsafe {
         // A command may exit after backgrounding a descendant that still owns
         // stdout/stderr. The descendant is part of this leaf, not a detached
-        // workflow, so close the whole session even on a nominal root exit.
+        // workflow, so kill its original process group even on a nominal root exit.
         // Otherwise the pipe drain can stall for minutes and the process can
         // outlive both its step and a normally exiting sfh.
         libc::kill(-pid, libc::SIGKILL);
@@ -1858,6 +1875,21 @@ mod tests {
         let a = Invocation::Argv(vec!["tool".into(), "--flag".into(), "two words".into()]);
         assert_eq!(a.describe(), "tool --flag \"two words\"");
         assert_eq!(Invocation::Shell("echo hi".into()).describe(), "$ echo hi");
+    }
+
+    #[test]
+    fn a_full_local_tracking_registry_rejects_without_touching_global_slots() {
+        // Use a private table rather than filling TRACKED: tests run in
+        // parallel, and a real 512-child fanout would make this regression
+        // needlessly expensive and platform-dependent.
+        let local = [AtomicI32::new(101), AtomicI32::new(202)];
+        assert!(track_in(&local, 303).is_err());
+        assert_eq!(local[0].load(Ordering::SeqCst), 101);
+        assert_eq!(local[1].load(Ordering::SeqCst), 202);
+
+        let with_space = [AtomicI32::new(0), AtomicI32::new(404)];
+        assert!(track_in(&with_space, 505).is_ok());
+        assert_eq!(with_space[0].load(Ordering::SeqCst), 505);
     }
 
     /// P0-04. The prompt an argv-delivery adapter carries is flow data - a
