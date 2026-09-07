@@ -3,6 +3,113 @@
 このCHANGELOGはrepository maintainer向けのリリース記録として日本語で記述します。
 利用者向け概要は英語版`README.md`を正とし、日本語版`README.ja.md`を併記します。
 
+## Unreleased
+
+v1.6.1のrelease後、repository全体をもう一度実測して監査した結果の修正です。
+engine、flow schema、machine API、resume形式は互換です。同梱flowのYAMLは変わり
+ますが、変わったのは宣言の明示性だけで、解決される挙動は同一です。
+
+見つかった問題は9件のうち5件が同じ形をしていました — **「検証した」と述べている
+主張のほうが検証されていない**。gateはrepositoryの内側を検査し、repositoryが
+外側について述べた主張は誰も検査していませんでした。今回の修正は、その主張を
+すべてgateへ移すことです。
+
+### 同梱flowが全数`--strict`を通るようになりました
+
+- READMEとskillsは`sfh validate --strict`を勧めながら、CIは緩い`validate`しか
+  走らせていませんでした。その結果、同梱flowにはv1.6.1のbinaryで192件の助言finding
+  が溜まり、packの検証レポートは「残るのは意図的なworkspace解決だけ」と述べて
+  いました。内訳は暗黙fall-through 98件、未宣言`effects:` 71件、暗黙のworkspace
+  解決19件、強制力のないUSD上限3件、終端不能1件です。
+- 暗黙fall-through 98件すべてに明示`route`を追加しました。挙動は変わりませんが、
+  stepの並び替えでrouteが黙って変わる状態がなくなります。この欠陥classは、
+  packの検証レポート自身が「実binaryで初めて見つかった」と誇っていたものです。
+- `cmd:`stepの`effects:`を71件宣言しました。commandの実際の内容で分類しています
+  （`cargo fmt`/`cargo test`/`git add`はsourceやtargetを書くので`workspace`、
+  `echo`/`cat`/`git diff --stat`は`read`、別OSのfilesystemでbuildするWSL stepは
+  `external`）。名前ではなく実行内容が根拠です。
+- `workspace.mode: auto`が管理worktreeへ解決していた19件を、`git-worktree`の
+  明示宣言へ変更しました。`sfh guide`が示し、`sfh-flow-design`がwriter flowに
+  勧めているのはこちらです。解決結果は同一で、意図が記述されるようになります。
+- CIは`examples/*.yaml`、`examples/ponytail/`、`skills/*/assets/`のすべてを
+  `--strict`で検証します。例外は`17-database-migration-dry-run.yaml`の1件だけで、
+  これは成功経路が必ず`stuck`へ着地してmigrationの適用を人へ返す設計です。
+  例外はci.yml、flowのheader、検証レポートの3か所に書かれ、
+  `tests/skills_checks.py`が3つの一致を検査します。
+
+### `allow_empty`の教材不足を解消しました（issue #25）
+
+- `allow_empty`はpreset toolで既定`false`であり、workspaceを書き換えたagentが
+  最終メッセージを出さずにturnを終えるとfail closedします。engineの判断は正しい
+  のですが、この語はREADME（日英）、`sfh guide`、9本のskillのどこにも1度も
+  現れず、`schema/flow.schema.json`だけが唯一の記載でした。実運用のrunが最初に
+  踏むfail-closed messageとして、これは発見不能です。
+- 日英READMEに`allow_empty:`節、`sfh guide`に実例、`sfh-flow-design`に
+  「Choose the right completion evidence for each step」、
+  `sfh-deterministic-gates`にverdict tokenを成果の証拠にしないanti-pattern、
+  `sfh-failure-recovery`に長時間AI stepの4つの失敗の区別表、
+  `sfh-tool-integration`にdaemon/serviceの`PATH`差の節を追加しました。
+- `stable-flow-skeleton.yaml`はworkerに`allow_empty: true`、reviewerに既定の
+  `false`を置いて対比を示します。
+- 参照先を失わないよう、この文言が全資料に残っていることをtestで固定しました。
+
+### 検証レポートを実測から書き直しました
+
+- `examples/ponytail/VALIDATION.md`は「18本の top-level example のうち 4本が
+  strict-clean」と書いていました。top-level exampleはv1.4.0以降どのtagでも17本で、
+  執筆時点でstrict-cleanは1本です。どちらの数字も測定されたものではありません
+  でした。`skills/VALIDATION.md`も、既に存在しないfindingを「受け入れ済み」として
+  列挙していました。
+- 両方を実測値で書き直し、`tests/skills_checks.py`がレポート中の比率をtreeから
+  再計算するようにしました。数字の陳腐化がCIで落ちます。
+
+### CIが検査していなかった経路
+
+- `docs/`のみの変更はlight pathでheavy CIを飛ばしていましたが、
+  `release-resources.txt`配下の全pathは`release-content-manifest.txt`にhash固定
+  されています。docs単独のcommitがmanifestを陳腐化させ、次の無関係なPRを落として
+  いました。light pathでも`tests/distribution_checks.py`を走らせます（python+git
+  のみ、数秒）。
+- README.md / README.ja.mdをheavy扱いにしました。両READMEは`cargo test`が
+  strict検証しdry-runする完全なflowを含みます。従来はQuick Startの1本だけが
+  検査され、しかもREADME単独の変更ではその検査自体が走りませんでした。
+  `api_version:`で始まる全fenceを検証するtestを追加しています。
+- READMEの目次anchorが実在の見出しへ解決することをtestで固定しました。
+
+### 契約の自己申告を直しました
+
+- `schema/*.json`の`$id`が`v1.4.0`のままでした。同梱flow 34本は`v1.6.0`をpinして
+  おり、schema本体もv1.4.0から25行変わっています。4つのschemaを現行seriesへ
+  修正し、`tests/distribution_checks.py`が`$id`のminor seriesとfile名を検査します。
+- Homebrew formulaの`pkgshare.install`一覧は`release-resources.txt`の手写しでした。
+  renderer側で生成するようにし、契約の複製をなくしました。
+- `CODE_OF_CONDUCT.md`をrelease resourceへ追加しました。他のpolicy fileは同梱
+  されており、これだけが漏れていたため、offline install時にREADMEのlinkが
+  切れていました。
+- installerが持つresource allowlistの重複をtestで固定しました。この重複は
+  意図的です — downloadしたarchiveを検証するinstallerは、そのarchive自身が申告する
+  「入っていてよいもの」を信用できないので、allowlistはinline でなければなりません。
+  ただし誰も複製の一致を検査しておらず、contractへ1件追加しただけで
+  shell/PowerShell installerの4つのinline listが取り残され、install job だけが
+  落ちました。`tests/distribution_checks.py`が両installerのmanifestとmember
+  allowlistを`release-resources.txt`と照合します。
+
+### engineの修正
+
+- `defaults.max_cost_usd`の助言警告が、`defaults.wall_clock_sec`が設定されていても
+  「`defaults.wall_clock_sec`を足せ」と言い続けていました。この警告が求める
+  backstopが既にある場合は出しません。本repositoryの3つのflowが該当していました。
+
+### 作業キューの一本化
+
+- `AGENTS.md`は`docs/v1.6-backlog.md`を "the current work queue" と指していました
+  が、唯一の未処理作業（issue #25）はそこにありませんでした。AGENTS.mdに従うagentは
+  それを一度も見ません。GitHub issuesをキューと明記し、backlogは「変更しないと
+  決めた境界」の記録に限定しました。
+- `docs/README.md`を追加し、shipされるdocs treeのどれが現行でどれが歴史的記録かを
+  示します。31KBの`docs/v1.1-spec.md`はどこからも参照されないまま全archiveへ同梱
+  されていました。実装状況を実測した見出しを付け、未実装4項目を明示しています。
+
 ## v1.6.1 - 2026-08-13
 
 v1.6.0の配布物を実際に展開・導入して監査し、repository内では成立していた

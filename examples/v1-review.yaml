@@ -32,6 +32,7 @@ defaults:
 
 steps:
   - id: stage
+    effects: workspace
     cmd: ["git", "add", "-A"]
     retry_on: never
     route: [{ goto: review }]
@@ -200,7 +201,10 @@ steps:
           **最後の行に `REVIEW-PASS` か `REVIEW-FAIL` を単独で書くこと。**
 
   # 3体の最終行を機械的に数える。末尾の空白と CR を許容する。
+    route:
+      - {goto: verdict}
   - id: verdict
+    effects: read
     cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS[[:space:]]*$' - || true); echo \"PASSES=$n\""]
     stdin: prompt
     prompt: "{{steps.review.outputs}}"
@@ -213,10 +217,12 @@ steps:
 
   # 自動で差し戻さない。所見を出して終わる。直すのは人間側。
   - id: report
+    effects: read
     cmd: ["sh", "-c", "echo 'NOT UNANIMOUS - see review outputs above'; git --no-pager diff --stat main | tail -3"]
     retry_on: never
     route: [{ goto: end }]
 
   - id: wrap
+    effects: read
     cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED THE 11-ITEM CHECKLIST'; git --no-pager diff --stat main | tail -3"]
     retry_on: never

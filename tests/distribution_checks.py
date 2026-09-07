@@ -30,6 +30,7 @@ RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 EXPECTED_RESOURCES = [
     "AGENTS.md",
     "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "README.ja.md",
@@ -52,6 +53,20 @@ WINDOWS_ASSET = "sfh-windows-x64.zip"
 TEST_APPLE_TEAM_ID = "A1B2C3D4E5"
 TEST_WINDOWS_SIGNER_SHA256 = "ab" * 32
 DISTRIBUTION_ASSETS = ["sfh-installer.ps1", "sfh-installer.sh", "sfh.rb"]
+# The `$id` every published schema carries: a raw URL pinned to a release tag,
+# naming the file it lives in.
+SCHEMA_ID_RE = re.compile(
+    r"https://raw\.githubusercontent\.com/Aero123421/SimpleFlowHarness"
+    r"/v(\d+)\.(\d+)\.(\d+)/schema/([A-Za-z0-9._-]+\.json)"
+)
+
+
+def crate_version() -> tuple[int, int]:
+    """The (major, minor) of the crate this checkout would publish."""
+    with (ROOT / "Cargo.toml").open("rb") as manifest:
+        version = tomllib.load(manifest)["package"]["version"]
+    major, minor, _ = version.split(".", 2)
+    return int(major), int(minor)
 
 
 def write_checksums(directory: Path) -> dict[str, str]:
@@ -159,8 +174,16 @@ class DistributionChecks(unittest.TestCase):
                 self.assertIn(checksums[asset], formula_text)
             self.assertNotIn("{{", formula_text)
             self.assertIn('pkgshare.install "release-resources.txt"', formula_text)
-            for resource in EXPECTED_RESOURCES:
-                self.assertIn(f'"{resource.rstrip("/")}"', formula_text)
+            # Exact, not "contains": the formula's install list is generated
+            # from release-resources.txt, so an entry the contract dropped must
+            # disappear here too. It used to be a hand-maintained second copy.
+            block = formula_text.split("pkgshare.install ", 1)[1].split("\n  end", 1)[0]
+            installed = re.findall(r'"([^"]+)"', block)
+            self.assertEqual(
+                installed,
+                ["release-resources.txt"]
+                + [resource.rstrip("/") for resource in EXPECTED_RESOURCES],
+            )
 
             ruby = shutil.which("ruby")
             if ruby:
@@ -330,6 +353,90 @@ class DistributionChecks(unittest.TestCase):
             EXPECTED_RESOURCES,
         )
 
+    def test_every_installer_allowlist_matches_the_resource_contract(self) -> None:
+        """The installers repeat release-resources.txt. Keep the copies equal.
+
+        The repetition is deliberate, not sloppy: an installer validating a
+        downloaded archive cannot take the archive's own idea of what belongs in
+        it, so the allowlist has to be inline. That makes it a trust boundary
+        AND a duplicate, and nothing checked the duplicate - adding
+        CODE_OF_CONDUCT.md to the contract left four inline lists behind and
+        every install job failed while the whole rest of CI stayed green.
+
+        Checked here rather than in the installer suites because this is the
+        cheap check that names the real cause; those suites report it as a
+        rejected archive several layers downstream.
+        """
+        contract = [
+            line.strip()
+            for line in RESOURCE_CONTRACT.read_text(encoding="ascii").splitlines()
+            if line.strip()
+        ]
+        files = [entry for entry in contract if not entry.endswith("/")]
+        directories = [entry.rstrip("/") for entry in contract if entry.endswith("/")]
+
+        shell = (ROOT / "installers/sfh-installer.sh").read_text(encoding="utf-8")
+        powershell = (ROOT / "installers/sfh-installer.ps1").read_text(encoding="utf-8")
+
+        # The manifest each installer compares the archive's own copy against.
+        shell_paths = re.search(
+            r"EXPECTED_RESOURCE_PATHS='([^']*)'", shell
+        )
+        self.assertIsNotNone(shell_paths, "shell installer declares no resource manifest")
+        assert shell_paths is not None
+        self.assertEqual(shell_paths.group(1).splitlines(), contract)
+
+        powershell_paths = re.search(
+            r"\$RequiredResources = @\(\n(.*?)\n\s*\)", powershell, re.S
+        )
+        self.assertIsNotNone(
+            powershell_paths, "PowerShell installer declares no resource manifest"
+        )
+        assert powershell_paths is not None
+        self.assertEqual(
+            re.findall(r'"([^"]+)"', powershell_paths.group(1)), contract
+        )
+
+        # The member allowlists, which reject anything the contract does not name.
+        # Anchored on the rejection arm and read backwards: the shell installer
+        # has more than one `case "$member" in`, and a forward non-greedy match
+        # swallows the unsafe-path one in between.
+        rejection = '*) fail "archive contains an unexpected member'
+        self.assertIn(rejection, shell, "shell installer has no member allowlist")
+        head = shell.split(rejection, 1)[0]
+        allowlist = head[head.rindex('case "$member" in') + len('case "$member" in') :]
+        tokens = {
+            token.strip().rstrip(")")
+            for token in re.split(r"[|\\\n]", allowlist)
+            if token.strip().rstrip(")") and token.strip() != ";;"
+        }
+        self.assertEqual(
+            tokens,
+            {"sfh", "release-resources.txt", *files}
+            | {name for entry in directories for name in (entry, f"{entry}/*")},
+        )
+
+        powershell_files = re.search(
+            r"\$allowedFiles = @\(\n(.*?)\n\s*\)", powershell, re.S
+        )
+        self.assertIsNotNone(powershell_files, "PowerShell installer has no file allowlist")
+        assert powershell_files is not None
+        self.assertEqual(
+            sorted(re.findall(r'"([^"]+)"', powershell_files.group(1))),
+            sorted(["sfh.exe", "release-resources.txt", *files]),
+        )
+
+        powershell_directories = re.search(
+            r"\$allowedDirectories = @\(([^)]*)\)", powershell
+        )
+        self.assertIsNotNone(
+            powershell_directories, "PowerShell installer has no directory allowlist"
+        )
+        assert powershell_directories is not None
+        self.assertEqual(
+            re.findall(r'"([^"]+)"', powershell_directories.group(1)), directories
+        )
+
     def test_release_content_manifest_is_current_and_canonical(self) -> None:
         result = self.run_release_helper(
             "content-manifest", "--output", str(CONTENT_MANIFEST), "--check"
@@ -364,6 +471,44 @@ class DistributionChecks(unittest.TestCase):
             text = (ROOT / readme).read_text(encoding="utf-8")
             pins = re.findall(r"`SFH_VERSION=([^`]+)`", text)
             self.assertEqual(pins, [version], f"stale install pin in {readme}")
+
+    def test_published_schemas_identify_the_series_they_ship_in(self) -> None:
+        """A schema's `$id` is a claim about which published document it is.
+
+        Nothing checked it, so `flow.schema.json` said it was the v1.4.0
+        document for two minor releases while every bundled flow pinned the
+        v1.6.0 URL and the file itself had gained `require_version` and
+        `when_protocol_is`. A validator that resolves `$id` as the base URI
+        fetched a different schema than the one the flows named.
+
+        Patch releases republish the same schema bytes under a new tag, so the
+        pin tracks the minor series - the same rule `skills_checks.py` applies
+        to the flows' `$schema` headers, kept identical on purpose.
+        """
+        major, minor = crate_version()
+        schemas = sorted((ROOT / "schema").glob("*.json"))
+        self.assertTrue(schemas, "no published schemas found")
+        for path in schemas:
+            with self.subTest(schema=path.name):
+                document = json.loads(path.read_text(encoding="utf-8"))
+                identifier = document.get("$id")
+                self.assertIsNotNone(identifier, "schema declares no $id")
+                found = SCHEMA_ID_RE.fullmatch(identifier)
+                self.assertIsNotNone(
+                    found,
+                    f"$id must be a raw.githubusercontent URL pinned to a v* tag: {identifier}",
+                )
+                assert found is not None
+                self.assertEqual(
+                    (int(found.group(1)), int(found.group(2))),
+                    (major, minor),
+                    "schema $id pins a different minor series than this crate",
+                )
+                self.assertEqual(
+                    found.group(4),
+                    path.name,
+                    "schema $id names a different file than it lives in",
+                )
 
     def test_shared_packager_builds_complete_tar_and_zip_packets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

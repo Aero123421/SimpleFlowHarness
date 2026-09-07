@@ -12,6 +12,13 @@ while IFS= read -r -d '' path; do
     */*)
       heavy=true
       ;;
+    README.md|README.ja.md)
+      # Both READMEs carry whole flows that `cargo test` strictly validates and
+      # dry-runs, so they are executable input under the same rule as skills/**
+      # rather than prose. Only the Quick Start fence used to be checked, and
+      # nothing ran that check on a README-only change.
+      heavy=true
+      ;;
     *.md)
       # Root prose only. Nested Markdown (notably skills/**) is executable or
       # validated repository input and was caught by the */* case above.

@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-python-regression-first
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -41,6 +41,8 @@ steps:
       Trace the Python call path and identify the smallest stable regression
       boundary. Prefer a plain pytest test over fixtures, factories, or a new
       testing layer unless the repository already uses them. Do not edit files.
+    route:
+      - {goto: add_test}
 
   - id: add_test
     use: builder
@@ -52,6 +54,8 @@ steps:
 
       Analysis:
       {{steps.analyze.output | truncate:14000}}
+    route:
+      - {goto: prove_failure}
 
   - id: prove_failure
     effects: workspace
@@ -75,12 +79,16 @@ steps:
       Implement the smallest root-cause fix that makes the new regression test
       and existing suite pass. Prefer existing code, then Python's standard library.
       Do not add a package for a few clear lines.
+    route:
+      - {goto: verify}
 
   - id: verify
     effects: workspace
     cmd: ["python", "-m", "pytest", "-q"]
     timeout_sec: 1200
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

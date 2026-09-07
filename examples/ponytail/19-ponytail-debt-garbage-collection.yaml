@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-debt-garbage-collection
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -68,6 +68,8 @@ steps:
     effects: read
     cmd: ["git", "diff", "--check"]
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

@@ -20,6 +20,7 @@ Use the installed schema as final authority. This file is a design map, not a re
 - `stdin: prompt` for command prompt input
 - `cwd`, `env`, `env_remove`, `timeout_sec`
 - `effects: read | workspace | external | unknown`
+- `allow_empty` — accept a turn whose final message is empty. Defaults to `false` for preset tools and `true` for `cmd:`. Set it to `true` on a worker whose artifact, not its prose, is the product; leave it `false` where the final message is the evidence a route reads.
 
 ## Control
 

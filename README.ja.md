@@ -12,6 +12,8 @@
 
 エンジンはプロセス実行、ルーティング、ログ記録の配管に専念し、タスクの合意形成や結果の評価はコマンドおよびAIエージェント自身が行います。
 
+**目次** — [なぜ sfh なのか？](#なぜ-sfh-なのか) · [インストール](#インストール) · [クイックスタート](#クイックスタート) · [メンタルモデル](#メンタルモデルと主要機能) · [Workspace・Context・Replay](#workspacecontextreplayv12) · [プログラムから動かす](#プログラムから-sfh-を動かす) · [成果物とスキーマ](#成果物と公開スキーマ) · [詳細情報](#詳細情報とリソース)
+
 ---
 
 ## なぜ sfh なのか？
@@ -301,6 +303,38 @@ structured adapterのdriftは引き続きfail-closedですが、保存された�
 
 `when_protocol_is`は`plain`、`valid`、`missing_terminal`、`invalid`を取り、他のpredicateとは通常どおりANDで合成されます。leaf step専用で、fan-out groupには単一のprotocol stateがありません。stateは`step_end`に記録されるため、resumeはtoolを再実行せず同じ判断を再生します。
 
+### `allow_empty:` — その step の答えは何か
+
+protocol evidenceが証明するのは、turnが**終わった**ことです。turnが何かを**言った**ことは証明しません。この2つは別の事実で、agentが実際の変更を完遂したまま最終メッセージを出さずに終わることは起こります。
+
+preset（AI）stepの既定は`allow_empty: false`なので、その沈黙したturnはこう失敗します。
+
+```text
+sfh: the tool exited successfully but produced no final message
+(set allow_empty: true if that is expected)
+```
+
+この既定は、最終メッセージ自体が成果物であるとき — routeを決める`PASS` / `REVISE`の1行を出すreviewer — には正しい判断です。成果物がdiffであるworkerには誤りです。
+
+```yaml
+- id: implement
+  tool: pi
+  access: write
+  effects: workspace
+  allow_empty: true       # 答えはdiffであって、締めの一文ではない
+  timeout_sec: 7200       # agent自身のtool呼び出しを含む、turn全体の締切
+
+  route: [{goto: verify}]
+
+- id: verify               # 仕事を証明するのはこれで、DONEの1行ではない
+  effects: workspace
+  cmd: ["cargo", "test"]
+```
+
+`cmd:` stepの既定は`allow_empty: true`です。何も出力せずexit 0で終わったcommandは、exit codeで既に何が起きたかを伝えているからです。
+
+ここから2つの原則が出ます。artifactをcommandで検査できるのなら、model が書いた`DONE`tokenをコードが正しいことの唯一の証拠にしないこと — そうすると書式のずれが正しいrunを落とし、自信のある一文が壊れたrunを通します。そして`timeout_sec`は、modelの最初の応答ではなくtool使用を含むturn全体に合わせて設定すること。timeoutしたleafのworkspace変更は残り得ますが、timeoutの繰り返しは継続の仕組みではありません。
+
 ### replay policy
 
 step が開始されたのに終了を記録しなかった場合、resume が何をすべきか。sfh が「もう実行されたのか」を本当に知り得ない唯一のケースです。
@@ -530,10 +564,13 @@ sfh はどの adapter についても **minimum version を固定していませ
 - サンプルワークフロー: [examples/](examples/) ディレクトリ (`research.yaml`, `hypotheses.yaml`, `parallel-ideas.yaml`)
 - 実務向けflow集: [examples/ponytail/](examples/ponytail/) — regression-first bugfix、依存削減、独立レビューcouncil、migration dry-run、release gateなど20本。`--profiles` で自分のprojectのCLI構成に差し替えて使います。
 - flowをAIに書かせる: [skills/](skills/) — sfhの設計規則をauthoring agentへ渡す[Agent Skills](https://agentskills.io/specification) 9本。resource directoryで`cp -R skills/sfh-* .agents/skills/`を実行して導入します。YAMLを**書く側**のAIを導くもので、sfh本体に `skills:` キーはありません。
+- 契約と決定の記録: [docs/](docs/) — まず [docs/README.md](docs/README.md) を見てください。どれが現行でどれが歴史的記録かを示しています。
+- sfh本体への貢献: [AGENTS.md](AGENTS.md) がmaintainer向けの案内です。repository map、CI gate、そしてすべての変更が judged される不変条件が書かれています。手続きは [CONTRIBUTING.md](CONTRIBUTING.md) です。
 - ガイドライン・ポリシー:
   - [CONTRIBUTING.md](CONTRIBUTING.md)
   - [SECURITY.md](SECURITY.md)
   - [SUPPORT.md](SUPPORT.md)
+  - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
   - [LICENSE](LICENSE)
   - [リリースページ](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)
 

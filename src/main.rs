@@ -1154,6 +1154,25 @@ mod tests {
         }
     }
 
+    const READMES: [(&str, &str); 2] = [
+        ("README.md", include_str!("../README.md")),
+        ("README.ja.md", include_str!("../README.ja.md")),
+    ];
+
+    /// Every ```yaml fence in a README that opens with `api_version:` claims to
+    /// be a whole flow; everything else is a deliberate fragment showing one
+    /// key. Same convention `src/guide.txt` already uses, so one marker decides
+    /// what is executable documentation in both places.
+    fn readme_flow_examples(readme: &str) -> Vec<&str> {
+        readme
+            .split("```yaml")
+            .skip(1)
+            .filter_map(|tail| tail.split("```").next())
+            .map(str::trim)
+            .filter(|yaml| yaml.starts_with("api_version:"))
+            .collect()
+    }
+
     fn quick_start_yaml<'a>(readme: &'a str, heading: &str) -> &'a str {
         let quick_start = readme
             .split(heading)
@@ -1165,6 +1184,70 @@ mod tests {
             .and_then(|tail| tail.split("```").next())
             .expect("Quick Start has a closed YAML example")
             .trim()
+    }
+
+    #[test]
+    fn every_readme_flow_example_strictly_validates_and_dry_runs() {
+        // The guide's fences were gated from the start; the README's were not,
+        // and only the Quick Start one was checked at all. The two fences under
+        // "Control Flow & Routing" and "Parallel Fan-out & Consensus" are whole
+        // flows a reader can paste, and nothing proved they still parsed. They
+        // are also the first flows most readers meet.
+        let mut checked = 0;
+        for (name, readme) in READMES {
+            for (index, yaml) in readme_flow_examples(readme).into_iter().enumerate() {
+                let path = std::env::temp_dir().join(format!(
+                    "sfh-readme-flow-{}-{index}-{}.yaml",
+                    name.replace('.', "_"),
+                    std::process::id()
+                ));
+                std::fs::write(&path, yaml).expect("write README flow example");
+                let validate_result =
+                    crate::engine::validate_with_options(&path, &[], true, false, &[]);
+                let runs_dir = std::env::temp_dir().join(format!(
+                    "sfh-readme-flow-{}-{index}-{}-runs",
+                    name.replace('.', "_"),
+                    std::process::id()
+                ));
+                let run_result = crate::engine::run(crate::engine::RunOpts {
+                    flow_path: path.clone(),
+                    vars: Vec::new(),
+                    emit: None,
+                    runs_dir: Some(runs_dir.clone()),
+                    dry_run: true,
+                    verbose: false,
+                    quiet: true,
+                    resume: None,
+                    resume_latest: false,
+                    force_resume: false,
+                    no_partial_emit: false,
+                    detach: false,
+                    run_dir: None,
+                    ..Default::default()
+                });
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_dir_all(&runs_dir);
+                assert_eq!(
+                    validate_result,
+                    0,
+                    "{name} flow example {} is not strict-clean",
+                    index + 1
+                );
+                assert_eq!(
+                    run_result,
+                    0,
+                    "{name} flow example {} does not dry-run",
+                    index + 1
+                );
+                checked += 1;
+            }
+        }
+        // Guards the marker convention itself: if `api_version:` stopped being
+        // the way a whole flow opens, this test would silently check nothing.
+        assert_eq!(
+            checked, 6,
+            "expected 3 whole-flow examples per README; the api_version: marker may have moved"
+        );
     }
 
     #[test]
@@ -1213,6 +1296,54 @@ mod tests {
     }
 
     #[test]
+    fn the_empty_final_message_refusal_is_explained_where_authors_read() {
+        // This refusal is correct and it is the one a real long-running run hits
+        // first (issue #25): an agent finished a workspace change and said
+        // nothing, so a preset step's allow_empty: false default failed it. The
+        // key had zero mentions in both READMEs, in `sfh guide`, and across all
+        // nine authoring skills - `schema/flow.schema.json` was the only place
+        // it existed. A fail-closed default that no shipped document names is
+        // indistinguishable from a bug to the person hitting it.
+        assert!(
+            crate::leaf::EMPTY_FINAL_MESSAGE_HINT.contains("allow_empty"),
+            "the refusal must name the key that resolves it"
+        );
+        for (name, text) in READMES {
+            assert!(
+                text.contains("allow_empty"),
+                "{name} does not document allow_empty"
+            );
+        }
+        assert!(
+            GUIDE.contains("allow_empty"),
+            "sfh guide does not mention allow_empty"
+        );
+
+        let skills = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+        let mut documented = Vec::new();
+        for entry in std::fs::read_dir(&skills).expect("skills directory") {
+            let directory = entry.expect("skills entry").path();
+            if !directory.is_dir() {
+                continue;
+            }
+            let markdown = directory.join("SKILL.md");
+            if std::fs::read_to_string(&markdown).is_ok_and(|text| text.contains("allow_empty")) {
+                documented.push(directory.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        documented.sort();
+        assert_eq!(
+            documented,
+            [
+                "sfh-deterministic-gates",
+                "sfh-failure-recovery",
+                "sfh-flow-design"
+            ],
+            "the skills that teach completion evidence must keep teaching it"
+        );
+    }
+
+    #[test]
     fn readme_relative_links_resolve_inside_the_release_resource_tree() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         for (name, readme) in [
@@ -1236,6 +1367,46 @@ mod tests {
                     "{name} links to missing release resource '{target}'"
                 );
             }
+        }
+    }
+
+    /// GitHub's heading slug: lowercase, drop everything that is not a letter,
+    /// digit, `_`, `-` or space, then spaces become hyphens. CJK headings keep
+    /// their characters, which is why the Japanese README's anchors are not
+    /// guessable by eye and need checking rather than trusting.
+    fn heading_slug(heading: &str) -> String {
+        heading
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+            .map(|c| if c == ' ' { '-' } else { c })
+            .collect()
+    }
+
+    #[test]
+    fn readme_table_of_contents_anchors_resolve_to_real_headings() {
+        for (name, readme) in READMES {
+            let headings: std::collections::HashSet<String> = readme
+                .lines()
+                .filter_map(|line| line.strip_prefix('#'))
+                .map(|rest| heading_slug(rest.trim_start_matches('#')))
+                .collect();
+            let mut checked = 0;
+            for tail in readme.split("](#").skip(1) {
+                let Some(anchor) = tail.split(')').next() else {
+                    continue;
+                };
+                assert!(
+                    headings.contains(anchor),
+                    "{name} links to '#{anchor}', which is not a heading in that file"
+                );
+                checked += 1;
+            }
+            assert_eq!(
+                checked, 8,
+                "{name} should link all eight top-level sections"
+            );
         }
     }
 

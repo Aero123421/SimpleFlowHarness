@@ -38,9 +38,14 @@ defaults:
   budget_reserve: {wall_clock_sec: 600}
 
 steps:
+  # The worker's product is the diff, so a finished turn that ends without a
+  # closing message is not a failure here. `verify` and `review` prove the work.
+  # `review` keeps the preset default allow_empty: false, because its final line
+  # IS the evidence its route reads.
   - id: implement
     use: builder
     effects: workspace
+    allow_empty: true
     context: [task, acceptance, implementation_rules, latest_review]
     retry: {max: 1, backoff_sec: 5}
     retry_on: transient
@@ -73,6 +78,7 @@ steps:
   - id: fix
     use: builder
     effects: workspace
+    allow_empty: true
     context: [task, acceptance, implementation_rules, latest_review, verification]
     max_visits: 4
     on_max_visits: goto:handoff

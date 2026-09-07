@@ -28,7 +28,7 @@ api_version: 1
 name: workspace-smoke
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -41,6 +41,8 @@ steps:
     effects: read
     context: [what_this_is]
     cmd: ["sh", "-c", "pwd && git rev-parse --abbrev-ref HEAD"]
+    route:
+      - {goto: change_something}
 
   - id: change_something
     effects: workspace

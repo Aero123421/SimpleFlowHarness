@@ -184,6 +184,58 @@ class VersionClaims(unittest.TestCase):
                 self.assertEqual((int(found.group(1)), int(found.group(2))), (major, minor))
 
 
+class ValidationReportClaims(unittest.TestCase):
+    """A validation report may not state a count nobody measured.
+
+    `examples/ponytail/VALIDATION.md` said "only 4 of this repository's own 18
+    top-level examples are strict-clean". There have been 17 top-level examples
+    at every tag since v1.4.0 and exactly 1 was strict-clean when that sentence
+    was written; neither number came from running anything. A file whose entire
+    purpose is to record what was verified is the last place a guess belongs.
+
+    Whether the flows are actually clean is CI's job - it runs `--strict` over
+    each set and fails on any finding. This test covers the other half: that the
+    denominators in the reports are the number of files that really exist.
+    """
+
+    REPORTS = (
+        ("examples/ponytail/VALIDATION.md", "examples/ponytail/[0-9][0-9]-*.yaml", 20, 19),
+        ("skills/VALIDATION.md", "skills/sfh-*/assets/*.yaml", 9, 9),
+    )
+
+    def test_reported_flow_counts_match_the_tree(self) -> None:
+        for report, pattern, total, strict_clean in self.REPORTS:
+            with self.subTest(report=report):
+                found = len(sorted(ROOT.glob(pattern)))
+                self.assertEqual(
+                    found, total, f"{report} counts {total} flows; the tree has {found}"
+                )
+                text = (ROOT / report).read_text(encoding="utf-8")
+                self.assertIn(
+                    f"{strict_clean}/{total}",
+                    text,
+                    f"{report} does not state the {strict_clean}/{total} strict ratio CI enforces",
+                )
+
+    def test_the_ponytail_strict_exception_is_named_and_real(self) -> None:
+        """One flow is exempt from --strict. Keep the exemption to exactly it."""
+        exception = ROOT / "examples/ponytail/17-database-migration-dry-run.yaml"
+        self.assertTrue(exception.is_file(), "the named --strict exception is gone")
+        self.assertIn(
+            "CI validates this file without --strict",
+            exception.read_text(encoding="utf-8"),
+            "the exempt flow must say why in its own header",
+        )
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            "*17-database-migration-dry-run.yaml)",
+            workflow,
+            "CI must name the exception rather than dropping the pack to plain validate",
+        )
+        report = (ROOT / "examples/ponytail/VALIDATION.md").read_text(encoding="utf-8")
+        self.assertIn("17-database-migration-dry-run.yaml", report)
+
+
 UNBOUNDED_CYCLE = """api_version: 1
 name: unbounded
 workspace: {mode: current}

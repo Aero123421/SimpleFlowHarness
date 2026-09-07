@@ -42,6 +42,7 @@ defaults:
 steps:
   # main の上で走らせない安全弁。
   - id: prep_verify
+    effects: read
     cmd: ["git", "branch", "--show-current"]
     route:
       - when_last_line_contains: "sfh/v1-harden"
@@ -51,11 +52,13 @@ steps:
   # 未追跡ファイル(contain.rs / sha256.rs)を git に載せる。
   # これをやらないとレビュアーの `git diff` に新規ファイルが現れない。
   - id: track_new
+    effects: workspace
     cmd: ["git", "add", "-A"]
     route: [{ goto: prior_findings }]
 
   # 第1ラウンドで2体が出した指摘を読み込む。捨てるには惜しい内容。
   - id: prior_findings
+    effects: read
     cmd: ["sh", "-c", "cat '{{vars.prior}}/rev_regression.chain.txt' '{{vars.prior}}/rev_complete.chain.txt' 2>/dev/null"]
     unsafe_shell_template: true
     route: [{ goto: fix1 }]
@@ -154,8 +157,11 @@ steps:
       cargo fmt / clippy -D warnings / cargo test / cargo build --release /
       bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
       R-1〜R-7 と「部分的」項目それぞれに挙動テストを足すこと。
+    route:
+      - {goto: check1}
 
   - id: check1
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 2400
@@ -166,6 +172,7 @@ steps:
 
   # 新規ファイルをレビュアーの diff に載せる。
   - id: stage
+    effects: workspace
     cmd: ["git", "add", "-A"]
     route: [{ goto: review }]
 
@@ -282,7 +289,10 @@ steps:
 
   # 合否は AI ではなく grep が数える。3体全員が PASS のときだけ先へ。
   # 1体が落ちて出力が無くても、PASS が減るだけで正しく差し戻しへ向かう。
+    route:
+      - {goto: verdict}
   - id: verdict
+    effects: read
     cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS$' - || true); echo \"PASSES=$n\""]
     stdin: prompt
     prompt: "{{steps.review.outputs}}"
@@ -312,8 +322,11 @@ steps:
       ## 完了条件
       cargo fmt / clippy -D warnings / cargo test / cargo build --release /
       bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+    route:
+      - {goto: check2}
 
   - id: check2
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 2400
@@ -323,8 +336,10 @@ steps:
       - goto: fix2
 
   - id: unresolved
+    effects: read
     cmd: ["sh", "-c", "echo 'UNRESOLVED: reviewers did not reach unanimous pass'; git --no-pager diff --stat main"]
     route: [{ goto: end }]
 
   - id: wrap
+    effects: workspace
     cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED'; git --no-pager diff --stat main; echo '--- tests ---'; cargo test 2>&1 | tail -3; bash tests/engine_behaviour.sh 2>&1 | tail -2"]

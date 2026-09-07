@@ -251,8 +251,9 @@ mkdir "$DUPLICATE_ASSET_DIR"
 tar czf "$DUPLICATE_ASSET_DIR/$ASSET" \
   -C "$PACKAGE_DIR" \
   sfh release-resources.txt \
-  AGENTS.md CHANGELOG.md CONTRIBUTING.md LICENSE README.ja.md README.md README.md \
-  SECURITY.md SUPPORT.md docs examples schema skills tests
+  AGENTS.md CHANGELOG.md CODE_OF_CONDUCT.md CONTRIBUTING.md LICENSE \
+  README.ja.md README.md README.md SECURITY.md SUPPORT.md \
+  docs examples schema skills tests
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$DUPLICATE_ASSET_DIR" && sha256sum "$ASSET" >"$ASSET.sha256")
 else
@@ -507,8 +508,8 @@ mkdir "$MANY_ASSET_DIR"
 tar czf "$MANY_ASSET_DIR/$ASSET" \
   -C "$MANY_PACKAGE_DIR" \
   sfh release-resources.txt \
-  AGENTS.md CHANGELOG.md CONTRIBUTING.md LICENSE README.ja.md README.md SECURITY.md \
-  SUPPORT.md docs examples schema skills tests
+  AGENTS.md CHANGELOG.md CODE_OF_CONDUCT.md CONTRIBUTING.md LICENSE \
+  README.ja.md README.md SECURITY.md SUPPORT.md docs examples schema skills tests
 printf '%s  %s\n' "$(file_sha256 "$MANY_ASSET_DIR/$ASSET")" "$ASSET" \
   >"$MANY_ASSET_DIR/$ASSET.sha256"
 if SFH_ASSET_DIR="$MANY_ASSET_DIR" \
@@ -532,8 +533,8 @@ rm -rf "$MISSING_PACKAGE_DIR/schema"
   tar czf "$MISSING_ASSET_DIR/$ASSET" \
   -C "$MISSING_PACKAGE_DIR" \
   sfh release-resources.txt \
-  AGENTS.md CHANGELOG.md CONTRIBUTING.md LICENSE README.ja.md README.md SECURITY.md \
-  SUPPORT.md docs examples skills tests
+  AGENTS.md CHANGELOG.md CODE_OF_CONDUCT.md CONTRIBUTING.md LICENSE \
+  README.ja.md README.md SECURITY.md SUPPORT.md docs examples skills tests
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$MISSING_ASSET_DIR" && sha256sum "$ASSET" >"$ASSET.sha256")
 else

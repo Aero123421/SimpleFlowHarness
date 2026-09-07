@@ -35,6 +35,8 @@ steps:
         prompt: |
           「{{vars.theme}}」についてユーザー体験の観点からアイデアを5つ出してください。
           各アイデアは見出し1行+説明2行以内。
+    route:
+      - {goto: report}
 
   - id: report
     use: cheap

@@ -42,6 +42,7 @@ defaults:
 
 steps:
   - id: prep_verify
+    effects: read
     cmd: ["git", "branch", "--show-current"]
     route:
       - when_last_line_contains: "sfh/v1-harden"
@@ -107,8 +108,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.checkA.output | optional | tail:120}}
+    route:
+      - {goto: checkA}
 
   - id: checkA
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 3600
@@ -200,8 +204,11 @@ steps:
 
       前回の検証結果(初回は空):
       {{steps.checkB.output | optional | tail:120}}
+    route:
+      - {goto: checkB}
 
   - id: checkB
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 3600
@@ -211,6 +218,7 @@ steps:
       - goto: fixB
 
   - id: stage
+    effects: workspace
     cmd: ["git", "add", "-A"]
     route: [{ goto: review }]
 
@@ -351,8 +359,11 @@ steps:
           項目ごとに「3 OS で同一 / OS 依存あり」の判定と根拠。
           **最後の行に `REVIEW-PASS`(全て 3 OS で同一)か
           `REVIEW-FAIL`(OS 依存がある)を単独で書くこと。**
+    route:
+      - {goto: verdict}
 
   - id: verdict
+    effects: read
     cmd: ["sh", "-c", "n=$(grep -c '^REVIEW-PASS$' - || true); echo \"PASSES=$n\""]
     stdin: prompt
     prompt: "{{steps.review.outputs}}"
@@ -384,8 +395,11 @@ steps:
       ## 完了条件
       cargo fmt / clippy -D warnings / cargo test / cargo build --release /
       bash tests/engine_behaviour.sh / 全 examples が validate を通ること。
+    route:
+      - {goto: checkC}
 
   - id: checkC
+    effects: workspace
     cmd: ["sh", "-c", "cargo fmt 2>&1 && cargo clippy --all-targets -- -D warnings 2>&1 && cargo test 2>&1 && cargo build --release 2>&1 && bash tests/engine_behaviour.sh 2>&1 && for f in examples/*.yaml; do ./target/release/sfh validate \"$f\" >/dev/null || exit 9; done; echo \"EXIT=$?\""]
     on_error: continue
     timeout_sec: 3600
@@ -395,8 +409,10 @@ steps:
       - goto: fixC
 
   - id: unresolved
+    effects: read
     cmd: ["sh", "-c", "echo 'UNRESOLVED: the 11-item checklist did not reach unanimous pass'; git --no-pager diff --stat main"]
     route: [{ goto: end }]
 
   - id: wrap
+    effects: workspace
     cmd: ["sh", "-c", "echo 'ALL THREE REVIEWERS PASSED THE 11-ITEM CHECKLIST'; git --no-pager diff --stat main; echo '--- unit ---'; cargo test 2>&1 | tail -3"]
