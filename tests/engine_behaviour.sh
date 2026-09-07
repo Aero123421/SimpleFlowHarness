@@ -304,6 +304,42 @@ contains "status exposes SFH_SESSION_UNVERIFIED" '"code": "SFH_SESSION_UNVERIFIE
 check "wait returns the fresh-session classification" 1 $?
 contains "wait exposes SFH_SESSION_UNVERIFIED" '"code": "SFH_SESSION_UNVERIFIED"' fresh-session-wait.json
 
+# An exact fresh session id does not prove that the tool returned a final
+# message. The empty-result failure must retain the ordinary step-failure
+# classification instead of being mislabeled as an unverified session.
+cat > fresh-session-empty.yaml <<YAML
+name: fresh-session-empty
+steps:
+  - id: first
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    args: ["--stub-no-output"]
+    prompt: "open a session"
+  - id: second
+    tool: claude
+    bin: "$STUB_BIN"
+    access: read
+    continue_from: first
+    prompt: "continue it"
+YAML
+"$SFH" run fresh-session-empty.yaml --runs-dir fresh-session-empty-runs --json > fresh-session-empty.out 2> fresh-session-empty.err
+check "an exact fresh session with an empty result fails" 1 $?
+contains "empty result diagnoses missing final message" "no final message" fresh-session-empty.err
+contains "empty exact session is a step failure" '"code": "SFH_STEP_FAILED"' fresh-session-empty.out
+not_contains "empty exact session is not mislabeled as session failure" '"code": "SFH_SESSION_UNVERIFIED"' fresh-session-empty.out
+FRESH_EMPTY_LOG="$(find fresh-session-empty-runs -type f -name 'log.jsonl' -print -quit)"
+contains "empty exact session leaves no typed session failure" '"failure_code":null' "$FRESH_EMPTY_LOG"
+FRESH_EMPTY_DIR="$(dirname "$FRESH_EMPTY_LOG")"
+"$SFH" status "$FRESH_EMPTY_DIR" --json > fresh-session-empty-status.json 2> fresh-session-empty-status.err
+check "status returns the empty-result step failure" 1 $?
+contains "status exposes SFH_STEP_FAILED for empty result" '"code": "SFH_STEP_FAILED"' fresh-session-empty-status.json
+not_contains "status keeps empty result free of session failure" '"code": "SFH_SESSION_UNVERIFIED"' fresh-session-empty-status.json
+"$SFH" wait "$FRESH_EMPTY_DIR" --json > fresh-session-empty-wait.json 2> fresh-session-empty-wait.err
+check "wait returns the empty-result step failure" 1 $?
+contains "wait exposes SFH_STEP_FAILED for empty result" '"code": "SFH_STEP_FAILED"' fresh-session-empty-wait.json
+not_contains "wait keeps empty result free of session failure" '"code": "SFH_SESSION_UNVERIFIED"' fresh-session-empty-wait.json
+
 # A crash after the failed leaf's step_end but before on_error is applied must
 # replay the durable classification as well as the declared goto:fail route.
 cat > fresh-session-goto-fail.yaml <<YAML

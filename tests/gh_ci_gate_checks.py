@@ -163,7 +163,8 @@ class GhCiGateChecks(unittest.TestCase):
         self.assertEqual(payload["kind"], "ci_watch_timeout")
         self.assertEqual(len(child_timeout), 1)
         self.assertGreater(child_timeout[0], 0)
-        self.assertLessEqual(child_timeout[0], args.timeout)
+        # Subtracting an absolute monotonic deadline can add floating-point noise.
+        self.assertLessEqual(child_timeout[0], args.timeout + 1e-9)
         self.assertLess(elapsed, 2)
 
     def test_delayed_success_after_deadline_cannot_pass(self) -> None:

@@ -2486,12 +2486,14 @@ fn exec_once(p: Prepared) -> LeafDone {
             && p.expect_session.is_none())
         .then_some(p.preassigned_session.as_deref())
         .flatten();
-        let session_failure = fresh_claude_expected
-            .and_then(|expected| check_fresh_claude_session(expected, &parsed))
-            .or_else(|| check_session(&expect, &parsed, &chain_output));
+        let fresh_session_failure = fresh_claude_expected
+            .and_then(|expected| check_fresh_claude_session(expected, &parsed));
+        let fresh_session_failed = fresh_session_failure.is_some();
+        let session_failure =
+            fresh_session_failure.or_else(|| check_session(&expect, &parsed, &chain_output));
         if let Some(why) = session_failure {
             exit_code = 1;
-            if fresh_claude_expected.is_some() {
+            if fresh_session_failed {
                 // The tool's envelope was valid; sfh failed because it could
                 // not prove which fresh conversation the turn used.
                 failure_code = Some(machine::ErrorCode::SessionUnverified);
@@ -3535,13 +3537,27 @@ mod tests {
         let root_help = codex_help_probe(root_only.to_str().unwrap(), Some(root.as_path()))
             .expect("fake codex should answer exec --help");
         assert!(root_help.contains("EXEC_HELP"));
-        assert!(root_help.contains(&format!("CWD={}", root.display())));
+        let root_cwd = root_help
+            .lines()
+            .find_map(|line| line.strip_prefix("CWD="))
+            .expect("fake codex should report its working directory");
+        assert_eq!(
+            Path::new(root_cwd).canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
         assert!(!preset::codex_fork_confirmed(Some(&root_help)));
 
         let fork_help = codex_help_probe(with_fork.to_str().unwrap(), Some(root.as_path()))
             .expect("fake codex should answer exec --help");
         assert!(fork_help.contains("EXEC_HELP"));
-        assert!(fork_help.contains(&format!("CWD={}", root.display())));
+        let fork_cwd = fork_help
+            .lines()
+            .find_map(|line| line.strip_prefix("CWD="))
+            .expect("fake codex should report its working directory");
+        assert_eq!(
+            Path::new(fork_cwd).canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
         assert!(preset::codex_fork_confirmed(Some(&fork_help)));
 
         let _ = std::fs::remove_dir_all(root);

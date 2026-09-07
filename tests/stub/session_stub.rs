@@ -47,6 +47,7 @@
 //! | --stub-stderr-every | SFH_STUB_STDERR_EVERY_MS| -          | progress line on stderr every N ms while asleep |
 //! | --stub-session      | SFH_STUB_SESSION        | see above  | force the reported session id                   |
 //! | --stub-no-session   | SFH_STUB_NO_SESSION     | off        | omit the reported session id                    |
+//! | --stub-no-output    | SFH_STUB_NO_OUTPUT      | off        | emit an empty result body                      |
 //! | --stub-error        | SFH_STUB_ERROR          | off        | set is_error=true while exiting with 0           |
 //! | --stub-cost         | SFH_STUB_COST           | 0          | total_cost_usd                                  |
 //! | --stub-tokens       | SFH_STUB_TOKENS         | 11,7       | usage input,output tokens                       |
@@ -123,6 +124,8 @@ struct Config {
     report_session: bool,
     /// Mark a terminal result as an in-band failure while keeping exit status 0.
     is_error: bool,
+    /// Emit a valid terminal envelope with an empty result body.
+    no_output: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -210,6 +213,7 @@ fn parse_config(argv: &[String]) -> Config {
     let mut no_terminal = env_var("SFH_STUB_NO_TERMINAL").is_some();
     let mut report_session = env_var("SFH_STUB_NO_SESSION").is_none();
     let mut is_error = env_var("SFH_STUB_ERROR").is_some();
+    let mut no_output = env_var("SFH_STUB_NO_OUTPUT").is_some();
 
     let mut i = 0;
     while i < argv.len() {
@@ -244,6 +248,7 @@ fn parse_config(argv: &[String]) -> Config {
             "--stub-protocol" => protocol = Some(value(&mut i)),
             "--stub-no-terminal" => no_terminal = true,
             "--stub-no-session" => report_session = false,
+            "--stub-no-output" => no_output = true,
             "--stub-error" => is_error = true,
             // codex's own flag: sfh hands it a path and reads the answer back
             // from there, so the stub has to honour it to be codex-shaped.
@@ -360,10 +365,14 @@ fn parse_config(argv: &[String]) -> Config {
         no_terminal,
         report_session,
         is_error,
+        no_output,
     }
 }
 
 fn build_body(cfg: &Config) -> String {
+    if cfg.no_output {
+        return String::new();
+    }
     let mut body = String::new();
     body.push_str(PROSE);
     body.push('\n');
