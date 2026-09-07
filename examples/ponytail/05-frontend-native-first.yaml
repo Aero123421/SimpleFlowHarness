@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-frontend-native-first
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -41,6 +41,8 @@ steps:
       native-first solution. Check semantic HTML, CSS, built-in controls,
       form validation, browser APIs, and existing components before proposing
       JavaScript or a package. Do not edit files.
+    route:
+      - {goto: implement}
 
   - id: implement
     use: builder
@@ -54,18 +56,24 @@ steps:
 
       Do not add a component library, state layer, custom widget, or dependency
       when semantic HTML/CSS/browser behavior satisfies the acceptance criteria.
+    route:
+      - {goto: lint}
 
   - id: lint
     effects: workspace
     cmd: ["npm", "run", "lint"]
     timeout_sec: 1200
     on_error: goto:fix
+    route:
+      - {goto: test}
 
   - id: test
     effects: workspace
     cmd: ["npm", "test"]
     timeout_sec: 1800
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

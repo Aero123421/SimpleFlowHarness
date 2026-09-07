@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/Aero123421/SimpleFlowHarness/blob/main/schema/retention.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/retention.schema.json",
   "title": "SimpleFlowHarness state retention policy",
   "description": "Host-owned policy read from <state-dir>/retention.yaml. The absence of this file disables automatic retention.",
   "type": "object",

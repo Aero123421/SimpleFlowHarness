@@ -28,6 +28,14 @@ resolve exact binary in preflight
 
 Never let model/web output choose argv[0], cwd, shell text, server, or credential path without an explicit trusted override.
 
+## Make the launching environment match the one you tested in
+
+A flow that works from your terminal can fail under a scheduler, a service unit, a cron job, or a CI runner, because those do not read an interactive login shell's profile. `PATH` is the usual casualty: `pi`, `codex`, `claude` and project tools installed under `~/.local/bin`, Cargo, Nix, nvm, or a user npm prefix simply are not there.
+
+- Declare what the flow depends on rather than inheriting it: set `env` (or `cwd`) on the steps that need a user-local CLI, or give the profile a `bin:` override with an absolute path.
+- Run `sfh preflight FLOW --json` **in the environment that will actually launch the run**, not only in your shell. It resolves every preset binary and every `cmd:` program without spending anything, so it is the cheapest way to catch this.
+- A missing binary and a broken tool are different facts. Preflight reports the first before a single step spawns.
+
 ## Web search and fetch
 
 Web results are nondeterministic and untrusted.

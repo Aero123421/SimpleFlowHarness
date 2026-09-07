@@ -1050,6 +1050,12 @@ fn load_resume_for_flow(
             .unwrap_or("")
             .to_string();
         match ev {
+            "run_start" => {
+                // A stuck stop authorizes corrections only for the attempt
+                // that resumes it. If that attempt crashes before its first
+                // position record, an older stuck must not waive the guard.
+                st.resumed_from_stuck = false;
+            }
             // A child finished (and may already have been billed), but sfh
             // could not publish the complete artifact set that would make the
             // result safe to restore. Treat this run as permanently
@@ -9505,6 +9511,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stuck_var_override_is_consumed_when_the_next_attempt_starts() {
+        for started_step in [false, true] {
+            let (root, flow_path, run_dir) =
+                stopped_run_with_recorded_var("stuck-then-crashed", "stuck");
+            let mut log = std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap();
+            log.push_str("{\"event\":\"run_start\",\"resumed\":true}\n");
+            if started_step {
+                log.push_str("{\"event\":\"step_start\",\"step\":\"one\",\"visit\":2}\n");
+            }
+            std::fs::write(run_dir.join("log.jsonl"), &log).unwrap();
+
+            let opts = resume_opts(&flow_path, &run_dir, &root, &[("topic", "beta")], false);
+            let outcome = run_inner(&opts);
+            assert!(
+                refused_for_changed_vars(&outcome),
+                "a crash after restarting must not inherit an older stuck exception: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(run_dir.join("log.jsonl")).unwrap(),
+                log,
+                "the changed var must be rejected before recording another attempt"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

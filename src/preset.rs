@@ -915,8 +915,38 @@ const CLAUDE_ENV_SCRUB: [&str; 8] = [
     "ANTHROPIC_MODEL",
 ];
 
-/// `CLAUDE_ENV_SCRUB` plus every live name starting with `CLAUDE`, sorted and
-/// deduped.
+/// Runtime identity namespaces may grow as Claude adds host/session features.
+/// Operator configuration is deliberately outside this list: CLAUDE also names
+/// OAuth credentials, provider selection, config directories and safety policy.
+/// Scrubbing the whole prefix silently changes who a child authenticates as and
+/// which restrictions it inherits (PR #27 review, 2026-09-07).
+fn claude_host_env(name: &str) -> bool {
+    let canonical;
+    let name = if cfg!(windows) {
+        canonical = name.to_ascii_uppercase();
+        canonical.as_str()
+    } else {
+        name
+    };
+    CLAUDE_ENV_SCRUB.contains(&name)
+        || matches!(
+            name,
+            "CLAUDE_CODE_REMOTE"
+                | "CLAUDE_CODE_REMOTE_SESSION_ID"
+                | "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
+        )
+        || [
+            "CLAUDE_CODE_SESSION_",
+            "CLAUDE_CODE_HOST_",
+            "CLAUDE_CODE_CHILD_",
+            "CLAUDE_CODE_MESSAGING_",
+            "CLAUDE_CODE_CONTAINER_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// `CLAUDE_ENV_SCRUB` plus live host/session names, sorted and deduped.
 ///
 /// A fixed blocklist goes stale on every CLI release. Live-verified 2026-08-27,
 /// claude 2.1.247 inside a Claude Code container: the environment carried ~20
@@ -927,19 +957,17 @@ const CLAUDE_ENV_SCRUB: [&str; 8] = [
 /// session, so a later `continue_from` would run `claude -r <host-session-id>`
 /// and append the flow to the host agent's conversation.
 ///
-/// The `ANTHROPIC_` prefix is deliberately NOT swept: `ANTHROPIC_API_KEY` and
-/// friends are how a standalone claude authenticates, and removing them would
-/// break every non-nested run. `ANTHROPIC_MODEL` alone stays scrubbed, via the
-/// static list.
-///
-/// Prefix match is case-sensitive; these names are upper-case by convention on
-/// every platform claude ships for.
+/// Authentication and operator settings stay intact, including the documented
+/// CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_* and CLAUDE_CONFIG_DIR variables:
+/// https://code.claude.com/docs/en/env-vars . ANTHROPIC_MODEL alone retains its
+/// historical removal. Windows names are matched case-insensitively, just like
+/// the child's environment, while the original spelling is passed to removal.
 fn claude_env_scrub_from<I>(live_names: I) -> Vec<String>
 where
     I: IntoIterator<Item = String>,
 {
     let mut out: Vec<String> = CLAUDE_ENV_SCRUB.iter().map(|s| s.to_string()).collect();
-    out.extend(live_names.into_iter().filter(|n| n.starts_with("CLAUDE")));
+    out.extend(live_names.into_iter().filter(|n| claude_host_env(n)));
     out.sort();
     out.dedup();
     out
@@ -2296,12 +2324,22 @@ mod tests {
     }
 
     #[test]
-    fn a_live_claude_prefixed_variable_is_scrubbed_even_when_the_static_list_predates_it() {
+    fn live_claude_host_identity_is_scrubbed_without_removing_operator_configuration() {
         let live = [
             "CLAUDE_CODE_MESSAGING_SOCKET",
-            "CLAUDE_NEWLY_INVENTED_THING",
-            "CLAUDE_NEWLY_INVENTED_THING",
-            "CLAUDECODE_EXTRA",
+            "CLAUDE_CODE_SESSION_FUTURE_FIELD",
+            "CLAUDE_CODE_SESSION_FUTURE_FIELD",
+            "CLAUDE_CODE_CONTAINER_ID",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "CLAUDE_CODE_REMOTE_SESSION_ID",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_RESTRICTED",
+            "CLAUDE_CODE_MCP_ALLOWLIST_ENV",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_NEW_OPERATOR_OPTION",
             "ANTHROPIC_API_KEY",
             "PATH",
             "XCLAUDE_NOT_A_PREFIX_MATCH",
@@ -2312,12 +2350,14 @@ mod tests {
 
         for name in [
             "CLAUDE_CODE_MESSAGING_SOCKET",
-            "CLAUDE_NEWLY_INVENTED_THING",
-            "CLAUDECODE_EXTRA",
+            "CLAUDE_CODE_SESSION_FUTURE_FIELD",
+            "CLAUDE_CODE_CONTAINER_ID",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "CLAUDE_CODE_REMOTE_SESSION_ID",
         ] {
             assert!(
                 got.iter().any(|v| v == name),
-                "{name}: a live CLAUDE* name the static list never heard of must still be scrubbed"
+                "{name}: inherited host/session identity must still be scrubbed"
             );
         }
         for name in CLAUDE_ENV_SCRUB {
@@ -2326,9 +2366,19 @@ mod tests {
                 "{name}: the static list is the floor, not a fallback"
             );
         }
-        // Auth must survive: only ANTHROPIC_MODEL is scrubbed, and only because
-        // the static list names it.
-        for name in ["ANTHROPIC_API_KEY", "PATH", "XCLAUDE_NOT_A_PREFIX_MATCH"] {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "PATH",
+            "XCLAUDE_NOT_A_PREFIX_MATCH",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_RESTRICTED",
+            "CLAUDE_CODE_MCP_ALLOWLIST_ENV",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_NEW_OPERATOR_OPTION",
+        ] {
             assert!(!got.iter().any(|v| v == name), "{name} must be left alone");
         }
 
@@ -2336,6 +2386,19 @@ mod tests {
         canonical.sort();
         canonical.dedup();
         assert_eq!(got, canonical, "output is sorted and deduped");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_host_names_follow_windows_environment_case_rules() {
+        let got = claude_env_scrub_from([
+            "claude_code_session_id".to_string(),
+            "Claude_Code_Messaging_Socket".to_string(),
+            "claude_code_oauth_token".to_string(),
+        ]);
+        assert!(got.iter().any(|n| n == "claude_code_session_id"));
+        assert!(got.iter().any(|n| n == "Claude_Code_Messaging_Socket"));
+        assert!(!got.iter().any(|n| n == "claude_code_oauth_token"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-python-trust-boundary-hardening
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -44,6 +44,8 @@ steps:
       validation order, failure behavior, and existing helpers.
       Do not propose a broad security framework when one boundary check is sufficient.
       Do not edit files.
+    route:
+      - {goto: implement}
 
   - id: implement
     use: builder
@@ -56,12 +58,16 @@ steps:
 
       Threat map:
       {{steps.threat_map.output | truncate:18000}}
+    route:
+      - {goto: test}
 
   - id: test
     effects: workspace
     cmd: ["python", "-m", "pytest", "-q"]
     timeout_sec: 1800
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-production-failure-to-eval
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -40,6 +40,8 @@ steps:
       Trace provenance from input through the incorrect result and identify the
       narrowest eval/test that captures the practitioner or user correction.
       Do not edit files.
+    route:
+      - {goto: add_eval}
 
   - id: add_eval
     use: builder
@@ -52,6 +54,8 @@ steps:
 
       Trace analysis:
       {{steps.analyze_trace.output | truncate:18000}}
+    route:
+      - {goto: prove_failure}
 
   - id: prove_failure
     effects: workspace
@@ -74,18 +78,24 @@ steps:
     prompt: |
       Implement the smallest root-cause fix that makes the new eval pass without
       teaching only the recorded example. Reuse the existing pipeline and preserve provenance.
+    route:
+      - {goto: targeted_eval}
 
   - id: targeted_eval
     effects: workspace
     cmd: ["python", "-m", "pytest", "-q", "tests"]
     timeout_sec: 1800
     on_error: goto:fix
+    route:
+      - {goto: full_regression}
 
   - id: full_regression
     effects: workspace
     cmd: ["python", "-m", "pytest", "-q"]
     timeout_sec: 3600
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     use: reviewer

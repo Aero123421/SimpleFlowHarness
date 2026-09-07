@@ -14,6 +14,12 @@ VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 APPLE_TEAM_ID_RE = re.compile(r"^[A-Z0-9]{10}$")
 PLACEHOLDER_RE = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 
+RESOURCE_CONTRACT = ROOT / "release-resources.txt"
+# `pkgshare.install` used to repeat release-resources.txt by hand, so the
+# contract had a second copy that only a test kept honest. Generating the list
+# means adding a resource in one place adds it to every channel.
+PKGSHARE_INDENT = " " * len("    pkgshare.install ")
+
 CHECKSUM_ASSETS = {
     "MACOS_ARM64_SHA256": "sfh-macos-arm64.tar.gz",
     "MACOS_X64_SHA256": "sfh-macos-x64.tar.gz",
@@ -21,6 +27,20 @@ CHECKSUM_ASSETS = {
     "LINUX_X64_SHA256": "sfh-linux-x64.tar.gz",
     "WINDOWS_X64_SHA256": "sfh-windows-x64.zip",
 }
+
+
+def pkgshare_resources() -> str:
+    """The Homebrew install list, rendered from the one resource contract."""
+    entries = ["release-resources.txt"]
+    for line in RESOURCE_CONTRACT.read_text(encoding="ascii").splitlines():
+        entry = line.strip()
+        if not entry:
+            continue
+        entries.append(entry.rstrip("/"))
+    if entries != ["release-resources.txt"] + sorted(entries[1:]):
+        raise SystemExit("release-resources.txt must be sorted")
+    separator = ",\n" + PKGSHARE_INDENT
+    return separator.join(f'"{entry}"' for entry in entries)
 
 
 def read_checksum(directory: Path, asset: str) -> str:
@@ -96,6 +116,7 @@ def main() -> None:
         raise SystemExit("invalid Windows code-signing certificate SHA-256")
 
     values = {
+        "PKGSHARE_RESOURCES": pkgshare_resources(),
         "VERSION": args.version,
         "APPLE_TEAM_ID": args.apple_team_id or "UNSIGNED",
         "WINDOWS_CODESIGN_CERT_SHA256": (

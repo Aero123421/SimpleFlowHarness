@@ -50,6 +50,14 @@ pub struct RetryCfg {
 /// Default silence before a timeout is read as a hang (seconds).
 pub const DEFAULT_HANG_AFTER_SEC: u64 = 300;
 
+/// What a preset step's `allow_empty: false` default refuses, and the key that
+/// resolves it. Named rather than inlined so a test can assert the shipped
+/// documentation still explains the refusal a caller will actually read: this
+/// is the first fail-closed message a real long-running agent run hits, and it
+/// went undocumented outside the JSON Schema for five releases.
+pub const EMPTY_FINAL_MESSAGE_HINT: &str =
+    "\nsfh: the tool exited successfully but produced no final message (set allow_empty: true if that is expected)\n";
+
 impl Default for RetryCfg {
     fn default() -> Self {
         RetryCfg {
@@ -1393,9 +1401,7 @@ pub fn check_session(e: &SessionExpect, parsed: &ParsedOut, chain: &str) -> Opti
         }
     }
     if chain.trim().is_empty() && !e.allow_empty {
-        return Some(
-            "\nsfh: the tool exited successfully but produced no final message (set allow_empty: true if that is expected)\n".to_string(),
-        );
+        return Some(EMPTY_FINAL_MESSAGE_HINT.to_string());
     }
     None
 }

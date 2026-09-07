@@ -4,7 +4,7 @@ api_version: 1
 name: ponytail-docs-code-drift-repair
 
 workspace:
-  mode: auto
+  mode: git-worktree
   cleanup: auto
 
 contexts:
@@ -41,6 +41,8 @@ steps:
       schemas, tests, and defaults. Identify only concrete drift.
       Prefer one canonical source plus links over repeated near-copies.
       Do not edit files.
+    route:
+      - {goto: repair}
 
   - id: repair
     use: builder
@@ -58,6 +60,8 @@ steps:
     effects: read
     cmd: ["git", "diff", "--check"]
     on_error: goto:fix
+    route:
+      - {goto: review}
 
   - id: review
     parallel:

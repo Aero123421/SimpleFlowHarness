@@ -28,6 +28,7 @@ fi
 
 EXPECTED_RESOURCE_PATHS='AGENTS.md
 CHANGELOG.md
+CODE_OF_CONDUCT.md
 CONTRIBUTING.md
 LICENSE
 README.ja.md
@@ -260,8 +261,8 @@ validate_archive_member() {
   esac
 
   case "$member" in
-    sfh | release-resources.txt | AGENTS.md | CHANGELOG.md | CONTRIBUTING.md | LICENSE | \
-      README.ja.md | README.md | SECURITY.md | SUPPORT.md)
+    sfh | release-resources.txt | AGENTS.md | CHANGELOG.md | CODE_OF_CONDUCT.md | \
+      CONTRIBUTING.md | LICENSE | README.ja.md | README.md | SECURITY.md | SUPPORT.md)
       ;;
     docs | docs/* | examples | examples/* | schema | schema/* | skills | skills/* | \
       tests | tests/*)
@@ -288,8 +289,8 @@ validate_extracted_resources() {
   [ -z "$unsafe_link" ] || fail "archive contains a symbolic or hard link: $unsafe_link"
 
   for file in \
-    AGENTS.md CHANGELOG.md CONTRIBUTING.md LICENSE README.ja.md README.md \
-    SECURITY.md SUPPORT.md; do
+    AGENTS.md CHANGELOG.md CODE_OF_CONDUCT.md CONTRIBUTING.md LICENSE \
+    README.ja.md README.md SECURITY.md SUPPORT.md; do
     [ -f "$root/$file" ] || fail "archive does not contain required resource: $file"
   done
   for directory in docs examples schema skills tests; do
@@ -368,8 +369,8 @@ stage_resources() {
 
   mkdir "$staged_data"
   for file in \
-    AGENTS.md CHANGELOG.md CONTRIBUTING.md LICENSE README.ja.md README.md \
-    SECURITY.md SUPPORT.md release-resources.txt; do
+    AGENTS.md CHANGELOG.md CODE_OF_CONDUCT.md CONTRIBUTING.md LICENSE \
+    README.ja.md README.md SECURITY.md SUPPORT.md release-resources.txt; do
     cp "$source_root/$file" "$staged_data/"
   done
   for directory in docs examples schema skills tests; do
