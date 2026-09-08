@@ -26,30 +26,44 @@ fn json_string(value: &str) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let session = args
-        .windows(2)
-        .find(|pair| pair[0] == "--session-id")
-        .map(|pair| pair[1].clone())
+    let session = std::env::var("SFH_PI_STUB_SESSION")
+        .ok()
+        .or_else(|| {
+            args.windows(2)
+                .find(|pair| pair[0] == "--session-id")
+                .map(|pair| pair[1].clone())
+        })
         .unwrap_or_else(|| "pi-stream-stub".to_string());
+    let report_session = std::env::var_os("SFH_PI_STUB_NO_SESSION").is_none();
 
     let mut prompt = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut prompt);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    writeln!(
-        out,
-        "{{\"type\":\"session\",\"id\":{},\"timestamp\":\"stream-marker\"}}",
-        json_string(&session)
-    )
-    .unwrap();
+    if report_session {
+        writeln!(
+            out,
+            "{{\"type\":\"session\",\"id\":{},\"timestamp\":\"stream-marker\"}}",
+            json_string(&session)
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            out,
+            "{{\"type\":\"session\",\"timestamp\":\"stream-marker\"}}"
+        )
+        .unwrap();
+    }
     writeln!(
         out,
         "{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"content\":[],\"usage\":{{\"input\":10,\"output\":2,\"cost\":{{\"total\":0.25}}}}}}}}"
     )
     .unwrap();
 
-    if std::env::var_os("SFH_PI_STUB_OVERSIZED_LINE").is_some() {
+    if std::env::var_os("SFH_PI_STUB_IDENTITY_ONLY").is_some() {
+        // Keep identity fixtures small while retaining a valid terminal event.
+    } else if std::env::var_os("SFH_PI_STUB_OVERSIZED_LINE").is_some() {
         let payload = "x".repeat(OVERSIZED_LINE_BYTES);
         writeln!(
             out,
@@ -58,9 +72,8 @@ fn main() {
         .unwrap();
     } else {
         let payload = "x".repeat(64 * 1024);
-        let noise = format!(
-            "{{\"type\":\"message_update\",\"partial\":{{\"payload\":\"{payload}\"}}}}\n"
-        );
+        let noise =
+            format!("{{\"type\":\"message_update\",\"partial\":{{\"payload\":\"{payload}\"}}}}\n");
         let mut written = 0usize;
         while written < NOISE_BYTES {
             out.write_all(noise.as_bytes()).unwrap();

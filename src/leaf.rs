@@ -1415,12 +1415,10 @@ pub fn check_session(e: &SessionExpect, parsed: &ParsedOut, chain: &str) -> Opti
     None
 }
 
-/// A fresh Claude run may receive a session id from sfh before it starts so a
-/// later `continue_from` can attach to it. Claude is expected to echo that id
-/// in its result envelope; falling back to the preassigned id when it does not
-/// would record an unverified session and let a later step resume the wrong
-/// conversation (rev_break #16).
-fn check_fresh_claude_session(expected: &str, parsed: &ParsedOut) -> Option<String> {
+/// Verified adapters must echo an id assigned before a fresh run. Falling back
+/// to the assigned value would record an unverified session and let a later
+/// step resume the wrong conversation (rev_break #16).
+fn check_fresh_session(expected: &str, parsed: &ParsedOut) -> Option<String> {
     match parsed.session.as_deref() {
         Some(got) if got == expected => None,
         Some(got) => Some(format!(
@@ -1586,6 +1584,24 @@ struct PiJsonlAccumulator {
     reported_usage: preset::Usage,
     saw_usage: bool,
     malformed: u32,
+    tool_use_pending: bool,
+}
+
+/// The AI package's AssistantMessage.stopReason is a closed union. In Pi's
+/// headless print/json lifecycle, `stop` and `length` finish an assistant
+/// response. `toolUse` needs a later response or an explicit non-retrying
+/// agent_end (a tool can terminate the loop). `pending`/`deferred` do not
+/// certify completion. These facts follow the v0.85.1 AI StopReason union and
+/// packages/agent/src/agent-loop.ts. A
+/// missing, non-string, or newly-added value must not be treated as success by
+/// an older sfh.
+fn pi_stop_verdict(message: &serde_json::Value) -> Result<Option<bool>, ()> {
+    match message.get("stopReason").and_then(|value| value.as_str()) {
+        Some("stop") | Some("length") => Ok(Some(true)),
+        Some("error") | Some("aborted") => Ok(Some(false)),
+        Some("pending") | Some("toolUse") | Some("deferred") => Ok(None),
+        _ => Err(()),
+    }
 }
 
 impl LineRecords for PiJsonlAccumulator {
@@ -1633,20 +1649,6 @@ impl LineRecords for PiJsonlAccumulator {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                // An assistant message_end is pi's terminal record for a turn.
-                // Later ones replace earlier ones, so the verdict is the last
-                // one's, not a sticky OR of every turn.
-                self.parsed.evidence.terminal_seen = true;
-                self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
-                if matches!(
-                    m.get("stopReason").and_then(|x| x.as_str()),
-                    Some("error") | Some("aborted")
-                ) {
-                    self.parsed.failed = true;
-                    self.parsed.evidence.terminal_success = Some(false);
-                } else {
-                    self.parsed.evidence.terminal_success = Some(true);
-                }
                 if let Some(u) = m.get("usage") {
                     self.saw_usage = true;
                     self.input_tokens = self
@@ -1662,6 +1664,55 @@ impl LineRecords for PiJsonlAccumulator {
                     {
                         self.reported_usage.add_reported_cost(cost);
                     }
+                }
+                // An assistant message_end carries the current turn's
+                // stopReason, but Pi may emit several of them while retrying.
+                // Later records replace earlier verdicts: a documented retry
+                // success therefore clears an earlier in-band error. Do not
+                // infer success from a missing or newly-added field; that is
+                // a malformed protocol record and remains invalid even if a
+                // later record happens to look successful.
+                self.tool_use_pending =
+                    m.get("stopReason").and_then(|value| value.as_str()) == Some("toolUse");
+                match pi_stop_verdict(m) {
+                    Ok(Some(success)) => {
+                        self.parsed.evidence.terminal_seen = true;
+                        self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
+                        self.parsed.evidence.terminal_success = Some(success);
+                        self.parsed.failed = !success;
+                    }
+                    Ok(None) => {
+                        // Tool-use text is retained internally only so an
+                        // explicit loop completion can certify it. finish
+                        // clears it if completion never arrives.
+                        if !self.tool_use_pending {
+                            self.parsed.text.clear();
+                        }
+                        self.parsed.failed = true;
+                        self.parsed.evidence.terminal_seen = false;
+                        self.parsed.evidence.final_message_seen = false;
+                        self.parsed.evidence.terminal_success = None;
+                    }
+                    Err(()) => {
+                        self.malformed = self.malformed.saturating_add(1);
+                        self.parsed.text.clear();
+                        self.parsed.failed = true;
+                        self.parsed.evidence.terminal_seen = false;
+                        self.parsed.evidence.final_message_seen = false;
+                        self.parsed.evidence.terminal_success = None;
+                    }
+                }
+            }
+            Some("agent_end") if self.tool_use_pending => {
+                // Pi's tool hooks can terminate the loop without another
+                // assistant response. The session event's explicit false
+                // willRetry value is proof that this was the final loop.
+                if v.get("willRetry").and_then(|value| value.as_bool()) == Some(false) {
+                    self.parsed.failed = false;
+                    self.parsed.evidence.terminal_seen = true;
+                    self.parsed.evidence.terminal_success = Some(true);
+                    self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
+                    self.tool_use_pending = false;
                 }
             }
             _ => {}
@@ -1680,6 +1731,10 @@ impl LineRecords for PiJsonlAccumulator {
         }
         let malformed = self.malformed;
         finish_stream_evidence(&mut self.parsed, Self::TOOL, malformed, Self::SHAPE);
+        if !self.parsed.evidence.allows_success() {
+            self.parsed.failed = true;
+            self.parsed.text.clear();
+        }
         self.parsed
     }
 }
@@ -2478,16 +2533,18 @@ fn exec_once(p: Prepared) -> LeafDone {
             expect_parent: p.expect_parent.as_deref(),
             allow_empty: p.allow_empty,
         };
-        // Only Claude's fresh path gets a preassigned id that is expected back:
-        // forked Claude sessions are checked by forbid_session, while Grok,
-        // Pi and Cursor have separate adapter contracts that remain unchanged.
-        let fresh_claude_expected = (p.tool.as_deref() == Some("claude")
+        // Fresh identity checks apply only to verified adapter contracts.
+        // Fork and resume retain their separate ancestry/identity checks.
+        let fresh_identity_expected = (p
+            .tool
+            .as_deref()
+            .is_some_and(preset::fresh_session_echoes_id)
             && p.session_parent.is_none()
             && p.expect_session.is_none())
         .then_some(p.preassigned_session.as_deref())
         .flatten();
-        let fresh_session_failure = fresh_claude_expected
-            .and_then(|expected| check_fresh_claude_session(expected, &parsed));
+        let fresh_session_failure =
+            fresh_identity_expected.and_then(|expected| check_fresh_session(expected, &parsed));
         let fresh_session_failed = fresh_session_failure.is_some();
         let session_failure =
             fresh_session_failure.or_else(|| check_session(&expect, &parsed, &chain_output));
@@ -3981,6 +4038,118 @@ mod tests {
     }
 
     #[test]
+    fn pi_requires_a_known_typed_stop_reason() {
+        let cases = [
+            (
+                "missing",
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"looks done"}]}}"#,
+            ),
+            (
+                "null",
+                r#"{"type":"message_end","message":{"role":"assistant","stopReason":null,"content":[]}}"#,
+            ),
+            (
+                "wrong type",
+                r#"{"type":"message_end","message":{"role":"assistant","stopReason":false,"content":[]}}"#,
+            ),
+            (
+                "unknown",
+                r#"{"type":"message_end","message":{"role":"assistant","stopReason":"provider_done","content":[]}}"#,
+            ),
+        ];
+        for (name, record) in cases {
+            let parsed = parse_pi_jsonl(record);
+            assert!(parsed.failed, "{name} verdict must fail closed");
+            assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid, "{name}");
+            assert_eq!(parsed.evidence.malformed_records, 1, "{name}");
+            assert!(
+                parsed.text.is_empty(),
+                "{name} text must not escape a malformed record"
+            );
+            assert!(!parsed.evidence.certifies_success(), "{name}");
+        }
+
+        // `pending` and `toolUse` are in Pi's public StopReason union, but
+        // neither can certify a completed headless turn.
+        let pending = parse_pi_jsonl(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"pending","content":[{"type":"text","text":"partial"}]}}"#,
+        );
+        assert!(pending.failed);
+        assert_eq!(pending.evidence.protocol, ProtocolState::MissingTerminal);
+        assert!(!pending.evidence.certifies_success());
+        let tool_use = parse_pi_jsonl(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[]}}"#,
+        );
+        assert!(tool_use.failed);
+        assert_eq!(tool_use.evidence.protocol, ProtocolState::MissingTerminal);
+        assert!(!tool_use.evidence.certifies_success());
+    }
+
+    #[test]
+    fn pi_retry_success_replaces_error_without_losing_usage() {
+        let stream = concat!(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","content":[],"usage":{"input":11,"output":2,"cost":{"total":0.11}}}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"retry succeeded"}],"usage":{"input":13,"output":3,"cost":{"total":0.13}}}}"#,
+            "\n",
+            r#"{"type":"agent_end","willRetry":false}"#,
+            "\n",
+            r#"{"type":"agent_settled"}"#,
+        );
+        let parsed = parse_pi_jsonl(stream);
+        assert!(!parsed.failed, "a successful retry is the final verdict");
+        assert_eq!(parsed.text, "retry succeeded");
+        assert_eq!(parsed.usage.input_tokens, Some(24));
+        assert_eq!(parsed.usage.output_tokens, Some(5));
+        assert_eq!(parsed.usage.cost_usd, Some(0.24));
+        assert_eq!(parsed.evidence.protocol, ProtocolState::Valid);
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn pi_tool_use_requires_a_followup_or_explicit_loop_completion() {
+        let tool_use = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","content":[{"type":"text","text":"tool phase"}]}}"#;
+        for end in [
+            "",
+            r#"{"type":"agent_end"}"#,
+            r#"{"type":"agent_end","willRetry":true}"#,
+        ] {
+            let parsed = parse_pi_jsonl(&format!("{tool_use}\n{end}"));
+            assert!(parsed.failed);
+            assert_eq!(parsed.evidence.protocol, ProtocolState::MissingTerminal);
+            assert!(parsed.text.is_empty());
+        }
+        let completed = parse_pi_jsonl(&format!(
+            "{tool_use}\n{}",
+            r#"{"type":"agent_end","willRetry":false}"#
+        ));
+        assert!(!completed.failed);
+        assert!(completed.evidence.certifies_success());
+        assert_eq!(completed.text, "tool phase");
+        let deferred = parse_pi_jsonl(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"deferred","content":[]}}"#,
+        );
+        assert_eq!(deferred.evidence.protocol, ProtocolState::MissingTerminal);
+        assert!(deferred.failed);
+    }
+
+    #[test]
+    fn pi_malformed_verdict_cannot_be_repaired_by_later_success() {
+        let parsed = parse_pi_jsonl(concat!(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":7,"output":2,"cost":{"total":0.25}}}}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"length","content":[{"type":"text","text":"looks successful"}],"usage":{"input":3,"output":1,"cost":{"total":0.5}}}}"#,
+        ));
+        assert!(parsed.failed);
+        assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid);
+        assert_eq!(parsed.evidence.malformed_records, 1);
+        assert!(parsed.text.is_empty());
+        assert_eq!(parsed.usage.input_tokens, Some(10));
+        assert_eq!(parsed.usage.output_tokens, Some(3));
+        assert_eq!(parsed.usage.cost_usd, Some(0.75));
+    }
+
+    #[test]
     fn parses_cursor_envelope_and_treats_a_missing_one_as_failure() {
         let s = r#"{"type":"result","subtype":"success","is_error":false,"result":"hi there","session_id":"c-1","usage":{"inputTokens":120,"outputTokens":7,"cacheReadTokens":900}}"#;
         let o = parse_cursor_json(s);
@@ -4545,18 +4714,17 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_claude_session_must_echo_its_preassigned_id() {
+    fn a_fresh_session_must_echo_its_preassigned_id() {
         let matching = parsed_with(Some("assigned"), None, None);
-        assert!(check_fresh_claude_session("assigned", &matching).is_none());
+        assert!(check_fresh_session("assigned", &matching).is_none());
 
-        let missing = check_fresh_claude_session("assigned", &parsed_with(None, None, None))
+        let missing = check_fresh_session("assigned", &parsed_with(None, None, None))
             .expect("missing fresh session id must be unverifiable");
         assert!(missing.contains("fresh session unverified"), "{missing}");
         assert!(missing.contains("assigned"), "{missing}");
 
-        let different =
-            check_fresh_claude_session("assigned", &parsed_with(Some("other"), None, None))
-                .expect("a different fresh session id must fail");
+        let different = check_fresh_session("assigned", &parsed_with(Some("other"), None, None))
+            .expect("a different fresh session id must fail");
         assert!(different.contains("fresh session mismatch"), "{different}");
         assert!(
             different.contains("assigned") && different.contains("other"),
