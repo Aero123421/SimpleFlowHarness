@@ -16,7 +16,7 @@ in this report.
 | OpenCode | 1.18.21 | [1.18.29](https://github.com/anomalyco/opencode/releases/tag/v1.18.29) | Fresh, resume, and fork completed with the expected session relationships. |
 | Pi | 0.84.4 | [0.85.1](https://github.com/earendil-works/pi/releases/tag/v0.85.1) | Fresh, resume, and fork completed. Resume retained both session ID and timestamp; fork returned a new ID. |
 | Grok | 1.0.5 | 1.0.13 | Required flags checked. The official stable pointer selected 1.0.13, while that binary identified itself as `[alpha]`. Both versions required login, so successful provider output remains unverified. |
-| Antigravity | 1.1.25 | [1.1.25](https://antigravity.google/docs/cli/install/) | Fresh and resume completed with the same conversation ID. Headless fork remains unsupported. |
+| Antigravity | 1.1.25 | [1.1.25](https://antigravity.google/docs/cli/install/), then observed 1.1.27 | Fresh and resume completed with the same conversation ID on both measured versions. Headless fork remains unsupported. |
 | Cursor Agent | Absent | Official installer advertised 2026.09.02-c22c1a3 | The package download returned HTTP 403. No current binary or successful turn was verified. |
 
 The four GitHub release archives were checked against their release asset
@@ -114,6 +114,38 @@ bundled CI watcher queried completed Actions run `34168435956`: the expected
 commit returned `ci_passed` (exit 0), and an intentionally different expected
 commit returned `ci_identity_or_protocol_error` (exit 30). This was a read-only
 API check; it did not start, rerun or cancel a workflow.
+
+## Final verification: 2026-09-08
+
+The final preflight used the corrected binary and found readable help with no
+missing required flags for Codex 0.153.4, Claude 2.1.263, OpenCode 1.18.29,
+Grok 1.0.13, Pi 0.85.1 and the now-installed Antigravity 1.1.27. Cursor remained
+absent. Preflight did not resolve the Claude/Grok authentication limitation.
+The cause of the Antigravity installation's version change was not established;
+it is recorded as a new observation rather than attributed to this audit.
+
+After the Pi parser and identity fixes, the Pi 0.85.1 fresh/resume/fork flow
+was repeated: all three steps reported valid protocol and exit zero, resume
+retained both ID and timestamp, and fork returned a different ID. Antigravity
+reported 1.1.27 both before and after a separate fresh/resume flow; both steps
+completed with valid protocol, exit zero and the same conversation ID. These
+five follow-up steps are additional to the initial 11-step measurement above.
+
+Code tree `3e9433990df8773d3c0c23f08c2c6250e1a1dbdb`, published in
+[PR #30](https://github.com/Aero123421/SimpleFlowHarness/pull/30), passed the
+Linux Rust 1.85 gates: fmt, clippy, 373 unit tests plus 18 integration tests,
+build, package, 900 engine checks, 114 independent checks, 22 distribution
+checks, 16 skills checks and 10 GitHub watcher checks. All 46 bundled flow
+assets validated, with the existing named strict-mode exception retained,
+and top-level example plans succeeded. Four new Pi protocol regressions were
+also run against the pre-fix code and failed there, establishing that they
+detect the repaired behavior.
+
+The preceding broader fixes are in
+[PR #29](https://github.com/Aero123421/SimpleFlowHarness/pull/29), which passed
+all three OS test and installer jobs before merging. Each PR's Actions checks
+record its separate cross-platform result; the real provider calls above
+were Linux measurements.
 
 ## Scope and remaining limits
 
