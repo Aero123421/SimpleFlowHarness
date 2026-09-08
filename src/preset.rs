@@ -223,6 +223,17 @@ pub fn wants_preassign(tool: &str) -> bool {
     matches!(tool, "claude" | "grok" | "pi" | "cursor")
 }
 
+/// Whether a fresh preassigned session id is echoed in the adapter's structured
+/// output. Pi 0.85.1's tagged CLI resolves `--session-id` as an exact project
+/// id and creates a session with that id when absent; its session header carries
+/// the same value (https://github.com/earendil-works/pi/blob/v0.85.1/packages/coding-agent/src/core/session-manager.ts).
+/// Claude has the same contract in its documented result envelope. Other
+/// preassigning adapters remain out until their fresh-session contracts are
+/// independently verified.
+pub fn fresh_session_echoes_id(tool: &str) -> bool {
+    matches!(tool, "claude" | "pi")
+}
+
 /// Tools where a resume MUST run in the same directory as the original, because
 /// a lookup miss silently creates a fresh session instead of failing. For these
 /// sfh refuses rather than warns.
@@ -2276,6 +2287,14 @@ mod tests {
     fn help_args_select_the_subcommand_where_codex_and_opencode_publish_flags() {
         assert_eq!(adapter_info("codex").unwrap().help_args, &["exec"][..]);
         assert_eq!(adapter_info("opencode").unwrap().help_args, &["run"][..]);
+    }
+
+    #[test]
+    fn fresh_identity_checks_only_cover_verified_echo_adapters() {
+        assert!(fresh_session_echoes_id("claude"));
+        assert!(fresh_session_echoes_id("pi"));
+        assert!(!fresh_session_echoes_id("grok"));
+        assert!(!fresh_session_echoes_id("cursor"));
     }
 
     #[test]

@@ -5,6 +5,16 @@
 
 ## Unreleased
 
+### 2026-09-08 Pi protocol・sessionの追加検証
+
+- Pi 0.85.1の公式sourceを確認し、新規sessionに指定したIDの欠落・不一致を
+  Claudeと同じ`SFH_SESSION_UNVERIFIED`で拒否します。resume/forkの既存検査は維持します。
+- Piの終了理由は既知のtyped値を必須とし、不明な値や未完了の応答を成功扱いしません。
+  tool-useで終わる場合は、後続の最終応答または再試行しない`agent_end`を必要とします。
+  CLI内部の再試行が成功した場合は以前の失敗判定を置き換え、両attemptのusageを保持します。
+- GitHub CLI 2.100.0で実際のActions APIを照会し、CI監視が対象commitの成功を受け取り、
+  異なるcommitの成功を拒否することを確認しました。
+
 ### 2026-09-07 CLI連携・機械向け結果の監査
 
 - CodexとOpenCodeのpreflightは、実行用subcommandのhelpを検査するよう修正しました。

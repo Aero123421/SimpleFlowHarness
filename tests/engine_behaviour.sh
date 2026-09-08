@@ -223,6 +223,84 @@ contains "raw artifact marks its omitted middle" "raw output middle omitted" "$P
 contains "raw artifact retains its terminal event" "VERDICT: PASS" "$PI_OVERSIZED_DIR/review.out.txt"
 contains "semantic capture reports complete processing" "semantic observer processed the complete stream" "$PI_OVERSIZED_DIR/review.err.txt"
 
+# Pi 0.85.1 creates a fresh project session with the exact --session-id it is
+# given. A later continue_from therefore lets sfh verify the fresh id in the
+# first response before attempting the resume. Keep these fixtures small: the
+# oversized stream tests above already cover Pi's large-output path.
+cat > pi-fresh-session.yaml <<YAML
+name: pi-fresh-session
+steps:
+  - id: first
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    env: {SFH_PI_STUB_IDENTITY_ONLY: "1"}
+    prompt: "open a Pi session"
+  - id: second
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    continue_from: first
+    env: {SFH_PI_STUB_IDENTITY_ONLY: "1"}
+    prompt: "continue the Pi session"
+YAML
+"$SFH" run pi-fresh-session.yaml --runs-dir pi-fresh-session-runs -q > pi-fresh-session.out 2> pi-fresh-session.err
+check "Pi fresh session echoes its assigned id and can be continued" 0 $?
+PI_FRESH_LOG="$(find pi-fresh-session-runs -type f -name 'log.jsonl' -print -quit)"
+PI_FRESH_SESSIONS="$(grep -cF '"session":{"access":"read"' "$PI_FRESH_LOG")"
+check "Pi fresh and resumed steps both record sessions" 2 "$PI_FRESH_SESSIONS"
+not_contains "Pi matching identity is not marked unverified" "fresh session" pi-fresh-session.err
+
+cat > pi-fresh-session-mismatch.yaml <<YAML
+name: pi-fresh-session-mismatch
+steps:
+  - id: first
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    env:
+      SFH_PI_STUB_IDENTITY_ONLY: "1"
+      SFH_PI_STUB_SESSION: "wrong-pi-session"
+    prompt: "open a Pi session"
+  - id: second
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    continue_from: first
+    env: {SFH_PI_STUB_IDENTITY_ONLY: "1"}
+    prompt: "continue the Pi session"
+YAML
+"$SFH" run pi-fresh-session-mismatch.yaml --runs-dir pi-fresh-session-mismatch-runs -q > pi-fresh-session-mismatch.out 2> pi-fresh-session-mismatch.err
+check "Pi fresh session with a different id fails" 1 $?
+contains "Pi fresh mismatch is diagnosed neutrally" "fresh session mismatch" pi-fresh-session-mismatch.err
+PI_MISMATCH_LOG="$(find pi-fresh-session-mismatch-runs -type f -name 'log.jsonl' -print -quit)"
+contains "Pi mismatch gets the typed unverified classification" '"failure_code":"SFH_SESSION_UNVERIFIED"' "$PI_MISMATCH_LOG"
+
+cat > pi-fresh-session-missing.yaml <<YAML
+name: pi-fresh-session-missing
+steps:
+  - id: first
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    env:
+      SFH_PI_STUB_IDENTITY_ONLY: "1"
+      SFH_PI_STUB_NO_SESSION: "1"
+    prompt: "open a Pi session"
+  - id: second
+    tool: pi
+    bin: "$PI_STUB_BIN"
+    access: read
+    continue_from: first
+    env: {SFH_PI_STUB_IDENTITY_ONLY: "1"}
+    prompt: "continue the Pi session"
+YAML
+"$SFH" run pi-fresh-session-missing.yaml --runs-dir pi-fresh-session-missing-runs -q > pi-fresh-session-missing.out 2> pi-fresh-session-missing.err
+check "Pi fresh session with no id fails" 1 $?
+contains "Pi missing identity is diagnosed neutrally" "fresh session unverified" pi-fresh-session-missing.err
+PI_MISSING_LOG="$(find pi-fresh-session-missing-runs -type f -name 'log.jsonl' -print -quit)"
+contains "Pi missing id gets the typed unverified classification" '"failure_code":"SFH_SESSION_UNVERIFIED"' "$PI_MISSING_LOG"
+
 cat > pi-oversized-line.yaml <<YAML
 api_version: 1
 name: pi-oversized-line

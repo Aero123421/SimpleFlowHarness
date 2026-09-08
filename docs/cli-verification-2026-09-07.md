@@ -48,12 +48,22 @@ establish billing accuracy or imply that an unreported cost is zero.
 - The Claude parser treated a missing or non-boolean `is_error` as success.
   It now requires the boolean verdict defined by the
   [official SDK parser](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/message_parser.py).
-- Fresh Claude calls now require the returned session ID to match the ID sfh
+- Fresh Claude and Pi calls now require the returned session ID to match the ID sfh
   supplied. Missing or different IDs fail with `SFH_SESSION_UNVERIFIED` and are
   not recorded as successful sessions. An optional durable `failure_code`
   preserves that classification when routing resumes after a crash. This rule
-  is limited to Claude; other adapters need their own identity-contract review
-  before it is generalized (issue #28).
+  covers Claude and Pi; Pi's tagged
+  [session manager](https://github.com/earendil-works/pi/blob/v0.85.1/packages/coding-agent/src/core/session-manager.ts)
+  creates and emits the supplied ID. Grok and Cursor still need their own
+  identity-contract review before it is generalized (issue #28).
+- Pi's assistant `stopReason` must belong to its typed
+  [0.85.1 union](https://github.com/earendil-works/pi/blob/v0.85.1/packages/ai/src/types.ts).
+  Missing, non-string and unknown values invalidate the stream, including when
+  followed by a plausible success. A documented successful retry replaces a
+  prior in-band error while retaining usage from both attempts. Pending and
+  deferred messages do not certify completion. A tool-use response needs a
+  later final response or an explicit non-retrying `agent_end`; this preserves
+  the [agent loop's tool-termination path](https://github.com/earendil-works/pi/blob/v0.85.1/packages/agent/src/agent-loop.ts).
 - Doctor could accept text without certified terminal evidence, or a nonzero
   exit from a CLI whose exit code is trustworthy. It now checks both. Agy's
   documented exit-code exception still requires certified success. Repeating
@@ -94,6 +104,16 @@ The latest Claude authentication response had `type: result`,
 `subtype: success`, and `is_error: true`. The subtype alone must therefore
 never be used as proof of success. The boolean error verdict remains
 authoritative.
+
+## GitHub CLI follow-up: 2026-09-08
+
+The installed GitHub CLI was 2.45.0. The official
+[2.100.0 release](https://github.com/cli/cli/releases/tag/v2.100.0) was unpacked
+separately after verifying its release asset SHA-256. With that binary, the
+bundled CI watcher queried completed Actions run `34168435956`: the expected
+commit returned `ci_passed` (exit 0), and an intentionally different expected
+commit returned `ci_identity_or_protocol_error` (exit 30). This was a read-only
+API check; it did not start, rerun or cancel a workflow.
 
 ## Scope and remaining limits
 
