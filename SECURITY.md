@@ -54,6 +54,17 @@ unsafe override in the plan, the execution closure and the run's metadata:
 - `workspace.allow_concurrent_writers` permits two potential writers in one
   workspace at once, which sfh cannot then tell apart.
 
+## Process cleanup limits
+
+On Unix, timeout and interruption cleanup targets the process group created
+for each command. Linux also requests a parent-death signal for the direct
+child. These mechanisms do not contain descendants that deliberately create
+another process group or session, and a force-killed owner cannot run its
+signal handler. macOS does not provide Linux's direct-child parent-death
+mechanism. Use an external OS containment boundary when every descendant must
+be terminated even after a crash or force kill. Windows uses job objects with
+kill-on-close for its owned process trees.
+
 ## What is not a secret
 
 `--var` values are not secrets: they are recorded in the run's `meta.json` and

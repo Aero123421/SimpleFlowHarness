@@ -83,7 +83,8 @@ state, alternate data streams, extended attributes, or custom ACLs in
 `SFH_DATA_DIR`; platform metadata is outside the portable inventory contract.
 
 Every rendered installer is release-bound. It embeds its stable version and
-all five platform archive hashes, and accepts only that version. To install an
+the archive hashes for its supported platforms, and accepts only that version.
+The shell and PowerShell installers collectively cover all five platforms. To install an
 older release, first download and verify the installer from that exact tag;
 setting `SFH_VERSION` on a newer installer does not retarget it. Windows and
 macOS additionally pin the native publisher when signing is enabled. The binary emits its embedded

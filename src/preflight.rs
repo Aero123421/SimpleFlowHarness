@@ -271,9 +271,67 @@ fn version_requirement_blockers(
     }
 }
 
+/// Build the help probe argv for one adapter. The flags sfh emits may live on
+/// a tool's subcommand help page rather than on its top-level page, so this
+/// keeps that command shape with the adapter facts in `preset` instead of
+/// making preflight guess from the generic `--help` spelling.
+fn help_argv(program: &str, tool: &str) -> Vec<String> {
+    let mut argv = vec![program.to_string()];
+    if let Some(info) = preset::adapter_info(tool) {
+        argv.extend(info.help_args.iter().map(|arg| (*arg).to_string()));
+    }
+    argv.push("--help".to_string());
+    argv
+}
+
+/// Check one adapter fact in the shape a CLI uses to publish it. Option names
+/// are tokens, so `--fork-session` cannot satisfy a required `--fork`, and
+/// command facts such as `run`/`exec` must occur in a usage header rather than
+/// in arbitrary prose.
+fn help_mentions_required(help: &str, tool: &str, required: &str) -> bool {
+    if required.starts_with('-') {
+        return help.split_whitespace().any(|token| {
+            let token = token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    ',' | ';' | ':' | '(' | ')' | '[' | ']' | '`' | '\'' | '"'
+                )
+            });
+            token == required
+                || token
+                    .strip_prefix(required)
+                    .is_some_and(|rest| rest.starts_with('='))
+        });
+    }
+
+    let Some(info) = preset::adapter_info(tool) else {
+        return false;
+    };
+    if !info.help_args.iter().any(|arg| *arg == required) {
+        return false;
+    }
+    let program = preset::default_program(tool);
+    help.lines().any(|line| {
+        let trimmed = line.trim();
+        let mut words = if let Some(usage) = trimmed.strip_prefix("Usage:") {
+            let mut words = usage.split_whitespace();
+            words.next();
+            words
+        } else if let Some(rest) = trimmed.strip_prefix(&program) {
+            if !rest.chars().next().is_some_and(|c| c.is_whitespace()) {
+                return false;
+            }
+            rest.split_whitespace()
+        } else {
+            return false;
+        };
+        words.next() == Some(required)
+    })
+}
+
 /// Read a CLI's own `--help`. Bounded and never fatal: a tool that has no
-/// `--help`, prints it to stderr, or wants to talk to a terminal is reported as
-/// "help unreadable" rather than as a missing flag, because "sfh could not
+/// `--help` fails, is interrupted, or wants to talk to a terminal is reported
+/// as "help unreadable" rather than as a missing flag, because "sfh could not
 /// check" and "the flag is gone" are different answers and only one of them
 /// should stop a run.
 ///
@@ -285,7 +343,7 @@ fn version_requirement_blockers(
 /// the rest of each adapter's command-line facts, not here.
 fn read_help(program: &str, tool: &str, cwd: &Path) -> Option<String> {
     let hardening = preset::probe_hardening(tool);
-    let mut argv = vec![program.to_string(), "--help".to_string()];
+    let mut argv = help_argv(program, tool);
     argv.extend(hardening.extra_args.iter().map(|s| s.to_string()));
     let env_set: Vec<(String, String)> = hardening
         .env_set
@@ -302,7 +360,7 @@ fn read_help(program: &str, tool: &str, cwd: &Path) -> Option<String> {
         execute::Observe::default(),
     )
     .ok()?;
-    if out.timed_out {
+    if out.timed_out || out.interrupted || out.exit_code != 0 {
         return None;
     }
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -421,22 +479,26 @@ fn probe(
                         help_readable = true;
                         if let Some(i) = &info {
                             for flag in i.required_flags {
-                                if !help.contains(flag) {
+                                if !help_mentions_required(&help, tool, flag) {
                                     missing_flags.push((*flag).to_string());
                                 }
                             }
                         }
                         if !missing_flags.is_empty() {
+                            let help_command = help_argv(program, tool).join(" ");
                             blockers.push(format!(
-                                "'{program} --help' does not mention {} - the installed CLI does not look like the one this adapter was built against (last verified {}). Run `sfh doctor` to see what it actually returns.",
+                                "'{help_command}' does not mention {} - the installed CLI does not look like the one this adapter was built against (last verified {}). Run `sfh doctor` to see what it actually returns.",
                                 missing_flags.join(", "),
                                 info.as_ref().map(|i| i.last_verified).unwrap_or("unknown")
                             ));
                         }
                     }
-                    None => warnings.push(format!(
-                        "'{program} --help' could not be read, so sfh could not check that this adapter's flags still exist"
-                    )),
+                    None => {
+                        let help_command = help_argv(program, tool).join(" ");
+                        warnings.push(format!(
+                            "'{help_command}' could not be read, so sfh could not check that this adapter's flags still exist"
+                        ));
+                    }
                 }
             }
         }
@@ -1306,6 +1368,141 @@ mod tests {
             r.blockers.iter().any(|b| b.contains(omitted)),
             "{:?}",
             r.blockers
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_uses_subcommand_help_and_blocks_a_missing_subcommand_flag() {
+        let required = preset::adapter_info("opencode").unwrap().required_flags;
+        let dir = test_scratch_dir("subcommand-help");
+
+        let write_fixture = |script: &Path, record: &Path, omit: Option<&str>| {
+            let help = required
+                .iter()
+                .copied()
+                .filter(|flag| Some(*flag) != omit)
+                .collect::<Vec<_>>()
+                .join(" ");
+            write_executable_script(
+                script,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"$1\" = \"--version\" ]; then\n  echo fake-opencode 1.18.21\nelif [ \"$1\" = \"run\" ] && [ \"$2\" = \"--help\" ]; then\n  echo 'opencode run [message..]'\n  echo 'Options:'\n  echo '{} '\nelse\n  echo root-only\nfi\n",
+                    record.display(),
+                    help
+                ),
+            );
+        };
+
+        // The root help deliberately does not advertise the adapter flags;
+        // only `run --help` does. Recording argv makes the regression catch a
+        // probe that happens to pass by merging or reusing the wrong output.
+        let complete_record = dir.join("complete.argv");
+        let complete_script = dir.join("complete-opencode.sh");
+        write_fixture(&complete_script, &complete_record, None);
+        let complete_program = complete_script.to_string_lossy().into_owned();
+        let complete = probe(
+            "opencode",
+            &complete_program,
+            Vec::new(),
+            false,
+            true,
+            Some(&dir),
+            Vec::new(),
+        );
+        assert!(complete.blockers.is_empty(), "{:#?}", complete.blockers);
+        assert!(
+            complete.missing_flags.is_empty(),
+            "{:#?}",
+            complete.missing_flags
+        );
+        assert_eq!(
+            std::fs::read_to_string(&complete_record).expect("read complete fixture argv"),
+            "--version\nrun --help\n"
+        );
+
+        // A real omission on the subcommand's help remains a blocker. This
+        // proves the fix changes only where facts are read, not the fail-closed
+        // meaning of `required_flags`.
+        let missing_record = dir.join("missing.argv");
+        let missing_script = dir.join("missing-opencode.sh");
+        write_fixture(&missing_script, &missing_record, Some("--variant"));
+        let missing_program = missing_script.to_string_lossy().into_owned();
+        let missing = probe(
+            "opencode",
+            &missing_program,
+            Vec::new(),
+            false,
+            true,
+            Some(&dir),
+            Vec::new(),
+        );
+        assert_eq!(missing.missing_flags, vec!["--variant"]);
+        assert!(missing
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("run --help") && blocker.contains("--variant")));
+        assert_eq!(
+            std::fs::read_to_string(&missing_record).expect("read missing fixture argv"),
+            "--version\nrun --help\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn help_matching_does_not_accept_near_prefixes_or_command_prose() {
+        let help =
+            "opencode run [message..]\n\nOptions:\n  --fork-session <id>\n  --format <format>\n";
+        assert!(help_mentions_required(help, "opencode", "run"));
+        assert!(help_mentions_required(help, "opencode", "--fork-session"));
+        assert!(!help_mentions_required(help, "opencode", "--fork"));
+        assert!(!help_mentions_required(
+            "run opencode with a message\n  --format <format>\n",
+            "opencode",
+            "run"
+        ));
+        assert!(!help_mentions_required(
+            "Usage: codex exec [OPTIONS]\n\nOptions:\n  -config <key=value>\n",
+            "codex",
+            "-c"
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_nonzero_help_probe_is_unreadable_even_if_it_prints_all_flags() {
+        let required = preset::adapter_info("opencode").unwrap().required_flags;
+        let dir = test_scratch_dir("nonzero-help");
+        let script = dir.join("failing-opencode.sh");
+        write_executable_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo fake-opencode 1.18.29\nelif [ \"$1\" = \"run\" ] && [ \"$2\" = \"--help\" ]; then\n  echo 'opencode run [message..]'\n  echo 'Options:'\n  echo '{}'\n  exit 7\nfi\n",
+                required.join(" ")
+            ),
+        );
+        let program = script.to_string_lossy().into_owned();
+
+        let report = probe(
+            "opencode",
+            &program,
+            Vec::new(),
+            false,
+            true,
+            Some(&dir),
+            Vec::new(),
+        );
+        assert_eq!(report.probe_state, ProbeState::Probed);
+        assert!(!report.help_readable);
+        assert!(report.missing_flags.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("run --help")
+                    && warning.contains("could not be read"))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

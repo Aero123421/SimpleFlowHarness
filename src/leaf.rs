@@ -1,6 +1,6 @@
 use crate::execute::OutputObserver;
 use crate::protocol::{self, ProtocolEvidence, ProtocolState};
-use crate::{contain, execute, flow, preset, template};
+use crate::{contain, execute, flow, machine, preset, template};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -201,6 +201,10 @@ pub struct LeafDone {
     /// What the structured protocol proved, recorded in `step_end` so a reader
     /// can tell "the tool failed" from "sfh could not verify that it finished".
     pub protocol: ProtocolEvidence,
+    /// Stable sfh classification for a harness verification failure that can
+    /// coexist with a valid tool protocol (for example, fresh Claude returning
+    /// a different session id than the one sfh assigned).
+    pub failure_code: Option<machine::ErrorCode>,
 }
 
 impl LeafDone {
@@ -328,8 +332,9 @@ fn fork_warmup_enabled(flow: &flow::Flow, tool: &str) -> bool {
     }
 }
 
-/// A bounded, best-effort read of the installed codex binary's own `--help`,
-/// consulted only to decide whether `exec fork` is safe to attempt (P1-07;
+/// A bounded, best-effort read of the installed codex binary's own
+/// `exec --help`, consulted only to decide whether `exec fork` is safe to
+/// attempt (P1-07;
 /// see `preset::build_fork`'s codex arm and `preset::codex_fork_confirmed`).
 ///
 /// Distinct from `preflight::read_help`: that one runs in an isolated scratch
@@ -343,7 +348,11 @@ fn fork_warmup_enabled(flow: &flow::Flow, tool: &str) -> bool {
 /// tell" and "sfh looked and it is not there" both fail closed, on purpose.
 fn codex_help_probe(program: &str, cwd: Option<&Path>) -> Option<String> {
     let out = execute::run_cmd(
-        &execute::Invocation::Argv(vec![program.to_string(), "--help".to_string()]),
+        &execute::Invocation::Argv(vec![
+            program.to_string(),
+            "exec".to_string(),
+            "--help".to_string(),
+        ]),
         None,
         cwd,
         Some(Duration::from_secs(15)),
@@ -1406,6 +1415,23 @@ pub fn check_session(e: &SessionExpect, parsed: &ParsedOut, chain: &str) -> Opti
     None
 }
 
+/// A fresh Claude run may receive a session id from sfh before it starts so a
+/// later `continue_from` can attach to it. Claude is expected to echo that id
+/// in its result envelope; falling back to the preassigned id when it does not
+/// would record an unverified session and let a later step resume the wrong
+/// conversation (rev_break #16).
+fn check_fresh_claude_session(expected: &str, parsed: &ParsedOut) -> Option<String> {
+    match parsed.session.as_deref() {
+        Some(got) if got == expected => None,
+        Some(got) => Some(format!(
+            "\nsfh: fresh session mismatch: expected the assigned session '{expected}' but the tool reported '{got}', so sfh cannot verify which conversation this step used\n"
+        )),
+        None => Some(format!(
+            "\nsfh: fresh session unverified: the tool reported no session id, so sfh cannot verify it opened the assigned session '{expected}'\n"
+        )),
+    }
+}
+
 /// Parse a tool's output. `run_dir`, when given, is the run dir the artifact
 /// paths must stay inside: the codex --output-last-message file is written by
 /// an external CLI and read back here, and on a resumed run that directory is
@@ -1463,10 +1489,11 @@ fn finish_parsed(
 }
 
 /// cursor-agent --output-format json: one result envelope. A model/API failure
-/// emits NO envelope at all and exits non-zero, and `is_error` is always false,
-/// so absence of the documented `{"type":"result"}` line is the failure signal -
-/// not that field. Any other trailing JSON object (a progress record, a config
-/// dump) is NOT a result and must not be read as one.
+/// emits NO envelope at all and exits non-zero. A successful envelope must carry
+/// both `subtype: "success"` and `is_error: false`; missing or contradictory
+/// verdict fields are not evidence of success. Any other trailing JSON object
+/// (a progress record, a config dump) is NOT a result and must not be read as
+/// one. See https://cursor.com/docs/cli/reference/output-format.
 fn parse_cursor_json(stdout: &str) -> ParsedOut {
     let mut o = ParsedOut::default();
     let v = match single_envelope(stdout, "cursor-agent", &|v| {
@@ -1494,22 +1521,49 @@ fn parse_cursor_json(stdout: &str) -> ParsedOut {
         o.usage.input_tokens = num(u.get("inputTokens"));
         o.usage.output_tokens = num(u.get("outputTokens"));
     }
-    // The documented subtypes are `success` and `error`; anything else is an
-    // envelope shape sfh does not know how to read a verdict out of.
-    match v.get("subtype").and_then(|x| x.as_str()) {
-        Some("success") | None => {
+    let subtype = match v.get("subtype").and_then(|x| x.as_str()) {
+        Some(subtype) => subtype,
+        None => {
+            o.failed = true;
+            o.text.clear();
+            o.evidence = ProtocolEvidence::invalid(
+                "cursor-agent result envelope did not contain a string 'subtype' verdict; sfh will not guess whether the turn succeeded",
+            );
+            return o;
+        }
+    };
+    let is_error = match v.get("is_error").and_then(|x| x.as_bool()) {
+        Some(is_error) => is_error,
+        None => {
+            o.failed = true;
+            o.text.clear();
+            o.evidence = ProtocolEvidence::invalid(
+                "cursor-agent result envelope did not contain a boolean 'is_error' verdict; sfh will not guess whether the turn succeeded",
+            );
+            return o;
+        }
+    };
+    match (subtype, is_error) {
+        ("success", false) => {
             o.evidence.protocol = ProtocolState::Valid;
             o.evidence.terminal_seen = true;
             o.evidence.terminal_success = Some(true);
             o.evidence.final_message_seen = !o.text.is_empty();
         }
-        Some("error") => {
+        ("error", true) => {
             o.failed = true;
             o.evidence.protocol = ProtocolState::Valid;
             o.evidence.terminal_seen = true;
             o.evidence.terminal_success = Some(false);
         }
-        Some(other) => {
+        ("success", true) | ("error", false) => {
+            o.failed = true;
+            o.text.clear();
+            o.evidence = ProtocolEvidence::invalid(format!(
+                "cursor-agent result envelope contradicted subtype '{subtype}' with is_error={is_error}; sfh will not guess whether the turn succeeded"
+            ));
+        }
+        (other, _) => {
             o.failed = true;
             o.text.clear();
             o.evidence = ProtocolEvidence::invalid(format!(
@@ -2062,6 +2116,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             // to describe.
             outcome: None,
             protocol: ProtocolEvidence::default(),
+            failure_code: None,
         };
     }
     // Compute the remaining wall budget at the last possible point before
@@ -2108,6 +2163,7 @@ fn exec_once(p: Prepared) -> LeafDone {
             persistence_error,
             outcome: None,
             protocol: ProtocolEvidence::default(),
+            failure_code: None,
         };
     }
     // pi/codex/opencode can each emit an event transcript larger than the raw
@@ -2166,6 +2222,7 @@ fn exec_once(p: Prepared) -> LeafDone {
                 persistence_error,
                 outcome: None,
                 protocol: ProtocolEvidence::default(),
+                failure_code: None,
             };
         }
     };
@@ -2395,6 +2452,7 @@ fn exec_once(p: Prepared) -> LeafDone {
     }
     let protocol_evidence = parsed.evidence.clone();
     let chain_output = parsed.text.clone();
+    let mut failure_code = None;
 
     let mut session_id = if exit_code == 0 && !outcome.timed_out {
         parsed
@@ -2420,8 +2478,26 @@ fn exec_once(p: Prepared) -> LeafDone {
             expect_parent: p.expect_parent.as_deref(),
             allow_empty: p.allow_empty,
         };
-        if let Some(why) = check_session(&expect, &parsed, &chain_output) {
+        // Only Claude's fresh path gets a preassigned id that is expected back:
+        // forked Claude sessions are checked by forbid_session, while Grok,
+        // Pi and Cursor have separate adapter contracts that remain unchanged.
+        let fresh_claude_expected = (p.tool.as_deref() == Some("claude")
+            && p.session_parent.is_none()
+            && p.expect_session.is_none())
+        .then_some(p.preassigned_session.as_deref())
+        .flatten();
+        let fresh_session_failure = fresh_claude_expected
+            .and_then(|expected| check_fresh_claude_session(expected, &parsed));
+        let fresh_session_failed = fresh_session_failure.is_some();
+        let session_failure =
+            fresh_session_failure.or_else(|| check_session(&expect, &parsed, &chain_output));
+        if let Some(why) = session_failure {
             exit_code = 1;
+            if fresh_session_failed {
+                // The tool's envelope was valid; sfh failed because it could
+                // not prove which fresh conversation the turn used.
+                failure_code = Some(machine::ErrorCode::SessionUnverified);
+            }
             harness_diagnostic = Some(why.trim().trim_start_matches("sfh: ").to_string());
             if !why.starts_with("\nsfh: the tool exited successfully") {
                 session_id = None;
@@ -2505,6 +2581,7 @@ fn exec_once(p: Prepared) -> LeafDone {
         harness_diagnostic,
         persistence_error,
         protocol: protocol_evidence,
+        failure_code,
     }
 }
 
@@ -2735,6 +2812,7 @@ fn single_envelope(
     }
     let mut malformed = 0u32;
     let mut terminal = None;
+    let mut terminal_count = 0u32;
     for line in t.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -2743,7 +2821,10 @@ fn single_envelope(
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(v) => {
                 if is_terminal(&v) {
-                    terminal = Some(v);
+                    terminal_count = terminal_count.saturating_add(1);
+                    if terminal.is_none() {
+                        terminal = Some(v);
+                    }
                 }
             }
             Err(_) => malformed = malformed.saturating_add(1),
@@ -2754,6 +2835,15 @@ fn single_envelope(
     // emit, so it is not by itself a broken protocol - the envelope still has
     // to be there. When it is NOT there, the leftover text is not promoted to
     // an answer: that is the fail-open this contract removes.
+    if terminal_count > 1 {
+        return Err(ProtocolEvidence {
+            protocol: ProtocolState::Invalid,
+            diagnostic: Some(format!(
+                "{tool} stdout contained {terminal_count} terminal result envelopes; sfh expected exactly one"
+            )),
+            ..Default::default()
+        });
+    }
     match terminal {
         Some(v) => Ok(v),
         None if malformed > 0 => Err(ProtocolEvidence {
@@ -2775,8 +2865,11 @@ fn single_envelope(
 }
 
 /// claude --output-format json: one envelope with .result/.session_id/.total_cost_usd.
-/// The documented terminal record is `{"type":"result", ...}`; `is_error`
-/// carries its verdict.
+/// The documented terminal record is `{"type":"result", ...}`; its required
+/// boolean `is_error` carries the verdict. The Agent SDK parses this field as
+/// required (`data["is_error"]`), so a missing or non-boolean value is an
+/// invalid protocol rather than an implicit success:
+/// https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/message_parser.py
 fn parse_claude_json(stdout: &str) -> ParsedOut {
     let mut o = ParsedOut::default();
     let v = match single_envelope(stdout, "claude", &|v| {
@@ -2804,7 +2897,21 @@ fn parse_claude_json(stdout: &str) -> ParsedOut {
         o.usage.input_tokens = num(u.get("input_tokens"));
         o.usage.output_tokens = num(u.get("output_tokens"));
     }
-    o.failed = v.get("is_error").and_then(|x| x.as_bool()).unwrap_or(false);
+    let is_error = match v.get("is_error").and_then(|x| x.as_bool()) {
+        Some(value) => value,
+        None => {
+            o.failed = true;
+            // A result envelope without a typed verdict is not evidence of a
+            // successful turn. Clear its text so a malformed terminal record
+            // cannot become downstream chain input (P0-01).
+            o.text.clear();
+            o.evidence = ProtocolEvidence::invalid(
+                "claude result envelope did not contain a boolean 'is_error' verdict; sfh will not guess whether the turn succeeded",
+            );
+            return o;
+        }
+    };
+    o.failed = is_error;
     o.evidence.protocol = ProtocolState::Valid;
     o.evidence.terminal_seen = true;
     o.evidence.terminal_success = Some(!o.failed);
@@ -3317,6 +3424,7 @@ fn synthetic_failure(idx: usize) -> LeafDone {
         persistence_error: None,
         outcome: None,
         protocol: ProtocolEvidence::invalid("worker thread died before producing a result"),
+        failure_code: None,
     }
 }
 
@@ -3398,6 +3506,63 @@ pub fn last_line(s: &str) -> &str {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn fake_codex(path: &Path, fork: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let exec_help = if fork {
+            "echo 'EXEC_HELP'\necho \"CWD=$PWD\"\necho 'Usage: codex exec [OPTIONS] [PROMPT]'\necho 'Commands:'\necho '  fork    Fork a previous session'\n"
+        } else {
+            "echo 'EXEC_HELP'\necho \"CWD=$PWD\"\necho 'Usage: codex exec [OPTIONS] [PROMPT]'\necho 'Commands:'\necho '  resume  Resume a previous session'\n"
+        };
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = exec ] && [ \"$2\" = --help ]; then\n{exec_help}else\n  echo 'ROOT_HELP'\n  echo 'Usage: codex [OPTIONS] [PROMPT]'\n  echo 'Commands:'\n  echo '  fork    Fork an interactive session'\nfi\n"
+        );
+        std::fs::write(path, script).unwrap();
+        let mut mode = std::fs::metadata(path).unwrap().permissions();
+        mode.set_mode(0o700);
+        std::fs::set_permissions(path, mode).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_probe_uses_exec_help_and_rejects_root_only_fork() {
+        let root = std::env::temp_dir().join(format!("sfh-codex-fork-probe-{}", gen_uuid()));
+        std::fs::create_dir(&root).unwrap();
+        let root_only = root.join("codex-root-only");
+        let with_fork = root.join("codex-with-fork");
+        fake_codex(&root_only, false);
+        fake_codex(&with_fork, true);
+
+        let root_help = codex_help_probe(root_only.to_str().unwrap(), Some(root.as_path()))
+            .expect("fake codex should answer exec --help");
+        assert!(root_help.contains("EXEC_HELP"));
+        let root_cwd = root_help
+            .lines()
+            .find_map(|line| line.strip_prefix("CWD="))
+            .expect("fake codex should report its working directory");
+        assert_eq!(
+            Path::new(root_cwd).canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+        assert!(!preset::codex_fork_confirmed(Some(&root_help)));
+
+        let fork_help = codex_help_probe(with_fork.to_str().unwrap(), Some(root.as_path()))
+            .expect("fake codex should answer exec --help");
+        assert!(fork_help.contains("EXEC_HELP"));
+        let fork_cwd = fork_help
+            .lines()
+            .find_map(|line| line.strip_prefix("CWD="))
+            .expect("fake codex should report its working directory");
+        assert_eq!(
+            Path::new(fork_cwd).canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+        assert!(preset::codex_fork_confirmed(Some(&fork_help)));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn zero_tool_gate_limit_is_defensively_bounded_instead_of_deadlocking() {
         let gate = ToolGate::new(HashMap::from([("claude".to_string(), 0)]));
@@ -3460,6 +3625,28 @@ mod tests {
         assert_eq!(o.usage.input_tokens, Some(10));
         assert!(!o.failed);
         assert!(parse_claude_json(r#"{"result":"x","is_error":true}"#).failed);
+    }
+
+    #[test]
+    fn claude_result_without_a_boolean_error_verdict_is_invalid_and_does_not_emit_text() {
+        for s in [
+            r#"{"type":"result","result":"looks successful"}"#,
+            r#"{"type":"result","result":"looks successful","is_error":null}"#,
+            r#"{"type":"result","result":"looks successful","is_error":"false"}"#,
+        ] {
+            let o = parse_claude_json(s);
+            assert!(o.failed, "malformed verdict must fail: {s}");
+            assert!(
+                o.text.is_empty(),
+                "malformed result must not emit text: {s}"
+            );
+            assert_eq!(o.evidence.protocol, ProtocolState::Invalid);
+            assert!(!o.evidence.allows_success());
+            assert!(o
+                .evidence
+                .failure_reason("claude")
+                .is_some_and(|reason| reason.contains("boolean 'is_error'")));
+        }
     }
 
     #[test]
@@ -3816,10 +4003,88 @@ mod tests {
         let noisy = format!("Using worktree: C:\\tmp\n{s}");
         assert_eq!(parse_cursor_json(&noisy).text, "hi there");
         assert!(parse_cursor_json(&noisy).evidence.certifies_success());
+        // A valid nonterminal JSON event may precede the result envelope.
+        let with_system = format!("{{\"type\":\"system\",\"subtype\":\"init\"}}\n{s}");
+        assert!(parse_cursor_json(&with_system).evidence.certifies_success());
         // An arbitrary trailing JSON object is not a result envelope.
         let not_a_result = r#"{"type":"progress","result":"looks like an answer"}"#;
         assert!(parse_cursor_json(not_a_result).failed);
         assert!(parse_cursor_json(not_a_result).text.is_empty());
+    }
+
+    #[test]
+    fn cursor_result_requires_typed_noncontradictory_verdict_fields() {
+        for (name, envelope) in [
+            (
+                "missing subtype",
+                r#"{"type":"result","is_error":false,"result":"looks successful"}"#,
+            ),
+            (
+                "null subtype",
+                r#"{"type":"result","subtype":null,"is_error":false,"result":"looks successful"}"#,
+            ),
+            (
+                "missing is_error",
+                r#"{"type":"result","subtype":"success","result":"looks successful"}"#,
+            ),
+            (
+                "null is_error",
+                r#"{"type":"result","subtype":"success","is_error":null,"result":"looks successful"}"#,
+            ),
+            (
+                "string is_error",
+                r#"{"type":"result","subtype":"success","is_error":"false","result":"looks successful"}"#,
+            ),
+            (
+                "success with error verdict",
+                r#"{"type":"result","subtype":"success","is_error":true,"result":"looks successful"}"#,
+            ),
+            (
+                "error with success verdict",
+                r#"{"type":"result","subtype":"error","is_error":false,"result":"looks successful"}"#,
+            ),
+            (
+                "unknown subtype",
+                r#"{"type":"result","subtype":"partial","is_error":false,"result":"looks successful"}"#,
+            ),
+        ] {
+            let o = parse_cursor_json(envelope);
+            assert!(o.failed, "{name} must fail closed");
+            assert!(o.text.is_empty(), "{name} must not emit text");
+            assert_eq!(o.evidence.protocol, ProtocolState::Invalid, "{name}");
+            assert!(!o.evidence.certifies_success(), "{name}");
+        }
+        // Preserve the documented terminal error shape as a known failure.
+        let error = parse_cursor_json(
+            r#"{"type":"result","subtype":"error","is_error":true,"result":"provider failed"}"#,
+        );
+        assert!(error.failed);
+        assert_eq!(error.evidence.protocol, ProtocolState::Valid);
+        assert_eq!(error.evidence.terminal_success, Some(false));
+        assert!(!error.evidence.certifies_success());
+    }
+
+    #[test]
+    fn single_envelope_rejects_duplicate_terminal_results() {
+        let success = r#"{"type":"result","subtype":"success","is_error":false,"result":"first"}"#;
+        let later_success =
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"second"}"#;
+        let o = parse_cursor_json(&format!("{success}\n{later_success}"));
+        assert!(o.failed);
+        assert!(o.text.is_empty());
+        assert_eq!(o.evidence.protocol, ProtocolState::Invalid);
+        assert!(o
+            .evidence
+            .failure_reason("cursor")
+            .is_some_and(|reason| reason.contains("exactly one")));
+
+        // A later success cannot launder an earlier terminal error into a pass.
+        let error = r#"{"type":"result","subtype":"error","is_error":true,"result":"failed"}"#;
+        let o = parse_cursor_json(&format!("{error}\n{later_success}"));
+        assert!(o.failed);
+        assert!(o.text.is_empty());
+        assert_eq!(o.evidence.protocol, ProtocolState::Invalid);
+        assert!(!o.evidence.certifies_success());
     }
 
     /// P0-01. Each of these is a real way agy ends a run, and every one of them
@@ -4280,6 +4545,26 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_claude_session_must_echo_its_preassigned_id() {
+        let matching = parsed_with(Some("assigned"), None, None);
+        assert!(check_fresh_claude_session("assigned", &matching).is_none());
+
+        let missing = check_fresh_claude_session("assigned", &parsed_with(None, None, None))
+            .expect("missing fresh session id must be unverifiable");
+        assert!(missing.contains("fresh session unverified"), "{missing}");
+        assert!(missing.contains("assigned"), "{missing}");
+
+        let different =
+            check_fresh_claude_session("assigned", &parsed_with(Some("other"), None, None))
+                .expect("a different fresh session id must fail");
+        assert!(different.contains("fresh session mismatch"), "{different}");
+        assert!(
+            different.contains("assigned") && different.contains("other"),
+            "{different}"
+        );
+    }
+
+    #[test]
     fn retry_backoff_yields_before_crossing_the_budget_landing_threshold() {
         let flow: flow::Flow = serde_yaml_ng::from_str(
             "steps:\n  - id: retrying\n    cmd: [\"sfh-this-program-does-not-exist-f6\"]\n    retry: {max: 3, backoff_sec: 30}\n    retry_on: any\n",
@@ -4602,6 +4887,62 @@ mod tests {
             None,
         )
         .expect("a non-permission flag must pass");
+
+        let claude_flow: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: c\n    tool: claude\n    access: read\n    args: [--allowed-tools, Read, '{{vars.extra_tool}}']\n    prompt: x\n",
+        )
+        .unwrap();
+        let claude_step_ids = claude_flow.step_ids();
+        vars.insert("extra_tool".to_string(), "PowerShell".to_string());
+        let e = prepare_leaf(
+            &ctx(
+                &claude_flow,
+                &vars,
+                &outputs,
+                &claude_step_ids,
+                &dir,
+                &sessions,
+                &needed,
+            ),
+            &claude_flow.steps[0],
+            1,
+            "c",
+            &[],
+            None,
+        )
+        .err()
+        .expect("a rendered later tool in a variadic allowlist must be checked");
+        assert!(e.contains("overrides the declared access level"), "{e}");
+
+        // Pi's platform-native PowerShell tool is also a full-access switch,
+        // including when the switch itself arrives through a rendered value.
+        let pi_flow: flow::Flow = serde_yaml_ng::from_str(
+            "steps:\n  - id: p\n    tool: pi\n    access: read\n    args: [\"{{vars.flag}}\"]\n    prompt: x\n",
+        )
+        .unwrap();
+        let mut pi_vars = BTreeMap::new();
+        pi_vars.insert("flag".to_string(), "--tools=PowerShell".to_string());
+        let pi_step_ids = pi_flow.step_ids();
+        let e = prepare_leaf(
+            &ctx(
+                &pi_flow,
+                &pi_vars,
+                &outputs,
+                &pi_step_ids,
+                &dir,
+                &sessions,
+                &needed,
+            ),
+            &pi_flow.steps[0],
+            1,
+            "p",
+            &[],
+            None,
+        )
+        .err()
+        .expect("a rendered PowerShell tool must be refused at read access");
+        assert!(e.contains("overrides the declared access level"), "{e}");
+        assert!(e.contains("--tools=PowerShell"), "{e}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

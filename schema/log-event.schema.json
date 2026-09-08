@@ -120,6 +120,33 @@
       "maxLength": 503,
       "description": "Bounded sfh-generated diagnosis for a leaf failure; never copied from tool-controlled stderr."
     },
+    "failure_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "SFH_USAGE",
+        "SFH_FLOW_INVALID",
+        "SFH_STEP_FAILED",
+        "SFH_PROTOCOL_INVALID",
+        "SFH_TERMINAL_MISSING",
+        "SFH_SESSION_UNVERIFIED",
+        "SFH_EXECUTION_CLOSURE_CHANGED",
+        "SFH_WORKSPACE_MISSING",
+        "SFH_WORKSPACE_DRIFT",
+        "SFH_WORKSPACE_BUSY",
+        "SFH_RUN_BUSY",
+        "SFH_WORKSPACE_UNOWNED",
+        "SFH_REPLAY_REFUSED",
+        "SFH_PERSISTENCE_FAILURE",
+        "SFH_CAPABILITY_UNAVAILABLE",
+        "SFH_STUCK",
+        "SFH_INTERRUPTED",
+        null
+      ],
+      "description": "step_end/aggregate_end: stable sfh classification for a harness verification failure. Absent or null in older logs and ordinary failures; added in v1.6.0."
+    },
     "protocol_expected": {
       "type": "string",
       "enum": [

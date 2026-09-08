@@ -20,8 +20,9 @@ The following classes are now enforced and tested:
   malformed management files fail closed;
 - `status`, `wait`, and `stop` authenticate the owning run using nonce, PID,
   process identity, and process start time;
-- process-tree termination covers children and grandchildren on all supported
-  operating systems;
+- process cleanup covers descendants in each owned Unix process group and
+  Windows job object; Unix descendants that leave the group and force-kill
+  behavior have the limits documented in [SECURITY.md](../SECURITY.md);
 - access-changing CLI arguments and session access escalation are rejected
   unless an explicit escape hatch is present;
 - run-derived values cannot select executables, working directories, or shell

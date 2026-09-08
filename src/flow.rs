@@ -4063,6 +4063,8 @@ mod tests {
                 "write",
                 "[\"-t\", \"read,bash,edit,write,grep,find,ls\"]",
             ),
+            ("pi", "read", "[\"--tools\", \"PowerShell\"]"),
+            ("pi", "write", "[\"-t=\\\"POWERSHELL\\\"\"]"),
             ("pi", "read", "[\"--approve\"]"),
             ("claude", "read", "[\"--allowedTools\", \"Bash\"]"),
             (

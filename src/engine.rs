@@ -788,6 +788,12 @@ fn failed_output(step: &str, text: &str, exit: i32, timed_out: bool) -> String {
     )
 }
 
+/// Prefixes on errors raised while a valid flow is being executed. These are
+/// deliberately attached only at the runtime sites below: prose such as
+/// "failed" also appears in static validation diagnostics, so the machine
+/// layer must not classify by a broad substring.
+const RUNTIME_STEP_FAILED: &str = "SFH_STEP_FAILED: ";
+
 fn claim_leaf_runs(
     total: &mut u32,
     additional: u32,
@@ -796,7 +802,7 @@ fn claim_leaf_runs(
 ) -> Result<(), String> {
     let next = total.checked_add(additional).ok_or_else(|| {
         format!(
-            "step '{step}' would overflow the total leaf-run counter (max_total_steps={max_total})"
+            "{RUNTIME_STEP_FAILED}step '{step}' would overflow the total leaf-run counter (max_total_steps={max_total})"
         )
     })?;
     if next > max_total {
@@ -805,7 +811,7 @@ fn claim_leaf_runs(
         // bare number does not explain. Name what is being counted and the key
         // that raises it, so the answer does not need the source.
         return Err(format!(
-            "step '{step}' would bring total leaf runs to {next} over max_total_steps ({max_total}). \
+            "{RUNTIME_STEP_FAILED}step '{step}' would bring total leaf runs to {next} over max_total_steps ({max_total}). \
              Every fan-out member, fallback and compact summarizer counts as one leaf run; raise \
              defaults.max_total_steps if this scale is intended."
         ));
@@ -851,6 +857,9 @@ struct PendingRoute {
     /// Durable protocol evidence for a leaf. None for fan-out composites and
     /// logs written before protocol_state was recorded.
     protocol: Option<protocol::ProtocolState>,
+    /// Stable sfh classification for a harness verification failure. Absent
+    /// in older logs, which fall back to the protocol state above.
+    failure_code: Option<machine::ErrorCode>,
     /// The step/aggregate result is durable, but compact/notes post-processing
     /// has not yet reached its own durable end marker. Resume must finish that
     /// stage before evaluating this route.
@@ -1455,6 +1464,21 @@ fn load_resume_for_flow(
                     } else {
                         failed_raw.is_some()
                     };
+                // An additive failure classification is optional for old logs,
+                // but if present it must be a real sfh vocabulary member. A
+                // forged or mistyped code makes this checkpoint unusable rather
+                // than silently degrading it to SFH_STEP_FAILED on replay.
+                let failure_code_value = v.get("failure_code");
+                let failure_code = failure_code_value
+                    .and_then(|value| value.as_str())
+                    .and_then(machine::ErrorCode::parse);
+                let failure_code_valid = match failure_code_value {
+                    None => true,
+                    Some(value) if value.is_null() => true,
+                    Some(_) => failure_code.is_some(),
+                };
+                let ok = ok && failure_code_valid;
+                let completed_event = completed_event && failure_code_valid;
                 // A SUCCESSFUL fan-out member: remember it under its PARENT
                 // group so a resume that re-enters the group skips it instead
                 // of spending money and sessions a second time (rev_regression:
@@ -1614,6 +1638,13 @@ fn load_resume_for_flow(
                                 .get("protocol_state")
                                 .and_then(|value| value.as_str())
                                 .and_then(protocol::ProtocolState::parse),
+                            failure_code: failure_code.or_else(|| {
+                                protocol_failure_code(
+                                    v.get("protocol_state")
+                                        .and_then(|value| value.as_str())
+                                        .and_then(protocol::ProtocolState::parse),
+                                )
+                            }),
                             postprocess: postprocess_pending,
                             compact_done: false,
                             notes_done: false,
@@ -1635,6 +1666,7 @@ fn load_resume_for_flow(
                             from_plain: true,
                             members,
                             protocol: None,
+                            failure_code,
                             postprocess: postprocess_pending,
                             compact_done: false,
                             notes_done: false,
@@ -4036,7 +4068,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     step,
                     &index_of,
                     &run_dir,
-                    protocol_failure_code(pending.protocol),
+                    pending
+                        .failure_code
+                        .or_else(|| protocol_failure_code(pending.protocol)),
                 )? {
                     ErrorDisposition::Continue => true,
                     ErrorDisposition::Goto(next) => {
@@ -4558,21 +4592,24 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // ---- execute the step (leaf / parallel / foreach) ----
             // route_text: what route conditions match against - always the
             // pre-compact text, without sfh's "--- id ---" aggregate headers.
+            type StepExecution = (
+                String,
+                String,
+                bool,
+                Option<Vec<MemberVerdict>>,
+                Option<protocol::ProtocolState>,
+                Option<machine::ErrorCode>,
+                bool,
+            );
             let (
                 mut chain_output,
                 route_text,
                 errored,
                 members,
                 protocol_state,
+                failure_code,
                 retry_budget_exhausted,
-            ): (
-                String,
-                String,
-                bool,
-                Option<Vec<MemberVerdict>>,
-                Option<protocol::ProtocolState>,
-                bool,
-            ) = if let Some(pending) = &resumed_postprocess {
+            ): StepExecution = if let Some(pending) = &resumed_postprocess {
                 let restored = outputs.get(&step.id).ok_or_else(|| {
                     format!(
                         "resume: step '{}' has pending post-processing but no durable output",
@@ -4585,6 +4622,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     pending.errored,
                     pending.members.clone(),
                     pending.protocol,
+                    pending.failure_code,
                     false,
                 )
             } else if let Some(children) = &step.parallel {
@@ -4910,6 +4948,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     )
                 })?;
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail)?;
+                let failure_code = hard_fail
+                    .then(|| dones.iter().find_map(|done| done.failure_code))
+                    .flatten();
                 log_aggregate_end(
                     &mut log,
                     AggregateEnd {
@@ -4920,6 +4961,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         plain: &plain,
                         plain_file: &plain_name,
                         members: &verdicts,
+                        failure_code,
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
@@ -4929,6 +4971,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     hard_fail,
                     Some(verdicts),
                     None,
+                    failure_code,
                     dones.iter().any(|done| done.retry_budget_exhausted),
                 )
             } else if let Some(fe) = &step.foreach {
@@ -4944,10 +4987,10 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 let from = template::render(&fe.from, &tctx)
                     .map_err(|e| format!("step '{}' foreach.from: {e}", step.id))?;
                 let items = split_items(&from, fe.split.as_deref())
-                    .map_err(|e| format!("step '{}': {e}", step.id))?;
+                    .map_err(|e| format!("{RUNTIME_STEP_FAILED}step '{}': {e}", step.id))?;
                 if items.len() > 100 {
                     return Err(format!(
-                        "step '{}': foreach produced {} items (max 100) - check the split",
+                        "{RUNTIME_STEP_FAILED}step '{}': foreach produced {} items (max 100) - check the split",
                         step.id,
                         items.len()
                     ));
@@ -5247,6 +5290,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     )
                 })?;
                 write_aggregate(&run_dir, &gtag, &agg, &mut outputs, &step.id, hard_fail)?;
+                let failure_code = hard_fail
+                    .then(|| dones.iter().find_map(|done| done.failure_code))
+                    .flatten();
                 log_aggregate_end(
                     &mut log,
                     AggregateEnd {
@@ -5257,6 +5303,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         plain: &plain,
                         plain_file: &plain_name,
                         members: &verdicts,
+                        failure_code,
                         postprocess_pending: !hard_fail && needs_postprocess,
                     },
                 )?;
@@ -5266,6 +5313,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     hard_fail,
                     Some(verdicts),
                     None,
+                    failure_code,
                     dones.iter().any(|done| done.retry_budget_exhausted),
                 )
             } else {
@@ -5435,6 +5483,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     !d.ok(),
                     None,
                     Some(d.protocol.protocol),
+                    d.failure_code,
                     d.retry_budget_exhausted,
                 )
             };
@@ -5654,7 +5703,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                     step,
                     &index_of,
                     &run_dir,
-                    protocol_failure_code(protocol_state),
+                    failure_code.or_else(|| protocol_failure_code(protocol_state)),
                 )? {
                     ErrorDisposition::Continue => {}
                     ErrorDisposition::Goto(next) => {
@@ -6091,25 +6140,47 @@ pub(crate) fn run_failure_code(msg: &str) -> machine::ErrorCode {
         machine::ErrorCode::ReplayRefused,
         machine::ErrorCode::PersistenceFailure,
         machine::ErrorCode::CapabilityUnavailable,
+        machine::ErrorCode::StepFailed,
         machine::ErrorCode::Stuck,
         machine::ErrorCode::Interrupted,
     ] {
-        if msg.contains(code.as_str()) {
+        // These markers are sfh's own canonical wrapper, always emitted as
+        // `SFH_*: ...`. A step id, flow path, or nested provider message may
+        // contain the same vocabulary, but that text is not an assertion of
+        // the corresponding machine error.
+        if msg
+            .strip_prefix(code.as_str())
+            .is_some_and(|rest| rest.starts_with(':'))
+        {
             return code;
         }
     }
-    if msg.contains("did not match its documented machine-readable format")
-        || msg.contains("not its documented machine-readable output")
+    // These unprefixed protocol diagnostics are emitted by the known preset
+    // adapters. Restrict the prose fallback to a tool-leading message so a
+    // flow path or static error text cannot select a protocol code by naming
+    // one of these phrases later in the message.
+    let known_tool_message = |needle: &str| {
+        ["codex", "claude", "opencode", "grok", "agy", "pi", "cursor"]
+            .iter()
+            .any(|tool| msg.starts_with(tool) && msg.contains(needle))
+    };
+    if known_tool_message("did not match its documented machine-readable format")
+        || known_tool_message("not its documented machine-readable output")
     {
         return machine::ErrorCode::ProtocolInvalid;
     }
-    if msg.contains("documented terminal record") || msg.contains("result envelope") {
+    if known_tool_message("documented terminal record") || known_tool_message("result envelope") {
         return machine::ErrorCode::TerminalMissing;
     }
-    if msg.contains("resume unverified") || msg.contains("resume mismatch") {
+    let trimmed = msg.trim_start();
+    if trimmed.starts_with("sfh: resume unverified") || trimmed.starts_with("sfh: resume mismatch")
+    {
         return machine::ErrorCode::SessionUnverified;
     }
-    if msg.contains("persist") {
+    // Persistence errors produced by the engine use this deliberate prefix.
+    // Matching the word anywhere let a step id such as `persisted` or a run
+    // directory containing `persist` relabel an ordinary step failure.
+    if msg.starts_with("cannot persist ") {
         return machine::ErrorCode::PersistenceFailure;
     }
     let step_failure = msg.starts_with("step '")
@@ -8184,10 +8255,14 @@ fn apply_on_error(
             }
             "fail" => {
                 log_position(log, &step.id, "fail".into(), PositionVia::OnError, None)?;
-                Err(format!(
-                    "step '{}' failed and on_error routed to fail",
-                    step.id
-                ))
+                Err(match failure_code {
+                    Some(code) => format!(
+                        "{}: step '{}' failed and on_error routed to fail",
+                        code.as_str(),
+                        step.id
+                    ),
+                    None => format!("step '{}' failed and on_error routed to fail", step.id),
+                })
             }
             "stuck" => {
                 log_position(log, &step.id, "stuck".into(), PositionVia::OnError, None)?;
@@ -8288,6 +8363,7 @@ fn log_step_end_with_next(
             "out_file": file_name(&d.out_file),
             "cmd": d.cmd, "session": session,
             "harness_diagnostic": d.harness_diagnostic.as_deref().map(|s| one_line(s, 500)),
+            "failure_code": d.failure_code.map(machine::ErrorCode::as_str),
             // Additive protocol evidence (spec 15.1). A reader that predates
             // these keys sees the same event it always did; a reader that wants
             // them can tell "the tool failed" from "sfh could not verify that
@@ -8323,6 +8399,7 @@ struct AggregateEnd<'a> {
     plain: &'a str,
     plain_file: &'a str,
     members: &'a [MemberVerdict],
+    failure_code: Option<machine::ErrorCode>,
     postprocess_pending: bool,
 }
 
@@ -8335,6 +8412,7 @@ fn log_aggregate_end(f: &mut std::fs::File, a: AggregateEnd<'_>) -> Result<(), S
             "output_hash": fingerprint(a.plain),
             "chain_file": format!("{}.chain.txt", a.gtag), "out_file": format!("{}.out.txt", a.gtag),
             "plain_file": a.plain_file,
+            "failure_code": a.failure_code.map(machine::ErrorCode::as_str),
             "postprocess_pending": a.postprocess_pending,
             // Who said what, per member. A resume re-decides a `when_members`
             // route from THIS and nothing else: the artifacts on disk hold the
@@ -9583,6 +9661,36 @@ mod tests {
         assert!(resumed.pending_route.is_none());
         assert_eq!(resumed.start.as_deref(), Some("probe"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_rejects_a_tampered_failure_code_checkpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "sfh-resume-failure-code-{}",
+            contain::random_nonce()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("probe.chain.txt"), "done\n").unwrap();
+        std::fs::write(dir.join("probe.out.txt"), "done\n").unwrap();
+        std::fs::write(dir.join("probe.err.txt"), "").unwrap();
+        std::fs::write(
+            dir.join("log.jsonl"),
+            concat!(
+                "{\"event\":\"step_end\",\"step\":\"probe\",\"visit\":1,",
+                "\"exit\":0,\"timed_out\":false,\"interrupted\":false,",
+                "\"failure_code\":\"SFH_NOT_A_CODE\",",
+                "\"chain_file\":\"probe.chain.txt\",\"out_file\":\"probe.out.txt\"}\n"
+            ),
+        )
+        .unwrap();
+        let flow: flow::Flow =
+            serde_yaml_ng::from_str("name: t\nsteps:\n  - id: probe\n    cmd: echo probe\n")
+                .unwrap();
+        let resumed = load_resume_for_flow(&dir, Some(&flow)).expect("load tampered log");
+        assert_eq!(resumed.last_success, None);
+        assert!(resumed.pending_route.is_none());
+        assert_eq!(resumed.start.as_deref(), Some("probe"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10903,6 +11011,12 @@ mod tests {
         assert_eq!(
             run_failure_code("SFH_PROTOCOL_INVALID: step 'boom' failed - see /tmp/x"),
             machine::ErrorCode::ProtocolInvalid
+        );
+        assert_eq!(
+            run_failure_code(
+                "SFH_SESSION_UNVERIFIED: step 'boom' failed - see /tmp/SFH_PROTOCOL_INVALID"
+            ),
+            machine::ErrorCode::SessionUnverified
         );
     }
 }

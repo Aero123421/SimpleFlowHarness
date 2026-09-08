@@ -5,6 +5,37 @@
 
 ## Unreleased
 
+### 2026-09-07 CLI連携・機械向け結果の監査
+
+- CodexとOpenCodeのpreflightは、実行用subcommandのhelpを検査するよう修正しました。
+  Codexのforkも`exec --help`にあるheadless forkを根拠に判定します。
+- Claudeのresultはbooleanの`is_error`を必須とし、不明なverdictを成功にしません。
+  `doctor`にもterminal evidenceと信頼できるexit codeの検査を適用し、認証失敗の
+  in-band messageを診断へ表示します。
+- Claudeの新規sessionは、sfhが指定したIDと返されたIDが一致することを検証します。
+  欠落・不一致は`SFH_SESSION_UNVERIFIED`とし、任意の`failure_code`を
+  `step_end`/`aggregate_end`へ追加して途中再開後も分類を保ちます。既存logは読み続けます。
+- Claudeの可変長tool list、`--allowed-tools` alias、`default`、shell/code toolと、
+  PiのPowerShell指定に対するaccess guardを補いました。明示的な
+  `allow_access_override`は引き続き利用できます。
+- Codexの値を連結した短縮option、Cursorの`-f`、Grokの`--allowedTools`、
+  Claudeの`auto` modeも既存access guardで検査します。
+- Cursorの成功verdictを必須とし、単一resultを返すprotocolでは複数のterminal
+  resultが混在した出力を拒否します。
+- 実行時に確定するforeach入力・展開数・leaf実行上限の失敗を、静的なflow不正から
+  `SFH_STEP_FAILED`へ正しく分類します。run/status/waitの結果を揃えました。
+- step IDやpathに含まれる`SFH_*`や`persist`の文字列で、実際の失敗分類が
+  上書きされないよう、engine自身のerror prefixを根拠に分類します。
+- `wait --json`は記録済み結果fileを読めない場合に成功を返さず、既存の
+  `SFH_PERSISTENCE_FAILURE`を返します。
+- GitHub CI監視scriptは`gh`実行とpoll間隔を残りdeadlineで制限し、実行不能・
+  不正JSON型・非有限timeout値を安定した失敗として扱います。
+- 子processの追跡tableが満杯の場合は、新しいprocessを終了・回収して実行を拒否し、
+  追跡対象から黙って漏らさないようにしました。
+- 最新CLIの実測範囲と認証・配布上の制約を
+  [検証記録](docs/cli-verification-2026-09-07.md)へ残しました。Unixのprocess groupを
+  離れた子孫や強制終了に対するcleanupの限界を、security policyにも明記しました。
+
 v1.6.1のrelease後、repository全体をもう一度実測して監査した結果の修正です。
 engine、flow schema、machine API、resume形式は互換です。同梱flowは主に既存の
 暗黙設定を明示しました。例外として`cross-os-gate.yaml`は外部buildが中断された

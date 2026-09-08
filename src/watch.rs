@@ -1070,10 +1070,24 @@ pub fn wait(
                         .unwrap_or(0),
                     _ => snap.exit(),
                 };
-                let result = snap
-                    .emit_file
-                    .as_deref()
-                    .and_then(|f| read_emit_file(&snap, f).ok());
+                let result = match snap.emit_file.as_deref() {
+                    Some(f) => match read_emit_file(&snap, f) {
+                        Ok(result) => Some(result),
+                        Err(e) => {
+                            return fail(
+                                as_json,
+                                "wait",
+                                crate::machine::ErrorCode::PersistenceFailure,
+                                &format!(
+                                    "refusing to report {} as '{}': cannot read result file: {e}",
+                                    dir.display(),
+                                    snap.state
+                                ),
+                            )
+                        }
+                    },
+                    None => None,
+                };
                 let body = serde_json::json!({
                     "state": snap.state,
                     "terminal": true,

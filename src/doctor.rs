@@ -29,6 +29,7 @@ struct Report {
     required: bool,
 }
 
+#[derive(Debug)]
 struct Detail {
     said_marker: bool,
     text: String,
@@ -147,7 +148,7 @@ pub fn run(flow_path: Option<&Path>, timeout_sec: u64, work: &Path) -> i32 {
         let outcome = if version.is_none() && !required {
             None
         } else {
-            Some(run_probe(built.expect("built"), timeout_sec, work))
+            Some(run_probe(&tool, built.expect("built"), timeout_sec, work))
         };
         let r = Report {
             tool,
@@ -181,8 +182,10 @@ pub fn run(flow_path: Option<&Path>, timeout_sec: u64, work: &Path) -> i32 {
                 .join(", ")
         );
         eprintln!(
-            "sfh: the CLI most likely changed its flags or output shape. Work around it per step\n\
-             sfh: with args: [...] or cmd: [...], and please open an issue so the preset can catch up."
+            "sfh: a probe failed its mechanical checks. This can be an authentication/provider error,\n\
+             sfh: process/timeout failure, or CLI protocol drift; use the row diagnosis above. Work\n\
+             sfh: around it per step with args: [...] or cmd: [...], and please open an issue so the\n\
+             sfh: preset can catch up."
         );
         return 1;
     }
@@ -284,7 +287,12 @@ fn build_probe(
     Ok((program, built))
 }
 
-fn run_probe(built: preset::Built, timeout_sec: u64, work: &Path) -> Result<Detail, String> {
+fn run_probe(
+    tool: &str,
+    built: preset::Built,
+    timeout_sec: u64,
+    work: &Path,
+) -> Result<Detail, String> {
     let mut argv = built.argv;
     let stdin_payload = match built.delivery {
         preset::Delivery::Stdin => Some(PROBE.as_bytes().to_vec()),
@@ -312,22 +320,45 @@ fn run_probe(built: preset::Built, timeout_sec: u64, work: &Path) -> Result<Deta
     if out.timed_out {
         return Err(format!("no answer within {timeout_sec}s"));
     }
+    if out.interrupted {
+        return Err("probe was interrupted before it completed".into());
+    }
 
     let stdout = leaf::clean_text(&out.stdout);
     let stderr = leaf::clean_text(&out.stderr);
     // None run dir: doctor's scratch files live in a dir sfh itself created and
     // cleared (build_probe), not an untrusted resumed run dir, so a plain read.
     let parsed = leaf::parse_output(&built.parse, &stdout, &stderr, None)?;
-    if parsed.failed || (out.exit_code != 0 && parsed.text.is_empty()) {
-        let why = leaf::tail_lines(&stderr, 3).join(" | ");
+    if parsed.failed || !parsed.evidence.certifies_success() {
+        let reason = if parsed.failed {
+            format!("{tool} reported an in-band failure in its output")
+        } else {
+            parsed.evidence.failure_reason(tool).unwrap_or_else(|| {
+                format!(
+                    "{tool} did not provide a terminal success record, so sfh cannot verify the probe"
+                )
+            })
+        };
+        let text = if parsed.failed && !parsed.text.trim().is_empty() {
+            format!("; tool text: {:?}", one_line(&parsed.text))
+        } else {
+            String::new()
+        };
+        let stderr_tail = leaf::tail_lines(&stderr, 3).join(" | ");
         return Err(format!(
-            "exit {} and no parseable answer{}",
+            "exit {}: {reason}{text}{}",
             out.exit_code,
-            if why.is_empty() {
+            if stderr_tail.is_empty() {
                 String::new()
             } else {
-                format!(": {why}")
+                format!("; stderr: {stderr_tail}")
             }
+        ));
+    }
+    if out.exit_code != 0 && preset::exit_code_trustworthy(tool) {
+        return Err(format!(
+            "exit {} despite a terminal success record; {tool}'s exit status is documented as trustworthy",
+            out.exit_code
         ));
     }
     if parsed.text.trim().is_empty() {
@@ -359,5 +390,177 @@ pub fn default_work_dir(runs_dir: &Path, state: &crate::state::StateRoot) -> Pat
     match state.doctor_dir() {
         Some(d) => d,
         None => runs_dir.join(".doctor"),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn write_probe_stub(path: &Path, body: &str, exit: i32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\nlast=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--output-last-message' ]; then\n    shift\n    last=\"$1\"\n  fi\n  shift\ndone\nif [ -n \"$last\" ]; then\n  printf 'SFH-OK\\n' > \"$last\"\nfi\n{body}\nexit {exit}\n"
+        );
+        std::fs::write(path, script).unwrap();
+        let mut mode = std::fs::metadata(path).unwrap().permissions();
+        mode.set_mode(0o700);
+        std::fs::set_permissions(path, mode).unwrap();
+    }
+
+    fn probe_paths() -> (PathBuf, PathBuf) {
+        let work = std::env::temp_dir().join(format!("sfh-doctor-test-{}", leaf::gen_uuid()));
+        std::fs::create_dir(&work).unwrap();
+        let script = work.join("fake-cli");
+        (work, script)
+    }
+
+    fn codex_probe(script: &Path, work: &Path) -> Result<Detail, String> {
+        let last = work.join("codex.last.txt");
+        let prompt = work.join("codex.prompt.txt");
+        crate::contain::write_private(&prompt, PROBE).unwrap();
+        let built = preset::build(
+            "codex",
+            preset::PresetInput {
+                model: None,
+                effort: None,
+                access: preset::Access::Read,
+                agent: None,
+                extra: &[],
+                bin: Some(script.display().to_string()),
+                timeout_sec: Some(5),
+            },
+            &preset::BuildPaths {
+                last_msg: &last,
+                prompt_file: &prompt,
+            },
+            None,
+        )
+        .unwrap();
+        run_probe("codex", built, 5, work)
+    }
+
+    #[test]
+    fn doctor_rejects_codex_missing_terminal_even_with_last_message() {
+        let (work, script) = probe_paths();
+        write_probe_stub(
+            &script,
+            "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"stub\"}'",
+            0,
+        );
+        let error = codex_probe(&script, &work).unwrap_err();
+        assert!(
+            error.contains("without its documented terminal record"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn doctor_rejects_codex_nonzero_despite_terminal_success() {
+        let (work, script) = probe_paths();
+        write_probe_stub(
+            &script,
+            concat!(
+                "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"stub\"}'\n",
+                "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'"
+            ),
+            1,
+        );
+        let error = codex_probe(&script, &work).unwrap_err();
+        assert!(
+            error.contains("exit 1 despite a terminal success record"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn doctor_accepts_codex_certified_success_with_zero_exit() {
+        let (work, script) = probe_paths();
+        write_probe_stub(
+            &script,
+            concat!(
+                "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"stub\"}'\n",
+                "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'"
+            ),
+            0,
+        );
+        let detail = codex_probe(&script, &work).unwrap();
+        assert!(detail.said_marker);
+        assert!(detail.usage);
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn doctor_rejects_codex_mixed_failure_and_success_stream() {
+        let (work, script) = probe_paths();
+        write_probe_stub(
+            &script,
+            concat!(
+                "printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"stub\"}'\n",
+                "printf '%s\\n' '{\"type\":\"turn.failed\"}'\n",
+                "printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SFH-OK\"}}'\n",
+                "printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'"
+            ),
+            0,
+        );
+        let error = codex_probe(&script, &work).unwrap_err();
+        assert!(error.contains("in-band failure"), "{error}");
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    fn agy_probe(script: &Path, work: &Path) -> Result<Detail, String> {
+        let last = work.join("agy.last.txt");
+        let prompt = work.join("agy.prompt.txt");
+        crate::contain::write_private(&prompt, PROBE).unwrap();
+        let built = preset::build(
+            "agy",
+            preset::PresetInput {
+                model: None,
+                effort: None,
+                access: preset::Access::Read,
+                agent: None,
+                extra: &[],
+                bin: Some(script.display().to_string()),
+                timeout_sec: Some(5),
+            },
+            &preset::BuildPaths {
+                last_msg: &last,
+                prompt_file: &prompt,
+            },
+            None,
+        )
+        .unwrap();
+        run_probe("agy", built, 5, work)
+    }
+
+    #[test]
+    fn doctor_accepts_agy_certified_success_despite_untrustworthy_exit() {
+        let (work, script) = probe_paths();
+        write_probe_stub(
+            &script,
+            "printf '%s\\n' '{\"response\":\"SFH-OK\",\"status\":\"SUCCESS\",\"conversation_id\":\"agy\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'",
+            1,
+        );
+        let detail = agy_probe(&script, &work).unwrap();
+        assert!(detail.said_marker);
+        assert!(detail.usage);
+        let _ = std::fs::remove_dir_all(work);
+    }
+
+    #[test]
+    fn doctor_rejects_agy_unknown_output_even_with_text() {
+        let (work, script) = probe_paths();
+        write_probe_stub(
+            &script,
+            "printf '%s\\n' 'agy: unknown flag --output-format'",
+            1,
+        );
+        let error = agy_probe(&script, &work).unwrap_err();
+        assert!(error.contains("agy"), "{error}");
+        assert!(!error.contains("all probed presets are working"), "{error}");
+        let _ = std::fs::remove_dir_all(work);
     }
 }
