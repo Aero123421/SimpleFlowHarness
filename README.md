@@ -110,6 +110,36 @@ Routing predicates available on any step:
 | `when_label_is: X` | a label you assigned to an exit code via `outcomes:` |
 | `when_members: {last_line_is: X, all/n: ...}` | consensus across `parallel` / `foreach` members |
 
+A review step routing on its final line:
+
+```yaml
+api_version: 1
+steps:
+  - id: review
+    tool: claude
+    access: read
+    prompt: "Review the code change. End your response with PASS or REVISE."
+    route:
+      - {when_last_line_is: PASS, goto: end}
+      - {when_last_line_is: REVISE, goto: stuck}
+      - {goto: stuck}
+```
+
+Two agents reviewing in parallel, shipping only on unanimous PASS:
+
+```yaml
+api_version: 1
+steps:
+  - id: council
+    max_parallel: 3
+    parallel:
+      - {id: rev_a, tool: claude, access: read, on_error: continue, prompt: "End with PASS or FAIL."}
+      - {id: rev_b, tool: codex, access: read, on_error: continue, prompt: "End with PASS or FAIL."}
+    route:
+      - {when_members: {last_line_is: PASS, all: true}, goto: end}
+      - {goto: fail}
+```
+
 Everything else — sessions (`continue_from` / `fork_from`), replay policy for interrupted steps (`replay.unfinished`), context pinning (`contexts:`), required tool versions (`require_version`), profile overlays (`--profiles`), exit-code conflicts (`exit_conflict`) — is documented in `sfh guide`, [CHANGELOG.md](CHANGELOG.md), and the schema.
 
 ## Exit codes

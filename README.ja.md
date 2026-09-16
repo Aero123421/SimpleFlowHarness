@@ -110,6 +110,36 @@ AIステップは既定で `allow_empty: false` です。最終メッセージ�
 | `when_label_is: X` | `outcomes:` で終了コードに付けたラベル |
 | `when_members: {last_line_is: X, all/n: ...}` | `parallel` / `foreach` メンバーの多数決 |
 
+最終行で分岐するレビューステップ:
+
+```yaml
+api_version: 1
+steps:
+  - id: review
+    tool: claude
+    access: read
+    prompt: "変更をレビューし、最後に PASS または REVISE とだけ書いてください。"
+    route:
+      - {when_last_line_is: PASS, goto: end}
+      - {when_last_line_is: REVISE, goto: stuck}
+      - {goto: stuck}
+```
+
+2つのエージェントが並列レビューし、全員一致のPASSのみ通過:
+
+```yaml
+api_version: 1
+steps:
+  - id: council
+    max_parallel: 3
+    parallel:
+      - {id: rev_a, tool: claude, access: read, on_error: continue, prompt: "最後に PASS または FAIL とだけ書いてください。"}
+      - {id: rev_b, tool: codex, access: read, on_error: continue, prompt: "最後に PASS または FAIL とだけ書いてください。"}
+    route:
+      - {when_members: {last_line_is: PASS, all: true}, goto: end}
+      - {goto: fail}
+```
+
 その他の機能 — セッション継続（`continue_from` / `fork_from`）、中断ステップの扱い（`replay.unfinished`）、コンテキスト固定（`contexts:`）、ツールバージョン指定（`require_version`）、プロファイルの上書き（`--profiles`）、終了コードとプロトコルの矛盾（`exit_conflict`） — は `sfh guide`、[CHANGELOG.md](CHANGELOG.md)、スキーマを参照してください。
 
 ## 終了コード
