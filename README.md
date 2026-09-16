@@ -47,7 +47,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 brew install Aero123421/tap/sfh
 ```
 
-Pre-built binaries and SHA-256 checksums: [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest). Pin a version with `SFH_VERSION`, choose directories with `SFH_INSTALL_DIR` / `SFH_DATA_DIR`, skip `PATH` changes with `SFH_NO_MODIFY_PATH=1`. What each channel verifies — and what piped installs inherently trust — is documented in [docs/distribution.md](docs/distribution.md).
+Pre-built binaries and SHA-256 checksums: [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest). Pin a version with `SFH_VERSION=1.6.1`, choose directories with `SFH_INSTALL_DIR` / `SFH_DATA_DIR`, skip `PATH` changes with `SFH_NO_MODIFY_PATH=1`. What each channel verifies — and what piped installs inherently trust — is documented in [docs/distribution.md](docs/distribution.md).
 
 ## Quick Start
 

@@ -47,7 +47,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 brew install Aero123421/tap/sfh
 ```
 
-ビルド済みバイナリとSHA-256チェックサムは [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)。バージョン固定は `SFH_VERSION`、インストール先の変更は `SFH_INSTALL_DIR` / `SFH_DATA_DIR`、PATH書き換えの抑止は `SFH_NO_MODIFY_PATH=1`。各インストール方法が何を検証し、何を信頼しているかは [docs/distribution.md](docs/distribution.md) にあります。
+ビルド済みバイナリとSHA-256チェックサムは [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)。バージョン固定は `SFH_VERSION=1.6.1`、インストール先の変更は `SFH_INSTALL_DIR` / `SFH_DATA_DIR`、PATH書き換えの抑止は `SFH_NO_MODIFY_PATH=1`。各インストール方法が何を検証し、何を信頼しているかは [docs/distribution.md](docs/distribution.md) にあります。
 
 ## クイックスタート
 
