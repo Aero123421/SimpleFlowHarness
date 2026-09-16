@@ -10,6 +10,8 @@ A single-binary workflow runner that chains AI coding CLIs — **Codex**, **Clau
 
 sfh handles process lifecycle, routing, logging, and recovery. Your commands and agents keep the say on what to do; a step is judged by exit codes and machine-readable protocols, not by parsing prose.
 
+**Contents** — [What you get](#what-you-get) · [Installation](#installation) · [Quick Start](#quick-start) · [Flow format](#the-flow-format-in-one-table) · [Exit codes](#exit-codes) · [Programmatic use](#driving-sfh-from-a-program) · [Run artifacts](#what-a-run-leaves-behind) · [Documentation](#documentation)
+
 ## What you get
 
 | Capability | How |
@@ -47,7 +49,7 @@ brew install Aero123421/tap/sfh
 
 Pre-built binaries and SHA-256 checksums: [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest). Pin a version with `SFH_VERSION`, choose directories with `SFH_INSTALL_DIR` / `SFH_DATA_DIR`, skip `PATH` changes with `SFH_NO_MODIFY_PATH=1`. What each channel verifies — and what piped installs inherently trust — is documented in [docs/distribution.md](docs/distribution.md).
 
-## Quick start
+## Quick Start
 
 A flow that runs tests and sends failures to an AI agent for repair, looping until they pass or give up twice (`max_visits: 3`):
 
@@ -96,6 +98,8 @@ Two step types:
 |---|---|---|
 | AI tool step | `tool: codex` (+ `access`, `prompt`) | the tool's machine-readable protocol (fail-closed: output shape drift fails the step) |
 | Shell command | `cmd: ["cargo", "test"]` (array: no shell; string: `sh -c` / `cmd /C`) | exit code — optionally remapped semantically with `outcomes:` |
+
+Preset AI steps default to `allow_empty: false`: a turn that finishes without a final message fails the step. For a worker whose product is the diff, set `allow_empty: true` and let a `cmd:` verification step prove the work instead.
 
 Routing predicates available on any step:
 
