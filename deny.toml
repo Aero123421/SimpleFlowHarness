@@ -3,6 +3,15 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+# RUSTSEC-2024-0449 is an "unmaintained" notice, not a vulnerability report:
+# serde_yaml_ng 0.10 depends on unsafe-libyaml, which upstream archived in
+# March 2024 with no successor release. sfh parses only the flow YAML its
+# operator chose to run, and a parser bug is not a new trust boundary here.
+# Remove this entry when the YAML parser moves off unsafe-libyaml; every other
+# advisory, and every vulnerability, still fails the gate.
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained serde_yaml_ng backend; no safe upgrade exists" },
+]
 
 [licenses]
 allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
