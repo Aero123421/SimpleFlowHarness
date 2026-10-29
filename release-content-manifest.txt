@@ -139,7 +139,7 @@ f 98e4f5564492724ead1d4be2950e84a74cbc19095d2c7ef889aea9a19344c51e skills/sfh-ev
 d - skills/sfh-eval-engineering/references/
 f b4584ae522b8f3247348a0e2536533fb324e63d0c03bd265cf44bb91d16bb323 skills/sfh-eval-engineering/references/failure-to-eval.md
 d - skills/sfh-failure-recovery/
-f e2e68640d792287033789e4368edf33b6bd833f84834591a670e76c333b3e68b skills/sfh-failure-recovery/SKILL.md
+f 499c9e7550dec1b1e02fd03b6a7bef0a727bcf4582313166d4bc77c27045c4bf skills/sfh-failure-recovery/SKILL.md
 d - skills/sfh-failure-recovery/assets/
 f 595aae40973cc7cd4ee5039c6e004e4276285df99fcf48ca4e340703918bb1e5 skills/sfh-failure-recovery/assets/external-effect-safe.yaml
 d - skills/sfh-failure-recovery/references/
