@@ -35,3 +35,5 @@ current behaviour. Each carries a header saying what has changed since.
 - [`../SECURITY.md`](../SECURITY.md) — the trust boundaries sfh does and does not enforce.
 - [`../CHANGELOG.md`](../CHANGELOG.md) — user-visible changes with reasoning.
 - [`../skills/`](../skills/) — authoring knowledge for AIs that *write* flows. Not a runtime feature; flows have no `skills:` key.
+
+Current v2 adapter and migration decisions: [October 2026 audit](harness-refresh-2026-10.md).

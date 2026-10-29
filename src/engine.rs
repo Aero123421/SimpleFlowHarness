@@ -239,18 +239,18 @@ pub fn validate_with_options(
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": true,
+                crate::machine::emit(&crate::machine::envelope(
+                    "validate",
+                    true,
+                    0,
+                    json!({
                         "path": path.display().to_string(),
                         "strict": strict,
                         "api_version": flow.api_version.unwrap_or(1),
                         "warnings": warnings,
                         "steps": steps,
-                    }))
-                    .unwrap_or_default()
-                );
+                    }),
+                ));
             } else {
                 eprintln!("OK: {} ({} steps)", path.display(), flow.steps.len());
                 for warning in &warnings {
@@ -269,16 +269,13 @@ pub fn validate_with_options(
         }
         Err(e) => {
             if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ok": false,
-                        "path": path.display().to_string(),
-                        "strict": strict,
-                        "error": e,
-                    }))
-                    .unwrap_or_default()
-                );
+                crate::machine::emit(&crate::machine::error_envelope(
+                    "validate",
+                    crate::machine::ErrorCode::FlowInvalid,
+                    &e,
+                    2,
+                    json!({"path": path.display().to_string(), "strict": strict}),
+                ));
             } else {
                 eprintln!("sfh: {e}");
             }
@@ -6746,7 +6743,6 @@ fn prepare_compact(
         agent: None,
         extra: &[],
         bin,
-        timeout_sec,
     };
     let built = preset::build(&tool, inp, &paths, None)?;
     let mut argv = built.argv;

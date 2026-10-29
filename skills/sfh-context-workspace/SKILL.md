@@ -2,10 +2,10 @@
 name: sfh-context-workspace
 description: >
   Design SimpleFlowHarness workspaces, named context, profiles, sessions, and execution inputs. Use when deciding current versus managed worktree execution, preventing folder/worktree explosion, passing task or review artifacts to specific phases, separating reusable roles from models, preserving context across long loops, or making resume behavior reproducible.
-compatibility: Uses sfh v1.6 workspace, contexts, profiles, session continuation, execution closure, and state-root behavior.
+compatibility: Uses sfh v2.0 workspace, contexts, profiles, session continuation, execution closure, and state-root behavior.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.6.x"
+  target-sfh: "2.0.x"
 ---
 
 # Workspace is where effects live; context is what a step knows
@@ -65,7 +65,7 @@ Use arbitrary role names and external `--profiles` overlays to swap tools/models
 
 ## Sessions
 
-Use `continue_from` when the same worker benefits from continuity; use fresh evaluators for independence. Never make provider session availability the only place a decision or task state exists.
+OpenCode 2 does not support verified `continue_from` or `fork_from` in sfh; pass durable artifacts into a fresh step. For adapters that support it, use `continue_from` when the same worker benefits from continuity; use fresh evaluators for independence. Never make provider session availability the only place a decision or task state exists.
 
 ## Durable handoff
 

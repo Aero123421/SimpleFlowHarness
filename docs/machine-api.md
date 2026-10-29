@@ -124,59 +124,41 @@ rest of the envelope is protected against a future bump; a caller that
 instead branches on `sfh_version` is not — that field moves every release for
 reasons unrelated to the envelope's contract.
 
-## Known inconsistency: commands with no envelope
+## Validation, run browsing, and cleanup (v2)
 
-Four `--json` commands predate this module and still print their own bare
-JSON. They carry none of the header above: no `schema_version`, no
-`command`, no `exit_code`, and no code from the `SFH_*` vocabulary. A caller
-that assumes every `--json` command answers with the envelope will parse
-these four incorrectly.
+Every `--json` command uses the common envelope above, including usage errors.
+Existing `run`, `plan`, and watch envelopes keep schema version 1 and their
+meaning. The formerly bare responses change in v2:
 
-- **`sfh validate --json`** — on success: `{"ok": true, "path", "strict",
-  "api_version", "warnings", "steps"}`. On failure: `{"ok": false, "path",
-  "strict", "error"}`, where `error` is a plain string, not the
-  `{"code", "message"}` object the envelope uses.
-- **`sfh runs list --json`** — `{"runs": [...], "total_cost_usd",
-  "total_own_cost_usd"}` (the two totals are identical; `total_cost_usd` is
-  kept for existing consumers and sums each listed run's `own_cost_usd` —
-  never `budget_position_usd`, which would double-count a carried run's
-  inherited dollars against its ancestor's own row). Each entry in `runs` has
-  `run_dir`, `status`, `started_utc`, `exit`, `ok`, `failed`, `visit`,
-  `repeat`, `cost_usd`, `own_cost_usd`, `carried_cost_usd`,
-  `budget_position_usd`, `lineage_cost_usd` — four differently-named answers
-  to "how much did this cost" (own spend; inherited via
-  `--carry-budget-from`; own+carried, what `max_cost_usd` is judged against;
-  and the full carry ancestry). `cost_usd` is kept, identical to
-  `budget_position_usd`, for existing consumers. `lineage_cost_usd` is `null`
-  — never a partial sum — the moment an ancestor in the carry chain has been
-  removed by `runs clean` and so can no longer be verified. There is no
-  lineage total across the listing: rows that share an ancestor would
-  double-count it.
-- **`sfh runs show --json`** — the same per-run fields as above flattened
-  into the top level (no nested `summary` key) alongside `flow`,
-  `sfh_version`, `tools`, `budget_landed`, `steps` — with no wrapper at all.
-  Each `steps[]` entry includes `attempts`, the total process attempts across
-  its leaf events; a legacy `step_end` without that field counts as one.
-- **`sfh runs why --json`** — `{"run_dir", "state", "current_step", "error",
-  "harness_diagnostic", "protocol_failure", "explanation", "last_event",
-  "last_position", "unfinished_leaves", "unfinished_fanouts",
-  "unfinished_fallbacks", "unfinished_postprocessing"}`. Note that `error`
-  here is a bare string-or-`null` from the run's `status.json`, which looks
-  superficially like the envelope's `error` field but is not shaped like it.
+| Command | Command-specific fields |
+| --- | --- |
+| `validate` | `path`, `strict`, `api_version`, `warnings`, `steps`; failure uses `SFH_FLOW_INVALID` |
+| `runs list` | `runs`, `total_cost_usd`, `total_own_cost_usd` |
+| `runs show` | per-run summary, `flow`, `run_sfh_version`, `tools`, `budget_landed`, `steps` |
+| `runs why` | `run_dir`, `state`, `current_step`, `run_error`, diagnostics, durable positions and unfinished work |
+| `runs clean` | `runs_dir`, `removed`, `skipped` with reasons, `dry_run`, `kept_newest`, `errors` |
 
-These legacy commands still honor the basic stdout guarantee on early
-failures. Missing arguments, unknown flags, and a missing/unsafe run directory
-produce valid bare JSON with `"ok": false` and a prose `"error"` string;
-they never leave stdout empty when `--json` was requested.
+The top-level `ok` is response success, not the number of successful steps.
+That count is now `successful_steps` in run summaries (including list rows).
+The top-level `sfh_version` identifies the inspecting binary; `run_sfh_version`
+is the recorded version. `runs why` can successfully inspect a failed run:
+`ok: true`, `error: null`, and `run_error` describes the run's failure.
+Missing/unreadable run data uses `SFH_PERSISTENCE_FAILURE`.
 
-This is a real trap, not just a hypothetical one: a `run --json` envelope's
-own `next_actions` routinely suggests `sfh runs why <dir> --json` as the next
-call, and that response is one of the four bare-JSON shapes above, not
-another envelope. Detect which kind of response you have by checking for
-`schema_version` rather than assuming based on which command you called.
+Cost fields keep their meanings: `own_cost_usd` is this run's spend,
+`carried_cost_usd` is inherited spend, `budget_position_usd` is their sum,
+and `lineage_cost_usd` is null when the complete ancestry cannot be verified.
+`total_own_cost_usd` sums only listed runs' own spend. `steps[].attempts`
+continues to count process attempts, with legacy events counting as one.
 
-**Intended direction, not yet scheduled:** unifying `validate` and `runs
-list|show|why` onto the envelope is the known fix for this gap. It has not
-happened as of 1.6.0 because it is a breaking change to four response shapes
-at once, and it is out of scope for the fixes in this document — treat the
-shapes above as current fact, not as something about to change underfoot.
+Cleanup's `removed` contains candidates when `dry_run` is true. Dry-run takes
+the same lease and repeats the same ownership checks as deletion; it may
+create a lock file. Active, ambiguous, unfinished, locked, and still-managed
+workspace runs are retained. A skipped run is not an IO failure; actual
+removal failures return exit 1 with `SFH_PERSISTENCE_FAILURE` and `errors`.
+
+`exit_bound` is an additive protocol state for OpenCode 2: structured completed
+text was observed, but success still depends on process exit. `terminal_seen`
+is false and `terminal_success` is null unless an actual error event arrived.
+It cannot justify `exit_conflict: trust_protocol` correcting a nonzero exit.
+`valid` retains its existing meaning: a documented terminal record was seen.

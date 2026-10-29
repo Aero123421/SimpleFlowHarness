@@ -5,14 +5,14 @@ description: >
 compatibility: Requires SimpleFlowHarness v1.6 syntax for the bundled examples. Use the installed sfh guide and schema as the final authority.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.6.x"
+  target-sfh: "2.0.x"
 ---
 
 # Design sfh flows as explicit state machines
 
 Use this skill before writing or substantially changing an sfh YAML file.
 
-This is an **authoring skill**. Do not add a `skills:` key to the generated flow: sfh v1.6 has no such key. Runtime instructions belong in existing `contexts:` or in provider-native configuration.
+This is an **authoring skill**. Do not add a `skills:` key to the generated flow: sfh v2.0 has no such key. Runtime instructions belong in existing `contexts:` or in provider-native configuration.
 
 ## Start with the execution contract
 
@@ -113,7 +113,7 @@ Activate `sfh-failure-recovery` when any of these matter.
 
 - `max_total_steps` counts logical leaf runs, not the process attempts inside one `retry`. Inspect `max_attempts` in `sfh plan --json` and actual `attempts` in `sfh runs show`.
 - A wall-clock `budget_reserve` pre-empts the next retry during backoff; it does not kill an attempt already running. Reserve enough for the complete `on_budget` handoff.
-- `max_cost_usd` sees only adapter-reported USD. Claude, OpenCode, Grok, and Pi report it; Codex, Agy, Cursor, and custom `cmd:` steps do not. Pair the cost ceiling with `wall_clock_sec` when coverage is incomplete.
+- `max_cost_usd` sees only adapter-reported USD. Claude, Grok, and Pi can report it; OpenCode 2 can omit it entirely. Codex, Agy, Cursor, and custom `cmd:` steps do not report USD. Pair the cost ceiling with `wall_clock_sec` when coverage is incomplete.
 
 ## Authoring workflow
 

@@ -128,7 +128,7 @@ pub fn run(flow_path: Option<&Path>, timeout_sec: u64, work: &Path) -> i32 {
     } in targets
     {
         // Build first: only the preset knows which binary it launches.
-        let built = build_probe(&tool, bin.as_deref(), model, effort, timeout_sec, work);
+        let built = build_probe(&tool, bin.as_deref(), model, effort, work);
         let (program, built) = match built {
             Ok((p, b)) => (p, Some(b)),
             Err(e) => {
@@ -256,7 +256,6 @@ fn build_probe(
     bin: Option<&str>,
     model: Option<String>,
     effort: Option<String>,
-    timeout_sec: u64,
     work: &Path,
 ) -> Result<(String, preset::Built), String> {
     let last = work.join(format!("{tool}.last.txt"));
@@ -275,7 +274,6 @@ fn build_probe(
             agent: None,
             extra: &[],
             bin: bin.map(String::from),
-            timeout_sec: Some(timeout_sec),
         },
         &preset::BuildPaths {
             last_msg: &last,
@@ -329,7 +327,11 @@ fn run_probe(
     // None run dir: doctor's scratch files live in a dir sfh itself created and
     // cleared (build_probe), not an untrusted resumed run dir, so a plain read.
     let parsed = leaf::parse_output(&built.parse, &stdout, &stderr, None)?;
-    if parsed.failed || !parsed.evidence.certifies_success() {
+    let complete = parsed.evidence.certifies_success()
+        || (parsed.evidence.protocol == crate::protocol::ProtocolState::ExitBound
+            && parsed.evidence.allows_success()
+            && out.exit_code == 0);
+    if parsed.failed || !complete {
         let reason = if parsed.failed {
             format!("{tool} reported an in-band failure in its output")
         } else {
@@ -429,7 +431,6 @@ mod tests {
                 agent: None,
                 extra: &[],
                 bin: Some(script.display().to_string()),
-                timeout_sec: Some(5),
             },
             &preset::BuildPaths {
                 last_msg: &last,
@@ -524,7 +525,6 @@ mod tests {
                 agent: None,
                 extra: &[],
                 bin: Some(script.display().to_string()),
-                timeout_sec: Some(5),
             },
             &preset::BuildPaths {
                 last_msg: &last,

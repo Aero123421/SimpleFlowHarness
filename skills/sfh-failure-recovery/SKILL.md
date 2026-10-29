@@ -2,10 +2,10 @@
 name: sfh-failure-recovery
 description: >
   Design failure handling and recovery for SimpleFlowHarness flows. Use when choosing retry, retry_on, fallback, on_error, replay.unfinished, resume, force-resume, adopt-workspace, carry-budget-from, budget landing, timeout, stuck, or idempotency behavior; especially for external APIs, deployments, migrations, CI, and long-running AI work.
-compatibility: Written for sfh v1.6 recovery, workspace checkpoint, budget, and machine-interface behavior.
+compatibility: Written for sfh v2.0 recovery, workspace checkpoint, budget, and machine-interface behavior.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.6.x"
+  target-sfh: "2.0.x"
 ---
 
 # Classify the failure before choosing the mechanism
@@ -15,7 +15,7 @@ Read [references/recovery-matrix.md](references/recovery-matrix.md).
 ## Failure classes
 
 - **transport/infra:** rate limit, temporary network error, provider outage, hung stream
-- **protocol:** expected structured terminal record missing or malformed
+- **protocol:** adapter-specific completion evidence missing or malformed
 - **empty final message:** the turn completed and the protocol is valid, but the agent said nothing
 - **hard timeout:** `timeout_sec` expired for the whole leaf run, tool use included
 - **logical rejection:** tests failed, evaluator says revise, acceptance incomplete
@@ -35,6 +35,10 @@ These require different actions.
 | deadline expired | timeout | the author's wall-clock estimate was wrong, or the agent hung | resize `timeout_sec` for the whole turn, or split the step; `hang_after_sec` is the separate no-output signal |
 
 The first row is the one that surprises people. A workspace-writing agent can make a complete, correct change and still end its turn silently; with the preset default `allow_empty: false` sfh refuses it, correctly, because nothing proved the work — and the fix is to let a command prove it instead of demanding a sentence. See `sfh-flow-design`, "Choose the right completion evidence for each step".
+
+OpenCode 2 records `exit_bound`: completed structured text plus process exit, with no invented terminal event. A missing terminal is not itself a failure for that adapter. Pi 1.4 requires `agent_settled` after the final assistant outcome. `allow_empty` never waives the adapter contract.
+
+`runs clean` keeps live, locked, unfinished or unverifiable runs, including their recovery evidence. Clean managed workspaces separately before removing their run manifests.
 
 ## Mechanisms
 

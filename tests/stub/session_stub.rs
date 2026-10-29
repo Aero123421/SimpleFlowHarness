@@ -438,14 +438,14 @@ opencode run [message..]
   -p --output-format --permission-mode --session-id
   run --format --agent --auto
   --prompt-file
-  --mode --print-timeout
+  --standalone --mode --print-timeout
   --offline --tools
   --trust --disable-project-configs
   --model --effort --thinking --reasoning-effort --variant
   --allowedTools --deny --approve --no-approve --force
   --dangerously-skip-permissions --dangerously-bypass-approvals-and-sandbox
   --resume --fork --fork-session --conversation
-  --no-context-files --no-extensions --no-skills --no-prompt-templates
+  --no-mcp --no-context-files --no-extensions --no-skills --no-prompt-templates
   --color --skip-git-repo-check --disable-auto-update
 ";
 

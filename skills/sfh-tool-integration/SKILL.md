@@ -2,10 +2,10 @@
 name: sfh-tool-integration
 description: >
   Integrate external CLIs, web-search tools, HTTP APIs, repository tools, and MCP-enabled AI agents into SimpleFlowHarness YAML. Use when a flow fetches changing remote information, invokes `gh`, `curl`, search CLIs, or provider MCP tools, crosses a network or authorization boundary, or needs reliable artifacts, rate-limit handling, least privilege, and safe replay semantics.
-compatibility: sfh v1.6 has no native MCP step; MCP is accessed through a selected AI CLI or an explicit wrapper command.
+compatibility: sfh v2.0 has no native MCP step; MCP is accessed through a selected AI CLI or an explicit wrapper command.
 metadata:
   version: "1.0.0"
-  target-sfh: "1.6.x"
+  target-sfh: "2.0.x"
 ---
 
 # Integrate tools through explicit contracts
@@ -51,9 +51,13 @@ Web results are nondeterministic and untrusted.
 
 Start from [assets/web-search-evidence.yaml](assets/web-search-evidence.yaml).
 
+## Current adapter limits
+
+Use `preflight --json` fields `verified_version` and `verification_scope` together. Help-only checks do not establish authenticated success. OpenCode 2 uses fresh standalone sessions and a v2 tool permission allowlist. Pi read/write presets disable MCP and extensions; MCP work therefore needs a deliberate separately scoped integration. Grok/Cursor current binaries were not obtainable in the October audit.
+
 ## MCP
 
-sfh v1.6 does not call MCP directly. An MCP-enabled step is normally a preset AI CLI whose provider configuration exposes servers/tools, or a project-owned wrapper command.
+sfh v2.0 does not call MCP directly. An MCP-enabled step is normally a preset AI CLI whose provider configuration exposes servers/tools, or a project-owned wrapper command.
 
 - Use a separate profile for MCP-enabled work.
 - `access: read` does not automatically prove every MCP tool is read-only.

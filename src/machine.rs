@@ -10,12 +10,9 @@
 //! among them carries a code whose MEANING is fixed for as long as
 //! `SCHEMA_VERSION` below does not change, even as its message changes.
 //!
-//! `validate --json` and `runs list|show|why --json` predate this module and
-//! still print their own bare JSON instead: no `schema_version`, no
-//! `command`, no `exit_code`, no code from `ErrorCode` at all. A caller has to
-//! special-case those four rather than assume the header below is universal -
-//! see docs/machine-api.md for the exact shape each one answers with and the
-//! plan to unify them onto this envelope.
+//! As of 2.0, validation, run browsing, and cleanup share this envelope too.
+//! Run-specific fields use distinct names (run_error, run_sfh_version,
+//! successful_steps), so they cannot collide with response header fields.
 //!
 //! Two rules keep the envelope usable:
 //!

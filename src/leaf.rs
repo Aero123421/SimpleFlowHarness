@@ -981,7 +981,6 @@ pub fn prepare_leaf(
                 agent,
                 extra: &args,
                 bin,
-                timeout_sec,
             };
             let session_ref = step.continue_from.as_ref().or(step.fork_from.as_ref());
             let b = if let Some(target) = session_ref {
@@ -1585,20 +1584,16 @@ struct PiJsonlAccumulator {
     saw_usage: bool,
     malformed: u32,
     tool_use_pending: bool,
+    settled: bool,
 }
 
-/// The AI package's AssistantMessage.stopReason is a closed union. In Pi's
-/// headless print/json lifecycle, `stop` and `length` finish an assistant
-/// response. `toolUse` needs a later response or an explicit non-retrying
-/// agent_end (a tool can terminate the loop). `pending`/`deferred` do not
-/// certify completion. These facts follow the v0.85.1 AI StopReason union and
-/// packages/agent/src/agent-loop.ts. A
-/// missing, non-string, or newly-added value must not be treated as success by
-/// an older sfh.
+/// Pi 1.4.0's JSON contract separates assistant responses from settlement.
+/// `length` is truncated output, not successful completion. Source:
+/// packages/coding-agent/docs/{json,cli-integration}.md at v1.4.0.
 fn pi_stop_verdict(message: &serde_json::Value) -> Result<Option<bool>, ()> {
     match message.get("stopReason").and_then(|value| value.as_str()) {
-        Some("stop") | Some("length") => Ok(Some(true)),
-        Some("error") | Some("aborted") => Ok(Some(false)),
+        Some("stop") => Ok(Some(true)),
+        Some("length") | Some("error") | Some("aborted") => Ok(Some(false)),
         Some("pending") | Some("toolUse") | Some("deferred") => Ok(None),
         _ => Err(()),
     }
@@ -1628,11 +1623,32 @@ impl LineRecords for PiJsonlAccumulator {
                     .and_then(|x| x.as_str())
                     .map(String::from);
             }
+            Some("agent_start" | "turn_start" | "auto_retry_start") => {
+                self.settled = false;
+                self.tool_use_pending = false;
+                self.parsed.text.clear();
+                self.parsed.failed = true;
+                self.parsed.evidence.terminal_seen = false;
+                self.parsed.evidence.terminal_success = None;
+                self.parsed.evidence.final_message_seen = false;
+            }
+            Some("compaction_start" | "summarization_retry_scheduled") => {
+                self.settled = false;
+            }
+            Some("message_start") if v["message"]["role"] == "assistant" => {
+                self.settled = false;
+                self.tool_use_pending = false;
+                self.parsed.text.clear();
+                self.parsed.evidence.terminal_seen = false;
+                self.parsed.evidence.terminal_success = None;
+                self.parsed.evidence.final_message_seen = false;
+            }
             Some("message_end") => {
                 let Some(m) = v.get("message") else { return };
                 if m.get("role").and_then(|x| x.as_str()) != Some("assistant") {
                     return;
                 }
+                self.settled = false;
                 // Later assistant messages replace earlier ones (tool-use
                 // turns and provider retries). Only text blocks are chain data.
                 self.parsed.text = m
@@ -1703,16 +1719,25 @@ impl LineRecords for PiJsonlAccumulator {
                     }
                 }
             }
-            Some("agent_end") if self.tool_use_pending => {
-                // Pi's tool hooks can terminate the loop without another
-                // assistant response. The session event's explicit false
-                // willRetry value is proof that this was the final loop.
-                if v.get("willRetry").and_then(|value| value.as_bool()) == Some(false) {
-                    self.parsed.failed = false;
-                    self.parsed.evidence.terminal_seen = true;
-                    self.parsed.evidence.terminal_success = Some(true);
-                    self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
-                    self.tool_use_pending = false;
+            Some("agent_settled") => {
+                match v.get("aborted").and_then(|value| value.as_bool()) {
+                    Some(aborted) => {
+                        self.settled = true;
+                        // A tool may intentionally finish a loop. Settlement
+                        // proves no recovery or queued work follows it.
+                        let success = !aborted
+                            && (self.parsed.evidence.terminal_success == Some(true)
+                                || self.tool_use_pending);
+                        let has_result =
+                            aborted || self.parsed.evidence.terminal_seen || self.tool_use_pending;
+                        self.parsed.failed = !success;
+                        self.parsed.evidence.terminal_seen = has_result;
+                        self.parsed.evidence.terminal_success = has_result.then_some(success);
+                        self.parsed.evidence.final_message_seen =
+                            success && !self.parsed.text.is_empty();
+                        self.tool_use_pending = false;
+                    }
+                    None => self.malformed = self.malformed.saturating_add(1),
                 }
             }
             _ => {}
@@ -1723,11 +1748,13 @@ impl LineRecords for PiJsonlAccumulator {
         if self.saw_usage {
             self.parsed.usage.input_tokens = Some(self.input_tokens);
             self.parsed.usage.output_tokens = Some(self.output_tokens);
-            if self.reported_usage.cost_usd.is_none() {
-                self.reported_usage.cost_usd = Some(0.0);
-            }
             self.parsed.usage.cost_usd = self.reported_usage.cost_usd;
             self.parsed.usage.invalid_cost = self.reported_usage.invalid_cost;
+        }
+        if !self.settled {
+            self.parsed.evidence.terminal_seen = false;
+            self.parsed.evidence.terminal_success = None;
+            self.parsed.evidence.final_message_seen = false;
         }
         let malformed = self.malformed;
         finish_stream_evidence(&mut self.parsed, Self::TOOL, malformed, Self::SHAPE);
@@ -2436,6 +2463,7 @@ fn exec_once(p: Prepared) -> LeafDone {
     // into a green step with empty output, which is precisely the fail-open the
     // artifact check exists to prevent.
     let declared = (protocol_failure.is_none()
+        && (parsed.evidence.protocol != ProtocolState::ExitBound || outcome.exit_code == 0)
         && !parsed.failed
         && !outcome.timed_out
         && !outcome.interrupted)
@@ -2979,8 +3007,8 @@ fn parse_claude_json(stdout: &str) -> ParsedOut {
 /// opencode --format json is NDJSON that can run just as large as codex/pi's
 /// streams: the session id arrives on the early events, text parts stream in
 /// incrementally (dedupe by part id, keep the last occurrence), and the
-/// terminal step_finish/finish/error record - and its usage - arrives at the
-/// end. Same accumulator/observer split as codex and pi, for the same reason.
+/// step_finish carries optional per-step usage. V2 may emit only text at
+/// success; process exit supplies completion. Errors remain in-band failures.
 #[derive(Default)]
 struct OpencodeNdjsonAccumulator {
     parsed: ParsedOut,
@@ -3007,9 +3035,16 @@ impl LineRecords for OpencodeNdjsonAccumulator {
                 return;
             }
         };
-        if self.parsed.session.is_none() {
-            if let Some(s) = v.get("sessionID").and_then(|x| x.as_str()) {
-                self.parsed.session = Some(s.to_string());
+        if let Some(session) = v.get("sessionID").and_then(|x| x.as_str()) {
+            if self
+                .parsed
+                .session
+                .as_deref()
+                .is_some_and(|old| old != session)
+            {
+                self.malformed = self.malformed.saturating_add(1);
+            } else {
+                self.parsed.session = Some(session.to_string());
             }
         }
         match v.get("type").and_then(|x| x.as_str()) {
@@ -3022,6 +3057,17 @@ impl LineRecords for OpencodeNdjsonAccumulator {
                         .to_string()
                 };
                 let (pid, mid, txt) = (get("id"), get("messageID"), get("text"));
+                if pid.is_empty()
+                    || mid.is_empty()
+                    || self.parsed.session.as_deref().unwrap_or("").is_empty()
+                    || part
+                        .and_then(|p| p.get("text"))
+                        .and_then(|t| t.as_str())
+                        .is_none()
+                {
+                    self.malformed = self.malformed.saturating_add(1);
+                    return;
+                }
                 if let Some(e) = self
                     .texts
                     .iter_mut()
@@ -3033,8 +3079,8 @@ impl LineRecords for OpencodeNdjsonAccumulator {
                 }
             }
             Some("step_finish") | Some("finish") => {
-                self.parsed.evidence.terminal_seen = true;
-                self.parsed.evidence.terminal_success.get_or_insert(true);
+                // step_finish ends one model step (often tool-calls), not the run.
+                // Preserve usage, but never let it excuse a failing process exit.
                 if let Some(part) = v.get("part") {
                     if let Some(tk) = part.get("tokens") {
                         self.parsed.usage.input_tokens = num(tk.get("input"));
@@ -3072,6 +3118,16 @@ impl LineRecords for OpencodeNdjsonAccumulator {
         self.parsed.evidence.final_message_seen = !self.parsed.text.is_empty();
         let malformed = self.malformed;
         finish_stream_evidence(&mut self.parsed, Self::TOOL, malformed, Self::SHAPE);
+        // V2's normal success can emit only completed text parts. The CLI's
+        // owned process exit supplies completion, not an invented terminal.
+        // This evidence can never excuse a nonzero exit via trust_protocol.
+        if malformed == 0
+            && !self.parsed.evidence.terminal_seen
+            && self.parsed.evidence.final_message_seen
+        {
+            self.parsed.evidence.protocol = ProtocolState::ExitBound;
+            self.parsed.evidence.diagnostic = None;
+        }
         self.parsed
     }
 }
@@ -3727,6 +3783,44 @@ mod tests {
     }
 
     #[test]
+    fn real_current_cli_transcripts_keep_completion_evidence_distinct() {
+        // Actual CLIs with a loopback synthetic provider; see fixture provenance.
+        let text = include_str!("../tests/fixtures/cli-2026-10/opencode-2.2.1-text.jsonl");
+        let o = parse_opencode_ndjson(text);
+        assert_eq!(o.text, "LOCAL MOCK OK");
+        assert_eq!(o.evidence.protocol, ProtocolState::ExitBound);
+        assert!(o.evidence.allows_success());
+        assert!(!o.evidence.terminal_seen);
+        assert!(!o.evidence.certifies_success());
+        assert_eq!(o.usage.cost_usd, None);
+        for bad in [
+            format!("{text}{{oops"),
+            format!("{text}{{\"type\":\"error\"}}"),
+        ] {
+            assert!(!parse_opencode_ndjson(&bad).evidence.allows_success());
+        }
+        let tool_only = r#"{"type":"step_finish","sessionID":"s","part":{"reason":"tool-calls"}}"#;
+        let o = parse_opencode_ndjson(tool_only);
+        assert!(!o.evidence.allows_success());
+        assert!(!o.evidence.certifies_success());
+        let pi = include_str!("../tests/fixtures/cli-2026-10/pi-1.4.0-read.jsonl");
+        let o = parse_pi_jsonl(pi);
+        assert_eq!(o.text, "LOCAL MOCK OK");
+        assert!(o.evidence.certifies_success());
+        let unsettled = pi
+            .lines()
+            .filter(|line| !line.contains("agent_settled"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!parse_pi_jsonl(&unsettled).evidence.allows_success());
+        assert!(
+            !parse_pi_jsonl(&pi.replace("\"aborted\":false", "\"aborted\":true"))
+                .evidence
+                .allows_success()
+        );
+    }
+
+    #[test]
     fn opencode_dedupes_streamed_part_updates() {
         let s = concat!(
             r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"par"}}"#,
@@ -3774,7 +3868,8 @@ mod tests {
         assert_eq!(parsed.usage.output_tokens, Some(3));
         assert_eq!(parsed.usage.cost_usd, Some(0.5));
         assert!(!parsed.failed);
-        assert!(parsed.evidence.certifies_success());
+        assert!(parsed.evidence.allows_success());
+        assert!(!parsed.evidence.certifies_success());
     }
 
     #[test]
@@ -3800,7 +3895,11 @@ mod tests {
         );
         let (parsed, diagnostic) = observer.finish();
 
-        assert_eq!(diagnostic, None);
+        assert!(
+            diagnostic.is_some(),
+            "usage without final text is not completion"
+        );
+        assert!(!parsed.evidence.allows_success());
         // Cost accumulates across every step_finish (preset::Usage's
         // add_reported_cost); tokens do not - they are overwritten by the
         // latest step. Both are parse_opencode_ndjson's existing rule, not
@@ -3874,10 +3973,11 @@ mod tests {
         let (parsed, diagnostic) = observer.finish();
 
         assert_eq!(diagnostic, None);
-        assert!(parsed.evidence.terminal_seen);
-        assert_eq!(parsed.evidence.terminal_success, Some(true));
+        assert!(!parsed.evidence.terminal_seen);
+        assert_eq!(parsed.evidence.terminal_success, None);
         assert_eq!(parsed.text, "answer");
-        assert!(parsed.evidence.certifies_success());
+        assert!(parsed.evidence.allows_success());
+        assert!(!parsed.evidence.certifies_success());
     }
 
     #[test]
@@ -3959,7 +4059,7 @@ mod tests {
             "\n",
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"thinking","text":"hidden"},{"type":"text","text":"final "},{"type":"text","text":"answer"}],"usage":{"input":200,"output":20,"cost":{"total":0.02}}}}"#,
             "\n",
-            r#"{"type":"agent_settled"}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
         );
         let o = parse_pi_jsonl(s);
         assert_eq!(
@@ -4008,6 +4108,7 @@ mod tests {
         let final_record = br#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"VERDICT: PASS"}],"usage":{"input":20,"output":3,"cost":{"total":0.5}}}}"#;
         observer.observe(&final_record[..37]);
         observer.observe(&final_record[37..]);
+        observer.observe(b"\n{\"type\":\"agent_settled\",\"aborted\":false}\n");
         let (parsed, diagnostic) = observer.finish();
 
         assert_eq!(diagnostic, None);
@@ -4035,6 +4136,45 @@ mod tests {
         let o = parse_pi_jsonl(empty);
         assert!(o.text.is_empty());
         assert_eq!(o.usage.input_tokens, None);
+    }
+
+    #[test]
+    fn pi_requires_session_settlement_after_the_last_automatic_work() {
+        let message = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"partial verdict"}]}}"#;
+        for suffix in [
+            "",
+            "\n{\"type\":\"agent_end\",\"willRetry\":false}",
+            "\n{\"type\":\"agent_settled\",\"aborted\":true}",
+            "\n{\"type\":\"agent_settled\",\"aborted\":false}\n{\"type\":\"agent_start\"}",
+            "\n{\"type\":\"auto_retry_start\"}",
+        ] {
+            let parsed = parse_pi_jsonl(&format!("{message}{suffix}"));
+            assert!(parsed.failed, "uncertified session accepted: {suffix}");
+            assert!(parsed.text.is_empty());
+        }
+        let parsed = parse_pi_jsonl(&format!(
+            "{message}\n{{\"type\":\"agent_settled\",\"aborted\":false}}"
+        ));
+        assert!(parsed.evidence.certifies_success());
+    }
+
+    #[test]
+    fn pi_rejects_untyped_settlement_and_token_limit_completion() {
+        let message = r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[]}}"#;
+        for settled in [
+            r#"{"type":"agent_settled"}"#,
+            r#"{"type":"agent_settled","aborted":"false"}"#,
+        ] {
+            let parsed = parse_pi_jsonl(&format!("{message}\n{settled}"));
+            assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid);
+        }
+        let limited = parse_pi_jsonl(concat!(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"length","content":[{"type":"text","text":"cut off"}]}}"#,
+            "\n",
+            r#"{"type":"agent_settled","aborted":false}"#
+        ));
+        assert!(limited.failed);
+        assert!(!limited.evidence.certifies_success());
     }
 
     #[test]
@@ -4094,7 +4234,7 @@ mod tests {
             "\n",
             r#"{"type":"agent_end","willRetry":false}"#,
             "\n",
-            r#"{"type":"agent_settled"}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
         );
         let parsed = parse_pi_jsonl(stream);
         assert!(!parsed.failed, "a successful retry is the final verdict");
@@ -4121,7 +4261,7 @@ mod tests {
         }
         let completed = parse_pi_jsonl(&format!(
             "{tool_use}\n{}",
-            r#"{"type":"agent_end","willRetry":false}"#
+            r#"{"type":"agent_settled","aborted":false}"#
         ));
         assert!(!completed.failed);
         assert!(completed.evidence.certifies_success());
@@ -4370,12 +4510,15 @@ mod tests {
         let o = parse_claude_json(r#"{"type":"system","result":"not the answer"}"#);
         assert_eq!(o.evidence.protocol, ProtocolState::MissingTerminal);
         assert!(o.text.is_empty());
-        // opencode: text parts but no finish/error event.
+        // OpenCode 2: text-only completion uses process exit, never a forged terminal.
         let o = parse_opencode_ndjson(
             r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"hi"}}"#,
         );
-        assert_eq!(o.evidence.protocol, ProtocolState::MissingTerminal);
-        assert!(!o.evidence.allows_success());
+        assert_eq!(o.evidence.protocol, ProtocolState::ExitBound);
+        assert!(o.evidence.allows_success());
+        assert!(!o.evidence.terminal_seen);
+        assert!(!o.evidence.certifies_success());
+
         // pi: a session header and nothing else.
         let o = parse_pi_jsonl(r#"{"type":"session","id":"s-1","timestamp":"2026-01-01"}"#);
         assert_eq!(o.evidence.protocol, ProtocolState::MissingTerminal);

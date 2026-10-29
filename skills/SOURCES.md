@@ -5,8 +5,8 @@ This pack is an independent set of Agent Skills for designing SimpleFlowHarness 
 ## SimpleFlowHarness
 
 - Repository: https://github.com/Aero123421/SimpleFlowHarness
-- Target release: https://github.com/Aero123421/SimpleFlowHarness/tree/v1.6.0
-- Flow schema: https://github.com/Aero123421/SimpleFlowHarness/blob/v1.6.0/schema/flow.schema.json
+- Target release: https://github.com/Aero123421/SimpleFlowHarness/tree/v2.0.0
+- Flow schema: https://github.com/Aero123421/SimpleFlowHarness/blob/v2.0.0/schema/flow.schema.json
 - Built-in guide: `sfh guide`
 
 The skills are written against sfh v1.6 concepts: routes, bounded visits, retry/fallback, replay, outcomes and labels, parallel/foreach, managed workspace, named context, execution closure, budgets, detach/status/wait/stop, preflight, doctor, plan, and machine JSON.
@@ -40,3 +40,5 @@ The recurring principles used here are: make the environment legible, split gene
 - Tool specification: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
 
 MCP tool annotations are treated as untrusted hints, not permission enforcement. Local MCP servers are executable code. Mutating MCP calls are external effects and should not be blindly retried.
+
+- v2 contract re-review: [CLI evidence and migration](../docs/harness-refresh-2026-10.md). All nine skills retain their authoring scope; MCP, session, protocol and cost guidance is updated for the new adapters.

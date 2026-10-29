@@ -86,5 +86,6 @@ fn main() {
         "{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"stopReason\":\"stop\",\"content\":[{{\"type\":\"text\",\"text\":\"VERDICT: PASS\"}}],\"usage\":{{\"input\":20,\"output\":3,\"cost\":{{\"total\":0.5}}}}}}}}"
     )
     .unwrap();
+    writeln!(out, "{{\"type\":\"agent_settled\",\"aborted\":false}}").unwrap();
     out.flush().unwrap();
 }

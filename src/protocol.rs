@@ -23,6 +23,9 @@ pub enum ProtocolState {
     Plain,
     /// Parsed, and the documented terminal record was present.
     Valid,
+    /// Completed structured text was observed; this adapter binds completion
+    /// to process exit instead of emitting a terminal verdict (OpenCode 2).
+    ExitBound,
     /// Records parsed, but the run never reached its documented terminal record.
     MissingTerminal,
     /// The stream itself was not the documented shape (unparseable, wrong
@@ -35,6 +38,7 @@ impl ProtocolState {
         match self {
             ProtocolState::Plain => "plain",
             ProtocolState::Valid => "valid",
+            ProtocolState::ExitBound => "exit_bound",
             ProtocolState::MissingTerminal => "missing_terminal",
             ProtocolState::Invalid => "invalid",
         }
@@ -44,6 +48,7 @@ impl ProtocolState {
         match value {
             "plain" => Some(Self::Plain),
             "valid" => Some(Self::Valid),
+            "exit_bound" => Some(Self::ExitBound),
             "missing_terminal" => Some(Self::MissingTerminal),
             "invalid" => Some(Self::Invalid),
             _ => None,
@@ -95,7 +100,9 @@ impl ProtocolEvidence {
     /// the caller checks against the chain text it actually got.
     pub fn allows_success(&self) -> bool {
         match self.protocol {
-            ProtocolState::Plain | ProtocolState::Valid => self.terminal_success != Some(false),
+            ProtocolState::Plain | ProtocolState::Valid | ProtocolState::ExitBound => {
+                self.terminal_success != Some(false)
+            }
             ProtocolState::MissingTerminal | ProtocolState::Invalid => false,
         }
     }
@@ -120,7 +127,7 @@ impl ProtocolEvidence {
             }
         }
         match self.protocol {
-            ProtocolState::Plain | ProtocolState::Valid => {
+            ProtocolState::Plain | ProtocolState::Valid | ProtocolState::ExitBound => {
                 if self.terminal_success == Some(false) {
                     Some(format!(
                         "{tool} reported an in-band failure in its terminal record"
