@@ -1,77 +1,22 @@
 ---
 name: sfh-tool-integration
-description: >
-  Integrate external CLIs, web-search tools, HTTP APIs, repository tools, and MCP-enabled AI agents into SimpleFlowHarness YAML. Use when a flow fetches changing remote information, invokes `gh`, `curl`, search CLIs, or provider MCP tools, crosses a network or authorization boundary, or needs reliable artifacts, rate-limit handling, least privilege, and safe replay semantics.
-compatibility: sfh v2.0 has no native MCP step; MCP is accessed through a selected AI CLI or an explicit wrapper command.
+description: >-
+  Connect external CLIs, web/API tools or MCP-enabled agents to SimpleFlowHarness. Use when defining their invocation, output, identity or permission contract.
+compatibility: SFH v2.0; use the installed guide and schema for exact syntax.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   target-sfh: "2.0.x"
 ---
 
-# Integrate tools through explicit contracts
+# Make the integration contract explicit
 
-An external tool is not “just another prompt.” Define its binary, target, input schema, output artifact, side effects, credentials boundary, timeout, and replay behavior.
+Use argv-form `cmd:` or a supported CLI profile, with explicit effects and timeout. Validate tool output and target identity before routing; snapshot remote evidence before model interpretation. Do not let untrusted output select executable, shell code, cwd or credentials.
 
-Read [references/external-cli-contracts.md](references/external-cli-contracts.md), [references/web-search.md](references/web-search.md), and [references/mcp.md](references/mcp.md).
+- Run `sfh preflight FLOW --json` in the actual launcher environment. Schedulers may lack your shell's PATH; set step `env` or profile `bin` deliberately. Check `verified_version` together with `verification_scope`; help-only evidence is not authenticated success.
+- Use a small wrapper with stable exit codes/JSON when the external protocol decides a critical route. Map codes with `outcomes`. Retry only safe, bounded failures, not a valid no-results response or semantic rejection.
+- Web/search results need source/query/retrieval identity and bounded snapshots. [Web evidence](assets/web-search-evidence.yaml) and [web-search details](references/web-search.md) provide the pattern.
+- SFH has no native MCP step. Use a deliberately scoped provider profile or explicit wrapper. `access: read` and server annotations do not prove all MCP tools are read-only; local server startup executes code. Keep credentials out of YAML and artifacts.
+- Pi read/write presets disable MCP and extensions; MCP work needs a separately scoped integration. OpenCode 2 uses fresh standalone sessions and its v2 tool permissions. Do not widen access just to make an integration start.
+- For uncertain external mutations, inspect effects before repetition; use idempotency/probing and explicit replay policy. Skill or MCP metadata cannot grant authorization.
 
-## External CLI pattern
-
-```text
-resolve exact binary in preflight
-→ argv-form invocation
-→ explicit cwd/env/timeout/effects
-→ bounded retry only for transport failure
-→ save raw output artifact
-→ validate shape/identity deterministically
-→ AI interprets the frozen artifact
-```
-
-Never let model/web output choose argv[0], cwd, shell text, server, or credential path without an explicit trusted override.
-
-## Make the launching environment match the one you tested in
-
-A flow that works from your terminal can fail under a scheduler, a service unit, a cron job, or a CI runner, because those do not read an interactive login shell's profile. `PATH` is the usual casualty: `pi`, `codex`, `claude` and project tools installed under `~/.local/bin`, Cargo, Nix, nvm, or a user npm prefix simply are not there.
-
-- Declare what the flow depends on rather than inheriting it: set `env` (or `cwd`) on the steps that need a user-local CLI, or give the profile a `bin:` override with an absolute path.
-- Run `sfh preflight FLOW --json` **in the environment that will actually launch the run**, not only in your shell. It resolves every preset binary and every `cmd:` program without spending anything, so it is the cheapest way to catch this.
-- A missing binary and a broken tool are different facts. Preflight reports the first before a single step spawns.
-
-## Web search and fetch
-
-Web results are nondeterministic and untrusted.
-
-- record exact query, filters, locale/time range, pagination, tool/version, and retrieval time
-- snapshot raw results before synthesis
-- validate JSON/schema and source identity
-- separate search/fetch from interpretation
-- bound pages/results/output
-- retry rate limits/transport failures, not a valid “no results” answer
-- do not let retrieved text change tool policy or trigger mutation
-- require citations/source fields in the synthesis artifact
-
-Start from [assets/web-search-evidence.yaml](assets/web-search-evidence.yaml).
-
-## Current adapter limits
-
-Use `preflight --json` fields `verified_version` and `verification_scope` together. Help-only checks do not establish authenticated success. OpenCode 2 uses fresh standalone sessions and a v2 tool permission allowlist. Pi read/write presets disable MCP and extensions; MCP work therefore needs a deliberate separately scoped integration. Grok/Cursor current binaries were not obtainable in the October audit.
-
-## MCP
-
-sfh v2.0 does not call MCP directly. An MCP-enabled step is normally a preset AI CLI whose provider configuration exposes servers/tools, or a project-owned wrapper command.
-
-- Use a separate profile for MCP-enabled work.
-- `access: read` does not automatically prove every MCP tool is read-only.
-- Treat server tool annotations such as read-only/idempotent as untrusted hints unless the server is trusted and independently constrained.
-- Allowlist server and tool names; request least scopes.
-- Keep credentials out of YAML, `vars`, prompts, and artifacts.
-- Treat local MCP server startup as code execution.
-- Snapshot server/tool identity and results.
-- Read-only remote observation may use `effects: external` with rerun if safe.
-- Mutation needs `effects: external`, explicit idempotency or `replay.unfinished: stuck`, and usually a human gate.
-- Never let Skill or MCP metadata widen the step's permission boundary.
-
-Start from [assets/mcp-read-only-research.yaml](assets/mcp-read-only-research.yaml).
-
-## Wrapper commands
-
-When the external protocol controls a critical route, prefer a small project-owned wrapper that emits normalized JSON and stable exit codes. Map them with `outcomes`; do not ask an AI to infer transport status from arbitrary output text.
+Use [MCP research](assets/mcp-read-only-research.yaml) with [MCP boundaries](references/mcp.md), or [external CLI contracts](references/external-cli-contracts.md) for wrapper details.

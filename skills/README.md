@@ -1,113 +1,28 @@
-# sfh Flow Design Agent Skills
+# SFH authoring skills
 
-SimpleFlowHarnessのYAMLをAIに設計・レビュー・改善させるためのAgent Skills集です。
+**SFH v2.0 のフローを設計・レビューする AI 向け**の Skills です。実行先の AI に渡す Skills とは別です。YAML に `skills:` キーはなく、実行時の指示には `contexts:` または CLI 固有の設定を使います。SFH 自身は native Skill の読込を証明しません。
 
-## これは何か
+新規設計は `sfh-flow-design`、既存フローの監査は `sfh-flow-review` が入口です。専門 Skill は必要な問題に応じて選びます。
 
-このSkill群は、**sfhのフローを書くAIのための設計知識**です。
-
-- `sfh`を実行するための新しいruntime機能ではありません。
-- sfh YAMLへ未実装の`skills:`キーを追加しません。
-- PonytailのSkillではなく、sfh固有の設計、loop engineering、failure recovery、CI監視、外部CLI/MCP連携を扱います。
-- 生成されたflowが実行時agentへ手順書を渡す場合は、既存の`contexts:`でfile/inline/templateを渡すか、選択したAI CLIのnative Skill機構を使います。
-- native Skillが確実に読み込まれたことをsfh自身は通常証明できないため、flow correctnessに必須の規則はnamed contextとして固定する方が安全です。
-
-## 収録Skill
-
-| Skill | 用途 |
+| Skill | 扱う問題 |
 |---|---|
-| `sfh-flow-design` | 要件からsfh YAMLを設計・作成する中心Skill |
-| `sfh-flow-review` | 既存flowを壊れやすさ、曖昧さ、portabilityの観点で監査 |
-| `sfh-loop-engineering` | review/fix、planner/builder/evaluator、長時間loopの収束設計 |
-| `sfh-deterministic-gates` | 決定論的commandと非決定論的AIの役割分離、route/outcomes設計 |
-| `sfh-context-workspace` | workspace、context、profile、session、execution closureの設計 |
-| `sfh-failure-recovery` | retry、fallback、replay、resume、carry-budget、stuckの使い分け |
-| `sfh-ci-monitoring` | GitHub Actions等をrun ID/SHA固定で壊れにくく監視するflow |
-| `sfh-tool-integration` | web検索CLI、API、MCP-enabled agent、外部toolの安全な接続 |
-| `sfh-eval-engineering` | production failureや失敗runをregression evalへ変換して改善 |
+| `sfh-loop-engineering` | フィードバックループの進捗と停止 |
+| `sfh-deterministic-gates` | 証拠から route を選ぶ方法 |
+| `sfh-context-workspace` | ファイル・入力・session の共有 |
+| `sfh-failure-recovery` | 安全に再試行・再開できる範囲 |
+| `sfh-ci-monitoring` | 正しい CI run の特定と監視 |
+| `sfh-tool-integration` | 外部 CLI/API/MCP の接続契約 |
+| `sfh-eval-engineering` | 失敗記録から回帰検査を作る方法 |
 
-## インストール
+参照資料やサンプルは必要時に使います。全 Skill の一括読込は不要です。SFH は worker → check → evaluator の閉ループを宣言 route で構成できます。品質を判断するのは check/evaluator であり、エンジンではありません。
 
-Project scopeの標準配置:
+配布物のルートから project scope に配置する例:
 
 ```bash
 mkdir -p .agents/skills
 cp -R skills/sfh-* .agents/skills/
 ```
 
-User scope:
+クライアント別の配置は [INSTALL.md](INSTALL.md) を参照してください。作成したフローは installed guide/schema、`sfh validate FLOW --strict`、`sfh run FLOW --dry-run` で確認します。live 実行前の preflight と plan はローカル能力・実行内容の確認であり、認証成功や結果不明の副作用の安全な再実行を保証しません。
 
-```bash
-mkdir -p ~/.agents/skills
-cp -R skills/sfh-* ~/.agents/skills/
-```
-
-Agent Skills対応clientは、通常name/descriptionだけをcatalogとして読み、必要時に`SKILL.md`とreferencesを読みます。
-
-## 推奨activation
-
-新規flow:
-
-```text
-Use sfh-flow-design.
-Also use sfh-loop-engineering if the flow loops,
-sfh-ci-monitoring for CI,
-and sfh-tool-integration for web/MCP/external APIs.
-```
-
-既存flow review:
-
-```text
-Use sfh-flow-review and return prioritized findings plus a corrected YAML.
-```
-
-## AIへ期待する標準手順
-
-```text
-1. sfh guide / current schemaを確認する。
-2. 要求をstate machineへ分解する。
-3. 各stepをdeterministic / nondeterministic / external effectへ分類する。
-4. workspace、context、evidence、budget、failure policyを決める。
-5. YAMLを書く。存在しないkeyを発明しない。
-6. skills/tools/lint_sfh_flow.pyでheuristic lintする。
-7. sfh validate --strictする。
-8. sfh preflight --jsonする。
-9. sfh plan --json --saveする。
-10. warningとplanを読んでからrunする。
-```
-
-## Validation
-
-Skill構造:
-
-```bash
-python3 skills/tools/validate_skills.py skills
-```
-
-sfh flowのheuristic lint:
-
-```bash
-python3 skills/tools/lint_sfh_flow.py path/to/flow.yaml
-```
-
-実際のsfh v1.6で:
-
-```bash
-sfh validate flow.yaml --strict
-sfh preflight flow.yaml --json
-sfh plan flow.yaml --json --save --state-dir ~/.local/state/sfh
-```
-
-`skills/tools/lint_sfh_flow.py`はsfh本体のvalidatorを置き換えません。合法だが壊れやすい設計を早く見つける補助です。
-
-## 重要な設計境界
-
-- deterministic factはAIの散文に判定させない。
-- nondeterministic generationの後ろにdeterministic gateか独立evaluatorを置く。
-- loopには明示的な上限、進捗証拠、handoff/stuckを置く。
-- `retry`はtransport/infra failure向け。logical rejectionを同じinvocationで再抽選しない。
-- external mutationは`effects: external`と`replay.unfinished: stuck`を基本にする。
-- CIは`latest`ではなくexact run IDとhead SHAを使う。
-- web/MCP outputはuntrusted contextとしてsnapshotし、取得と解釈を分ける。
-- MCPのread-only annotationやSkillのallowed-toolsはsecurity boundaryではない。
-- native sessionはcache。workspace、artifact、context manifestがdurable truth。
+配布検査: `python3 tests/skills_checks.py`、`python3 skills/tools/validate_pack.py skills`。選択と作成品質の検証は [EVALS.md](EVALS.md)、設計根拠は [SOURCES.md](SOURCES.md) を参照してください。

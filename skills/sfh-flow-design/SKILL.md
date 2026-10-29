@@ -1,142 +1,32 @@
 ---
 name: sfh-flow-design
-description: >
-  Design, write, or refactor SimpleFlowHarness (sfh) YAML workflows. Use when turning a task, engineering process, review loop, CI process, research process, or tool chain into a stable sfh flow; when choosing steps, routes, workspaces, contexts, profiles, retries, budgets, and terminal states; or when an AI-authored sfh flow is vague, brittle, or uses invented syntax.
-compatibility: Requires SimpleFlowHarness v1.6 syntax for the bundled examples. Use the installed sfh guide and schema as the final authority.
+description: >-
+  Write or refactor SimpleFlowHarness YAML from a task. Use for a new flow or a change to its overall execution graph.
+compatibility: SFH v2.0; use the installed guide and schema for exact syntax.
 metadata:
-  version: "1.0.0"
+  version: "1.1.0"
   target-sfh: "2.0.x"
 ---
 
-# Design sfh flows as explicit state machines
+# Write an SFH flow
 
-Use this skill before writing or substantially changing an sfh YAML file.
+Use `sfh guide` and the installed flow schema for syntax. These are authoring instructions; SFH has no `skills:` field. Pass runtime instructions through `contexts:` or the selected CLI's native configuration.
 
-This is an **authoring skill**. Do not add a `skills:` key to the generated flow: sfh v2.0 has no such key. Runtime instructions belong in existing `contexts:` or in provider-native configuration.
+SFH records process facts and follows declared routes. It does not judge work quality. Put acceptance checks in commands or an explicit evaluator, then route on their evidence. This supports closed feedback loops without making the engine the judge.
 
-## Start with the execution contract
+- Choose `cmd:` for mechanical checks and a CLI profile for agent work. If the artifact is the product, use `allow_empty: true` and verify that artifact; this never waives the adapter's completion contract.
+- Choose the workspace explicitly. One managed `git-worktree` is reused across visits; serialize writers. Keep run evidence outside a tree the worker can change.
+- Declare effects and error paths. Use `end` for accepted completion, `fail` for failure, `stuck` for an unresolved decision. External effects with uncertain results need inspection before repetition.
+- Bound cycles with `max_visits` / `on_max_visits` and total work with `max_total_steps` or wall-clock limits. A cost ceiling sees only adapter-reported USD.
+- Keep retry (same invocation), fallback (another profile), route revisit (new improvement pass), and replay (unfinished work on resume) distinct.
 
-Before YAML, write down:
+Start with [the skeleton](assets/stable-flow-skeleton.yaml) and its adjacent context files; replace project-specific checks. Check the resulting flow with `sfh validate FLOW --strict` and `sfh run FLOW --dry-run`. Before live execution, `sfh preflight FLOW --json` checks local capabilities and `sfh plan FLOW --json` exposes resolved commands and limits. Neither proves authenticated success.
 
-1. Goal and terminal success evidence.
-2. Inputs and which may change during the run.
-3. Side effects: read, workspace write, external mutation, or unknown.
-4. Deterministic facts versus semantic judgments.
-5. Required artifacts and handoffs.
-6. Failure classes and whether another attempt is safe.
-7. Loop progress signal and hard stop.
-8. Workspace, context, model/profile, time, step, and cost limits.
-9. Human decisions or irreversible operations.
+Use only the detail the task needs:
 
-If a material item is unknown, expose it as an assumption or route to `stuck`; do not hide it in a prompt.
+- [Primitive map](references/primitive-reference.md): keys and commands.
+- [Design choices](references/flow-design-method.md): evidence, state and boundaries.
+- [Anti-patterns](references/anti-patterns.md): suspicious control flow; [linter](scripts/lint_sfh_flow.py) offers heuristic warnings.
+- `sfh-loop-engineering` for feedback cycles; `sfh-failure-recovery` for replay/resume; other specialists only when their problem occurs.
 
-## Build the state machine
-
-- Each step should have one mechanical responsibility.
-- Use `cmd:` for observable facts: builds, tests, schema validation, exact API status, parsing, checksums.
-- Use an AI preset for synthesis, planning, diagnosis, implementation, or semantic review.
-- Put a deterministic gate after nondeterministic generation whenever possible.
-- Use `end`, `fail`, and `stuck` deliberately. `stuck` means work is preserved but sfh cannot safely decide.
-- Keep route conditions local to the step whose evidence they inspect.
-- Every cycle must have a visit bound and an escalation path.
-
-Read [references/flow-design-method.md](references/flow-design-method.md) and [references/primitive-reference.md](references/primitive-reference.md) when designing a nontrivial flow.
-
-## Separate deterministic and nondeterministic work
-
-Classify each step:
-
-- **Deterministic gate:** a command maps declared inputs to a machine-checkable result.
-- **Nondeterministic worker:** an LLM, web search, remote service, or evaluator may vary.
-- **External effect:** a call may mutate state outside the workspace.
-
-Do not ask an AI whether a command exited successfully. Do not interpret test names or result payloads as transport errors. Freeze remote/web evidence before asking an AI to reason over it.
-
-For detailed routing choices, activate `sfh-deterministic-gates`.
-
-## Choose the right completion evidence for each step
-
-sfh proves that a turn finished. It does not prove the artifact is correct. Those are different facts, and a step should ask for the one it actually needs.
-
-Preset (AI) steps default to `allow_empty: false`: a turn that exits cleanly with no final message is a failure, because an empty answer is not evidence of anything. That default is right for a reviewer whose verdict *is* the product, and wrong for a worker whose product is the diff.
-
-A worker whose prose is not the deliverable should say so and let commands prove the work:
-
-```yaml
-- id: implement
-  use: builder
-  effects: workspace
-  allow_empty: true      # the diff is the product, not the closing sentence
-  timeout_sec: 7200      # one hard deadline for the whole turn, tool use included
-  route: [{goto: verify}]
-```
-
-Then gate it: `fmt`, build, tests, schema validation, `git diff --check`.
-
-- Keep `allow_empty: false` where the final message is the evidence — a semantic reviewer whose exact `PASS` / `REVISE` line drives routing.
-- Do not make a model-authored `DONE` / `IMPLEMENTED` line the sole proof that code is correct when a command can check the artifact instead. That turns a formatting slip into a failed run and a confident sentence into a passed one.
-- `timeout_sec` is wall-clock for the entire leaf run, including the agent's own tool calls and the tests it starts. Size it for the whole turn, or split the work into smaller artifact-shaped steps. Workspace changes may survive a timed-out leaf, but repeated timeout is not a continuation mechanism.
-
-The shape to reach for:
-
-```text
-nondeterministic worker (allow_empty)
-  → deterministic artifact gates
-  → semantic reviewer only where judgment is genuinely required
-```
-
-## Choose workspace and context explicitly
-
-- Read-only flow: `workspace.mode: current` is often enough.
-- Any writer: use explicit `workspace.mode: git-worktree` for a strict-clean flow where one run owns one worktree; use `auto` only when its resolution warning is intentional.
-- Do not run parallel writers in one workspace unless the flow explicitly accepts the race.
-- Use named context for task contracts, acceptance criteria, review rules, and bounded handoffs.
-- Give each role only the context it needs. Avoid copying the entire conversation.
-- Treat native sessions as caches; artifacts and workspace state are durable truth.
-- Treat context files as immutable during a running flow. If another process may edit them, snapshot them first.
-
-Activate `sfh-context-workspace` for detailed choices.
-
-## Design failure behavior, not only the happy path
-
-- `retry` handles another attempt of the same invocation.
-- `fallback` changes the profile/tool after retries.
-- a route revisit is a domain improvement loop.
-- `replay.unfinished` decides what resume does after a crash without a durable end.
-- `--resume` continues an unchanged run.
-- `--carry-budget-from` starts a corrected flow without erasing previous spend.
-- external mutation normally needs `effects: external`, no blind logical retry, and `replay.unfinished: stuck`.
-
-Activate `sfh-failure-recovery` when any of these matter.
-
-## Bound retries and budgets
-
-- `max_total_steps` counts logical leaf runs, not the process attempts inside one `retry`. Inspect `max_attempts` in `sfh plan --json` and actual `attempts` in `sfh runs show`.
-- A wall-clock `budget_reserve` pre-empts the next retry during backoff; it does not kill an attempt already running. Reserve enough for the complete `on_budget` handoff.
-- `max_cost_usd` sees only adapter-reported USD. Claude, Grok, and Pi can report it; OpenCode 2 can omit it entirely. Codex, Agy, Cursor, and custom `cmd:` steps do not report USD. Pair the cost ceiling with `wall_clock_sec` when coverage is incomplete.
-
-## Authoring workflow
-
-1. Inspect `sfh guide`, `sfh --help`, and the installed flow schema.
-2. Draft the state graph in plain text.
-3. Write the smallest YAML that expresses it.
-4. Resolve the installed skill directory, then run `<skill-dir>/scripts/lint_sfh_flow.py FLOW` for design warnings.
-5. Run `sfh validate FLOW --strict`.
-6. Run `sfh preflight FLOW --json`.
-7. Run `sfh plan FLOW --json --save --state-dir <dir>` and inspect commands, context, workspace, warnings, and maximum work.
-8. Correct the flow before any paid or external step runs.
-
-## Output requirements
-
-When asked to design a flow, return:
-
-1. The YAML.
-2. Assumptions and project-specific commands that must be replaced.
-3. Why each loop terminates.
-4. Which steps are deterministic, nondeterministic, and externally effectful.
-5. Validation/preflight/plan commands.
-6. Remaining risks or human gates.
-
-Never invent an sfh field. If the installed version is unknown, say which keys require verification.
-
-See [references/anti-patterns.md](references/anti-patterns.md) before finalizing. Start from [assets/stable-flow-skeleton.yaml](assets/stable-flow-skeleton.yaml) rather than an unbounded conversational chain.
+Return usable YAML with required inputs, meaningful assumptions and validation results. Identify unresolved gates instead of implying they passed.
