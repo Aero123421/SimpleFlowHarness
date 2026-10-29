@@ -3,7 +3,7 @@
 このCHANGELOGはrepository maintainer向けのリリース記録として日本語で記述します。
 利用者向け概要は英語版`README.md`を正とし、日本語版`README.ja.md`を併記します。
 
-## 2.0.0 (release candidate; publication pending)
+## v2.0.0 (release candidate; publication pending)
 
 ### 2026-10-29 現行CLI契約と実行証拠の刷新
 
