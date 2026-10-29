@@ -2535,7 +2535,16 @@ fn exec_once(p: Prepared) -> LeafDone {
     }
     let protocol_evidence = parsed.evidence.clone();
     let chain_output = parsed.text.clone();
-    let mut failure_code = None;
+    // Killing an owned process explains its unfinished stream. Preserve the
+    // observed protocol facts, but do not misclassify timeout/cancellation as
+    // adapter drift just because a terminal record could no longer arrive.
+    let mut failure_code = if outcome.interrupted {
+        Some(machine::ErrorCode::Interrupted)
+    } else if outcome.timed_out {
+        Some(machine::ErrorCode::StepFailed)
+    } else {
+        None
+    };
 
     let mut session_id = if exit_code == 0 && !outcome.timed_out {
         parsed

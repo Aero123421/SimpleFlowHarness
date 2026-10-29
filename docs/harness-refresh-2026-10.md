@@ -57,7 +57,11 @@ No change to retry/replay defaults is justified: effects with an unknown result
 must still stop for reconciliation. Existing per-tool concurrency limits and
 run leases remain the coordination mechanism. Existing process-group and
 Windows job-object cleanup remain the process boundary; escaping Unix process
-groups still requires an external OS sandbox.
+groups still requires an external OS sandbox. SFH waits for its direct
+children; killed orphan descendants can remain as zombies until the host's
+reaper collects them. The Linux behavior test checks execution state as well
+as PID existence, with a live-process negative control. In this container,
+`kill -0` alone falsely called a terminated `sleep` zombie alive.
 
 ## Baseline and reproduction
 
@@ -145,6 +149,13 @@ Sol evidence ZIP (126208 bytes, SHA-256
 could not be materialized in this environment using the official Library
 helper, including one authorized retry. Its hash is received provenance,
 not locally verified. Local fixtures above are our separate captures.
+
+The real OpenCode 2 SFH smoke returned `LOCAL MOCK OK` with `exit_bound`.
+An SFH one-second timeout returned failure, recorded `timed_out: true`, and
+left no owned OpenCode process. This exposed an error-classification gap:
+expected EOF after an SFH deadline was labelled missing terminal. The fix
+preserves protocol facts but gives the timeout/cancellation classification
+precedence; a process fixture guards timeout even after a completed text event.
 
 ### Additional interfaces considered
 

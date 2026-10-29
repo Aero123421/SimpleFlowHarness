@@ -19,6 +19,8 @@
   拡張の明示ロード・tool wildcard・default変更による権限拡大を検出します。
 - agy 1.4.10: 内部timeoutによる部分応答成功を避け、`--print-timeout 0`とsfhの
   外側deadlineに統一します。Codex/Claudeの既存fail-closed判定は維持します。
+- timeout・cancelによる未完了streamは、観測したprotocolを保持しつつ
+  `SFH_STEP_FAILED`・`SFH_INTERRUPTED`を優先し、adapter driftと誤分類しません。
 - `preflight --json`に実測版と検証範囲を追加。未認証、実CLI＋local mock、
   synthetic fixtureを区別し、現行Grok/Cursor未実測を明示します。
 - **破壊的変更:** `validate`、`runs list/show/why`も共通JSON envelopeを返します。
