@@ -138,16 +138,16 @@ complete `SHA256SUMS` file then binds `provenance.json` as well:
 ```json
 {
   "schema_version": 1,
-  "version": "1.6.1",
-  "tag": "v1.6.1",
+  "version": "2.0.0",
+  "tag": "v2.0.0",
   "commit": "<full sha>",
-  "source_archive": "sfh-1.6.1-source.tar.gz",
-  "archive_sha256": "<sha256 of sfh-1.6.1-source.tar.gz>",
+  "source_archive": "sfh-2.0.0-source.tar.gz",
+  "archive_sha256": "<sha256 of sfh-2.0.0-source.tar.gz>",
   "generated_utc": "<timestamp>",
   "assets": {
     "sfh-linux-x64.tar.gz": "<sha256>",
     "sfh-linux-x64.tar.gz.sha256": "<sha256>",
-    "sfh-1.6.1-source.tar.gz": "<sha256>"
+    "sfh-2.0.0-source.tar.gz": "<sha256>"
   }
 }
 ```
@@ -201,7 +201,7 @@ its sidecar first. On Linux or macOS:
 ```bash
 (
   set -eu
-  version=1.6.1
+  version=2.0.0
   base="https://github.com/Aero123421/SimpleFlowHarness/releases/download/v$version"
   curl --proto '=https' --tlsv1.2 -fLO "$base/sfh-installer.sh"
   curl --proto '=https' --tlsv1.2 -fLO "$base/sfh-installer.sh.sha256"
@@ -221,7 +221,7 @@ its sidecar first. On Linux or macOS:
 On Windows PowerShell:
 
 ```powershell
-$version = "1.6.1"
+$version = "2.0.0"
 $base = "https://github.com/Aero123421/SimpleFlowHarness/releases/download/v$version"
 Invoke-WebRequest "$base/sfh-installer.ps1" -OutFile sfh-installer.ps1
 Invoke-WebRequest "$base/sfh-installer.ps1.sha256" -OutFile sfh-installer.ps1.sha256

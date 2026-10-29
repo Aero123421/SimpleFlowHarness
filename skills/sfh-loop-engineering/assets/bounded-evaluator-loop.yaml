@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v2.0.0/schema/flow.schema.json
 api_version: 1
 name: bounded-independent-evaluator-loop
 
@@ -12,6 +12,7 @@ contexts:
       {{steps.evaluate.output | optional | truncate:16000}}
   verification:
     template: |
+      {{steps.verify.output | optional | truncate:8000}}
       exit={{steps.verify.exit | optional}}
       stdout={{steps.verify.output_file | optional}}
       stderr={{steps.verify.stderr_file | optional}}
@@ -32,6 +33,7 @@ steps:
   - id: build
     use: writer
     effects: workspace
+    allow_empty: true
     context: [task, acceptance, latest_evaluation]
     retry: {max: 1, backoff_sec: 5}
     retry_on: transient
@@ -43,9 +45,17 @@ steps:
     effects: read
     max_visits: 5
     on_max_visits: goto:handoff
+    # This sample checks whitespace only. Replace command AND exit mapping
+    # with project acceptance checks. git diff --check uses 2 for whitespace.
     cmd: ["git", "diff", "--check"]
-    on_error: goto:improve
-    route: [{goto: evaluate}]
+    outcomes:
+      0: {result: continue, label: checks_passed}
+      2: {result: continue, label: checks_failed}
+    on_error: goto:handoff
+    route:
+      - {when_label_is: checks_failed, goto: improve}
+      - {when_label_is: checks_passed, goto: evaluate}
+      - {goto: stuck}
 
   - id: evaluate
     use: evaluator
@@ -64,6 +74,7 @@ steps:
   - id: improve
     use: writer
     effects: workspace
+    allow_empty: true
     context: [task, acceptance, latest_evaluation, verification]
     max_visits: 4
     on_max_visits: goto:handoff

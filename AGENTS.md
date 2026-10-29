@@ -20,7 +20,7 @@ invariants.
 | `src/flow.rs` | YAML schema and static validation (steps, routes, outcomes, profiles, workspace, contexts, replay) |
 | `src/leaf.rs` | One step's prepare/execute: template-to-argv safety checks, per-tool output parsers, sessions, fan-out pool |
 | `src/preset.rs` | All per-tool adapter facts: argv builders, `AdapterInfo` (flags, gaps, enforcement), escalation guard |
-| `src/protocol.rs` | Fail-closed protocol evidence (`Plain/Valid/MissingTerminal/Invalid`) |
+| `src/protocol.rs` | Fail-closed protocol evidence (`Plain/Valid/ExitBound/MissingTerminal/Invalid`) |
 | `src/execute.rs` | Spawn, capture, interrupt tracking, detach, kill-tree, pid identity |
 | `src/contain.rs` | Path containment: nofollow opens, private perms, atomic writes, nonces |
 | `src/watch.rs` | `status`/`wait`/`stop`, owner-liveness proof (pid + start time) |
@@ -72,8 +72,10 @@ toolchain is pinned in `rust-toolchain.toml`.
 ## Invariants — do not break these
 
 - **Fail closed.** Missing/invalid success, session, or protocol evidence is
-  failure, never success. A parser that cannot prove the documented terminal
-  record arrived must not pass raw stdout along as an answer.
+  failure, never success. A parser must satisfy its adapter-specific completion contract; never invent
+  a terminal record or pass unparsed stdout as an answer. OpenCode 2 binds
+  structured text to process exit (`ExitBound`); other adapters require their
+  documented terminal evidence.
 - **No new dependencies** without an argued need. `cargo deny` gates; SHA-256
   is hand-rolled (`src/sha256.rs`) precisely to keep the tree small.
 - **Cross-OS byte-identical decisions.** Fingerprints normalise line endings;

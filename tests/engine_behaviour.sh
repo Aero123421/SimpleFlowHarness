@@ -1281,6 +1281,21 @@ YAML
 BACKGROUND_RUN_PID=$!
 BACKGROUND_RUN_WINPID="$(winpid_of "$BACKGROUND_RUN_PID")"
 BACKGROUND_CHILD_PID=""
+# A killed orphan can remain a zombie under a container PID 1 that does not
+# reap it. kill -0 alone calls that "alive" although it cannot run or own pipes.
+# Keep the running-process assertion strict; SFH reaps its direct children,
+# while the host reaper owns orphan descendants.
+background_child_stopped() {
+  if ! kill -0 "$1" 2>/dev/null; then return 0; fi
+  if [ "$(uname -s)" = Linux ]; then
+    case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 0 ;; esac
+  fi
+  return 1
+}
+if background_child_stopped "$$"; then
+  echo "FAIL - process-state fixture treated the running test shell as stopped"
+  fail=$((fail + 1))
+fi
 BACKGROUND_RUN_FINISHED=0
 BACKGROUND_CHILD_GONE=0
 # Process state is the assertion; this generous deadline only keeps a broken
@@ -1293,7 +1308,7 @@ for _ in $(seq 1 600); do
   if ! kill -0 "$BACKGROUND_RUN_PID" 2>/dev/null; then
     BACKGROUND_RUN_FINISHED=1
   fi
-  if [ -n "$BACKGROUND_CHILD_PID" ] && ! kill -0 "$BACKGROUND_CHILD_PID" 2>/dev/null; then
+  if [ -n "$BACKGROUND_CHILD_PID" ] && background_child_stopped "$BACKGROUND_CHILD_PID"; then
     BACKGROUND_CHILD_GONE=1
   fi
   if [ "$BACKGROUND_RUN_FINISHED" -eq 1 ] && [ "$BACKGROUND_CHILD_GONE" -eq 1 ]; then
@@ -1304,7 +1319,7 @@ done
 if [ -z "$BACKGROUND_CHILD_PID" ] && [ -s background-child.pid ]; then
   BACKGROUND_CHILD_PID="$(tr -d '\r\n' < background-child.pid 2>/dev/null || true)"
 fi
-if [ -n "$BACKGROUND_CHILD_PID" ] && ! kill -0 "$BACKGROUND_CHILD_PID" 2>/dev/null; then
+if [ -n "$BACKGROUND_CHILD_PID" ] && background_child_stopped "$BACKGROUND_CHILD_PID"; then
   BACKGROUND_CHILD_GONE=1
 fi
 if [ "$BACKGROUND_RUN_FINISHED" -eq 1 ]; then

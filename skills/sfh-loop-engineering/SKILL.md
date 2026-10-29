@@ -1,84 +1,25 @@
 ---
 name: sfh-loop-engineering
-description: >
-  Design stable, bounded SimpleFlowHarness loops: review/fix cycles, planner-builder-evaluator systems, long-running chunked work, multi-agent councils, and iterative improvement. Use when a route revisits a step, an AI must improve work over several laps, a run may last hours, or an existing sfh loop oscillates, repeats work, loses context, or never converges.
-compatibility: Written for sfh v1.6 loop, route, fan-out, budget, context, and resume semantics.
+description: >-
+  Design bounded feedback cycles in SimpleFlowHarness. Use for review/fix or planner/worker/evaluator loops, repeated route visits, or a loop that stalls.
+compatibility: SFH v2.0; use the installed guide and schema for exact syntax.
 metadata:
-  version: "1.0.0"
-  target-sfh: "1.6.x"
+  version: "1.1.0"
+  target-sfh: "2.0.x"
 ---
 
-# Engineer loops that make progress or stop honestly
+# Close the loop with evidence
 
-A loop is not “call the model again.” It is a state machine with a progress contract.
+SFH can run a worker → check → evaluator → correction loop. The check or evaluator supplies the verdict; SFH follows the declared route. Keep acceptance criteria fixed and pass current artifacts and blockers between visits.
 
-## Required loop contract
+Start from [the bounded evaluator loop](assets/bounded-evaluator-loop.yaml) with its task/acceptance files. Reuse one workspace, check after each write, and give the evaluator current evidence rather than relying on the writer's self-assessment. Replace the sample `git diff --check` with the project's acceptance checks.
 
-Before YAML, name:
+- Use a route revisit for REVISE, `retry` for a safe repeat of the invocation, `fallback` for a different profile, and `replay.unfinished` for interrupted work on resume.
+- Bound revisited steps with `max_visits` and `on_max_visits: goto:handoff`. Add a total-step or wall-clock ceiling; preserve blockers and land on `stuck` when exhausted. Reserve time for the full `on_budget` handoff.
+- `max_total_steps` counts logical leaf runs, not their retry attempts. Inspect `plan`'s `max_attempts`; cost limits cover reported USD only.
+- Separate a failed acceptance check from a check that could not run; map only documented outcomes to correction. Pass the check evidence and current evaluator blockers to both correction and handoff.
+- Route exact evaluator verdicts or validated wrapper outcomes; send unknown verdicts to `stuck`. SFH does not infer progress from prose. If repeated blockers should stop the loop early, encode that decision in an evaluator/check and route it.
+- Parallelize independent evaluators; serialize overlapping writers. Use `when_members` for exact member votes, with child `on_error: continue` when the group must inspect failures. Failed members do not vote.
+- Long work can use sequential chunks, artifacts and bounded handoffs. Session continuation and `compact` do not replace durable evidence.
 
-- invariant that must remain true every lap
-- evidence that changes when progress occurs
-- evaluator and its independence from the writer
-- deterministic checks between write and evaluation
-- maximum visits and total work
-- budget landing and durable handoff
-- behavior when the same blocker persists
-- behavior after a crash mid-step
-
-Read [references/stable-loop-patterns.md](references/stable-loop-patterns.md) for patterns and [references/convergence.md](references/convergence.md) for failure modes.
-
-## Canonical improvement loop
-
-```text
-fixed task contract
-→ writer changes current workspace
-→ deterministic checks
-→ independent evaluator
-→ PASS: end
-→ REVISE: smallest correction
-→ repeat under explicit bound
-→ bound/budget exhausted: durable handoff → stuck
-```
-
-Use the same workspace for one change series. Do not create a new worktree per visit. Give the reviewer current files and evidence, not only the writer's story.
-
-## Distinguish four repetitions
-
-- **retry:** same invocation after transient transport/infra failure
-- **fallback:** different profile/tool after retries
-- **revisit:** domain loop because work is not accepted yet
-- **resume replay:** crash recovery for work without a durable end
-
-Never use retry to “roll the dice again” on a logical rejection.
-
-## Prevent oscillation
-
-- Keep acceptance criteria immutable during the run.
-- Carry current unresolved findings, not every historical review.
-- Ask corrections to close named blockers and avoid unrelated rewrites.
-- Re-run deterministic checks after each write.
-- Prefer a fresh evaluator session when independence matters.
-- Set `max_visits` on the revisited writer and `on_max_visits: goto:handoff`.
-- Use `max_total_steps` and wall-clock landing as a second ceiling.
-- If output repeats without workspace/evidence progress, hand off rather than enlarge prompts indefinitely.
-
-## Long-running work
-
-Chunk work into dependency-ordered units with verifiable completion. Serialize writers in one workspace. Use structured artifacts and `notes`/named context to hand off between phases. `compact` is a transport optimization, not the source of truth; retain the original artifact.
-
-## Fan-out
-
-Parallelize independent readers/evaluators, not overlapping writers. For votes, use `when_members`; failed members do not vote. Give each child `on_error: continue` when the group route must inspect all verdicts.
-
-## Final checks
-
-A loop is acceptable only if you can answer:
-
-1. What improves per lap?
-2. Who verifies it?
-3. What machine evidence is refreshed?
-4. What stops the loop?
-5. What survives a crash?
-6. What happens when progress is ambiguous?
-
-Start from [assets/bounded-evaluator-loop.yaml](assets/bounded-evaluator-loop.yaml).
+For other shapes, use [loop patterns](references/stable-loop-patterns.md); for oscillation or stale feedback, use [convergence](references/convergence.md). Validate and dry-run the resulting graph, including rejection and exhaustion paths.

@@ -12,6 +12,8 @@ sfh handles process lifecycle, routing, logging, and recovery. Your commands and
 
 **Contents** — [What you get](#what-you-get) · [Installation](#installation) · [Quick Start](#quick-start) · [Flow format](#the-flow-format-in-one-table) · [Exit codes](#exit-codes) · [Programmatic use](#driving-sfh-from-a-program) · [Run artifacts](#what-a-run-leaves-behind) · [Documentation](#documentation)
 
+Version 2 targets the current CLI contracts. OpenCode requires v2 and uses fresh standalone sessions; Pi requires session-level settlement. See the [migration guide and measured support matrix](docs/harness-refresh-2026-10.md) before upgrading. Existing run data is preserved.
+
 ## What you get
 
 | Capability | How |
@@ -47,7 +49,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 brew install Aero123421/tap/sfh
 ```
 
-Pre-built binaries and SHA-256 checksums: [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest). Pin a version with `SFH_VERSION=1.6.1`, choose directories with `SFH_INSTALL_DIR` / `SFH_DATA_DIR`, skip `PATH` changes with `SFH_NO_MODIFY_PATH=1`. What each channel verifies — and what piped installs inherently trust — is documented in [docs/distribution.md](docs/distribution.md).
+Pre-built binaries and SHA-256 checksums: [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest). Pin a version with `SFH_VERSION=2.0.0`, choose directories with `SFH_INSTALL_DIR` / `SFH_DATA_DIR`, skip `PATH` changes with `SFH_NO_MODIFY_PATH=1`. What each channel verifies — and what piped installs inherently trust — is documented in [docs/distribution.md](docs/distribution.md).
 
 ## Quick Start
 
@@ -106,7 +108,7 @@ Routing predicates available on any step:
 | Predicate | Matches |
 |---|---|
 | `when_last_line_is: X` | exact final line of output |
-| `when_protocol_is:` `plain / valid / missing_terminal / invalid` | adapter protocol state after a failed leaf (requires `on_error: continue`) |
+| `when_protocol_is:` `plain / valid / exit_bound / missing_terminal / invalid` | adapter protocol state after a failed leaf (requires `on_error: continue`) |
 | `when_label_is: X` | a label you assigned to an exit code via `outcomes:` |
 | `when_members: {last_line_is: X, all/n: ...}` | consensus across `parallel` / `foreach` members |
 

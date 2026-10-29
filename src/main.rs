@@ -281,22 +281,6 @@ fn usage_err_for(command: &str, as_json: bool, msg: &str) -> i32 {
     }
 }
 
-fn bare_json_err(as_json: bool, msg: &str) -> i32 {
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": false,
-                "error": msg,
-            }))
-            .unwrap_or_default()
-        );
-        2
-    } else {
-        usage_err(msg)
-    }
-}
-
 fn need<'a>(rest: &'a [String], i: &mut usize, what: &str) -> Result<&'a String, String> {
     *i += 1;
     rest.get(*i).ok_or_else(|| format!("{what} needs a value"))
@@ -864,21 +848,25 @@ fn cmd_validate(rest: &[String]) -> i32 {
         match rest[i].as_str() {
             "--var" => {
                 if let Err(e) = parse_vars_flag(rest, &mut i, &mut vars) {
-                    return bare_json_err(requested_json, &e);
+                    return usage_err_for("validate", requested_json, &e);
                 }
             }
             "--profiles" => match need(rest, &mut i, "--profiles") {
                 Ok(v) => profiles.push(PathBuf::from(v)),
-                Err(e) => return bare_json_err(requested_json, &e),
+                Err(e) => return usage_err_for("validate", requested_json, &e),
             },
             "--strict" => strict = true,
             "--json" => as_json = true,
             s if s.starts_with('-') => {
-                return bare_json_err(requested_json, &format!("unknown flag '{s}'"))
+                return usage_err_for("validate", requested_json, &format!("unknown flag '{s}'"))
             }
             s => {
                 if flow_path.is_some() {
-                    return bare_json_err(requested_json, "more than one flow file given");
+                    return usage_err_for(
+                        "validate",
+                        requested_json,
+                        "more than one flow file given",
+                    );
                 }
                 flow_path = Some(PathBuf::from(s));
             }
@@ -886,7 +874,8 @@ fn cmd_validate(rest: &[String]) -> i32 {
         i += 1;
     }
     let Some(fp) = flow_path else {
-        return bare_json_err(
+        return usage_err_for(
+            "validate",
             requested_json,
             "usage: sfh validate <flow.yaml> [--var k=v]...",
         );
@@ -956,12 +945,13 @@ fn cmd_runs(rest: &[String]) -> i32 {
     let mut target: Option<PathBuf> = None;
     let sub = rest.first().map(String::as_str).unwrap_or("list");
     let requested_json = requested_json(rest);
+    let command = format!("runs {sub}");
     if rest.iter().any(|arg| arg == "-h" || arg == "--help") {
         let usage = match sub {
             "list" => "sfh runs list [--runs-dir d] [--state-dir d] [-n N] [--json]",
             "show" => "sfh runs show <run-dir> [--json]",
             "why" => "sfh runs why <run-dir> [--json]",
-            "clean" => "sfh runs clean [--runs-dir d] [--state-dir d] [--older-than DAYS] [--keep N] [--dry-run]",
+            "clean" => "sfh runs clean [--runs-dir d] [--state-dir d] [--older-than DAYS] [--keep N] [--dry-run] [--json]",
             "-h" | "--help" => "sfh runs list|show|why|clean [options]",
             _ => "sfh runs list|show|why|clean [options]",
         };
@@ -1002,7 +992,7 @@ fn cmd_runs(rest: &[String]) -> i32 {
                 dry = true;
                 Ok(())
             }
-            "--json" if sub == "list" || sub == "show" || sub == "why" => {
+            "--json" => {
                 as_json = true;
                 Ok(())
             }
@@ -1020,7 +1010,7 @@ fn cmd_runs(rest: &[String]) -> i32 {
             )),
         };
         if let Err(e) = r {
-            return bare_json_err(requested_json, &e);
+            return usage_err_for(&command, requested_json, &e);
         }
         i += 1;
     }
@@ -1029,14 +1019,19 @@ fn cmd_runs(rest: &[String]) -> i32 {
         "list" => runs::list(&runs_dir, limit, as_json),
         "show" => match target {
             Some(d) => runs::show(&d, as_json),
-            None => bare_json_err(requested_json, "usage: sfh runs show <run-dir>"),
+            None => usage_err_for(&command, requested_json, "usage: sfh runs show <run-dir>"),
         },
         "why" => match target {
             Some(d) => runs::why(&d, as_json),
-            None => bare_json_err(requested_json, "usage: sfh runs why <run-dir> [--json]"),
+            None => usage_err_for(
+                &command,
+                requested_json,
+                "usage: sfh runs why <run-dir> [--json]",
+            ),
         },
-        "clean" => runs::clean(&runs_dir, days, keep, dry),
-        other => bare_json_err(
+        "clean" => runs::clean(&runs_dir, days, keep, dry, as_json),
+        other => usage_err_for(
+            &command,
             requested_json,
             &format!("unknown runs subcommand '{other}' (list/show/why/clean)"),
         ),
@@ -1051,7 +1046,8 @@ mod tests {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         let pid = std::process::id();
-        let start = crate::execute::pid_start_time(pid);
+        // A terminal fixture whose original owner has exited (the PID was reused).
+        let start = Some(1);
         crate::contain::write_nonce(&dir, pid, start, "watch-order").unwrap();
         std::fs::write(
             dir.join("log.jsonl"),

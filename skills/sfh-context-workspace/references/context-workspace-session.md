@@ -61,8 +61,8 @@ Execution closure detects changes on resume, but a long live run should not depe
 
 ## Profile overlays
 
-Control logic stays in the flow; environment-specific binary/model settings live in overlays. Always inspect effective config and include overlay files in review.
+Control logic stays in the flow; environment-specific binary/model settings live in overlays. Keep provider-specific settings in the chosen overlay: scalar `null` does not clear a base value, and step-level settings override the profile. Inspect the effective plan when switching providers.
 
 ## Provider-native Skills
 
-Agent Skills may be used by the CLI that authors or executes work. sfh v1.6 does not have a native `skills:` field. If a runtime rule is required for correctness, include a stable distilled form through `contexts:` instead of relying only on hidden native skill activation.
+Agent Skills may be used by the CLI that authors or executes work. sfh v2.0 does not have a native `skills:` field. If a runtime rule is required for correctness, include a stable distilled form through `contexts:` instead of relying only on hidden native skill activation.

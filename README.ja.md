@@ -12,6 +12,8 @@ sfh はプロセスの起動・ルーティング・記録・復旧だけを行�
 
 **目次** — [できること](#できること) · [インストール](#インストール) · [クイックスタート](#クイックスタート) · [フロー形式](#フロー形式まとめ) · [終了コード](#終了コード) · [プログラムからの実行](#プログラムからの実行) · [実行後に残るもの](#実行後に残るもの) · [ドキュメント](#ドキュメント)
 
+v2 は現行 CLI の契約に対応します。OpenCode は v2 の独立した新規セッション、Pi はセッション終端の確認を使用します。更新前に[移行手順と実測対応表](docs/harness-refresh-2026-10.md)を確認してください。既存の実行データは削除しません。
+
 ## できること
 
 | 機能 | 仕組み |
@@ -47,7 +49,7 @@ irm https://github.com/Aero123421/SimpleFlowHarness/releases/latest/download/sfh
 brew install Aero123421/tap/sfh
 ```
 
-ビルド済みバイナリとSHA-256チェックサムは [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)。バージョン固定は `SFH_VERSION=1.6.1`、インストール先の変更は `SFH_INSTALL_DIR` / `SFH_DATA_DIR`、PATH書き換えの抑止は `SFH_NO_MODIFY_PATH=1`。各インストール方法が何を検証し、何を信頼しているかは [docs/distribution.md](docs/distribution.md) にあります。
+ビルド済みバイナリとSHA-256チェックサムは [GitHub Releases](https://github.com/Aero123421/SimpleFlowHarness/releases/latest)。バージョン固定は `SFH_VERSION=2.0.0`、インストール先の変更は `SFH_INSTALL_DIR` / `SFH_DATA_DIR`、PATH書き換えの抑止は `SFH_NO_MODIFY_PATH=1`。各インストール方法が何を検証し、何を信頼しているかは [docs/distribution.md](docs/distribution.md) にあります。
 
 ## クイックスタート
 
@@ -106,7 +108,7 @@ AIステップは既定で `allow_empty: false` です。最終メッセージ�
 | 条件 | 判定内容 |
 |---|---|
 | `when_last_line_is: X` | 出力の最終行が厳密に一致 |
-| `when_protocol_is:` `plain / valid / missing_terminal / invalid` | 失敗したリーフのプロトコル状態（`on_error: continue` が前提） |
+| `when_protocol_is:` `plain / valid / exit_bound / missing_terminal / invalid` | 失敗したリーフのプロトコル状態（`on_error: continue` が前提） |
 | `when_label_is: X` | `outcomes:` で終了コードに付けたラベル |
 | `when_members: {last_line_is: X, all/n: ...}` | `parallel` / `foreach` メンバーの多数決 |
 

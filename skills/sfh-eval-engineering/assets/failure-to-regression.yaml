@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v2.0.0/schema/flow.schema.json
 api_version: 1
 name: failure-to-regression-eval
 
@@ -9,10 +9,13 @@ contexts:
   acceptance: {file: ./ACCEPTANCE.md}
   latest_failure:
     template: |
-      reproduce stdout={{steps.reproduce.output_file | optional}}
-      reproduce stderr={{steps.reproduce.stderr_file | optional}}
-      focused stdout={{steps.focused.output_file | optional}}
-      focused stderr={{steps.focused.stderr_file | optional}}
+      reproduction: {{steps.reproduce.output | optional | truncate:5000}}
+      exit={{steps.reproduce.exit | optional}} stderr={{steps.reproduce.stderr_file | optional}}
+      focused: {{steps.focused.output | optional | truncate:5000}}
+      exit={{steps.focused.exit | optional}} stderr={{steps.focused.stderr_file | optional}}
+      regression: {{steps.regression.output | optional | truncate:5000}}
+      exit={{steps.regression.exit | optional}} stderr={{steps.regression.stderr_file | optional}}
+      review: {{steps.review.output | optional | truncate:5000}}
 
 profiles:
   engineer: {tool: pi, access: write}
@@ -20,22 +23,31 @@ profiles:
 
 steps:
   - id: write_eval
+    allow_empty: true
     use: engineer
     effects: workspace
     context: [incident, acceptance]
     prompt: |
+      Also create tools/check_incident.py: run the focused regression and inspect
+      its assertion evidence against the incident. Exit 0 if it passes, 20 only
+      for the confirmed incident failure, and 2 if inspection cannot complete.
+      With --regression, run the full suite: 20 requires actual failing assertions.
+      Print expected/observed evidence. Never map arbitrary nonzero to 20.
       Add the smallest deterministic regression test or fixture reproducing the
       incident. Do not fix production code yet.
+    route: [{goto: reproduce}]
 
-  # Replace with the project-specific focused test command. It is expected to
-  # fail before the fix, so outcome 2 is a valid continue result.
+  # tools/check_incident.py is project-specific, created with the regression.
+  # 0 = checks pass; 20 = verified assertion failure; other = cannot inspect.
+  # Before fixing, 20 must identify THIS incident, not just any failed test.
   - id: reproduce
-    effects: read
-    cmd: ["python", "-m", "pytest", "-q", "tests/regression_test.py"]
+    effects: workspace
+    cmd: ["python", "tools/check_incident.py"]
+    timeout_sec: 1800
     outcomes:
-      0: {result: fail, label: test_did_not_reproduce}
-      1: {result: continue, label: reproduced}
-    on_error: goto:handoff
+      0: {result: continue, label: not_reproduced}
+      20: {result: continue, label: reproduced}
+    on_error: goto:stuck
     route:
       - {when_label_is: reproduced, goto: fix}
       - {goto: stuck}
@@ -43,6 +55,7 @@ steps:
   - id: fix
     use: engineer
     effects: workspace
+    allow_empty: true
     context: [incident, acceptance, latest_failure]
     max_visits: 3
     on_max_visits: goto:handoff
@@ -52,15 +65,30 @@ steps:
       - {goto: focused}
 
   - id: focused
-    effects: read
-    cmd: ["python", "-m", "pytest", "-q", "tests/regression_test.py"]
-    on_error: goto:fix
+    effects: workspace
+    cmd: ["python", "tools/check_incident.py"]
+    timeout_sec: 1800
+    outcomes:
+      0: {result: continue, label: checks_passed}
+      20: {result: continue, label: checks_failed}
+    on_error: goto:stuck
+    route:
+      - {when_label_is: checks_failed, goto: fix}
+      - {when_label_is: checks_passed, goto: regression}
+      - {goto: stuck}
 
   - id: regression
-    effects: read
-    cmd: ["python", "-m", "pytest", "-q"]
-    on_error: goto:fix
-    route: [{goto: review}]
+    effects: workspace
+    cmd: ["python", "tools/check_incident.py", "--regression"]
+    timeout_sec: 1800
+    outcomes:
+      0: {result: continue, label: checks_passed}
+      20: {result: continue, label: checks_failed}
+    on_error: goto:stuck
+    route:
+      - {when_label_is: checks_failed, goto: fix}
+      - {when_label_is: checks_passed, goto: review}
+      - {goto: stuck}
 
   - id: review
     use: reviewer

@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json",
+  "$id": "https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v2.0.0/schema/flow.schema.json",
   "title": "sfh flow",
   "description": "A SimpleFlowHarness flow: staged AI CLI invocations with routing, parallelism and session continuation.",
   "type": "object",
@@ -407,9 +407,10 @@
             "plain",
             "valid",
             "missing_terminal",
+            "exit_bound",
             "invalid"
           ],
-          "description": "Equality against sfh's recorded structured-protocol state for this leaf. cmd: steps are plain; preset tool steps are valid, missing_terminal, or invalid."
+          "description": "Equality against sfh's recorded structured-protocol state for this leaf. cmd: steps are plain; preset tool steps are valid, exit_bound, missing_terminal, or invalid."
         }
       }
     },

@@ -1,34 +1,20 @@
 //! Preset command builders for the supported AI CLIs.
 //!
-//! Grounded in live-verified research (2026-07-27) against:
-//!   codex-cli 0.146.0-alpha.3.1, claude 2.1.220, opencode 1.18.3,
-//!   grok 0.2.112, agy 1.0.8.
+//! Measured versions and scope live in AdapterInfo and
+//! docs/harness-refresh-2026-10.md. A help probe is not an authenticated turn.
 //!
-//! Every preset runs in the tool's machine-readable output mode, which gives
-//! three things at once: a clean final message, the session id, and token/cost
-//! usage. Key per-tool facts encoded here:
-//! - codex: prompt on stdin via '-'; final text from --output-last-message;
-//!   `--json` stdout carries thread.started/turn.completed; `exec resume` and
-//!   `exec fork` (P1-07) both lack -s, so the sandbox is re-specified with
-//!   -c sandbox_mode=...; fork ships after this file's LAST_VERIFIED date, so
-//!   sfh additionally demands a live --help probe of the installed binary
-//!   before it will use it (see `codex_fork_confirmed`).
-//! - claude: prompt on stdin; --output-format json gives .result/.session_id/
-//!   .total_cost_usd; plan mode is only advisory, so read = dontAsk + --tools.
-//! - opencode: prompt on stdin; --auto is mandatory headless (an "ask" hangs
-//!   forever); --format json emits NDJSON with sessionID on every line.
-//! - grok: prompt ONLY via --prompt-file (stdin opens the TUI and hangs);
-//!   --output-format json gives .text/.sessionId; read = dontAsk + --deny.
-//! - agy: prompt ONLY as the value of a trailing -p; --output-format json gives
-//!   .response/.status/.conversation_id; --print-timeout defaults to 5m.
-//! - pi: prompt on stdin; --mode json emits JSONL (session header, then
-//!   message_end events); --session-id both creates and resumes; there is no
-//!   sandbox at all, so access levels are expressed as a --tools allowlist.
-//! - cursor: prompt on stdin, but ONLY when no positional prompt is given;
-//!   --output-format json returns one .result envelope; headless permissions are
-//!   binary (deny-all without --force, approve-all with it); --resume creates or
-//!   resumes, so a resume is only trustworthy once sfh has checked that the
-//!   chat's store.db still exists in the same directory bucket.
+//! - Codex uses stdin, a final-message file, and JSONL turn evidence. Resume
+//!   and fork rebuild the sandbox via config; fork additionally probes help.
+//! - Claude uses stdin and a typed JSON result; is_error wins over subtype.
+//! - OpenCode 2 uses stdin and a private standalone server. Completed text
+//!   plus clean process exit can be the entire contract; usage is optional.
+//!   Verified native resume/fork is deliberately unsupported.
+//! - Grok uses a prompt file and JSON; its current binary remains unverified.
+//! - agy receives the prompt as the last -p value; SFH owns the hard deadline.
+//! - Pi JSONL requires session-level settlement after its last automatic work.
+//!   Its tool allowlists are not a sandbox; read/write disable MCP/extensions.
+//! - Cursor uses stdin and a JSON result; its resume store must still exist.
+//!   Its current binary remains unverified.
 
 use std::path::{Path, PathBuf};
 
@@ -209,8 +195,6 @@ pub struct PresetInput<'a> {
     pub extra: &'a [String],
     /// Replaces the preset's default executable name (argv[0]).
     pub bin: Option<String>,
-    /// Step timeout; agy needs it as a CLI flag (--print-timeout), not just a kill timer.
-    pub timeout_sec: Option<u64>,
 }
 
 pub struct BuildPaths<'a> {
@@ -269,8 +253,7 @@ pub fn session_is_cwd_scoped(tool: &str) -> bool {
     matches!(tool, "claude" | "grok" | "agy" | "pi" | "cursor")
 }
 
-/// Fork resolution is more tolerant than resume: pi's --fork looks up the id
-/// project-locally then globally, and opencode session ids are global. codex
+/// Pi fork lookup searches project-locally then globally. Codex
 /// stays out of this list for the same reason it is absent from
 /// `session_is_cwd_scoped`: sfh has no evidence that codex scopes a thread id
 /// to the directory it was created in, so treating a cwd change as risky here
@@ -298,7 +281,11 @@ pub fn supports_fork(tool: &str) -> bool {
 /// not do the thing sfh had just started doing. A refusal that names the wrong
 /// alternatives is worse than one that names none, so the messages now read
 /// from the same slice the decision does.
-pub const FORKABLE: &[&str] = &["codex", "claude", "opencode", "grok", "pi"];
+pub const FORKABLE: &[&str] = &["codex", "claude", "grok", "pi"];
+
+pub fn supports_resume(tool: &str) -> bool {
+    tool != "opencode"
+}
 
 /// `FORKABLE` as a message fragment, in the shape both refusals want.
 pub fn forkable_list() -> String {
@@ -332,6 +319,8 @@ pub enum Coverage {
     Cost,
     /// Token counts only; a cost ceiling cannot be enforced from them.
     TokensOnly,
+    /// The current protocol does not reliably report either cost or tokens.
+    Unavailable,
 }
 
 impl Coverage {
@@ -339,6 +328,7 @@ impl Coverage {
         match self {
             Coverage::Cost => "cost",
             Coverage::TokensOnly => "tokens-only",
+            Coverage::Unavailable => "unavailable",
         }
     }
 }
@@ -426,6 +416,8 @@ pub struct AdapterInfo {
     pub default_program: String,
     /// When this adapter's command line was last checked against the real CLI.
     pub last_verified: &'static str,
+    pub verified_version: &'static str,
+    pub verification_scope: &'static str,
     /// `None` unless a floor is documented (see the struct doc comment); every
     /// `Some` cites its source where it is pinned in `adapter_info`.
     pub minimum_version: Option<&'static str>,
@@ -538,19 +530,16 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
         ),
         "opencode" => (
             "opencode-ndjson",
-            Coverage::Cost,
-            // P0-02: downgraded from Enforced. OPENCODE_CONFIG_CONTENT only
-            // denies the permission keys sfh names; --auto approves whatever
-            // it does not name, so an unnamed capability defaults to open.
+            Coverage::Unavailable,
             [BestEffort, BestEffort, BestEffort],
-            &["run", "--format", "--variant", "--agent", "--auto", "--fork"],
+            &["run", "--standalone", "--format", "--model", "--agent", "--auto"],
             &["run"],
             &[
-                "read/write are enforced through OPENCODE_CONFIG_CONTENT, which merges with the user's own config",
-                "there is no OS sandbox, so write denies bash outright",
-                "--auto approves anything the config does not explicitly deny, so a capability this preset's deny list omits defaults to allowed",
-                "task (subagent) and skill invocations are not covered by the edit/bash/external_directory denies this preset writes",
-                "MCP servers and custom tools sit outside the permission keys this preset sets, and plugins run outside the permission system entirely",
+                "OpenCode 2 uses a private --standalone server; process exit and valid text events are the completion contract, not a guaranteed terminal event",
+                "read/write use v2 agent permission allowlists; task/subagent, skill, MCP and new actions are denied, but plugin code and managed configuration are outside this boundary",
+                "--auto resolves asks only; explicit denies remain; this is not an OS sandbox",
+                "continue_from/fork_from are refused: an unknown session id creates a new session and stdout does not attest its creation marker or parent",
+                "normal v2 output can omit usage entirely, so no cost or token coverage is promised",
             ],
             None,
         ),
@@ -636,6 +625,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
                 "--thinking",
                 "--tools",
                 "--no-extensions",
+                "--no-mcp",
                 "--no-skills",
                 "--no-prompt-templates",
                 "--no-context-files",
@@ -646,7 +636,7 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
             ],
             &[],
             &[
-                "no sandbox at all: access is expressed purely as a --tools allowlist, and write therefore excludes bash",
+                "no sandbox at all: read/write disable MCP and extension discovery and use a built-in --tools allowlist; write excludes shell tools",
                 "--session-id CREATES a session when the id is not found in this cwd, so a resume is only trustworthy with the session marker",
                 "--no-context-files stops pi reading AGENTS.md/CLAUDE.md off disk, but a SYSTEM or APPEND_SYSTEM environment variable injects a hidden system prompt through a path sfh does not scrub",
             ],
@@ -683,13 +673,25 @@ pub fn adapter_info(tool: &str) -> Option<AdapterInfo> {
         ),
         _ => return None,
     };
+    let (last_verified, verified_version, verification_scope) = match tool {
+        "codex" => ("2026-10-29", "0.165.0", "version/help and unauthenticated failure; authenticated turns untested"),
+        "claude" => ("2026-10-29", "2.1.312", "version/help and unauthenticated JSON failure; authenticated turns untested"),
+        "opencode" => ("2026-10-29", "2.2.1", "version/help and real CLI with loopback mock provider; no paid model calls"),
+        "pi" => ("2026-10-29", "1.4.0", "version/help, no-key failure and real CLI with loopback mock provider; no paid model calls"),
+        "agy" => ("2026-10-29", "1.4.10", "version/help; isolated no-auth probe timed out; authenticated turns untested"),
+        "grok" => ("2026-09-07", "1.0.13", "historical CLI checks only; current 1.0.70 installer denied by network policy"),
+        "cursor" => (LAST_VERIFIED, "historical baseline", "current 2026.10.22-27dcf5f installer denied by network policy"),
+        _ => unreachable!(),
+    };
     Some(AdapterInfo {
         tool: crate::flow::TOOLS.iter().find(|t| **t == tool)?,
         default_program: default_program(tool),
-        last_verified: LAST_VERIFIED,
+        last_verified,
+        verified_version,
+        verification_scope,
         minimum_version: min_version,
         protocol,
-        supports_resume: true,
+        supports_resume: supports_resume(tool),
         supports_fork: supports_fork(tool),
         cost_coverage: cost,
         policy_coverage: policy,
@@ -823,6 +825,7 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
             a,
             &[
                 "--no-extensions",
+                "--no-mcp",
                 "--no-skills",
                 "--no-prompt-templates",
                 "--no-context-files",
@@ -834,6 +837,7 @@ fn pi_common(a: &mut Vec<String>, inp: &PresetInput, warnings: &mut Vec<String>)
                 a,
                 &[
                     "--no-extensions",
+                    "--no-mcp",
                     "--no-skills",
                     "--no-prompt-templates",
                     "--no-context-files",
@@ -1278,23 +1282,9 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                 }
             }
             "opencode" => {
-                // The agent selects the permission set; "build" is the known
-                // write tier. A custom agent could be anything, so anything
-                // else is let through (a miss is still the user's own config).
                 if flag == "--agent" {
-                    if let Some(v) = value_of(true) {
-                        let clean = unquote(&v);
-                        if clean == "build" {
-                            if let Some(e) = wider(
-                                a,
-                                "the build agent edits files, above the declared 'read'"
-                                    .to_string(),
-                                1,
-                                access,
-                            ) {
-                                return Some(e);
-                            }
-                        }
+                    if let Some(e) = wider(a, "raw --agent can bypass the selected agent's permission rules; use agent: instead".into(), 2, access) {
+                        return Some(e);
                     }
                 }
             }
@@ -1372,10 +1362,12 @@ pub fn find_escalation(tool: &str, access: Access, args: &[String]) -> Option<Es
                 }
             }
             "pi" => {
-                if flag == "--approve" && access != Access::Full {
+                if matches!(flag.as_str(), "--approve" | "-a" | "--extension" | "-e")
+                    && access != Access::Full
+                {
                     return Some(Escalation {
                         arg: a.clone(),
-                        reason: "auto-approves every action (= full access)".to_string(),
+                        reason: "trusts project resources or explicitly loads executable extensions (= full access)".to_string(),
                     });
                 }
                 if flag == "--tools" || flag == "-t" {
@@ -1442,6 +1434,31 @@ mod claude_access_tests {
     use super::*;
 
     #[test]
+    fn pi_current_tool_selectors_and_explicit_extensions_cannot_widen_access() {
+        for values in [
+            vec!["--tools", "+bash"],
+            vec!["--tools", "-write"],
+            vec!["--tools", "*"],
+            vec!["-t", "b*"],
+            vec!["--tools", "read,+powershell"],
+            vec!["--tools", "mcp__remote__run"],
+            vec!["--extension", "local.ts"],
+            vec!["-e", "local.ts"],
+            vec!["-a"],
+        ] {
+            let args = values.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert!(
+                find_escalation("pi", Access::Read, &args).is_some(),
+                "{values:?}"
+            );
+            assert!(
+                find_escalation("pi", Access::Full, &args).is_none(),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
     fn claude_variadic_alias_and_shell_tools_cannot_widen_read_access() {
         for values in [
             vec!["--tools", "Read", "Bash"],
@@ -1483,17 +1500,25 @@ mod claude_access_tests {
 
 /// pi --tools/-t: bash is full, edit/write are the write tier.
 fn pi_tool_list_rank(list: &str) -> u8 {
-    let tools: Vec<String> = list
+    let tools: Vec<&str> = list
         .split(',')
-        .map(|t| t.trim().trim_matches('"').to_lowercase())
+        .map(|t| t.trim().trim_matches('"'))
         .collect();
-    if tools.iter().any(|t| t == "bash" || t == "powershell") {
-        2
-    } else if tools.iter().any(|t| t == "edit" || t == "write") {
-        1
-    } else {
-        0
+    // Pi 1.4 accepts wildcard/custom names and additive/subtractive selectors.
+    // A list consisting only of +/- entries modifies defaults (including bash).
+    // Do not reimplement its pattern language: unprovable scope is full.
+    if tools.iter().any(|t| t.starts_with(['+', '-'])) {
+        return 2;
     }
+    tools
+        .iter()
+        .map(|tool| match *tool {
+            "" | "read" | "grep" | "find" | "ls" => 0,
+            "edit" | "write" => 1,
+            _ => 2,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The shared error text for a widening arg. Deliberately does NOT suggest
@@ -1551,25 +1576,42 @@ fn opencode_agent(a: &mut Vec<String>, inp: &PresetInput) -> String {
 /// silently vanish - or, worse, valid JSON with an attacker-chosen structure.
 /// `serde_json` escapes the key for us, so no name can do either.
 fn opencode_env(agent_name: &str, access: Access) -> Vec<(String, String)> {
-    let config = match access {
-        // The stock plan agent denies edits but NOT bash (1.18.3), so a read step
-        // could still write via shell redirection. OPENCODE_CONFIG_CONTENT is the
-        // highest-precedence config layer and merges with the user's config.
-        Access::Read => serde_json::json!({
-            "agent": { agent_name: { "permission": { "edit": "deny", "bash": "deny" } } }
-        }),
-        // --auto auto-approves whatever is not explicitly denied, so write denies
-        // two things: bash (opencode has no OS sandbox - an auto-approved shell
-        // would make write == full, the same rule pi/claude/grok follow) and
-        // out-of-tree writes. Agent-scoped so a user-selected agent cannot
-        // inherit looser defaults.
-        Access::Write => serde_json::json!({
-            "agent": { agent_name: { "permission": { "bash": "deny" } } },
-            "permission": { "external_directory": "deny" }
-        }),
-        Access::Full => return Vec::new(),
-    };
+    if access == Access::Full {
+        return Vec::new();
+    }
+    // V2 uses ordered permissions, agents (plural), and shell. A default deny
+    // also bounds newly registered actions; plugins and managed policy remain
+    // outside this best-effort tool boundary. See docs/harness-refresh-2026-10.md.
+    let mut rules = vec![serde_json::json!({"action":"*","resource":"*","effect":"deny"})];
+    let mut allowed = vec!["read", "glob", "grep", "webfetch", "websearch"];
+    if access == Access::Write {
+        allowed.push("edit");
+    } else {
+        allowed.push("external_directory");
+    }
+    for action in allowed {
+        rules.push(serde_json::json!({"action":action,"resource":"*","effect":"allow"}));
+    }
+    let config = serde_json::json!({"agents": {agent_name: {"permissions": rules}}});
     vec![("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string())]
+}
+
+fn reject_agy_soft_timeout(tool: &str, args: &[String]) -> Result<(), String> {
+    if tool == "agy"
+        && args
+            .iter()
+            // agy's Go flag parser accepts one or two leading dashes and
+            // either separated or equals values (independent v2 review).
+            .any(|arg| {
+                matches!(
+                    arg.split('=').next(),
+                    Some("-print-timeout" | "--print-timeout")
+                )
+            })
+    {
+        return Err("agy --print-timeout can return partial success; use timeout_sec for sfh's hard deadline".into());
+    }
+    Ok(())
 }
 
 /// Build the command line for a fresh (non-resumed) preset run.
@@ -1579,6 +1621,7 @@ pub fn build(
     paths: &BuildPaths,
     preassign_session: Option<&str>,
 ) -> Result<Built, String> {
+    reject_agy_soft_timeout(tool, inp.extra)?;
     let mut a: Vec<String> = Vec::new();
     let mut warnings = Vec::new();
     let mut env_remove = Vec::new();
@@ -1639,19 +1682,47 @@ pub fn build(
             delivery = Delivery::Stdin;
         }
         "opencode" => {
-            push(&mut a, &["opencode", "run", "--format", "json"]);
-            if let Some(m) = &inp.model {
-                push(&mut a, &["-m"]);
-                a.push(m.clone());
+            // A shared or remote server outlives sfh's owned process tree. Do
+            // not let raw args silently replace this lifecycle or session mode.
+            if inp.extra.iter().any(|a| {
+                matches!(
+                    a.split('=').next().unwrap_or(a),
+                    "--server"
+                        | "--standalone"
+                        | "--session"
+                        | "-s"
+                        | "--continue"
+                        | "-c"
+                        | "--fork"
+                )
+            }) {
+                return Err("opencode server and session flags are managed by sfh; use a fresh standalone step".into());
             }
-            if let Some(e) = &inp.effort {
-                push(&mut a, &["--variant"]);
-                a.push(e.clone());
+            push(
+                &mut a,
+                &["opencode", "--standalone", "run", "--format", "json"],
+            );
+            match (&inp.model, &inp.effort) {
+                (Some(model), effort) => {
+                    let model = if let Some(effort) = effort {
+                        if model.contains('#') {
+                            return Err(
+                                "opencode: use either model#variant or effort, not both".into()
+                            );
+                        }
+                        format!("{model}#{effort}")
+                    } else {
+                        model.clone()
+                    };
+                    push(&mut a, &["--model"]);
+                    a.push(model);
+                }
+                (None, Some(_)) => {
+                    return Err("opencode effort requires an explicit provider/model".into())
+                }
+                (None, None) => {}
             }
             let agent_name = opencode_agent(&mut a, &inp);
-            // --auto is mandatory headless: any permission that resolves to "ask"
-            // has no UI in `opencode run` and hangs forever. Explicit deny rules
-            // are still enforced with --auto.
             push(&mut a, &["--auto"]);
             env_set = opencode_env(&agent_name, inp.access);
             a.extend(inp.extra.iter().cloned());
@@ -1694,10 +1765,8 @@ pub fn build(
                 push(&mut a, &["--agent"]);
                 a.push(ag.clone());
             }
-            // agy's --print-timeout defaults to 5m0s and kills longer runs.
-            let t = inp.timeout_sec.unwrap_or(3600);
-            push(&mut a, &["--print-timeout"]);
-            a.push(format!("{t}s"));
+            // Internal expiry can return partial success in 1.4; sfh owns the deadline.
+            push(&mut a, &["--print-timeout", "0"]);
             match inp.access {
                 Access::Read => push(&mut a, &["--mode", "plan"]),
                 Access::Write => push(&mut a, &["--mode", "accept-edits"]),
@@ -1812,10 +1881,11 @@ pub fn build_resume(
     inp: PresetInput,
     paths: &BuildPaths,
 ) -> Result<Built, String> {
+    reject_agy_soft_timeout(tool, inp.extra)?;
     let mut a: Vec<String> = Vec::new();
     let mut warnings = Vec::new();
     let mut env_remove = Vec::new();
-    let mut env_set = Vec::new();
+    let env_set = Vec::new();
     let parse;
     let delivery;
     let mut expect_session = None;
@@ -1870,25 +1940,7 @@ pub fn build_resume(
             parse = OutputParse::ClaudeJson;
             delivery = Delivery::Stdin;
         }
-        "opencode" => {
-            push(&mut a, &["opencode", "run", "--format", "json", "-s"]);
-            a.push(session_id.to_string());
-            if let Some(m) = &inp.model {
-                push(&mut a, &["-m"]);
-                a.push(m.clone());
-            }
-            if let Some(e) = &inp.effort {
-                push(&mut a, &["--variant"]);
-                a.push(e.clone());
-            }
-            let agent_name = opencode_agent(&mut a, &inp);
-            push(&mut a, &["--auto"]);
-            env_set = opencode_env(&agent_name, inp.access);
-            a.extend(inp.extra.iter().cloned());
-            expect_session = Some(session_id.to_string());
-            parse = OutputParse::OpencodeNdjson;
-            delivery = Delivery::Stdin;
-        }
+        "opencode" => return Err("opencode 2 cannot verify resume or fork continuity: an unknown id creates a new session; pass prior output as context to a fresh step".into()),
         "grok" => {
             push(&mut a, &["grok", "--output-format", "json", "--resume"]);
             a.push(session_id.to_string());
@@ -1921,9 +1973,7 @@ pub fn build_resume(
                 push(&mut a, &["--agent"]);
                 a.push(ag.clone());
             }
-            let t = inp.timeout_sec.unwrap_or(3600);
-            push(&mut a, &["--print-timeout"]);
-            a.push(format!("{t}s"));
+            push(&mut a, &["--print-timeout", "0"]);
             match inp.access {
                 Access::Read => push(&mut a, &["--mode", "plan"]),
                 Access::Write => push(&mut a, &["--mode", "accept-edits"]),
@@ -2056,10 +2106,10 @@ pub fn build_fork(
     let mut a: Vec<String> = Vec::new();
     let mut warnings = Vec::new();
     let mut env_remove = Vec::new();
-    let mut env_set = Vec::new();
+    let env_set = Vec::new();
     let parse;
     let delivery;
-    // opencode and codex mint the child id themselves; the others let sfh
+    // Codex mints the child id itself; the others let sfh
     // name it.
     let mut preassigned = Some(child_session_id.to_string());
     match tool {
@@ -2140,26 +2190,7 @@ pub fn build_fork(
             parse = OutputParse::ClaudeJson;
             delivery = Delivery::Stdin;
         }
-        "opencode" => {
-            push(&mut a, &["opencode", "run", "--format", "json", "-s"]);
-            a.push(parent_session_id.to_string());
-            push(&mut a, &["--fork"]);
-            if let Some(m) = &inp.model {
-                push(&mut a, &["-m"]);
-                a.push(m.clone());
-            }
-            if let Some(e) = &inp.effort {
-                push(&mut a, &["--variant"]);
-                a.push(e.clone());
-            }
-            let agent_name = opencode_agent(&mut a, &inp);
-            push(&mut a, &["--auto"]);
-            env_set = opencode_env(&agent_name, inp.access);
-            a.extend(inp.extra.iter().cloned());
-            preassigned = None; // the child id only exists in the output stream
-            parse = OutputParse::OpencodeNdjson;
-            delivery = Delivery::Stdin;
-        }
+        "opencode" => return Err("opencode 2 cannot verify resume or fork continuity: an unknown id creates a new session; pass prior output as context to a fresh step".into()),
         "grok" => {
             push(&mut a, &["grok", "--output-format", "json", "--resume"]);
             a.push(parent_session_id.to_string());
@@ -2275,7 +2306,6 @@ mod tests {
             agent: None,
             extra,
             bin: None,
-            timeout_sec: Some(900),
         }
     }
 
@@ -2332,8 +2362,34 @@ mod tests {
         );
         assert!(argv
             .windows(2)
-            .any(|w| w[0] == "--print-timeout" && w[1] == "900s"));
+            .any(|w| w[0] == "--print-timeout" && w[1] == "0"));
         assert!(argv.windows(2).any(|w| w[0] == "--mode" && w[1] == "plan"));
+    }
+
+    #[test]
+    fn agy_rejects_both_go_flag_spellings_of_soft_timeout_on_fresh_and_resume() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        for flag in ["-print-timeout", "--print-timeout"] {
+            for extra in [
+                vec![flag.to_string(), "1s".into()],
+                vec![format!("{flag}=1s")],
+            ] {
+                for access in [Access::Read, Access::Write, Access::Full] {
+                    let fresh = build("agy", inp(access, &extra), &bp, None)
+                        .err()
+                        .expect("fresh must reject soft timeout");
+                    assert!(fresh.contains("timeout_sec"), "{fresh}");
+                    let resumed = build_resume("agy", "session", inp(access, &extra), &bp)
+                        .err()
+                        .expect("resume must reject soft timeout");
+                    assert!(resumed.contains("timeout_sec"), "{resumed}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2384,6 +2440,49 @@ mod tests {
     }
 
     #[test]
+    fn opencode_v2_selects_variant_and_owns_server_lifetime_but_refuses_unprovable_sessions() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        let mut input = inp(Access::Read, &[]);
+        input.model = Some("provider/model".into());
+        input.effort = Some("high".into());
+        let built = build("opencode", input, &bp, None).unwrap();
+        assert!(built
+            .argv
+            .windows(2)
+            .any(|w| w == ["--model", "provider/model#high"]));
+        assert!(built.argv.iter().any(|a| a == "--standalone"));
+        assert!(!built.argv.iter().any(|a| a == "--variant"));
+        assert!(!adapter_info("opencode").unwrap().supports_resume);
+        assert!(!supports_fork("opencode"));
+        assert!(build_resume("opencode", "missing", inp(Access::Read, &[]), &bp).is_err());
+        assert!(build_fork(
+            "opencode",
+            "missing",
+            "child",
+            inp(Access::Read, &[]),
+            &bp,
+            None
+        )
+        .is_err());
+        for arg in [
+            "--server=http://localhost",
+            "--standalone=false",
+            "--session=missing",
+            "--continue",
+            "--fork",
+        ] {
+            assert!(
+                build("opencode", inp(Access::Full, &[arg.into()]), &bp, None).is_err(),
+                "{arg}"
+            );
+        }
+    }
+
+    #[test]
     fn opencode_is_always_auto_and_hardened_per_access() {
         let read = build(
             "opencode",
@@ -2408,7 +2507,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(cfg).is_ok(),
             "config env must be valid JSON: {cfg}"
         );
-        assert!(cfg.contains("\"bash\":\"deny\""));
+        assert!(cfg.contains("\"effect\":\"deny\""));
 
         let write = build(
             "opencode",
@@ -2424,11 +2523,11 @@ mod tests {
             .argv
             .windows(2)
             .any(|w| w[0] == "--agent" && w[1] == "build"));
-        assert!(write.env_set[0].1.contains("external_directory"));
+        assert!(!write.env_set[0].1.contains("external_directory"));
         // --auto approves whatever is not denied, and opencode has no sandbox:
         // an auto-approved shell would make write == full.
         assert!(
-            write.env_set[0].1.contains("\"bash\":\"deny\""),
+            write.env_set[0].1.contains("\"action\":\"*\""),
             "opencode write must deny bash: {}",
             write.env_set[0].1
         );
@@ -2697,7 +2796,7 @@ mod tests {
             last_msg: &l,
             prompt_file: &p,
         };
-        for t in ["claude", "opencode", "grok", "pi", "codex"] {
+        for t in ["claude", "grok", "pi", "codex"] {
             assert!(supports_fork(t), "{t}");
             // codex additionally needs live proof the installed binary knows
             // about `exec fork` (P1-07; see build_fork's codex arm) before it
@@ -2973,7 +3072,7 @@ mod tests {
             last_msg: &l,
             prompt_file: &p,
         };
-        for t in ["claude", "opencode", "grok", "agy", "pi"] {
+        for t in ["claude", "grok", "agy", "pi"] {
             let b = build_resume(t, "sid", inp(Access::Read, &[]), &bp).unwrap();
             assert_eq!(b.expect_session.as_deref(), Some("sid"), "{t}");
         }
@@ -3238,12 +3337,12 @@ mod tests {
                 Access::Write,
                 args(&["--tools", "read,edit,write,grep,find,ls"]),
             ),
-            ("opencode", Access::Write, args(&["--agent", "build"])),
-            ("opencode", Access::Read, args(&["--agent", "plan"])),
+            ("opencode", Access::Full, args(&["--agent", "build"])),
+            ("opencode", Access::Full, args(&["--agent", "plan"])),
             // a custom agent could be anything: ambiguous args are let through
             (
                 "opencode",
-                Access::Read,
+                Access::Full,
                 args(&["--agent", "my-custom-agent"]),
             ),
             ("codex", Access::Read, args(&["-s", "some-future-mode"])),
@@ -3327,46 +3426,30 @@ mod tests {
         ];
         for name in hostile {
             for (access, denied) in [
-                (Access::Read, vec!["edit", "bash"]),
-                (Access::Write, vec!["bash"]),
+                (Access::Read, vec!["edit", "shell"]),
+                (Access::Write, vec!["shell"]),
             ] {
                 let env = opencode_env(name, access);
                 let (key, raw) = env.first().expect("read/write must set the config layer");
                 assert_eq!(key, "OPENCODE_CONFIG_CONTENT");
                 let v: serde_json::Value = serde_json::from_str(raw)
                     .unwrap_or_else(|e| panic!("agent {name:?} produced invalid JSON: {e}\n{raw}"));
-                let agents = v
-                    .get("agent")
-                    .and_then(|a| a.as_object())
-                    .unwrap_or_else(|| panic!("agent {name:?}: no agent map in {raw}"));
+                let agents = v["agents"].as_object().expect("v2 agents map");
+                assert_eq!(agents.len(), 1, "agent key injection: {raw}");
+                let perms = agents[name]["permissions"].as_array().unwrap();
                 assert_eq!(
-                    agents.len(),
-                    1,
-                    "agent {name:?} injected extra agent keys: {raw}"
+                    perms[0],
+                    serde_json::json!({"action":"*","resource":"*","effect":"deny"})
                 );
-                let perms = agents
-                    .get(name)
-                    .and_then(|a| a.get("permission"))
-                    .and_then(|p| p.as_object())
-                    .unwrap_or_else(|| panic!("agent {name:?}: name is not the key in {raw}"));
-                for d in &denied {
-                    assert_eq!(
-                        perms.get(*d).and_then(|x| x.as_str()),
-                        Some("deny"),
-                        "agent {name:?}: {d} must stay denied in {raw}"
-                    );
+                for action in denied {
+                    assert!(!perms
+                        .iter()
+                        .any(|r| r["action"] == action && r["effect"] == "allow"));
                 }
-                assert!(
-                    !perms.values().any(|x| x.as_str() == Some("allow")),
-                    "agent {name:?} smuggled an allow into {raw}"
-                );
                 if access == Access::Write {
-                    assert_eq!(
-                        v.pointer("/permission/external_directory")
-                            .and_then(|x| x.as_str()),
-                        Some("deny"),
-                        "agent {name:?}: out-of-tree writes must stay denied in {raw}"
-                    );
+                    assert!(!perms
+                        .iter()
+                        .any(|r| r["action"] == "external_directory" && r["effect"] == "allow"));
                 }
             }
             assert!(
@@ -3658,7 +3741,6 @@ mod tests {
             agent: Some("test-agent".to_string()),
             extra: &[],
             bin: None,
-            timeout_sec: Some(900),
         };
         let long_flags = |argv: &[String]| -> Vec<String> {
             argv.iter()

@@ -1856,7 +1856,7 @@ impl Flow {
             "this flow has no cost-reporting preset launches".to_string()
         } else {
             format!(
-                "every resolved preset is tokens-only ({})",
+                "every resolved preset lacks reliable USD reporting ({})",
                 names.into_iter().collect::<Vec<_>>().join(", ")
             )
         };
@@ -3595,7 +3595,7 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
         ));
     }
     // Fork support is per-tool; catch it at load time instead of mid-flow.
-    if s.fork_from.is_some() {
+    if s.fork_from.is_some() || s.continue_from.is_some() {
         let tool = s
             .tool
             .clone()
@@ -3607,9 +3607,12 @@ fn validate_step(flow: &Flow, s: &Step, is_child: bool, legacy: bool) -> Result<
             })
             .or_else(|| flow.defaults.tool.clone());
         if let Some(t) = tool {
-            if !crate::preset::supports_fork(&t) {
+            if s.continue_from.is_some() && !crate::preset::supports_resume(&t) {
+                return Err(format!("step '{sid}': tool '{t}' cannot verify continue_from continuity; pass prior output as context to a fresh step"));
+            }
+            if s.fork_from.is_some() && !crate::preset::supports_fork(&t) {
                 return Err(format!(
-                    "step '{sid}': tool '{t}' cannot fork a session headlessly (only {} can); use continue_from to chain this step serially, or drop fork_from and give it its own context",
+                    "step '{sid}': tool '{t}' cannot fork a session headlessly (only {} can); drop fork_from and give the step explicit context",
                     crate::preset::forkable_list()
                 ));
             }

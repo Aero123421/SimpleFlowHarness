@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "instructions": "Run each case several times because skill activation is nondeterministic. should_trigger names the expected skill.",
+  "instructions": "Compare selection on repeated runs under the same model/settings when authorized. should_trigger lists relevant skills, not a requirement to load every specialist. Also score the authored result; do not count structural checks as model trials.",
   "cases": [
     {
       "prompt": "sfhで実装→テスト→レビュー→修正のYAMLを作って",

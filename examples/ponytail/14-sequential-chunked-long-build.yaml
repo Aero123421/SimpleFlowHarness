@@ -1,6 +1,8 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v1.6.0/schema/flow.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Aero123421/SimpleFlowHarness/v2.0.0/schema/flow.schema.json
 # Pattern: decompose a large task, execute chunks sequentially in one workspace,
 # compact the aggregate handoff, and bound the correction loop.
+# For validated queues and remaining-only reselection, see
+# ../../skills/sfh-loop-engineering/references/stable-loop-patterns.md#outer-loop
 api_version: 1
 name: ponytail-sequential-chunked-build
 
@@ -21,6 +23,11 @@ contexts:
   latest_review:
     template: |
       {{steps.review.output | optional | truncate:18000}}
+  verification:
+    template: |
+      {{steps.verify.output | optional | truncate:8000}}
+      exit={{steps.verify.exit | optional}}
+      stderr={{steps.verify.stderr_file | optional}}
 
 profiles:
   planner: {tool: codex, access: read}
@@ -78,15 +85,22 @@ steps:
 
   - id: verify
     effects: read
+    # This sample checks whitespace only. Replace command AND exit mapping
+    # with project acceptance checks. git diff --check uses 2 for whitespace.
     cmd: ["git", "diff", "--check"]
-    on_error: goto:repair
+    outcomes:
+      0: {result: continue, label: checks_passed}
+      2: {result: continue, label: checks_failed}
+    on_error: goto:handoff
     route:
-      - {goto: review}
+      - {when_label_is: checks_failed, goto: repair}
+      - {when_label_is: checks_passed, goto: review}
+      - {goto: stuck}
 
   - id: review
     use: reviewer
     effects: read
-    context: [backlog, acceptance, project_rules, evaluator, harness]
+    context: [backlog, acceptance, project_rules, evaluator, harness, verification]
     retry: {max: 1, backoff_sec: 5}
     retry_on: transient
     prompt: |
@@ -109,7 +123,8 @@ steps:
     use: builder
     fallback: [builder_fallback]
     effects: workspace
-    context: [backlog, acceptance, project_rules, ponytail, harness, latest_review]
+    allow_empty: true
+    context: [backlog, acceptance, project_rules, ponytail, harness, latest_review, verification]
     max_visits: 4
     on_max_visits: goto:handoff
     retry: {max: 1, backoff_sec: 5}
@@ -123,7 +138,7 @@ steps:
   - id: handoff
     use: planner
     effects: read
-    context: [backlog, acceptance, project_rules, harness, latest_review]
+    context: [backlog, acceptance, project_rules, harness, latest_review, verification]
     prompt: |
       Record a compact handoff: chunks completed, current workspace state,
       checks run, unresolved blockers, and the next smallest action.

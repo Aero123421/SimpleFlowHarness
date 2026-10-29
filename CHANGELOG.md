@@ -3,7 +3,52 @@
 このCHANGELOGはrepository maintainer向けのリリース記録として日本語で記述します。
 利用者向け概要は英語版`README.md`を正とし、日本語版`README.ja.md`を併記します。
 
-## Unreleased
+## v2.0.0 - 2026-10-29
+
+### 2026-10-29 現行CLI契約と実行証拠の刷新
+
+- Issue #40: `runs clean` と自動retentionで削除条件を共有し、terminal・所有者終了・
+  nonce整合・workspace不在・排他leaseを削除直前に再確認します。稼働中・不明・
+  未完了のrunは保持。dry-runも同じ判定を使い、除外理由を表示します。
+  独立レビューで再開可能な中断runの削除を再現し、削除対象を`done`に限定。
+  `failed/stuck/stopped/dead`は再開不能でもowner終了後に復旧・診断の証拠を保持します。
+  強制削除モードはありません。
+- OpenCode 2.2.1: `--standalone`、`provider/model#variant`、v2の`agents/permissions`
+  と既定denyに移行。textだけで終了する正常応答を`exit_bound`として記録し、
+  終端イベントを捏造しません。`step_finish`はtool step終了であり最終成功ではありません。
+  text partの型・内外session一致・start/end時刻を検証し、不正なpartは拒否します。
+  検証できない`continue_from/fork_from`は拒否し、明示的なartifact引継ぎを使います。
+- Pi 1.4.0: 最終応答のstopReasonと`agent_settled.aborted`を確認。length/error/aborted、
+  再試行中や未settledを成功にしません。read/writeで`--no-mcp`を追加し、
+  拡張の明示ロード・tool wildcard・default変更による権限拡大を検出します。
+- agy 1.4.10: 内部timeoutによる部分応答成功を避け、`--print-timeout 0`とsfhの
+  外側deadlineに統一します。Go flagの単一/二重dash・分離/equals表記の上書きも拒否。
+  Codex/Claudeの既存fail-closed判定は維持します。
+- timeout・cancelによる未完了streamは、観測したprotocolを保持しつつ
+  `SFH_STEP_FAILED`・`SFH_INTERRUPTED`を優先し、adapter driftと誤分類しません。
+  Ctrl+Cとfallback待機中の中断もengineから`SFH_INTERRUPTED`を引き継ぎます。
+- `preflight --json`に実測版と検証範囲を追加。未認証、実CLI＋local mock、
+  synthetic fixtureを区別し、現行Grok/Cursor未実測を明示します。
+- **破壊的変更:** `validate`、`runs list/show/why`も共通JSON envelopeを返します。
+  run集計の`ok`は`successful_steps`、記録版は`run_sfh_version`、runのerrorは
+  `run_error`へ変更。`runs clean --json`を追加。envelope自体はschema version 1を維持。
+- YAML api_version 1、既存logの意味と既存実行データは維持します。旧版で中断した
+  runを再開する場合は旧binaryを保持して復旧し、新版は新しいrunから開始してください。
+  closureが変わったrunへ無条件に`--force-resume`しないでください。
+
+実測版・一次資料・制約・移行手順は[October audit](docs/harness-refresh-2026-10.md)。
+実装SHA `8253930cbd6010337c6302bfbc57b3086b467462` は独立Terra/Solの4指摘を修正し、
+両担当の再確認がPASS。作者のRust 1.85 release試験409・engine900・独立shell114、
+全3 OSのCI/installerが成功しました。Solも409/900/114とdistribution22・skills16を
+独立再実行。TerraはRust 1.92の限定再確認で、対象Rust4・distribution22・skills16と
+SIGINT/保持/resume/leaseを検証しました。Terraによる全試験・他OS・実AI CLI・認証済み
+動作・fallback中断の独立実プロセス試験は未実施です。
+認証・課金・実providerの正常応答は本リリースの実測に含みません。OpenCode/Piの
+成功系は本物CLI＋localhost合成モデル。現行Grok/Cursor binaryは公式取得403により未検証。
+既存のpublisher pinがnullのためmacOS/Windowsのnative署名は無効です。
+公開前には最終commitのCI・配布物・provenance・remote hashを別途照合します。
+
+### 前版以降の既存修正（維持）
 
 ### 2026-09-08 Pi protocol・sessionの追加検証
 

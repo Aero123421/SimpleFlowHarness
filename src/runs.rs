@@ -57,17 +57,15 @@ fn get<'a>(v: &'a Value, k: &str) -> &'a str {
     v.get(k).and_then(|x| x.as_str()).unwrap_or("-")
 }
 
-fn bare_json_error(as_json: bool, dir: &Path, message: &str) -> i32 {
+fn run_read_error(command: &str, as_json: bool, dir: &Path, message: &str) -> i32 {
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": false,
-                "run_dir": dir.display().to_string(),
-                "error": message,
-            }))
-            .unwrap_or_default()
-        );
+        crate::machine::emit(&crate::machine::error_envelope(
+            command,
+            crate::machine::ErrorCode::PersistenceFailure,
+            message,
+            2,
+            serde_json::json!({"run_dir": dir.display().to_string()}),
+        ));
     } else {
         eprintln!("sfh: {message}");
     }
@@ -201,6 +199,7 @@ struct RunSummary {
     status: Option<String>,
     started_utc: Option<String>,
     exit: Option<i64>,
+    #[serde(rename = "successful_steps")]
     ok: u64,
     failed: u64,
     visit: u64,
@@ -230,6 +229,7 @@ struct RunDetails {
     #[serde(flatten)]
     summary: RunSummary,
     flow: Option<String>,
+    #[serde(rename = "run_sfh_version")]
     sfh_version: Option<String>,
     tools: Value,
     /// The `on_budget` landing, if this run spent one. Absent (null) is the
@@ -480,15 +480,16 @@ pub fn list(root: &Path, limit: usize, as_json: bool) -> i32 {
 
     if as_json {
         let runs: Vec<&RunSummary> = selected.iter().map(|r| &r.summary).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        crate::machine::emit(&crate::machine::envelope(
+            "runs list",
+            true,
+            0,
+            serde_json::json!({
                 "runs": runs,
                 "total_cost_usd": total_own_cost_usd,
                 "total_own_cost_usd": total_own_cost_usd,
-            }))
-            .expect("serializing run summaries cannot fail")
-        );
+            }),
+        ));
         return 0;
     }
 
@@ -545,14 +546,16 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
     match contain::read_contained_opt(dir, "log.jsonl") {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return bare_json_error(
+            return run_read_error(
+                "runs show",
                 as_json,
                 dir,
                 &format!("{} is not an sfh run directory", dir.display()),
             );
         }
         Err(e) => {
-            return bare_json_error(
+            return run_read_error(
+                "runs show",
                 as_json,
                 dir,
                 &format!("refusing unsafe run directory {}: {e}", dir.display()),
@@ -561,11 +564,12 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
     }
     let snapshot = match crate::watch::read(dir) {
         Ok(snapshot) => snapshot,
-        Err(error) => return bare_json_error(as_json, dir, &error),
+        Err(error) => return run_read_error("runs show", as_json, dir, &error),
     };
     if snapshot.terminal() {
         if let Err(error) = crate::watch::terminal_consistent(dir, &snapshot) {
-            return bare_json_error(
+            return run_read_error(
+                "runs show",
                 as_json,
                 dir,
                 &format!(
@@ -578,10 +582,12 @@ pub fn show(dir: &Path, as_json: bool) -> i32 {
     }
     let run = details(dir);
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&run).expect("serializing run details cannot fail")
-        );
+        crate::machine::emit(&crate::machine::envelope(
+            "runs show",
+            true,
+            0,
+            serde_json::to_value(&run).expect("serializing run details cannot fail"),
+        ));
         return 0;
     }
 
@@ -675,14 +681,16 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
     let log = match contain::read_contained_opt(dir, "log.jsonl") {
         Ok(Some(log)) => log,
         Ok(None) => {
-            return bare_json_error(
+            return run_read_error(
+                "runs why",
                 as_json,
                 dir,
                 &format!("{} is not an sfh run directory", dir.display()),
             );
         }
         Err(e) => {
-            return bare_json_error(
+            return run_read_error(
+                "runs why",
                 as_json,
                 dir,
                 &format!("cannot safely read {}/log.jsonl: {e}", dir.display()),
@@ -817,7 +825,7 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
         "run_dir": dir.display().to_string(),
         "state": state,
         "current_step": current,
-        "error": error,
+        "run_error": error,
         "harness_diagnostic": harness_diagnostic,
         "protocol_failure": protocol_failure,
         "explanation": explanation,
@@ -829,10 +837,7 @@ pub fn why(dir: &Path, as_json: bool) -> i32 {
         "unfinished_postprocessing": postprocessing.into_values().collect::<Vec<_>>(),
     });
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
+        crate::machine::emit(&crate::machine::envelope("runs why", true, 0, report));
     } else {
         println!("run dir : {}", dir.display());
         println!("state   : {}", report["state"].as_str().unwrap_or("-"));
@@ -856,7 +861,10 @@ pub struct RetentionReport {
     pub warnings: Vec<String>,
 }
 
-fn terminal_for_retention(dir: &Path) -> Result<bool, String> {
+// A terminal process is not a completed flow: failed/stuck/stopped/dead runs
+// may still be resumable. Keep their recovery evidence even when the owner is
+// gone (independent v2 review, issue #40). Only done is cleanup-eligible.
+fn completed_for_cleanup(dir: &Path) -> Result<bool, String> {
     let Some(text) = contain::read_contained_opt(dir, "status.json")? else {
         return Ok(false);
     };
@@ -864,14 +872,8 @@ fn terminal_for_retention(dir: &Path) -> Result<bool, String> {
         .map_err(|error| format!("cannot parse {}/status.json: {error}", dir.display()))?;
     Ok(matches!(
         value.get("state").and_then(Value::as_str),
-        Some("done" | "failed" | "stuck" | "stopped" | "dead")
+        Some("done")
     ))
-}
-
-fn identity_verified_for_retention(dir: &Path) -> Result<bool, String> {
-    let snapshot = crate::watch::read(dir)?;
-    crate::watch::nonce_consistent(dir, &snapshot)?;
-    Ok(true)
 }
 
 /// A retained managed worktree needs its run manifest as the durable link back
@@ -907,6 +909,37 @@ fn managed_workspace_is_gone(dir: &Path) -> Result<bool, String> {
     }
 }
 
+/// One eligibility rule for automatic retention and explicit clean (issue #40).
+/// A lease must additionally be held across the final check and deletion.
+fn deletion_eligible(dir: &Path, canon_root: &Path) -> Result<(), String> {
+    if !dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+        || !dir
+            .canonicalize()
+            .map(|p| p.starts_with(canon_root))
+            .unwrap_or(false)
+    {
+        return Err("unsafe run directory".into());
+    }
+    if !completed_for_cleanup(dir)? {
+        return Err("run is not completed; preserve recovery and diagnostic evidence".into());
+    }
+    let snapshot = crate::watch::read(dir)?;
+    if !snapshot.terminal() {
+        return Err("run terminal state cannot be verified".into());
+    }
+    crate::watch::terminal_consistent(dir, &snapshot)?;
+    if !matches!(crate::watch::owner_verifiably_dead(dir)?, Some(true)) {
+        return Err("run owner is alive or cannot be verified dead".into());
+    }
+    if !managed_workspace_is_gone(dir)? {
+        return Err("managed workspace still needs this run's ownership evidence".into());
+    }
+    Ok(())
+}
+
 /// Opportunistically prune old run evidence under a host-owned policy.
 /// Every uncertain fact keeps the directory; cleanup must never be the event
 /// that decides whether a run or its managed worktree was still live.
@@ -938,11 +971,7 @@ pub fn apply_retention(root: &Path, policy: crate::state::RunRetention) -> Reten
         if !old_enough {
             continue;
         }
-        if !matches!(terminal_for_retention(dir), Ok(true))
-            || !matches!(identity_verified_for_retention(dir), Ok(true))
-            || !matches!(crate::watch::owner_verifiably_dead(dir), Ok(Some(true)))
-            || !matches!(managed_workspace_is_gone(dir), Ok(true))
-        {
+        if deletion_eligible(dir, &canon_root).is_err() {
             continue;
         }
 
@@ -959,19 +988,7 @@ pub fn apply_retention(root: &Path, policy: crate::state::RunRetention) -> Reten
                 continue;
             }
         };
-        let still_safe = dir
-            .symlink_metadata()
-            .map(|metadata| metadata.file_type().is_dir())
-            .unwrap_or(false)
-            && dir
-                .canonicalize()
-                .map(|resolved| resolved.starts_with(&canon_root))
-                .unwrap_or(false)
-            && matches!(terminal_for_retention(dir), Ok(true))
-            && matches!(identity_verified_for_retention(dir), Ok(true))
-            && matches!(crate::watch::owner_verifiably_dead(dir), Ok(Some(true)))
-            && matches!(managed_workspace_is_gone(dir), Ok(true));
-        if !still_safe {
+        if deletion_eligible(dir, &canon_root).is_err() {
             drop(lease);
             continue;
         }
@@ -988,61 +1005,112 @@ pub fn apply_retention(root: &Path, policy: crate::state::RunRetention) -> Reten
 }
 
 /// Delete run dirs older than `days`, always keeping the newest `keep`.
-pub fn clean(root: &Path, days: u64, keep: usize, dry: bool) -> i32 {
+pub fn clean(root: &Path, days: u64, keep: usize, dry: bool, as_json: bool) -> i32 {
     let dirs = run_dirs(root);
-    if dirs.len() <= keep {
-        println!("nothing to clean ({} runs, keeping {keep})", dirs.len());
-        return 0;
-    }
-    let now = std::time::SystemTime::now();
-    let cutoff = std::time::Duration::from_secs(days.saturating_mul(86_400));
-    let canon_root = match root.canonicalize() {
-        Ok(root) => root,
-        Err(e) => {
-            eprintln!("sfh: cannot resolve runs root {}: {e}", root.display());
-            return 2;
+    let candidates = dirs.len().saturating_sub(keep);
+    let canon_root = if candidates == 0 {
+        root.to_path_buf()
+    } else {
+        match root.canonicalize() {
+            Ok(root) => root,
+            Err(error) => return run_read_error("runs clean", as_json, root, &error.to_string()),
         }
     };
-    let mut removed = 0;
-    for d in dirs.iter().take(dirs.len() - keep) {
-        // Re-check immediately before a destructive operation. The runs root
-        // is expected to be private, but a path swapped for a symlink/junction
-        // after enumeration must still be refused.
-        let still_safe = d
-            .symlink_metadata()
-            .map(|m| m.file_type().is_dir())
-            .unwrap_or(false)
-            && d.canonicalize()
-                .map(|resolved| resolved.starts_with(&canon_root))
-                .unwrap_or(false);
-        if !still_safe {
-            eprintln!("sfh: refusing unsafe run directory {}", d.display());
-            continue;
-        }
-        let age_ok = std::fs::metadata(d)
+    let now = std::time::SystemTime::now();
+    let cutoff = std::time::Duration::from_secs(days.saturating_mul(86_400));
+    let mut removed = Vec::new();
+    let mut skipped = Vec::new();
+    let mut errors = Vec::new();
+    for dir in dirs.iter().take(candidates) {
+        let old_enough = std::fs::metadata(dir)
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| now.duration_since(t).ok())
-            .map(|age| age > cutoff)
-            .unwrap_or(false);
-        if !age_ok {
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > cutoff);
+        if !old_enough {
+            skipped.push(serde_json::json!({"path": dir, "reason": "age is too recent or cannot be verified"}));
             continue;
         }
-        if dry {
-            println!("would remove {}", d.display());
-        } else if let Err(e) = std::fs::remove_dir_all(d) {
-            eprintln!("sfh: cannot remove {}: {e}", d.display());
+        if let Err(reason) = deletion_eligible(dir, &canon_root) {
+            skipped.push(serde_json::json!({"path": dir, "reason": reason}));
             continue;
-        } else {
-            println!("removed {}", d.display());
         }
-        removed += 1;
+        // Dry-run shares the deletion lease and final checks. An active resume
+        // must not be advertised as removable. A new lock file may remain.
+        let lease = match contain::try_run_lease_for_delete(dir) {
+            Ok(lease) => lease,
+            Err(contain::RunLeaseError::Busy) => {
+                skipped.push(serde_json::json!({"path": dir, "reason": "run lease is busy"}));
+                continue;
+            }
+            Err(contain::RunLeaseError::Io(error)) => {
+                errors.push(format!(
+                    "cannot lock cleanup candidate {}: {error}",
+                    dir.display()
+                ));
+                continue;
+            }
+        };
+        if let Err(reason) = deletion_eligible(dir, &canon_root) {
+            skipped.push(serde_json::json!({"path": dir, "reason": reason}));
+            drop(lease);
+            continue;
+        }
+        if !dry {
+            if let Err(error) = std::fs::remove_dir_all(dir) {
+                errors.push(format!("cannot remove {}: {error}", dir.display()));
+                continue;
+            }
+        }
+        removed.push(dir.clone());
+        drop(lease);
     }
-    println!(
-        "{} {removed} run dir(s) older than {days}d (kept newest {keep})",
-        if dry { "would remove" } else { "removed" }
-    );
-    0
+    let exit = i32::from(!errors.is_empty());
+    if as_json {
+        let body = serde_json::json!({
+            "runs_dir": root, "removed": removed, "skipped": skipped,
+            "dry_run": dry, "kept_newest": dirs.len().min(keep), "errors": errors,
+        });
+        crate::machine::emit(&if errors.is_empty() {
+            crate::machine::envelope("runs clean", true, 0, body)
+        } else {
+            crate::machine::error_envelope(
+                "runs clean",
+                crate::machine::ErrorCode::PersistenceFailure,
+                "one or more run directories could not be cleaned",
+                exit,
+                body,
+            )
+        });
+    } else {
+        for row in &skipped {
+            println!(
+                "kept {}: {}",
+                row["path"].as_str().unwrap_or("?"),
+                row["reason"].as_str().unwrap_or("?")
+            );
+        }
+        for dir in &removed {
+            println!(
+                "{} {}",
+                if dry { "would remove" } else { "removed" },
+                dir.display()
+            );
+        }
+        for error in &errors {
+            eprintln!("sfh: {error}");
+        }
+        if candidates == 0 {
+            println!("nothing to clean ({} runs, keeping {keep})", dirs.len());
+        } else {
+            println!(
+                "{} {} run dir(s) older than {days}d (kept newest {keep})",
+                if dry { "would remove" } else { "removed" },
+                removed.len()
+            );
+        }
+    }
+    exit
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,7 +1424,11 @@ mod tests {
     fn retention_run(root: &Path, name: &str, owner_start: Option<u64>) -> PathBuf {
         let dir = root.join(name);
         contain::mkdir_private(&dir).unwrap();
-        std::fs::write(dir.join("log.jsonl"), "{\"event\":\"run_end\"}\n").unwrap();
+        std::fs::write(
+            dir.join("log.jsonl"),
+            "{\"event\":\"run_end\",\"status\":\"ok\"}\n",
+        )
+        .unwrap();
         contain::write_private_atomic(
             &dir.join("status.json"),
             serde_json::json!({
@@ -1433,6 +1505,106 @@ mod tests {
         );
         assert!(newest.exists(), "the newest keep entries are unconditional");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manual_clean_preserves_live_owners_even_with_terminal_status() {
+        let root = std::env::temp_dir().join(format!("sfh-clean-live-{}", contain::random_nonce()));
+        contain::mkdir_private(&root).unwrap();
+        let live = retention_run(
+            &root,
+            "live",
+            crate::execute::pid_start_time(std::process::id()),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(clean(&root, 0, 0, false, false), 0);
+        assert!(
+            live.join("log.jsonl").exists(),
+            "Issue #40: live evidence was deleted"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_clean_cannot_delete_evidence_while_resume_holds_the_lease() {
+        let root =
+            std::env::temp_dir().join(format!("sfh-clean-lease-{}", contain::random_nonce()));
+        contain::mkdir_private(&root).unwrap();
+        let dir = retention_run(&root, "resuming", Some(1));
+        let lease = contain::try_run_lease(&dir).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(clean(&root, 0, 0, false, false), 0);
+        assert!(
+            dir.join("log.jsonl").exists(),
+            "Issue #40: lease did not exclude clean"
+        );
+        drop(lease);
+        assert_eq!(clean(&root, 0, 0, false, false), 0);
+        assert!(!dir.exists(), "a released, dead terminal run is eligible");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_every_noncompleted_terminal_state() {
+        let root =
+            std::env::temp_dir().join(format!("sfh-clean-recovery-{}", contain::random_nonce()));
+        contain::mkdir_private(&root).unwrap();
+        for state in ["failed", "stuck", "stopped", "dead"] {
+            let dir = retention_run(&root, state, Some(1));
+            let mut value = status(&dir);
+            value["state"] = serde_json::json!(state);
+            contain::write_private_atomic(&dir.join("status.json"), value.to_string()).unwrap();
+            std::fs::write(
+                dir.join("log.jsonl"),
+                format!("{{\"event\":\"run_end\",\"status\":\"{state}\"}}\n"),
+            )
+            .unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let report = apply_retention(
+            &root,
+            crate::state::RunRetention {
+                older_than_days: 0,
+                keep: 0,
+            },
+        );
+        assert!(report.removed.is_empty());
+        assert_eq!(clean(&root, 0, 0, false, false), 0);
+        for state in ["failed", "stuck", "stopped", "dead"] {
+            assert!(root.join(state).join("log.jsonl").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_clean_keeps_unverifiable_or_unfinished_runs() {
+        let root =
+            std::env::temp_dir().join(format!("sfh-clean-uncertain-{}", contain::random_nonce()));
+        contain::mkdir_private(&root).unwrap();
+        let missing = retention_run(&root, "missing", Some(1));
+        std::fs::remove_file(missing.join("sfh-nonce")).unwrap();
+        let unfinished = retention_run(&root, "unfinished", Some(1));
+        let mut value = status(&unfinished);
+        value["state"] = Value::String("running".into());
+        contain::write_private_atomic(&unfinished.join("status.json"), value.to_string()).unwrap();
+        let mismatched = retention_run(&root, "mismatched", Some(1));
+        contain::write_nonce(&mismatched, std::process::id(), Some(1), "different").unwrap();
+        let contradictory = retention_run(&root, "contradictory", Some(1));
+        std::fs::write(
+            contradictory.join("log.jsonl"),
+            "{\"event\":\"step_start\"}\n",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(clean(&root, 0, 0, false, false), 0);
+        for dir in [missing, unfinished, mismatched, contradictory] {
+            assert!(
+                dir.join("log.jsonl").exists(),
+                "unverified evidence removed: {}",
+                dir.display()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

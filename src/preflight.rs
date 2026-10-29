@@ -214,6 +214,8 @@ impl ToolReport {
             // against the CLI's own documentation and a live probe.
             "minimum_version": info.and_then(|i| i.minimum_version),
             "last_verified": info.map(|i| i.last_verified),
+            "verified_version": info.map(|i| i.verified_version),
+            "verification_scope": info.map(|i| i.verification_scope),
             "protocol": info.map(|i| i.protocol),
             "supports_resume": info.map(|i| i.supports_resume),
             "supports_fork": info.map(|i| i.supports_fork),
@@ -1427,7 +1429,7 @@ mod tests {
         // meaning of `required_flags`.
         let missing_record = dir.join("missing.argv");
         let missing_script = dir.join("missing-opencode.sh");
-        write_fixture(&missing_script, &missing_record, Some("--variant"));
+        write_fixture(&missing_script, &missing_record, Some("--standalone"));
         let missing_program = missing_script.to_string_lossy().into_owned();
         let missing = probe(
             "opencode",
@@ -1438,11 +1440,11 @@ mod tests {
             Some(&dir),
             Vec::new(),
         );
-        assert_eq!(missing.missing_flags, vec!["--variant"]);
+        assert_eq!(missing.missing_flags, vec!["--standalone"]);
         assert!(missing
             .blockers
             .iter()
-            .any(|blocker| blocker.contains("run --help") && blocker.contains("--variant")));
+            .any(|blocker| blocker.contains("run --help") && blocker.contains("--standalone")));
         assert_eq!(
             std::fs::read_to_string(&missing_record).expect("read missing fixture argv"),
             "--version\nrun --help\n"

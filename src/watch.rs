@@ -882,8 +882,16 @@ pub fn owner_verifiably_dead(dir: &Path) -> Result<Option<bool>, String> {
     }
     Ok(match start {
         None => Some(false),
-        Some(recorded) => Some(execute::pid_start_time(pid) != Some(recorded)),
+        Some(recorded) => Some(start_time_proves_reuse(
+            recorded,
+            execute::pid_start_time(pid),
+        )),
     })
+}
+
+// An inaccessible live process is not evidence that its PID was reused.
+fn start_time_proves_reuse(recorded: u64, current: Option<u64>) -> bool {
+    current.is_some_and(|actual| actual != recorded)
 }
 
 /// Whether the process this run recorded as its owner might still be running,
@@ -1316,6 +1324,13 @@ mod tests {
         );
         assert!(terminal_consistent(&dir, &snapshot).is_ok());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unavailable_live_start_time_cannot_authorize_deletion() {
+        assert!(!start_time_proves_reuse(123, None));
+        assert!(!start_time_proves_reuse(123, Some(123)));
+        assert!(start_time_proves_reuse(123, Some(124)));
     }
 
     #[test]
