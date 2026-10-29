@@ -38,7 +38,7 @@ The first row is the one that surprises people. A workspace-writing agent can ma
 
 OpenCode 2 records `exit_bound`: completed structured text plus process exit, with no invented terminal event. A missing terminal is not itself a failure for that adapter. Pi 1.4 requires `agent_settled` after the final assistant outcome. `allow_empty` never waives the adapter contract.
 
-`runs clean` keeps live, locked, unfinished or unverifiable runs, including their recovery evidence. Clean managed workspaces separately before removing their run manifests.
+`runs clean` removes only proven `done` runs. It keeps failed, stuck, stopped, dead, live, locked or unverifiable runs and their recovery evidence. Clean managed workspaces separately before removing their run manifests.
 
 ## Mechanisms
 

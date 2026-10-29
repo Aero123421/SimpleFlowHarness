@@ -10,17 +10,22 @@
 - Issue #40: `runs clean` と自動retentionで削除条件を共有し、terminal・所有者終了・
   nonce整合・workspace不在・排他leaseを削除直前に再確認します。稼働中・不明・
   未完了のrunは保持。dry-runも同じ判定を使い、除外理由を表示します。
+  独立レビューで再開可能な中断runの削除を再現し、削除対象を`done`に限定。
+  `failed/stuck/stopped/dead`はowner終了後も復旧・診断の証拠を保持します。
 - OpenCode 2.2.1: `--standalone`、`provider/model#variant`、v2の`agents/permissions`
   と既定denyに移行。textだけで終了する正常応答を`exit_bound`として記録し、
   終端イベントを捏造しません。`step_finish`はtool step終了であり最終成功ではありません。
+  text partの型・内外session一致・start/end時刻を検証し、不正なpartは拒否します。
   検証できない`continue_from/fork_from`は拒否し、明示的なartifact引継ぎを使います。
 - Pi 1.4.0: 最終応答のstopReasonと`agent_settled.aborted`を確認。length/error/aborted、
   再試行中や未settledを成功にしません。read/writeで`--no-mcp`を追加し、
   拡張の明示ロード・tool wildcard・default変更による権限拡大を検出します。
 - agy 1.4.10: 内部timeoutによる部分応答成功を避け、`--print-timeout 0`とsfhの
-  外側deadlineに統一します。Codex/Claudeの既存fail-closed判定は維持します。
+  外側deadlineに統一します。Go flagの単一/二重dash・分離/equals表記の上書きも拒否。
+  Codex/Claudeの既存fail-closed判定は維持します。
 - timeout・cancelによる未完了streamは、観測したprotocolを保持しつつ
   `SFH_STEP_FAILED`・`SFH_INTERRUPTED`を優先し、adapter driftと誤分類しません。
+  Ctrl+Cとfallback待機中の中断もengineから`SFH_INTERRUPTED`を引き継ぎます。
 - `preflight --json`に実測版と検証範囲を追加。未認証、実CLI＋local mock、
   synthetic fixtureを区別し、現行Grok/Cursor未実測を明示します。
 - **破壊的変更:** `validate`、`runs list/show/why`も共通JSON envelopeを返します。

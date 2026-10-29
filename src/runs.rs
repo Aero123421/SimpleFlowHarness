@@ -861,7 +861,10 @@ pub struct RetentionReport {
     pub warnings: Vec<String>,
 }
 
-fn terminal_for_retention(dir: &Path) -> Result<bool, String> {
+// A terminal process is not a completed flow: failed/stuck/stopped/dead runs
+// may still be resumable. Keep their recovery evidence even when the owner is
+// gone (independent v2 review, issue #40). Only done is cleanup-eligible.
+fn completed_for_cleanup(dir: &Path) -> Result<bool, String> {
     let Some(text) = contain::read_contained_opt(dir, "status.json")? else {
         return Ok(false);
     };
@@ -869,7 +872,7 @@ fn terminal_for_retention(dir: &Path) -> Result<bool, String> {
         .map_err(|error| format!("cannot parse {}/status.json: {error}", dir.display()))?;
     Ok(matches!(
         value.get("state").and_then(Value::as_str),
-        Some("done" | "failed" | "stuck" | "stopped" | "dead")
+        Some("done")
     ))
 }
 
@@ -920,8 +923,8 @@ fn deletion_eligible(dir: &Path, canon_root: &Path) -> Result<(), String> {
     {
         return Err("unsafe run directory".into());
     }
-    if !terminal_for_retention(dir)? {
-        return Err("run is unfinished or its terminal state is unknown".into());
+    if !completed_for_cleanup(dir)? {
+        return Err("run is not completed; preserve recovery and diagnostic evidence".into());
     }
     let snapshot = crate::watch::read(dir)?;
     if !snapshot.terminal() {
@@ -1538,6 +1541,38 @@ mod tests {
         drop(lease);
         assert_eq!(clean(&root, 0, 0, false, false), 0);
         assert!(!dir.exists(), "a released, dead terminal run is eligible");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_every_noncompleted_terminal_state() {
+        let root =
+            std::env::temp_dir().join(format!("sfh-clean-recovery-{}", contain::random_nonce()));
+        contain::mkdir_private(&root).unwrap();
+        for state in ["failed", "stuck", "stopped", "dead"] {
+            let dir = retention_run(&root, state, Some(1));
+            let mut value = status(&dir);
+            value["state"] = serde_json::json!(state);
+            contain::write_private_atomic(&dir.join("status.json"), value.to_string()).unwrap();
+            std::fs::write(
+                dir.join("log.jsonl"),
+                format!("{{\"event\":\"run_end\",\"status\":\"{state}\"}}\n"),
+            )
+            .unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let report = apply_retention(
+            &root,
+            crate::state::RunRetention {
+                older_than_days: 0,
+                keep: 0,
+            },
+        );
+        assert!(report.removed.is_empty());
+        assert_eq!(clean(&root, 0, 0, false, false), 0);
+        for state in ["failed", "stuck", "stopped", "dead"] {
+            assert!(root.join(state).join("log.jsonl").exists());
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

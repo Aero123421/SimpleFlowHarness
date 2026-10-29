@@ -13,7 +13,7 @@ agent framework, database, generic plugin protocol, or compatibility layer.
 The changes address observed contract gaps:
 
 1. **One deletion policy.** Manual cleanup and automatic retention must both
-   prove terminal state, consistent ownership, a dead owner and absence of a
+   prove completed (`done`) state, consistent ownership, a dead owner and absence of a
    managed workspace that still depends on the run manifest. Both acquire the
    existing deletion lease and repeat the checks before removal. Dry-run uses
    the same eligibility and lease checks and explains retained runs. Ambiguous
@@ -186,7 +186,8 @@ Explicit `cmd:` wrappers remain available with author-owned exit/artifact gates.
    Keep deterministic gates after agent work. Pair USD ceilings with wall-clock
    limits when coverage is incomplete, especially with OpenCode 2.
 5. `runs clean --dry-run --json` explains retained evidence. Live, locked,
-   contradictory, legacy/unverifiable and still-managed workspace runs remain.
+   contradictory, failed/stuck/stopped/dead, legacy/unverifiable and still-managed
+   workspace runs remain. Only a proven `done` run is eligible.
    No force-delete mode or automatic conversion of old data is introduced.
 
 ## Release gates
@@ -198,3 +199,24 @@ independent review and fix recheck, and the existing release inventory and
 provenance gates. Compare the published remote tag and every downloaded
 distribution packet to that final commit. Preserve all existing releases and
 run data.
+
+## Independent patch review follow-up
+
+Terra reproduced deletion of a resumable interrupted run and a Ctrl+C envelope
+misclassified as `SFH_FLOW_INVALID` at fad1f9c8. New real-process tests failed
+before the fixes and pass afterward. Cleanup now requires `done` before and
+after the lease, preserving all other states without duplicating the engine's
+resume diagnosis. Engine interrupt checks, including fallback checkpoints,
+carry the canonical `SFH_INTERRUPTED` prefix into status and JSON envelopes.
+The process regression checks SIGINT with incomplete structured output, stop,
+dry-run, actual cleanup, automatic retention, successful resume, and deletion
+after completion. CLI output in this regression is a synthetic fixture.
+Independent re-review of the fixes remains a separate gate.
+
+Sol also reproduced acceptance of agy's single-dash Go flag spelling and three
+malformed OpenCode text parts. Fresh/resume builders now reject both dash
+spellings, with separated or equals values. OpenCode requires typed text parts,
+matching outer/inner session IDs and numeric start/end times in order. Mutations
+of the captured valid transcript fail as protocol invalid; the unchanged real
+transcript still succeeds. Unit and process fixtures cover these counterexamples;
+they do not claim that the real CLI emitted the malformed records.

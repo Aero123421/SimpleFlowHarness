@@ -4208,7 +4208,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                 return Err(e);
             }
             if execute::interrupted() {
-                return Err("interrupted (Ctrl+C): child processes were terminated".into());
+                return Err(
+                    "SFH_INTERRUPTED: interrupted (Ctrl+C): child processes were terminated".into(),
+                );
             }
             if forced_budget_trigger.is_some() && (budget_plan.is_none() || budget_landed) {
                 return Err(
@@ -4516,7 +4518,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         {
                             if execute::interrupted() {
                                 return Err(format!(
-                                    "interrupted after fan-out member '{}' completed an attempt; its selected fallback is checkpointed for resume",
+                                    "SFH_INTERRUPTED: interrupted after fan-out member '{}' completed an attempt; its selected fallback is checkpointed for resume",
                                     $label
                                 ));
                             }
@@ -5386,7 +5388,7 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
                         // an uncheckpointed primary that resume runs again.
                         if execute::interrupted() {
                             return Err(
-                                "interrupted after a completed attempt; the selected fallback is checkpointed for resume"
+                                "SFH_INTERRUPTED: interrupted after a completed attempt; the selected fallback is checkpointed for resume"
                                     .into(),
                             );
                         }
@@ -5493,7 +5495,9 @@ fn run_inner(opts: &RunOpts) -> Result<i32, String> {
             // to `end` (or append/compact partial output) before the loop-top
             // interrupt check gets another chance to run.
             if execute::interrupted() {
-                return Err("interrupted (Ctrl+C): child processes were terminated".into());
+                return Err(
+                    "SFH_INTERRUPTED: interrupted (Ctrl+C): child processes were terminated".into(),
+                );
             }
             // A failed attempt is durable above, but its next retry was
             // pre-empted when backoff entered the wall-clock reserve. Budget

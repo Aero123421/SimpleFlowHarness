@@ -3066,9 +3066,19 @@ impl LineRecords for OpencodeNdjsonAccumulator {
                         .to_string()
                 };
                 let (pid, mid, txt) = (get("id"), get("messageID"), get("text"));
+                let session = v.get("sessionID").and_then(|value| value.as_str());
+                let completed = part.and_then(|p| p.get("time")).is_some_and(|time| {
+                    time.get("start")
+                        .and_then(|value| value.as_u64())
+                        .zip(time.get("end").and_then(|value| value.as_u64()))
+                        .is_some_and(|(start, end)| end >= start)
+                });
                 if pid.is_empty()
                     || mid.is_empty()
-                    || self.parsed.session.as_deref().unwrap_or("").is_empty()
+                    || session.is_none_or(str::is_empty)
+                    || get("sessionID") != session.unwrap_or("")
+                    || get("type") != "text"
+                    || !completed
                     || part
                         .and_then(|p| p.get("text"))
                         .and_then(|t| t.as_str())
@@ -3776,11 +3786,11 @@ mod tests {
         let s = concat!(
             r#"{"type":"step_start","sessionID":"ses_1","part":{}}"#,
             "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old"}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old","type":"text","sessionID":"ses_1","time":{"start":1,"end":2}}}"#,
             "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new "}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new ","type":"text","sessionID":"ses_1","time":{"start":1,"end":2}}}"#,
             "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer"}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer","type":"text","sessionID":"ses_1","time":{"start":1,"end":2}}}"#,
             "\n",
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"tokens":{"input":171,"output":6},"cost":0.5}}"#,
         );
@@ -3830,11 +3840,54 @@ mod tests {
     }
 
     #[test]
+    fn opencode_rejects_text_without_typed_completion_and_matching_sessions() {
+        let original: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/cli-2026-10/opencode-2.2.1-text.jsonl"
+        ))
+        .unwrap();
+        for defect in [
+            "end_missing",
+            "end_string",
+            "end_before_start",
+            "inner_session",
+            "outer_session_missing",
+            "part_type",
+        ] {
+            let mut event = original.clone();
+            match defect {
+                "end_missing" => {
+                    event["part"]["time"].as_object_mut().unwrap().remove("end");
+                }
+                "end_string" => event["part"]["time"]["end"] = serde_json::json!("complete"),
+                "end_before_start" => event["part"]["time"]["end"] = serde_json::json!(0),
+                "inner_session" => event["part"]["sessionID"] = serde_json::json!("different"),
+                "outer_session_missing" => {
+                    event.as_object_mut().unwrap().remove("sessionID");
+                }
+                "part_type" => event["part"]["type"] = serde_json::json!("tool"),
+                _ => unreachable!(),
+            }
+            let text = event.to_string();
+            let parsed = parse_opencode_ndjson(&text);
+            assert_eq!(parsed.evidence.protocol, ProtocolState::Invalid, "{defect}");
+            assert!(!parsed.evidence.allows_success(), "{defect}");
+            let observer = OpencodeStreamObserver::default();
+            observer.observe(text.as_bytes());
+            let (streamed, _) = observer.finish();
+            assert_eq!(
+                streamed.evidence.protocol,
+                ProtocolState::Invalid,
+                "{defect}"
+            );
+        }
+    }
+
+    #[test]
     fn opencode_dedupes_streamed_part_updates() {
         let s = concat!(
-            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"par"}}"#,
+            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"par","type":"text","sessionID":"s","time":{"start":1,"end":2}}}"#,
             "\n",
-            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"partial full"}}"#,
+            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m","text":"partial full","type":"text","sessionID":"s","time":{"start":1,"end":2}}}"#,
         );
         assert_eq!(parse_opencode_ndjson(s).text, "partial full");
     }
@@ -3849,7 +3902,7 @@ mod tests {
     fn opencode_ndjson_streaming_semantics_survive_more_than_raw_capture_limit() {
         let observer = OpencodeStreamObserver::default();
         observer.observe(
-            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p0","messageID":"m0","text":"interim"}}
+            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p0","messageID":"m0","text":"interim","type":"text","sessionID":"stream-session","time":{"start":1,"end":2}}}
 "#,
         );
 
@@ -3862,7 +3915,7 @@ mod tests {
         }
 
         observer.observe(
-            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p1","messageID":"m1","text":"VERDICT: PASS"}}
+            br#"{"type":"text","sessionID":"stream-session","part":{"id":"p1","messageID":"m1","text":"VERDICT: PASS","type":"text","sessionID":"stream-session","time":{"start":1,"end":2}}}
 "#,
         );
         let final_record = br#"{"type":"step_finish","sessionID":"stream-session","part":{"tokens":{"input":20,"output":3},"cost":0.5}}"#;
@@ -3944,7 +3997,7 @@ mod tests {
     fn opencode_ndjson_single_record_over_the_per_record_ceiling_fails_closed() {
         let observer = OpencodeStreamObserver::default();
         observer.observe(
-            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"before"}}
+            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"before","type":"text","sessionID":"s","time":{"start":1,"end":2}}}
 "#,
         );
         // One line bigger than MAX_JSONL_LINE_BYTES, delivered in 64 KiB pieces
@@ -3973,7 +4026,7 @@ mod tests {
     fn opencode_ndjson_final_line_without_a_trailing_newline_is_still_a_complete_record() {
         let observer = OpencodeStreamObserver::default();
         observer.observe(
-            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"answer"}}
+            br#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"answer","type":"text","sessionID":"s","time":{"start":1,"end":2}}}
 "#,
         );
         observer.observe(
@@ -3992,13 +4045,13 @@ mod tests {
     #[test]
     fn opencode_ndjson_observer_and_non_streaming_parser_agree_on_small_input() {
         let text = concat!(
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old"}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p1","messageID":"m1","text":"old","type":"text","sessionID":"ses_1","time":{"start":1,"end":2}}}"#,
             "\n",
             "{not json",
             "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new "}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p2","messageID":"m2","text":"new ","type":"text","sessionID":"ses_1","time":{"start":1,"end":2}}}"#,
             "\n",
-            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer"}}"#,
+            r#"{"type":"text","sessionID":"ses_1","part":{"id":"p3","messageID":"m2","text":"answer","type":"text","sessionID":"ses_1","time":{"start":1,"end":2}}}"#,
             "\n",
             r#"{"type":"step_finish","sessionID":"ses_1","part":{"tokens":{"input":171,"output":6},"cost":0.5}}"#,
             "\n",
@@ -4521,7 +4574,7 @@ mod tests {
         assert!(o.text.is_empty());
         // OpenCode 2: text-only completion uses process exit, never a forged terminal.
         let o = parse_opencode_ndjson(
-            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"hi"}}"#,
+            r#"{"type":"text","sessionID":"s","part":{"id":"p1","messageID":"m1","text":"hi","type":"text","sessionID":"s","time":{"start":1,"end":2}}}"#,
         );
         assert_eq!(o.evidence.protocol, ProtocolState::ExitBound);
         assert!(o.evidence.allows_success());

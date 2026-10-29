@@ -1600,7 +1600,14 @@ fn reject_agy_soft_timeout(tool: &str, args: &[String]) -> Result<(), String> {
     if tool == "agy"
         && args
             .iter()
-            .any(|arg| arg.split('=').next() == Some("--print-timeout"))
+            // agy's Go flag parser accepts one or two leading dashes and
+            // either separated or equals values (independent v2 review).
+            .any(|arg| {
+                matches!(
+                    arg.split('=').next(),
+                    Some("-print-timeout" | "--print-timeout")
+                )
+            })
     {
         return Err("agy --print-timeout can return partial success; use timeout_sec for sfh's hard deadline".into());
     }
@@ -2357,6 +2364,32 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--print-timeout" && w[1] == "0"));
         assert!(argv.windows(2).any(|w| w[0] == "--mode" && w[1] == "plan"));
+    }
+
+    #[test]
+    fn agy_rejects_both_go_flag_spellings_of_soft_timeout_on_fresh_and_resume() {
+        let (l, p) = paths();
+        let bp = BuildPaths {
+            last_msg: &l,
+            prompt_file: &p,
+        };
+        for flag in ["-print-timeout", "--print-timeout"] {
+            for extra in [
+                vec![flag.to_string(), "1s".into()],
+                vec![format!("{flag}=1s")],
+            ] {
+                for access in [Access::Read, Access::Write, Access::Full] {
+                    let fresh = build("agy", inp(access, &extra), &bp, None)
+                        .err()
+                        .expect("fresh must reject soft timeout");
+                    assert!(fresh.contains("timeout_sec"), "{fresh}");
+                    let resumed = build_resume("agy", "session", inp(access, &extra), &bp)
+                        .err()
+                        .expect("resume must reject soft timeout");
+                    assert!(resumed.contains("timeout_sec"), "{resumed}");
+                }
+            }
+        }
     }
 
     #[test]

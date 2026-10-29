@@ -153,12 +153,16 @@ continues to count process attempts, with legacy events counting as one.
 
 Cleanup's `removed` contains candidates when `dry_run` is true. Dry-run takes
 the same lease and repeats the same ownership checks as deletion; it may
-create a lock file. Active, ambiguous, unfinished, locked, and still-managed
-workspace runs are retained. A skipped run is not an IO failure; actual
+create a lock file. Only a proven `done` run is eligible. `failed`, `stuck`,
+`stopped`, and `dead` runs retain recovery/diagnostic evidence even after their
+owner exits; terminal process state does not mean the flow completed. Active,
+ambiguous, locked, and still-managed workspace runs are also retained. A skipped run is not an IO failure; actual
 removal failures return exit 1 with `SFH_PERSISTENCE_FAILURE` and `errors`.
 
 `exit_bound` is an additive protocol state for OpenCode 2: structured completed
-text was observed, but success still depends on process exit. `terminal_seen`
+text was observed, but success still depends on process exit. A completed text
+part must have type `text`, matching outer/inner session IDs, text/part/message
+identifiers of the expected types, and numeric start/end times with end >= start. `terminal_seen`
 is false and `terminal_success` is null unless an actual error event arrived.
 It cannot justify `exit_conflict: trust_protocol` correcting a nonzero exit.
 `valid` retains its existing meaning: a documented terminal record was seen.
