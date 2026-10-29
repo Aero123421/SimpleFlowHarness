@@ -19,6 +19,15 @@ contexts:
   latest_review:
     template: |
       {{steps.review.output | optional | truncate:18000}}
+  latest_failure:
+    template: |
+      reproduction: {{steps.prove_failure.output | optional | truncate:5000}}
+      exit={{steps.prove_failure.exit | optional}} stderr={{steps.prove_failure.stderr_file | optional}}
+      focused: {{steps.targeted_eval.output | optional | truncate:5000}}
+      exit={{steps.targeted_eval.exit | optional}} stderr={{steps.targeted_eval.stderr_file | optional}}
+      regression: {{steps.full_regression.output | optional | truncate:5000}}
+      exit={{steps.full_regression.exit | optional}} stderr={{steps.full_regression.stderr_file | optional}}
+      review: {{steps.review.output | optional | truncate:5000}}
 
 profiles:
   analyst: {tool: codex, access: read}
@@ -44,10 +53,16 @@ steps:
       - {goto: add_eval}
 
   - id: add_eval
+    allow_empty: true
     use: builder
     effects: workspace
     context: [incident, acceptance, project_rules, ponytail]
     prompt: |
+      Also create tools/check_incident.py: run the focused regression and inspect
+      its assertion evidence against the incident. Exit 0 if it passes, 20 only
+      for the confirmed incident failure, and 2 if inspection cannot complete.
+      With --regression, run the full suite: 20 requires actual failing assertions.
+      Print expected/observed evidence. Never map arbitrary nonzero to 20.
       Add the smallest regression eval or test that reproduces the real failure.
       Do not implement the fix yet. Keep source evidence and expected correction
       visible in the test.
@@ -57,24 +72,26 @@ steps:
     route:
       - {goto: prove_failure}
 
+  # tools/check_incident.py is project-specific, created with the regression.
+  # 0 = checks pass; 20 = verified assertion failure; other = cannot inspect.
+  # Before fixing, 20 must identify THIS incident, not just any failed test.
   - id: prove_failure
     effects: workspace
-    cmd: ["python", "-m", "pytest", "-q", "tests"]
+    cmd: ["python", "tools/check_incident.py"]
     timeout_sec: 1800
-    on_error: goto:implement
+    outcomes:
+      0: {result: continue, label: not_reproduced}
+      20: {result: continue, label: reproduced}
+    on_error: goto:stuck
     route:
-      # Exit 0 means the failure did NOT reproduce, so there is nothing to
-      # root-cause yet: stop rather than let a model invent a fix. Any other
-      # exit is the expected reproduction. The catch-all is written out because
-      # an implicit fall-through silently follows step order, and step order is
-      # exactly what an edit to this file is most likely to change.
-      - {when_exit: 0, goto: stuck}
-      - {goto: implement}
+      - {when_label_is: reproduced, goto: implement}
+      - {goto: stuck}
 
   - id: implement
     use: builder
     effects: workspace
-    context: [incident, acceptance, project_rules, ponytail]
+    allow_empty: true
+    context: [incident, acceptance, project_rules, ponytail, latest_failure]
     prompt: |
       Implement the smallest root-cause fix that makes the new eval pass without
       teaching only the recorded example. Reuse the existing pipeline and preserve provenance.
@@ -83,24 +100,34 @@ steps:
 
   - id: targeted_eval
     effects: workspace
-    cmd: ["python", "-m", "pytest", "-q", "tests"]
+    cmd: ["python", "tools/check_incident.py"]
     timeout_sec: 1800
-    on_error: goto:fix
+    outcomes:
+      0: {result: continue, label: checks_passed}
+      20: {result: continue, label: checks_failed}
+    on_error: goto:stuck
     route:
-      - {goto: full_regression}
+      - {when_label_is: checks_failed, goto: fix}
+      - {when_label_is: checks_passed, goto: full_regression}
+      - {goto: stuck}
 
   - id: full_regression
     effects: workspace
-    cmd: ["python", "-m", "pytest", "-q"]
-    timeout_sec: 3600
-    on_error: goto:fix
+    cmd: ["python", "tools/check_incident.py", "--regression"]
+    timeout_sec: 1800
+    outcomes:
+      0: {result: continue, label: checks_passed}
+      20: {result: continue, label: checks_failed}
+    on_error: goto:stuck
     route:
-      - {goto: review}
+      - {when_label_is: checks_failed, goto: fix}
+      - {when_label_is: checks_passed, goto: review}
+      - {goto: stuck}
 
   - id: review
     use: reviewer
     effects: read
-    context: [incident, acceptance, project_rules, correctness]
+    context: [incident, acceptance, project_rules, correctness, latest_failure]
     prompt: |
       Verify the production trace, regression eval, generalization, and current code.
       End with exactly REVIEW: PASS or REVIEW: REVISE.
@@ -112,7 +139,8 @@ steps:
   - id: fix
     use: builder
     effects: workspace
-    context: [incident, acceptance, project_rules, ponytail, latest_review]
+    allow_empty: true
+    context: [incident, acceptance, project_rules, ponytail, latest_review, latest_failure]
     max_visits: 3
     on_max_visits: goto:stuck
     prompt: |

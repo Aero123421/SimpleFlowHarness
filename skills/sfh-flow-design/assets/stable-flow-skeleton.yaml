@@ -20,6 +20,7 @@ contexts:
       {{steps.review.output | optional | truncate:16000}}
   verification:
     template: |
+      {{steps.verify.output | optional | truncate:8000}}
       exit={{steps.verify.exit | optional}}
       stdout={{steps.verify.output_file | optional}}
       stderr={{steps.verify.stderr_file | optional}}
@@ -57,9 +58,17 @@ steps:
     effects: read
     max_visits: 5
     on_max_visits: goto:handoff
+    # This sample checks whitespace only. Replace command AND exit mapping
+    # with project acceptance checks. git diff --check uses 2 for whitespace.
     cmd: ["git", "diff", "--check"]
-    on_error: goto:fix
-    route: [{goto: review}]
+    outcomes:
+      0: {result: continue, label: checks_passed}
+      2: {result: continue, label: checks_failed}
+    on_error: goto:handoff
+    route:
+      - {when_label_is: checks_failed, goto: fix}
+      - {when_label_is: checks_passed, goto: review}
+      - {goto: stuck}
 
   - id: review
     use: reviewer

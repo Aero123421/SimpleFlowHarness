@@ -332,8 +332,8 @@ steps:
         self.assertIn("SFH033", self.lint(remote_write))
 
     def test_the_bundled_flows_are_clean(self) -> None:
-        # The pack's own README makes this linter step 6 of the standard
-        # authoring procedure, so its reference flows have to pass it.
+        # The linter is optional authoring help; its shipped reference flows
+        # must still be clean so it does not teach authors to ignore warnings.
         flows = sorted(ROOT.glob("examples/ponytail/[0-9][0-9]-*.yaml"))
         flows += sorted(SKILLS.glob("sfh-*/assets/*.yaml"))
         self.assertTrue(flows)

@@ -61,7 +61,7 @@ Execution closure detects changes on resume, but a long live run should not depe
 
 ## Profile overlays
 
-Control logic stays in the flow; environment-specific binary/model settings live in overlays. Always inspect effective config and include overlay files in review.
+Control logic stays in the flow; environment-specific binary/model settings live in overlays. Keep provider-specific settings in the chosen overlay: scalar `null` does not clear a base value, and step-level settings override the profile. Inspect the effective plan when switching providers.
 
 ## Provider-native Skills
 

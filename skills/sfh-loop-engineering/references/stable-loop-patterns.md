@@ -49,3 +49,20 @@ Best for web, CI, metrics, or MCP reads.
 - save immutable artifact
 - AI interprets the frozen artifact
 - remote mutation is a separate, explicitly guarded step
+
+## Outer loop
+
+For work-list selection → delegation → integration → remaining-only reselection:
+validate the selected IDs, item count, duplicates and scope before `foreach`;
+use `max_parallel: 1` for writers sharing a workspace. Integration checks actual
+artifacts and records accepted IDs plus remaining blockers. Feed that record
+back to selection, so accepted chunks are not bought again. Bound selection
+visits and total work; hand off ambiguous or exhausted work.
+
+In the full distribution, `examples/ponytail/14-sequential-chunked-long-build.yaml`
+shows sequential chunks with a later repair loop. To make selection itself
+repeat, add the queue validator and route integration's declared `remaining`
+result back to selection. For multi-stage per-chunk repair, use one graph:
+select current chunk → build → verify → evaluate → record acceptance → select.
+The inner correction route and outer next-chunk route remain distinct; no new
+planner or loop DSL is needed in the engine.

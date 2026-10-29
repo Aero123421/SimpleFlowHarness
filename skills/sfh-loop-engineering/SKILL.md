@@ -17,6 +17,7 @@ Start from [the bounded evaluator loop](assets/bounded-evaluator-loop.yaml) with
 - Use a route revisit for REVISE, `retry` for a safe repeat of the invocation, `fallback` for a different profile, and `replay.unfinished` for interrupted work on resume.
 - Bound revisited steps with `max_visits` and `on_max_visits: goto:handoff`. Add a total-step or wall-clock ceiling; preserve blockers and land on `stuck` when exhausted. Reserve time for the full `on_budget` handoff.
 - `max_total_steps` counts logical leaf runs, not their retry attempts. Inspect `plan`'s `max_attempts`; cost limits cover reported USD only.
+- Separate a failed acceptance check from a check that could not run; map only documented outcomes to correction. Pass the check evidence and current evaluator blockers to both correction and handoff.
 - Route exact evaluator verdicts or validated wrapper outcomes; send unknown verdicts to `stuck`. SFH does not infer progress from prose. If repeated blockers should stop the loop early, encode that decision in an evaluator/check and route it.
 - Parallelize independent evaluators; serialize overlapping writers. Use `when_members` for exact member votes, with child `on_error: continue` when the group must inspect failures. Failed members do not vote.
 - Long work can use sequential chunks, artifacts and bounded handoffs. Session continuation and `compact` do not replace durable evidence.
