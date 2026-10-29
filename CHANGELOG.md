@@ -3,7 +3,7 @@
 このCHANGELOGはrepository maintainer向けのリリース記録として日本語で記述します。
 利用者向け概要は英語版`README.md`を正とし、日本語版`README.ja.md`を併記します。
 
-## v2.0.0 (release candidate; publication pending)
+## v2.0.0 - 2026-10-29
 
 ### 2026-10-29 現行CLI契約と実行証拠の刷新
 
@@ -11,7 +11,8 @@
   nonce整合・workspace不在・排他leaseを削除直前に再確認します。稼働中・不明・
   未完了のrunは保持。dry-runも同じ判定を使い、除外理由を表示します。
   独立レビューで再開可能な中断runの削除を再現し、削除対象を`done`に限定。
-  `failed/stuck/stopped/dead`はowner終了後も復旧・診断の証拠を保持します。
+  `failed/stuck/stopped/dead`は再開不能でもowner終了後に復旧・診断の証拠を保持します。
+  強制削除モードはありません。
 - OpenCode 2.2.1: `--standalone`、`provider/model#variant`、v2の`agents/permissions`
   と既定denyに移行。textだけで終了する正常応答を`exit_bound`として記録し、
   終端イベントを捏造しません。`step_finish`はtool step終了であり最終成功ではありません。
@@ -36,7 +37,16 @@
   closureが変わったrunへ無条件に`--force-resume`しないでください。
 
 実測版・一次資料・制約・移行手順は[October audit](docs/harness-refresh-2026-10.md)。
-公開前の独立review、最終SHAの全OS CI、配布検証は別のrelease gateです。
+実装SHA `8253930cbd6010337c6302bfbc57b3086b467462` は独立Terra/Solの4指摘を修正し、
+両担当の再確認がPASS。作者のRust 1.85 release試験409・engine900・独立shell114、
+全3 OSのCI/installerが成功しました。Solも409/900/114とdistribution22・skills16を
+独立再実行。TerraはRust 1.92の限定再確認で、対象Rust4・distribution22・skills16と
+SIGINT/保持/resume/leaseを検証しました。Terraによる全試験・他OS・実AI CLI・認証済み
+動作・fallback中断の独立実プロセス試験は未実施です。
+認証・課金・実providerの正常応答は本リリースの実測に含みません。OpenCode/Piの
+成功系は本物CLI＋localhost合成モデル。現行Grok/Cursor binaryは公式取得403により未検証。
+既存のpublisher pinがnullのためmacOS/Windowsのnative署名は無効です。
+公開前には最終commitのCI・配布物・provenance・remote hashを別途照合します。
 
 ### 前版以降の既存修正（維持）
 

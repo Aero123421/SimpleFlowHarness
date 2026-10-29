@@ -211,7 +211,8 @@ carry the canonical `SFH_INTERRUPTED` prefix into status and JSON envelopes.
 The process regression checks SIGINT with incomplete structured output, stop,
 dry-run, actual cleanup, automatic retention, successful resume, and deletion
 after completion. CLI output in this regression is a synthetic fixture.
-Independent re-review of the fixes remains a separate gate.
+Both independent reviewers passed their targeted fix rechecks at the implementation
+commit below; final release artifact verification remains a separate gate.
 
 Sol also reproduced acceptance of agy's single-dash Go flag spelling and three
 malformed OpenCode text parts. Fresh/resume builders now reject both dash
@@ -220,3 +221,33 @@ matching outer/inner session IDs and numeric start/end times in order. Mutations
 of the captured valid transcript fail as protocol invalid; the unchanged real
 transcript still succeeds. Unit and process fixtures cover these counterexamples;
 they do not claim that the real CLI emitted the malformed records.
+
+### Independent recheck results
+
+Reviewed implementation: `8253930cbd6010337c6302bfbc57b3086b467462`.
+
+- **Terra: PASS for its two findings.** Its own real-process fixtures verified
+  SIGINT exit 1 / `SFH_INTERRUPTED` / resumable=true, dry-run and actual cleanup
+  preservation, successful resume, and deletion only after releasing the lease.
+  Targeted tests passed: run_cleanup 3, opencode_exit 1, distribution 22, skills 16.
+  This used **Rust 1.92**, not the pinned 1.85. It did not independently rerun
+  the full suite, Windows/macOS, real AI CLIs, authenticated providers or the
+  fallback-interruption process cases. Synthetic fixtures are not live CLI tests.
+- **Sol: PASS for its two findings.** Eight agy timeout-argument variants were
+  refused before the leaf ran, while normal fresh/resume succeeded. The three
+  mutated OpenCode records failed and the original succeeded; additional fields
+  and equal start/end timestamps remained accepted. Wrong types, reversed time
+  and missing outer session were rejected. Its independent Rust 409, engine 900,
+  shell 114, distribution 22 and skills 16 checks all passed. Real OpenCode
+  permission cases (4) and Pi success/error/length cases (3) used localhost
+  synthetic models; authentication, billing, other OSes and publication were
+  outside its recheck. These are separate executions, not author results.
+
+The author used Rust 1.85.0 for 409 release tests, engine 900, shell 114 and
+package/clean-install checks. The implementation commit passed full Linux,
+macOS and Windows CI, including installers. Subsequent release-documentation
+commits must preserve the reviewed implementation and pass their own CI and
+resource-manifest checks; no new source or test changes are implied by the
+review results above. The existing null native publisher pins mean the macOS
+and Windows artifacts are unsigned; GitHub release immutability, checksums
+and artifact attestations are separate publication gates.
